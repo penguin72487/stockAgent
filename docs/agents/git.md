@@ -44,6 +44,10 @@ blob refs require explicit review. A commit-only history walk is insufficient.
 
 Put new node data under root `data_*`, outputs under `artifacts`, and transient
 report exports under `reports`; shared code/config/fixtures remain visible.
+Mutable service state, execution ledgers and service caches belong under the
+node-local `service_data/`, which is excluded from Git. Existing immutable
+manifests retain their original bytes and paths; compatibility names do not
+authorize deleting the underlying service state.
 Small reviewed binary fixtures belong under `test/fixtures`, not an exception
 for all production datasets. Avoid blanket `*.json`, `*.csv`, `*.html`, `docs/`
 or `.agents/skills/` ignores: those also hide necessary software and evidence.

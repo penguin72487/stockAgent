@@ -316,6 +316,7 @@ def compact_packed_day_trade_carry_session(
         minimum_exit_prices=minimum,
         maximum_exit_prices=maximum,
         terminal_liquidation_price=packed.terminal_liquidation_price,
+        short_limit_up_penalty_per_share=packed.short_limit_up_penalty_per_share,
     )
 
 
@@ -1740,11 +1741,16 @@ def build_prepared_day_trade_carry_source(
     cache_dir: str | Path, allow_daily_proxy: bool,
     daily_proxy_price_policy: str, corporate_action_mode: str,
     terminal_liquidation_unlimited_capacity: bool = False,
+    short_limit_up_penalty_rate: float = 0.0,
     entry_remainder_policy: str = "first_minute_only",
     subscription_right_policy: str = "reference_value_cash",
     sparse_event_slots: int | None = None,
 ) -> PreparedDayTradeCarrySource:
     from stockagent.storage_layout import admit_output
+    if (isinstance(short_limit_up_penalty_rate, bool)
+            or not np.isfinite(short_limit_up_penalty_rate)
+            or not 0 <= short_limit_up_penalty_rate <= 1):
+        raise ValueError("short limit-up penalty rate must be finite in [0, 1]")
     cache_dir = admit_output(Path(cache_dir), 'cache')
     if subscription_right_policy not in {"reference_value_cash", "reject_held"}:
         raise ValueError("unsupported physical subscription right policy")
@@ -2706,6 +2712,15 @@ def build_prepared_day_trade_carry_source(
             unresolved_action_gap_mask=tensor(unresolved_gap),
             daily_proxy_mask=tensor(daily_proxy_mask),
             terminal_liquidation_price=terminal_liquidation_price,
+            short_limit_up_penalty_per_share=(
+                tensor(np.where(
+                    np.isfinite(closes[row]) & (closes[row] > 0)
+                    & np.isfinite(upper[row])
+                    & np.isclose(closes[row], upper[row], rtol=0, atol=1e-8)
+                    & (gap == 0) & ~no_regular_execution[row],
+                    closes[row] * short_limit_up_penalty_rate, 0.0,
+                )) if short_limit_up_penalty_rate else None
+            ),
             entry_path=tensor(entry_path) if sweep_entries else None,
             stop_hits=tensor(stop_hits) if sweep_entries else None,
         )
@@ -2743,6 +2758,7 @@ def build_prepared_day_trade_carry_source(
             unresolved_action_gap_mask=packed.unresolved_action_gap_mask,
             daily_proxy_mask=packed.daily_proxy_mask,
             terminal_liquidation_price=packed.terminal_liquidation_price,
+            short_limit_up_penalty_per_share=packed.short_limit_up_penalty_per_share,
             entry_path=packed.entry_path,
             stop_hits=packed.stop_hits,
         )
@@ -2808,6 +2824,13 @@ def build_prepared_day_trade_carry_source(
                 else "source_minute_capacity_then_physical_margin_carry"
             ),
             "entry_remainder_policy": entry_remainder_policy,
+            **({"short_limit_up_close_penalty": {
+                "contract": "official_limit_up_close_source_residual_short_expense_v1",
+                "rate": float(short_limit_up_penalty_rate),
+                "assessment": "after_source_capacity_before_synthetic_terminal_liquidation",
+                "base": "uncovered_short_shares_times_official_close",
+                "research_only": True,
+            }} if short_limit_up_penalty_rate else {}),
         },
     )
 

@@ -24,6 +24,107 @@ def _ledger():
         "provider_aliases": {"unregistered:example.org": "moneydj"}}
 
 
+@pytest.mark.parametrize(('provider', 'heads', 'shape_counts'), [
+    ('unregistered:www.facebook.com', 948, ('post_permalink_candidates', 'video_candidates', 'other_url_shapes')),
+    ('unregistered:www.youtube.com', 153, ('watch_with_video_id_candidates', 'other_url_shapes')),
+])
+def test_social_shape_census_keeps_capture_and_text_unverified(provider, heads, shape_counts):
+    from scripts.plan_news_sources import review_resume_plan
+    from stockagent.live.news_dashboard import _source_review_followup
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[provider]
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert scope['queue_url_heads'] == scope['awaiting_authorization_heads'] == heads
+    assert scope['heads_with_recorded_attempts'] == scope['heads_with_body_pointer'] == 0
+    assert sum(scope[name] for name in shape_counts) == heads
+    assert not scope['source_review_grants_capture_access']
+    assert not scope['url_shape_proves_news_article_or_publisher']
+    plan = review_resume_plan({'enabled': False}, review, now=NOW + timedelta(days=365))
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert plan['recorded_open_review_question_count'] == 3
+    assert not plan['review_annotation_grants_capture_access']
+    assert _source_review_followup(review, review_valid=True, now=NOW + timedelta(days=365)) == 'open'
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_gotv_historical_identity_review_does_not_authorize_capture():
+    from scripts.plan_news_sources import review_resume_plan
+    from stockagent.live.news_dashboard import _source_review_followup
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))[
+        'unregistered:gotv.ctitv.com.tw']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert scope['queue_url_heads'] == scope['awaiting_authorization_heads'] == 52
+    assert scope['heads_with_recorded_attempts'] == scope['heads_with_body_pointer'] == 0
+    assert not scope['source_review_grants_capture_access']
+    plan = review_resume_plan({'enabled': False}, review, now=NOW + timedelta(days=365))
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert plan['recorded_open_review_question_count'] == 4
+    assert not plan['review_annotation_grants_capture_access']
+    assert _source_review_followup(review, review_valid=True, now=NOW + timedelta(days=365)) == 'open'
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_ettoday_stored_head_audit_keeps_missing_work_open_without_new_access():
+    from scripts.plan_news_sources import review_resume_plan
+    from stockagent.live.news_dashboard import _source_review_followup
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['ettoday']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'reviewed_existing_scope'
+    assert (scope['known_url_heads'], scope['stored_body_heads'], scope['missing_body_heads']) == (24310, 17549, 6761)
+    assert scope['stored_body_heads'] + scope['missing_body_heads'] == scope['known_url_heads']
+    assert sum(scope[key] for key in ('missing_attribution_heads', 'missing_identity_heads',
+        'missing_rights_or_scope_excluded_heads', 'unsupported_article_path_heads',
+        'missing_source_not_found_heads', 'missing_redirect_not_article_heads')) == scope['missing_body_heads']
+    assert sum(scope[key] for key in ('unsupported_www_article_path_with_query_heads',
+        'unsupported_finance_article_path_with_query_heads', 'unsupported_house_article_path_with_query_heads',
+        'unsupported_other_routes_heads')) == scope['unsupported_article_path_heads']
+    assert scope['unsupported_current_literal_identity_matches'] == 0
+    assert scope['retained_body_attribution_head'] == 1
+    assert not scope['review_annotation_grants_new_capture_access'] and not scope['whole_publisher_history_complete']
+    plan = review_resume_plan({'enabled': True}, review, now=NOW + timedelta(days=365))
+    assert plan['review_question_inventory_available'] and plan['recorded_open_review_question_count'] == 4
+    assert not plan['review_annotation_grants_capture_access']
+    assert not plan['review_questions_are_exhaustive_body_work']
+    assert _source_review_followup(review, review_valid=True, now=NOW + timedelta(days=365)) == 'open'
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
+def test_fed_board_offline_storage_scope_preserves_clock_and_remaining_work():
+    from scripts.plan_news_sources import review_resume_plan
+    from stockagent.live.news_dashboard import _source_review_followup
+
+    configuration = Path('configs/news_fulltext.json')
+    before = configuration_revision(configuration), load_news_configuration(configuration)
+    review = load_source_review_ledger(Path('configs/news/source_reviews_20261009.json'))['fed_board']
+    scope = review['current_scope_review']
+    assert review['capture_decision'] == 'review_incomplete'
+    assert (scope['known_url_heads'], scope['stored_body_heads'], scope['missing_body_heads']) == (13871, 13864, 7)
+    assert scope['stored_body_heads'] + scope['missing_body_heads'] == scope['known_url_heads']
+    assert scope['image_only_pdf_heads'] + scope['document_landing_page_heads'] == scope['missing_body_heads']
+    assert scope['reused_previously_verified_batches'] + scope['newly_verified_batches'] == scope['verified_storage_batches'] == 555
+    assert scope['heads_with_nonempty_published_at_raw'] == 1729
+    assert scope['heads_with_audit_parsed_aware_publication_clock'] == 0
+    assert not scope['blank_recorded_clock_proves_no_publisher_clock']
+    assert not scope['review_annotation_grants_new_capture_access']
+    assert not scope['whole_publisher_history_complete']
+    plan = review_resume_plan({'enabled': True}, review, now=NOW + timedelta(days=365))
+    assert plan['source_review_work_state'] == 'partially_completed'
+    assert plan['recorded_open_review_question_count'] == 4
+    assert not plan['review_annotation_grants_capture_access']
+    assert _source_review_followup(review, review_valid=True, now=NOW + timedelta(days=365)) == 'open'
+    assert before == (configuration_revision(configuration), load_news_configuration(configuration))
+
+
 def test_cmoney_readmo_review_keeps_unreviewed_paths_out_of_capture():
     from downloader.news_fulltext import fetch_article, load_config
     from downloader.news_fulltext_policy import NewsError
@@ -1082,8 +1183,13 @@ def test_cmnews_completed_originals_do_not_turn_into_native_body_or_question_com
     assert scope['onlynotecontent_stored_same_slug_candidates'] == scope['unsupported_onlynotecontent_paths']
     assert (scope['missing_identity_heads_with_prior_candidate_jobs']
             + scope['missing_identity_heads_with_reused_failure_literal']
+            + scope['missing_identity_heads_with_new_observed_diagnostic']
             + scope['missing_identity_heads_with_new_pending_diagnostic']) == 32
-    assert scope['missing_identity_heads_with_new_pending_diagnostic'] == 2
+    assert scope['missing_identity_heads_with_new_observed_diagnostic'] == 2
+    assert scope['missing_identity_heads_with_new_pending_diagnostic'] == 0
+    assert scope['missing_identity_original_heads_matching_prior'] == 32
+    assert scope['identity_reconciliation_evidence'].endswith('/cmnews_completed_observations_reuse_20261029.json')
+    assert not any('two pending identity observations' in question for question in scope['remaining_questions'])
     assert not any(scope[key] for key in ('same_slug_is_proven_alias', 'missing_heads_are_unique_articles',
                                           'whole_publisher_history_complete'))
     assert _source_review_followup(review, review_valid=True, now=NOW + timedelta(days=365)) == 'open'

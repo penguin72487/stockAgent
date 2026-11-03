@@ -1,7 +1,9 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "authority_node_id": "penguin",
   "purpose": "lab203-backup-transport-only",
-  "physical_volume": "D:",
-  "independent_disaster_recovery_copy": false
+  "physical_volume": "E:",
+  "independent_disaster_recovery_copy": false,
+  "backing": "enrolled_ext4_workspace",
+  "relative_root": "transport/lab203"
 }

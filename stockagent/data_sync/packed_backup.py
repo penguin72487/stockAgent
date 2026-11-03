@@ -258,8 +258,7 @@ class PinnedObjectSignatures:
         completed capture. O_NONBLOCK prevents a substituted FIFO from hanging.
         No object payload, source or catalog is changed.
         """
-        with self._lock:
-            parts, parent_fd = self._parent(relative)
+        def read(parts, parent_fd):
             descriptor = os.open(parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent_fd)
             try:
                 stream = os.fdopen(descriptor, "rb")
@@ -278,6 +277,27 @@ class PinnedObjectSignatures:
                     or len(raw) != before.st_size):
                 raise SnapshotError(f"backup metadata changed during read: {relative}")
             return raw, observed
+
+        if self._parallel_signatures:
+            # Match the parallel leaf-stat contract: the duplicated parent
+            # remains pinned even if the shared directory cache evicts it.
+            # recheck()/close() wait for every complete read and name check.
+            with self._condition:
+                parts, parent_fd = self._parent(relative)
+                pinned_fd = os.dup(parent_fd)
+                self._inflight_signatures += 1
+            try:
+                return read(parts, pinned_fd)
+            finally:
+                try:
+                    os.close(pinned_fd)
+                finally:
+                    with self._condition:
+                        self._inflight_signatures -= 1
+                        self._condition.notify_all()
+        with self._lock:
+            parts, parent_fd = self._parent(relative)
+            return read(parts, parent_fd)
 
     def recheck(self) -> None:
         with self._condition:

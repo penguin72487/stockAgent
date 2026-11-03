@@ -27,7 +27,7 @@ from stockagent.data_sync.desync_snapshots import (
     SnapshotError, atomic_write_bytes, atomic_write_json, sha256_file,
 )
 from stockagent.data_sync.packed_snapshots import (
-    PackedPublicationBusy, _check_packed_read_authority, _iter_inventory,
+    PackedPublicationBusy, UnsafeSnapshotSymlink, _check_packed_read_authority, _iter_inventory,
     _storage_extents,
     initialize_packed_layout, publish_packed_snapshot, resolve_latest_packed,
     resolve_packed_snapshot_id, verify_packed_snapshot,
@@ -38,6 +38,7 @@ CONTRACT = "all_catalog_incremental_migration_v1"
 PRIVATE_RELATIVE = ".local-state/private-history"
 CONTROL_SCOPE = "recursive_mutable_controls_v17"
 FROZEN_CONTROLS_INLINE_LIMIT = 4096
+MIGRATION_OPERATIONS = Path('/var/lib/stockagent/lakehouse-control/dataset-versions/operations')
 
 
 def _identity(document):
@@ -59,6 +60,19 @@ def _require_capture_headroom(directory: Path, payload_bytes: int) -> None:
     minimum = max(5 * 1024**3, load_capacity_policy()['minimum_free_bytes'])
     growth = (payload_bytes * 6 + 4) // 5 + 1024**2
     available = shutil.disk_usage(directory).free
+    # The enrolled data VHD is backed by E:. Its guest free space alone does
+    # not guarantee that the Windows volume can grow. This inexpensive 9p
+    # capacity query avoids starting PowerShell once per captured control file;
+    # the workspace identity is independently admitted before creating a stage.
+    from stockagent.data_sync.workspace_volume import ENROLLMENT, configuration
+    if ENROLLMENT.exists() or ENROLLMENT.is_symlink():
+        config = configuration()
+        if directory.absolute().is_relative_to(Path(config['mount_point'])):
+            physical = Path('/mnt/e')
+            if physical.is_symlink() or not physical.is_mount():
+                raise SnapshotError('E workspace physical capacity mount is unavailable')
+            minimum = max(minimum, config['minimum_free_bytes'])
+            available = min(available, shutil.disk_usage(physical).free)
     if available < minimum + growth:
         raise SnapshotError(
             f'migration capture scratch headroom insufficient: available={available}, '
@@ -816,6 +830,33 @@ def _preparation_path(args, dataset):
     return args.migration_state.absolute() / "preparations" / (dataset + ".json")
 
 
+def _migration_scratch_root(directory: Path, *, create: bool) -> Path:
+    """Use E for new production preparations; keep journals and old paths fixed.
+
+    Non-production operations remain isolated at their supplied test root.
+    Once E is enrolled, a missing or changed mount is an error, not a C
+    fallback. The fixed operation name prevents one journal from owning
+    another operation's scratch.
+    """
+    directory = directory.absolute()
+    if directory.parent != MIGRATION_OPERATIONS:
+        return directory
+    if (not re.fullmatch(r'[0-9a-f]{16}-[0-9a-f]{32}', directory.name)
+            or directory.is_symlink() or directory.resolve() != directory):
+        raise SnapshotError('migration scratch operation identity changed')
+    from stockagent.data_sync.workspace_volume import ENROLLMENT, admit, path as workspace_path
+    if not (ENROLLMENT.exists() or ENROLLMENT.is_symlink()):
+        return directory
+    if create:
+        admit(0)
+    root = workspace_path('migration', create=create) / 'dataset-versions' / directory.name
+    if root.resolve() != root:
+        raise SnapshotError('migration scratch workspace is redirected')
+    if create:
+        root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return root
+
+
 def _private_preparation(entry: dict, args, source: Path, cold: Path, policy: dict) -> dict:
     """Persist SQLite bindings/control copies before attempting the main head.
 
@@ -841,7 +882,7 @@ def _private_preparation(entry: dict, args, source: Path, cold: Path, policy: di
             if relative in known:
                 continue
             name = str(entry["dataset"]) + "-state-" + hashlib.sha256(relative.encode()).hexdigest()[:12]
-            stage = args.migration_state.absolute() / "sqlite-snapshots" / ("sqlite-" + uuid.uuid4().hex)
+            stage = _migration_scratch_root(args.migration_state, create=True) / "sqlite-snapshots" / ("sqlite-" + uuid.uuid4().hex)
             # Persist the exact native backup target BEFORE copying a byte.
             # Restarting an interrupted attempt reuses this SQLite destination
             # via its own backup API, never a growing pile of orphan 10 GB files.
@@ -872,7 +913,7 @@ def _private_preparation(entry: dict, args, source: Path, cold: Path, policy: di
             relative = row["source_relative"]
             excluded.extend((relative, relative + "-wal", relative + "-shm", relative + "-journal"))
         if "controls_staging" not in prepared:
-            prepared["controls_staging"] = str(args.migration_state.absolute() / "controls"
+            prepared["controls_staging"] = str(_migration_scratch_root(args.migration_state, create=True) / "controls"
                                                / ("controls-" + uuid.uuid4().hex))
             atomic_write_json(path, prepared)
         prepared["controls"] = _freeze_controls(source, Path(prepared["controls_staging"]), excluded,
@@ -1016,19 +1057,35 @@ def _recover(cold: Path, dataset: str, snapshot: str, receipt: Path, progress_pa
                 or proof.get("full_original_file_reconstruction_verified") is not True):
             raise SnapshotError("previous recovery receipt does not match the fixed migration release")
         return proof
-    last = 0.0
+    last, last_stage = 0.0, None
     def progress(document):
-        nonlocal last
-        if time.monotonic() - last >= 5:
-            last = time.monotonic()
+        nonlocal last, last_stage
+        now, stage = time.monotonic(), document.get('stage')
+        if (stage != last_stage or now - last >= 5
+                or (document.get('completed_items') is not None
+                    and document['completed_items'] == document.get('total_items'))):
+            last, last_stage = now, stage
             atomic_write_json(progress_path, {**document, "updated_at_utc": _now(),
                               "snapshot_id": snapshot, "attempt_id": attempt_id,
                               "acceptance": False}, durable=False)
     started = time.monotonic()
     primary = Path('/srv/stockagent-packed')
     native_pack_reads = cold in (primary, primary / '.local-state/private-history')
+    from stockagent.data_sync.packed_verification import configuration as pack_verification_configuration
+    pack_verification = pack_verification_configuration(dataset) if native_pack_reads else None
+    if pack_verification is not None:
+        from stockagent.data_sync.packed_verification_reuse import find_completed_pack_evidence
+        evidence_parent = receipt.parent / 'pack-verification' / dataset
+        completed = find_completed_pack_evidence(evidence_parent, selected, pack_verification)
+        pack_verification = {**pack_verification, 'evidence_directory': str(
+            evidence_parent / uuid.uuid4().hex),
+            **({'completed_evidence': str(completed)} if completed is not None else {})}
     proof = verify_packed_snapshot(cold, selected, reconstruct_all=True, progress=progress,
+                                  d_primary_native_blob_reads=native_pack_reads,
+                                  d_primary_native_original_hashes=native_pack_reads,
                                   d_primary_native_pack_reads=native_pack_reads,
+                                  adaptive_inventory_memory=native_pack_reads,
+                                  pack_verification=pack_verification,
                                   d_primary_native_chunk_reads=(cold in {
                                       primary, primary / '.local-state/private-history'}))
     proof.update(contract=CONTRACT, dataset=dataset, snapshot_id=snapshot,
@@ -1073,6 +1130,9 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict, *, p
               "source_files_deleted": 0, "cold_objects_deleted": 0, "nas_files_deleted": 0,
               "files": previous.get("files", {})}
     permitted = (directory / "controls", directory / "sqlite-snapshots", hints_root)
+    if any(not any(Path(name).is_relative_to(root) for root in permitted) for name in targets):
+        scratch = _migration_scratch_root(directory, create=False)
+        permitted += (scratch / 'controls', scratch / 'sqlite-snapshots')
     pending = []
     last_report = 0.0
     def report(stage, completed=0, *, force=False):
@@ -1217,6 +1277,90 @@ def _source_step_order(entries, datasets, priorities):
     return sorted(entries, key=key)
 
 
+def _source_link_observation(source: Path, relative: str) -> dict | None:
+    """Bounded metadata for one known bad link; never follow its target."""
+    from stockagent.data_sync.desync_snapshots import _safe_relative_path
+    try:
+        relative_path = _safe_relative_path(relative, 'blocked source link')
+        source = source.absolute()
+        path = source / relative_path
+        if source.resolve() != source or path.parent.resolve() != path.parent:
+            return None
+        try:
+            info = path.lstat()
+        except FileNotFoundError:
+            return {'state': 'absent'}
+        return {'state': 'present', 'signature': [info.st_dev, info.st_ino, info.st_mode,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns],
+                'target': os.readlink(path) if stat.S_ISLNK(info.st_mode) else None}
+    except (OSError, TypeError, ValueError, SnapshotError):
+        return None
+
+
+def _source_precondition_wait(entry: dict, row: dict, datasets: dict, *, retry_seconds: float,
+                              cold: Path | None = None) -> bool:
+    """Wait on observable conditions without spending another publication attempt.
+
+    Fixed committed releases must finish their own recovery first. Every real
+    retry still uses the original publisher and complete reconstruction gates.
+    """
+    if 'snapshot_id' in row:
+        return False
+    if cold is not None:
+        # A bounded physical preflight prevents repeating a multi-million-file
+        # census while no new pack can be installed. This is a write admission,
+        # not a recovery proof, reservation or guarantee the whole source fits.
+        available = shutil.disk_usage(cold).free
+        minimum = 64 * 1024**2
+        if available < minimum:
+            row.update(state='waiting_retry', retry_at_unix=time.time() + retry_seconds,
+                capacity_wait={'contract': 'source_publication_capacity_v1',
+                    'available_bytes': available, 'minimum_write_headroom_bytes': minimum,
+                    'observed_at_utc': _now()})
+            return True
+        if row.pop('capacity_wait', None) is not None:
+            row['retry_at_unix'] = 0
+    if entry['dataset'] == 'local-tw-futures' and 'local-tw-index-futures' in datasets:
+        dependency = datasets['local-tw-index-futures']
+        if dependency['state'] != 'verified':
+            row.update(state='waiting_retry',
+                dependency_wait={'dataset': 'local-tw-index-futures', 'state': dependency['state']},
+                retry_at_unix=time.time() + retry_seconds)
+            # Keep the original error/attempt receipt, if present. A pending
+            # dependent has not made a failed publisher call.
+            return True
+        if row.pop('dependency_wait', None) is not None:
+            row['retry_at_unix'] = 0
+    from scripts.publish_data_releases import _source_path
+    source = _source_path(entry).absolute()
+    wait = row.get('blocked_source_link')
+    if wait is None:
+        # Older workers recorded only the message. Adopt it only after the
+        # current source independently matches the exact bad link and target.
+        match = re.fullmatch(r'absolute symlink is not snapshot-safe: (.+) -> (/.+)',
+                             str(row.get('error', '')))
+        if match:
+            observation = _source_link_observation(source, match[1])
+            if observation and observation.get('target') == match[2]:
+                wait = {'contract': 'source_link_precondition_v1', 'path': match[1],
+                        'observation': observation, 'failed_attempt_id': row.get('attempt_id')}
+                row['blocked_source_link'] = wait
+    if not isinstance(wait, dict) or wait.get('contract') != 'source_link_precondition_v1':
+        return False
+    observation = _source_link_observation(source, wait.get('path'))
+    if observation is None:
+        # Unknown metadata cannot authorize another full source read or clear
+        # the original failure. Re-observe at the next original owner turn.
+        row['retry_at_unix'] = time.time() + retry_seconds
+        return True
+    if observation == wait.get('observation'):
+        row['retry_at_unix'] = time.time() + retry_seconds
+        return True
+    row['last_source_link_wait'] = row.pop('blocked_source_link')
+    row['retry_at_unix'] = 0
+    return False
+
+
 def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
     """One resumable operation; all concrete catalog sources, not just repo links."""
     from scripts.publish_data_releases import _publish_entry, _source_path
@@ -1239,6 +1383,11 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
     priorities = _pending_source_priorities(getattr(args, 'pending_source_priority', ()), entries)
     identity = _identity({"catalog": entries, "policy": policy})
     run_args = SimpleNamespace(**vars(args))
+    # The CLI supplies this option, but the durable activity is also an
+    # original publisher caller. Closed-source/fixed-forward reuse must use
+    # the same retention owner instead of failing after the journal starts.
+    run_args.retention_config = getattr(args, 'retention_config',
+        repo / 'configs/data_sync/packed_retention.json')
     run_args.all_ready = True
     run_args.reader_contract = "packed-v2-chunks"
     run_args.defer_scan = (parent / ".stockagent-d-primary").is_file()
@@ -1289,6 +1438,7 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
         save()
         completed_this_call = 0
         attempted_this_call = 0
+        stop_requested = getattr(args, 'stop_requested', lambda: False)
         for pass_number in range(args.maximum_passes):
             # Resume committed releases first, then untouched work. A repeatedly
             # changing multi-million-file source must not starve every pending
@@ -1296,10 +1446,31 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
             # goes first: historical failure counts are not waiting time.
             ordered = _source_step_order(entries, result['datasets'], priorities)
             for entry in ordered:
+                if stop_requested():
+                    return result
                 row = result["datasets"][entry["dataset"]]
                 if getattr(args, 'committed_recovery_only', False) and 'snapshot_id' not in row:
                     continue
                 if row["state"] == "verified":
+                    continue
+                if ('snapshot_id' not in row and entry['publish']
+                        and shutil.disk_usage(parent).free < 64 * 1024**2):
+                    # A crash may have committed the exact release before its
+                    # journal write. Disk pressure forbids new publication,
+                    # never recovery of an already admitted fixed version.
+                    committed = _committed_catalog_release(entry, run_args, parent)
+                    if committed is not None:
+                        row.update(snapshot_id=committed.manifest['snapshot_id'],
+                            manifest_sha256=committed.manifest_sha256, retry_at_unix=0,
+                            source_files=committed.manifest['source']['files'],
+                            logical_bytes=committed.manifest['source']['logical_bytes'],
+                            publication={'state': 'fixed_committed_catalog_release',
+                                'catalog_entry_sha256': committed.manifest['metadata']['catalog_entry_sha256'],
+                                'current_source_freshness_checked': False,
+                                'all_current_source_history_complete_claim': False})
+                if _source_precondition_wait(entry, row, result['datasets'], retry_seconds=args.retry_seconds,
+                                             cold=parent):
+                    save()
                     continue
                 if row.get("retry_at_unix", 0) > time.time():
                     continue
@@ -1334,8 +1505,14 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                     elif entry["publish"]:
                         saved = _committed_catalog_release(entry, run_args, parent)
                         if saved is None:
+                            from stockagent.data_sync.packing_checkpoint import SealedPackHints
+                            run_args.sealed_pack_hints = SealedPackHints(
+                                directory / 'sealed-pack-checkpoints' / entry['dataset'],
+                                parent, _source_path(entry).resolve(), entry['dataset'])
                             status, saved = _publish_entry(entry, run_args, parent)
-                            extra = {"source_status": status}
+                            extra = {"source_status": status,
+                                "sealed_pack_hint_files": list(run_args.sealed_pack_hints.receipts.values()),
+                                "sealed_pack_hints": dict(run_args.sealed_pack_hints.statistics)}
                         else:
                             extra = {"state": "fixed_committed_catalog_release",
                                 "catalog_entry_sha256": saved.manifest['metadata']['catalog_entry_sha256'],
@@ -1401,13 +1578,30 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                     completed_this_call += 1
                     row.pop("error", None)
                 except (SnapshotError, OSError, ValueError, sqlite3.Error, ImportError) as error:
-                    row.update(state="waiting_retry", error_type=type(error).__name__, error=str(error),
-                               retry_at_unix=time.time() + args.retry_seconds)
+                    if stop_requested():
+                        # A drained worker can lose its native I/O child. Keep
+                        # the committed binding and the original phase so the
+                        # next exclusive owner records/resumes interruption;
+                        # shutdown is not a corrupt-source cooldown.
+                        row['shutdown_interruption'] = {'observed_at_utc': _now(),
+                            'error_type': type(error).__name__, 'error': str(error),
+                            'reason': 'canonical_activity_stop_requested'}
+                    else:
+                        row.update(state="waiting_retry", error_type=type(error).__name__, error=str(error),
+                                   retry_at_unix=time.time() + args.retry_seconds)
+                        if isinstance(error, UnsafeSnapshotSymlink) and 'snapshot_id' not in row:
+                            observation = _source_link_observation(_source_path(entry), error.relative_path)
+                            if observation and observation.get('target') == error.target:
+                                row['blocked_source_link'] = {'contract': 'source_link_precondition_v1',
+                                    'path': error.relative_path, 'observation': observation,
+                                    'failed_attempt_id': row['attempt_id']}
                 finally:
                     atomic_write_json(directory / "attempts" / entry["dataset"] / (row["attempt_id"] + ".json"),
                                       {**row, "finished_at_utc": _now()})
                     activity.update(active_dataset=None, active_attempt_id=None)
                     save()
+                if stop_requested():
+                    return result
                 if budget is not None and completed_this_call >= budget:
                     return result
             if result["state"] == "verified" or not args.watch:
@@ -1634,7 +1828,8 @@ def _catalog_contract_transition(repo, root, current, catalog, policy, cold):
         return transition
 
 
-def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | None = None) -> dict:
+def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | None = None,
+                             stop_requested=None) -> dict:
     """One bounded source step for the existing Temporal storage worker.
 
     No market API, new scheduler/service, external export or moving-latest
@@ -1712,6 +1907,7 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
             maximum_attempted_sources=1,
             pending_source_priority=settings.get('pending_source_priority', ()),
             committed_recovery_only=committed_recovery_only,
+            stop_requested=stop_requested if stop_requested is not None else lambda: False,
             recover_missing_base_objects=False, source_lock_fd=None)
         result = migrate_catalog(repo, args, catalog)
         current.update(state=result["state"], verified_datasets=result["verified_datasets"],

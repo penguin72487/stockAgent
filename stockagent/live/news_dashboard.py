@@ -8,14 +8,22 @@ from __future__ import annotations
 
 from collections import Counter
 from datetime import UTC, datetime, timedelta
+import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
+import stat
 from typing import Any, Mapping
 from urllib.parse import urlsplit
 from stockagent.data.news_disk_contract import BACKING_SAMPLE_MAX_AGE_SECONDS
-from stockagent.data.news_worker_lifecycle import read_news_worker_lifecycle
+from stockagent.data.news_worker_lifecycle import (
+    LOCAL_SQLITE_WAIT_MAX_AGE_SECONDS, read_news_worker_lifecycle,
+)
+from stockagent.live.news_corpus_quality import (
+    public_corpus_quality_statuses, public_sort_day_quality_status, reference_paths,
+)
 from stockagent.data.news_source_catalog import (
     configuration_paths, load_news_configuration, load_source_review_ledger,
     planning_review_path, source_role, classify_news_outcomes, recorded_review_questions,
@@ -45,6 +53,123 @@ def _url_metadata_inbox(value):
             or not pending <= targets <= pending * 512):
         return None
     return {'contract_version': 1, **{name: value[name] for name in names}}
+
+
+def _finlab_cnyes_priority(value, observed=None):
+    """Bounded owner-receipt progress; never publish request IDs or URLs."""
+    if (not isinstance(value, dict) or type(value.get('contract_version')) is not int
+            or value['contract_version'] != 1 or value.get('body_completion_proven') is not False
+            or value.get('association_completion_proven') is not False):
+        return None
+    recorded = _stamp(value.get('recorded_at_utc'))
+    if not recorded or (observed is not None and recorded > observed + timedelta(seconds=5)):
+        return None
+    delta, examined, targets = (value.get(name) for name in ('raw_unique_delta', 'raw_hints_examined', 'targets'))
+    if (any(type(item) is not int or not 0 <= item < 2**53 for item in (delta, examined, targets))
+            or examined != min(delta, 4096) or targets > min(examined, 512)):
+        return None
+    state, checked, outcomes = (value.get(name) for name in ('request_state', 'owner_checked', 'outcomes'))
+    if not isinstance(state, str):
+        return None
+    if state in {'unknown', 'unobserved'}:
+        if not targets or checked is not None or outcomes is not None:
+            return None
+    elif state in {'not_applicable', 'processing', 'checked'}:
+        names = ('metadata_registered', 'existing_head_preserved', 'source_contract_changed', 'other')
+        if (type(checked) is not int or not 0 <= checked <= targets or not isinstance(outcomes, dict)
+                or set(outcomes) != set(names)
+                or any(type(outcomes.get(name)) is not int or outcomes[name] < 0 for name in names)
+                or sum(outcomes[name] for name in names) != checked
+                or (state == 'not_applicable' and (targets != 0 or checked != 0))
+                or (state == 'processing' and (targets == 0 or checked >= targets))
+                or (state == 'checked' and (targets == 0 or checked != targets))):
+            return None
+        outcomes = {name: outcomes[name] for name in names}
+    else:
+        return None
+    # Optional in older snapshots. It is a subset of "other", not an
+    # additional outcome or a claim that an article body was retrieved.
+    unverified_origin = value.get('unverified_origin')
+    if (unverified_origin is not None
+            and (type(unverified_origin) is not int or unverified_origin < 0 or outcomes is None
+                 or unverified_origin > outcomes['other'])):
+        return None
+    return {'contract_version': 1, 'raw_unique_delta': delta, 'raw_hints_examined': examined,
+            'targets': targets, 'request_state': state, 'owner_checked': checked, 'outcomes': outcomes,
+            'unverified_origin': unverified_origin,
+            'recorded_at_utc': recorded.isoformat(),
+            'body_completion_proven': False, 'association_completion_proven': False}
+
+
+def _retained_handoff_plan_path(repo_root, config):
+    spec = config.get('retained_link_handoff')
+    if (not isinstance(spec, dict) or set(spec) != {'path', 'sha256'}
+            or not isinstance(spec['path'], str) or Path(spec['path']).is_absolute()
+            or not isinstance(spec['sha256'], str) or not re.fullmatch(r'[0-9a-f]{64}', spec['sha256'])):
+        return None
+    artifacts = (repo_root / 'artifacts').resolve()
+    path = (repo_root / spec['path']).resolve()
+    return path if path != artifacts and path.is_relative_to(artifacts) else None
+
+
+def _retained_handoff_projection(repo_root, config, runtime):
+    """Expose only aggregate local hints; never paths, URLs or body claims."""
+    plan = None
+    path = _retained_handoff_plan_path(repo_root, config)
+    if path is not None:
+        try:
+            fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_NONBLOCK', 0))
+            try:
+                info = os.fstat(fd)
+                if not stat.S_ISREG(info.st_mode) or info.st_mode & 0o077 or info.st_size > 2 << 20:
+                    raise ValueError('invalid private handoff artifact')
+                with os.fdopen(fd, 'rb', closefd=False) as stream:
+                    raw = stream.read((2 << 20) + 1)
+                if len(raw) > 2 << 20 or hashlib.sha256(raw).hexdigest() != config['retained_link_handoff']['sha256']:
+                    raise ValueError('handoff digest mismatch')
+            finally:
+                os.close(fd)
+            cert = json.loads(raw)
+            count, requests = cert.get('candidate_count'), cert.get('requests')
+            if (cert.get('contract') == 'cmnews_retained_link_handoff_v1'
+                    and cert.get('source_root') == str((repo_root / config.get('root', '')).resolve())
+                    and cert.get('target_identity_or_body_verified') is False
+                    and type(count) is int and 0 < count < 2**53 and type(requests) is list
+                    and 0 < len(requests) <= count):
+                plan = {'provider': 'cmnews', 'candidates': count, 'requests': len(requests),
+                        'source_and_policy_revalidation_required': True, 'body_verified': False}
+        except (OSError, ValueError, TypeError, KeyError, RecursionError):
+            pass
+    projected = None
+    if (isinstance(runtime, dict) and type(runtime.get('contract_version')) is int
+            and runtime['contract_version'] == 1 and runtime.get('provider') == 'cmnews'
+            and runtime.get('state') in {'validating', 'waiting_inbox', 'submitted', 'owner_checked', 'deferred'}
+            and isinstance(runtime.get('plan_sha256'), str)
+            and re.fullmatch(r'[0-9a-f]{64}', runtime['plan_sha256'])
+            and runtime['plan_sha256'] == _object(config.get('retained_link_handoff')).get('sha256')
+            and runtime.get('body_verified') is False):
+        candidates, requests, submitted = (runtime.get(k) for k in ('candidates', 'requests', 'submitted_requests'))
+        if (type(submitted) is int and submitted >= 0 and
+                ((candidates is None and requests is None and submitted == 0)
+                 or (type(candidates) is int and type(requests) is int and 0 < requests <= candidates < 2**53
+                     and submitted <= requests))):
+            reason = runtime.get('reason')
+            reason = reason if reason in {'url_metadata_inbox_full', 'handoff_parent_head_changed',
+                'handoff_batch_changed', 'handoff_target_or_policy_changed', 'handoff_proof_digest_changed',
+                'handoff_certificate_digest_changed', 'local_input_unavailable'} else ('other' if reason else None)
+            projected = {'provider': 'cmnews', 'state': runtime['state'], 'candidates': candidates,
+                         'requests': requests, 'submitted_requests': submitted, 'reason': reason,
+                         'body_verified': False}
+            if runtime['state'] == 'owner_checked':
+                outcomes = runtime.get('outcomes')
+                names = ('metadata_registered', 'existing_head_preserved', 'source_contract_changed')
+                if (not isinstance(outcomes, dict) or any(type(v) is not int or v < 0 for v in outcomes.values())
+                        or sum(outcomes.values()) != candidates):
+                    projected = None
+                else:
+                    projected['outcomes'] = {name: outcomes.get(name, 0) for name in names}
+                    projected['outcomes']['other'] = sum(v for name, v in outcomes.items() if name not in names)
+    return {'plan': plan, 'runtime': projected}
 
 
 def _disk_admission(value, observed, now):
@@ -145,8 +270,17 @@ def _candidate_diagnostic_progress(value, known_providers):
               for key in _CANDIDATE_WORK_KEYS}
     if totals['pending_unadmitted'] != value['pending_unadmitted'] or any(totals[key] != jobs[key] for key in states):
         return None
+    raw_local_retry = value.get('local_retry')
+    local_retry = None
+    retry_keys = ('request_io', 'quarantine', 'archive')
+    if (isinstance(raw_local_retry, dict)
+            and all(type(raw_local_retry.get(key)) is int and 0 <= raw_local_retry[key] <= value['request_files']
+                    for key in retry_keys)
+            and sum(raw_local_retry[key] for key in retry_keys) <= value['request_files']):
+        local_retry = {key: raw_local_retry[key] for key in retry_keys}
     return {'contract_version': 1, **{key: value[key] for key in names},
-            'jobs': {key: jobs[key] for key in states}, 'providers': providers, 'unregistered': unregistered}
+            'jobs': {key: jobs[key] for key in states}, 'providers': providers, 'unregistered': unregistered,
+            'local_retry': local_retry}
 
 
 _STATES = NEWS_OUTCOME_STATES
@@ -188,11 +322,42 @@ def _metadata_feed_progress(value, *, now):
         return None
     next_check = _stamp(raw.get('next_check_at_utc'))
     last_check = _stamp(raw.get('last_check_at_utc'))
+    recovery = None
+    legacy_index = None
+    legacy = _object(raw.get('legacy_original_index'))
+    legacy_fields = ('expected_directories', 'registered_directories', 'examined_directories',
+                     'candidate_originals', 'verified_originals', 'pending_originals', 'retry_originals',
+                     'invalid_originals', 'other_originals')
+    legacy_numbers = {key: _count(legacy.get(key)) for key in legacy_fields}
+    if (type(legacy.get('contract_version')) is int and legacy['contract_version'] == 1
+            and all(value is not None for value in legacy_numbers.values())
+            and type(legacy.get('discovery_complete')) is bool
+            and 0 < legacy_numbers['expected_directories'] <= 56
+            and legacy_numbers['examined_directories'] <= legacy_numbers['registered_directories'] <= legacy_numbers['expected_directories']
+            and legacy_numbers['candidate_originals'] == sum(legacy_numbers[key] for key in (
+                'verified_originals', 'pending_originals', 'retry_originals', 'invalid_originals', 'other_originals'))
+            and legacy['discovery_complete'] == (legacy_numbers['registered_directories'] == legacy_numbers['expected_directories']
+                                                   and legacy_numbers['examined_directories'] == legacy_numbers['expected_directories'])):
+        legacy_index = {'contract_version': 1, **legacy_numbers, 'discovery_complete': legacy['discovery_complete']}
+    if type(raw.get('checkpoint_contract_version')) is int and raw['checkpoint_contract_version'] == 1:
+        pending_feeds = _count(raw.get('pending_recovery_feeds'))
+        pending_originals = _count(raw.get('pending_recovery_originals'))
+        recovery_at = _stamp(raw.get('next_local_recovery_at_utc'))
+        ready = raw.get('local_recovery_ready')
+        if (pending_feeds is not None and pending_originals is not None and type(ready) is bool
+                and pending_feeds <= numbers['registered_feeds'] and pending_originals >= pending_feeds
+                and ((pending_feeds == 0 and pending_originals == 0 and not ready and raw.get('next_local_recovery_at_utc') is None)
+                     or (pending_feeds > 0 and recovery_at is not None))):
+            recovery = {'pending_feeds': pending_feeds, 'pending_originals': pending_originals,
+                        'next_retry_ready': bool(recovery_at and recovery_at <= now),
+                        'next_retry_at_utc': recovery_at.isoformat() if recovery_at and recovery_at.timestamp() > 0 else None}
     # The canonical queue's due=0 means ready, not a January 1970 appointment.
     return {'contract_version': raw['contract_version'], 'enabled': True, **numbers,
         'next_check_ready': bool(next_check and next_check <= now),
         'next_check_at_utc': next_check.isoformat() if next_check and next_check.timestamp() > 0 else None,
         'last_check_at_utc': last_check.isoformat() if last_check else None,
+        'local_recovery': recovery,
+        'legacy_original_index': legacy_index,
         'article_bodies_accepted': 0, 'overlapping_feed_items_not_unique_articles': True,
         'all_history_complete': False, 'finish_eta_utc': None}
 
@@ -302,6 +467,21 @@ def _publisher_reference_coverage(value: Any, known: int | None, stored: int | N
         'new_article_bodies': 0, 'raw_alias_response_retained': False, 'all_history_complete': False}
 
 
+def _native_lookup_recheck_progress(value: Any) -> dict[str, Any] | None:
+    """Allow only the bounded local journal count, never URLs or completion claims."""
+    raw = _object(value)
+    pending = raw.get('pending_records_lower_bound')
+    exact = raw.get('count_exact')
+    if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
+            or type(pending) is not int or type(exact) is not bool
+            or not 0 <= pending <= 2049 or exact != (pending < 2049)
+            or raw.get('records_are_article_completion') is not False
+            or raw.get('source_lookup_performed') is not False):
+        return None
+    return {'contract_version': 1, 'pending_records_lower_bound': pending, 'count_exact': exact,
+            'records_are_article_completion': False, 'source_lookup_performed': False}
+
+
 def _body_work_progress(value: Any, ready: int | None) -> dict[str, Any] | None:
     """Safe optional owner projection; legacy/unreconciled snapshots are unknown."""
     raw = _object(value)
@@ -387,7 +567,7 @@ def _body_request_scope_progress(value: Any, work: Mapping[str, Any] | None,
             'source_recovery_verified': False}
 
 
-def _cnyes_public_index_progress(value: Any) -> dict[str, Any] | None:
+def _cnyes_public_index_progress(value: Any, *, now: datetime) -> dict[str, Any] | None:
     """Project receipted metadata counts, never a body/history denominator.
 
     Dates with every currently reported page are only the dates already
@@ -420,8 +600,20 @@ def _cnyes_public_index_progress(value: Any) -> dict[str, Any] | None:
         if (reconciling is None or reconciling > dates
                 or counts['dates_all_reported_pages_observed'] + reconciling > dates):
             return None
+    recovery = None
+    if type(raw.get('checkpoint_contract_version')) is int and raw['checkpoint_contract_version'] == 1:
+        pending = _count(raw.get('pending_local_originals'))
+        retry_at = _stamp(raw.get('next_local_recovery_at_utc'))
+        ready = raw.get('local_recovery_ready')
+        if (pending is not None and type(ready) is bool
+                and ((pending == 0 and not ready and raw.get('next_local_recovery_at_utc') is None)
+                     or (pending > 0 and retry_at is not None))):
+            recovery = {'pending_originals': pending,
+                        'next_retry_ready': bool(retry_at and retry_at <= now),
+                        'next_retry_at_utc': retry_at.isoformat() if retry_at and retry_at.timestamp() > 0 else None}
     return {'contract_version': 1, 'enabled': True, **counts,
             'dates_reconciling_page_membership': reconciling,
+            'local_recovery': recovery,
             'article_bodies_accepted_by_index': 0, 'all_history_complete': False,
             'finish_eta_utc': None, 'progress_ratio': None,
             'source_total_is_not_unique_story_count': True, 'category_gaps_preserved': True}
@@ -532,7 +724,7 @@ def _cnyes_manifest_phase_progress(value: Any, metrics: Mapping[str, Any],
     ratios and scenario times from typed counts; never open the queue, read
     publisher originals, extrapolate unseen dates, or expose scope URLs.
     """
-    index = _cnyes_public_index_progress(value)
+    index = _cnyes_public_index_progress(value, now=now)
     raw = _object(_object(value).get('manifest_phase'))
     if (index is None or type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
             or raw.get('scope') != 'actual_category_overflow_source_dates'
@@ -668,12 +860,14 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
     states = raw.get('current_source_contract_scope_states')
     complete = ('list_complete', 'list_complete_by_page_ID_equivalence', 'partition_list_complete')
     waiting = ('waiting_page_evidence', 'waiting_original_page_recheck', 'waiting_child_evidence')
-    inconsistent = ('inconsistent_source_snapshot', 'inconsistent_original_page_ID_reference',
-                    'inconsistent_source_identity_or_date', 'inconsistent_partition_evidence')
+    inconsistent = ('inconsistent_source_snapshot', 'inconsistent_source_identity_or_date',
+                    'inconsistent_partition_evidence')
     # These are actual canonical producer outcomes, not unknown states that
     # may be silently coerced into complete. A source conflict must remain
     # visible without hiding all otherwise verified historical scopes.
-    allowed = complete + waiting + inconsistent + ('source_page_cap_exceeded',)
+    allowed = complete + waiting + inconsistent + ('inconsistent_original_page_ID_reference',
+                                                    'source_page_cap_exceeded', 'invalid_page_evidence',
+                                                    'invalid_scope_evidence')
     retired = _count(raw.get('retired_gap_receipts'))
     if (type(raw.get('contract_version')) is not int or raw['contract_version'] != 1
             or not isinstance(states, Mapping) or set(states) - set(allowed)
@@ -683,6 +877,22 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
     counts = {key: _count(states.get(key, 0)) for key in allowed}
     if any(value is None for value in counts.values()) or sum(counts.values()) > 2**53 - 1:
         return None
+    legacy = raw.get('legacy_metadata_scans')
+    local_legacy = None
+    if isinstance(legacy, Mapping):
+        local_legacy = {}
+        for kind in ('mismatch', 'unavailable', 'empty'):
+            item = legacy.get(kind)
+            if not isinstance(item, Mapping):
+                item = {}
+            scan_state = item.get('scan_state')
+            if type(scan_state) is not str or scan_state not in ('not_started', 'scanning', 'complete', 'unknown'):
+                scan_state = 'unknown'
+            problem = item.get('checkpoint_problem')
+            if (scan_state != 'unknown' or type(problem) is not str
+                    or problem not in ('invalid_checkpoint', 'unsupported_version', 'audit_conflict')):
+                problem = None
+            local_legacy[kind] = {'scan_state': scan_state, 'checkpoint_problem': problem}
     recovery = raw.get('overflow_retained_recovery')
     local_recovery = None
     if isinstance(recovery, Mapping):
@@ -695,8 +905,13 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
                 and recovery.get('local_raw_only') is True
                 and recovery.get('category_gap_completion_claimed') is False
                 and type(recovery.get('publisher_requests')) is int and recovery['publisher_requests'] == 0):
+            problem = recovery.get('checkpoint_problem')
+            if (scan_state != 'unknown' or type(problem) is not str
+                    or problem not in ('invalid_checkpoint', 'unsupported_version', 'audit_conflict')):
+                problem = None
             local_recovery = {'contract_version': 1, 'scan_state': scan_state,
-                'pending_retained_pages': pending, 'local_retry_pages': retries, 'local_raw_only': True,
+                'pending_retained_pages': pending, 'local_retry_pages': retries, 'checkpoint_problem': problem,
+                'local_raw_only': True,
                 'category_gap_completion_claimed': False, 'publisher_requests': 0}
     nonzero = raw.get('unobserved_nonzero_retained_scan')
     local_nonzero = None
@@ -711,8 +926,12 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
                 and scan_state in ('not_started', 'scanning', 'complete', 'unknown') and counts_valid
                 and nonzero.get('local_raw_only') is True and nonzero.get('all_history_complete') is False
                 and type(nonzero.get('publisher_requests')) is int and nonzero['publisher_requests'] == 0):
+            problem = nonzero.get('checkpoint_problem')
+            if (scan_state != 'unknown' or type(problem) is not str
+                    or problem not in ('invalid_checkpoint', 'unsupported_version', 'audit_conflict')):
+                problem = None
             local_nonzero = {'contract_version': 1, 'scan_state': scan_state, 'checked_steps': checked,
-                'queued_candidate_pages': queued, 'local_raw_only': True,
+                'queued_candidate_pages': queued, 'checkpoint_problem': problem, 'local_raw_only': True,
                 'all_history_complete': False, 'publisher_requests': 0}
     accepted = raw.get('accepted_body_batch_scan')
     local_accepted = None
@@ -720,27 +939,164 @@ def _cnyes_history_list_progress(value: Any, gaps: Any) -> dict[str, Any] | None
         scan_state = accepted.get('scan_state')
         scanned = _count(accepted.get('scanned_batches'))
         indexed = _count(accepted.get('indexed_candidates'))
+        local_retries = _count(accepted.get('local_retry_batches'))
+        local_missing = _count(accepted.get('local_missing_retry_batches'))
+        local_invalid = _count(accepted.get('local_invalid_retry_batches'))
+        remaining_frontier = _count(accepted.get('remaining_frontier_batches'))
+        estimated_frontier = _count(accepted.get('estimated_frontier_batches'))
+        raw_migration = accepted.get('local_invalid_migration_state')
+        migration = (None if raw_migration is None else raw_migration
+                     if type(raw_migration) is str and raw_migration in ('not_started', 'scanning', 'complete', 'unknown')
+                     else 'unknown')
+        retries_valid = ((accepted.get('local_retry_batches') is None or local_retries is not None)
+                         and (accepted.get('local_missing_retry_batches') is None or local_missing is not None)
+                         and (accepted.get('local_invalid_retry_batches') is None or local_invalid is not None))
         counts_valid = ((scanned is not None and indexed is not None)
                         or (scan_state == 'unknown' and accepted.get('scanned_batches') is None
                             and accepted.get('indexed_candidates') is None))
         if (type(accepted.get('contract_version')) is int and accepted['contract_version'] == 1
                 and scan_state in ('not_started', 'scanning', 'complete', 'local_retry_wait', 'unknown')
-                and counts_valid and accepted.get('local_raw_only') is True
+                and counts_valid and retries_valid and accepted.get('local_raw_only') is True
                 and accepted.get('all_history_complete') is False
                 and type(accepted.get('publisher_requests')) is int and accepted['publisher_requests'] == 0):
-            local_accepted = {'contract_version': 1, 'scan_state': scan_state, 'scanned_batches': scanned,
-                'indexed_candidates': indexed, 'local_raw_only': True,
+            problem = accepted.get('checkpoint_problem')
+            if scan_state != 'unknown' or problem not in ('invalid_checkpoint', 'unsupported_version', 'audit_conflict'):
+                problem = None
+            if scan_state == 'complete':
+                if local_retries or local_missing:
+                    scan_state = 'local_retry_wait'
+                elif migration in ('not_started', 'scanning'):
+                    scan_state = 'scanning'
+                elif migration == 'unknown':
+                    scan_state = 'unknown'
+                elif local_invalid:
+                    scan_state = 'local_retry_wait'
+                elif migration is None:
+                    scan_state = 'unknown'
+            if (scan_state == 'unknown' or scanned is None or remaining_frontier is None
+                    or estimated_frontier is None or scanned + remaining_frontier != estimated_frontier
+                    or scan_state == 'not_started' and scanned != 0):
+                remaining_frontier = estimated_frontier = None
+            local_accepted = {'contract_version': 1, 'scan_state': scan_state, 'checkpoint_problem': problem, 'scanned_batches': scanned,
+                'indexed_candidates': indexed, 'local_retry_batches': local_retries,
+                'local_missing_retry_batches': local_missing, 'local_invalid_retry_batches': local_invalid,
+                'local_invalid_migration_state': migration,
+                'remaining_frontier_batches': remaining_frontier,
+                'estimated_frontier_batches': estimated_frontier,
+                'local_raw_only': True,
                 'all_history_complete': False, 'publisher_requests': 0}
+    integrity = raw.get('completed_integrity_scan')
+    local_integrity = None
+    if isinstance(integrity, Mapping):
+        scan_state = integrity.get('scan_state')
+        checked = _count(integrity.get('checked_scopes'))
+        affected = _count(integrity.get('affected_scopes'))
+        counts_valid = (checked is not None and affected is not None
+                        or scan_state == 'unknown' and integrity.get('checked_scopes') is None
+                        and integrity.get('affected_scopes') is None)
+        if (type(integrity.get('contract_version')) is int and integrity['contract_version'] == 1
+                and scan_state in ('not_started', 'scanning', 'complete', 'unknown') and counts_valid
+                and integrity.get('local_metadata_only') is True and integrity.get('all_history_complete') is False
+                and type(integrity.get('publisher_requests')) is int and integrity['publisher_requests'] == 0):
+            local_integrity = {'contract_version': 1, 'scan_state': scan_state, 'checked_scopes': checked,
+                'affected_scopes': affected, 'local_metadata_only': True,
+                'all_history_complete': False, 'publisher_requests': 0}
+    original = raw.get('original_envelope_audit')
+    local_original = None
+    if isinstance(original, Mapping):
+        scan_state = original.get('scan_state')
+        checked = _count(original.get('checked_pages'))
+        verified = _count(original.get('verified_pages'))
+        out_of_scope = _count(original.get('out_of_scope_pages'))
+        mismatched = _count(original.get('mismatched_pages'))
+        unverified = _count(original.get('unverified_pages'))
+        counts_valid = (all(item is not None for item in (checked, verified, out_of_scope, mismatched, unverified))
+                        and verified + out_of_scope + mismatched + unverified == checked
+                        or scan_state == 'unknown' and original.get('checked_pages') is None
+                        and all(original.get(k) is None for k in ('verified_pages', 'out_of_scope_pages',
+                                                                   'mismatched_pages', 'unverified_pages')))
+        if (type(original.get('contract_version')) is int and original['contract_version'] == 1
+                and scan_state in ('not_started', 'scanning', 'complete', 'unknown') and counts_valid
+                and original.get('local_raw_only') is True and original.get('all_history_complete') is False
+                and type(original.get('publisher_requests')) is int and original['publisher_requests'] == 0):
+            problem = original.get('checkpoint_problem')
+            if scan_state != 'unknown' or problem not in ('invalid_checkpoint', 'unsupported_version', 'audit_conflict'):
+                problem = None
+            local_original = {'contract_version': 1, 'scan_state': scan_state, 'checked_pages': checked,
+                'verified_pages': verified, 'out_of_scope_pages': out_of_scope,
+                'mismatched_pages': mismatched, 'unverified_pages': unverified, 'local_raw_only': True,
+                'all_history_complete': False, 'publisher_requests': 0, 'checkpoint_problem': problem}
+            local_original['retry_pending_pages'] = _count(original.get('retry_pending_pages'))
+            next_audit = _stamp(original.get('next_audit_at_utc')) if scan_state == 'complete' else None
+            local_original['next_audit_at_utc'] = next_audit.isoformat() if next_audit else None
+    priority = raw.get('original_priority_admission')
+    local_priority = None
+    if isinstance(priority, Mapping):
+        priority_state = priority.get('state')
+        target = _count(priority.get('targets'))
+        processed = _count(priority.get('processed_targets'))
+        stale = _count(priority.get('stale_targets'))
+        added = _count(priority.get('enqueued_pages'))
+        existing = _count(priority.get('existing_pages'))
+        counts_valid = (all(item is not None for item in (target, processed, stale, added, existing))
+                        and 0 < target and stale <= processed <= target
+                        and (priority_state != 'complete' or processed == target)
+                        or priority_state == 'blocked' and all(priority.get(key) is None for key in
+                            ('targets', 'processed_targets', 'stale_targets', 'enqueued_pages', 'existing_pages')))
+        problem = priority.get('problem')
+        if problem not in ('source_unavailable', 'plan_unavailable_or_invalid', 'source_identity_changed',
+                           'invalid_checkpoint', 'checkpoint_archive_conflict'):
+            problem = None
+        if (type(priority.get('contract_version')) is int and priority['contract_version'] == 1
+                and priority_state in ('blocked', 'scanning', 'complete') and counts_valid
+                and type(priority.get('publisher_requests')) is int and priority['publisher_requests'] == 0
+                and priority.get('accepted_as_originals') is False and priority.get('all_history_complete') is False
+                and (priority_state == 'blocked' and problem is not None
+                     or priority_state != 'blocked' and priority.get('problem') is None)):
+            local_priority = {'contract_version': 1, 'state': priority_state, 'problem': problem,
+                'targets': target, 'processed_targets': processed, 'stale_targets': stale,
+                'enqueued_pages': added, 'existing_pages': existing, 'publisher_requests': 0,
+                'accepted_as_originals': False, 'all_history_complete': False}
+    priority_audit = raw.get('original_priority_audit')
+    local_priority_audit = None
+    if isinstance(priority_audit, Mapping) and local_priority and local_priority['state'] != 'blocked':
+        keys = ('awaiting_pages', 'verified_pages', 'mismatched_pages', 'unverified_pages',
+                'outside_pages', 'changed_pages')
+        version = priority_audit.get('contract_version')
+        if type(version) is int and version == 2:
+            keys += ('recovered_id_pages',)
+        audit_counts = {key: _count(priority_audit.get(key)) for key in keys}
+        tracked = _count(priority_audit.get('tracked_pages'))
+        tracking_complete = priority_audit.get('tracking_complete')
+        expected = local_priority['enqueued_pages'] + local_priority['existing_pages']
+        if (type(version) is int and version in (1, 2)
+                and tracked is not None and all(value is not None for value in audit_counts.values())
+                and sum(audit_counts.values()) == tracked and type(tracking_complete) is bool
+                and tracking_complete == (tracked == expected)
+                and priority_audit.get('local_raw_only') is True
+                and type(priority_audit.get('publisher_requests')) is int and priority_audit['publisher_requests'] == 0
+                and priority_audit.get('all_history_complete') is False):
+            local_priority_audit = {'contract_version': version, 'tracked_pages': tracked,
+                'tracking_complete': tracking_complete, **audit_counts, 'local_raw_only': True,
+                'publisher_requests': 0, 'all_history_complete': False}
     return {'contract_version': 1, 'current_source_contract_scope_states': counts,
             'scope_outcome_projection_contract_version': 1,
             'verified_list_scopes': sum(counts[key] for key in complete),
             'waiting_list_scopes': sum(counts[key] for key in waiting),
             'inconsistent_source_scopes': sum(counts[key] for key in inconsistent),
+            'invalid_page_evidence_scopes': counts['invalid_page_evidence'],
+            'invalid_scope_evidence_scopes': counts['invalid_scope_evidence'],
+            'original_page_reference_scopes': counts['inconsistent_original_page_ID_reference'],
             'page_cap_exceeded_scopes': counts['source_page_cap_exceeded'],
             'retired_gap_receipts': retired, 'unresolved_category_scopes': _cnyes_category_gap_count(gaps),
+            'legacy_metadata_scans': local_legacy,
             'overflow_retained_recovery': local_recovery,
             'unobserved_nonzero_retained_scan': local_nonzero,
             'accepted_body_batch_scan': local_accepted,
+            'completed_integrity_scan': local_integrity,
+            'original_envelope_audit': local_original,
+            'original_priority_admission': local_priority,
+            'original_priority_audit': local_priority_audit,
             'list_coverage_is_not_body_coverage': True, 'all_history_complete': False,
             'finish_eta_utc': None, 'progress_ratio': None}
 
@@ -780,6 +1136,21 @@ def _read_news_status(path: Path) -> tuple[dict[str, Any], int]:
 
 def _count(value: Any) -> int | None:
     return value if type(value) is int and 0 <= value <= 2**53 - 1 else None
+
+
+def _source_catalog_errors(status: Mapping[str, Any], source: str) -> int | None:
+    """Old or inconsistent snapshots do not establish a healthy catalog."""
+    inventory = _object(status.get('metadata_inventory'))
+    version = inventory.get('contract_version')
+    if type(version) is not int or version not in ({5, 6, 7} if source == 'finmind' else {6, 7}):
+        return None
+    count = _count(inventory.get(source + '_catalog_errors'))
+    total = _count(status.get('metadata_partition_errors'))
+    other = _count(inventory.get(('finlab' if source == 'finmind' else 'finmind') + '_catalog_errors'))
+    if (version == 6 and count is not None and other is not None
+            and total is not None and count + other > total):
+        return None
+    return count if count is not None and total is not None and count <= total else None
 
 
 def _discovery_error_rollup(value, expected_total):
@@ -963,9 +1334,9 @@ def _stamp(value: Any) -> datetime | None:
         return None
     try:
         stamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    except ValueError:
+        return stamp.astimezone(UTC) if stamp.tzinfo is not None else None
+    except (ValueError, OverflowError):
         return None
-    return stamp.astimezone(UTC) if stamp.tzinfo is not None else None
 
 
 def _completion_forecast(metrics: Mapping[str, Any], calibration: Mapping[str, Any],
@@ -1097,6 +1468,50 @@ def _robots_origin_pause(control: Mapping[str, Any], metrics: Mapping[str, Any],
             'permission_granted': False, 'provider_recovery_verified': False}
 
 
+_PROVIDER_SOURCE_GATE_MAPS = ('temporarily_paused_robots_origins', 'temporarily_paused_gateway_hosts',
+                              'unverified_robots_origins', 'unverified_gateway_hosts')
+
+
+def _provider_has_unscoped_source_gate(control: Mapping[str, Any]) -> bool:
+    """A provider gate without a URL-scope proof makes a whole-queue ETA unknown.
+
+    The maps are bounded owner telemetry. Expired rechecks are deliberately
+    retained until an actual source response proves recovery. Missing fields
+    remain compatible with older snapshots; a present malformed field is not
+    evidence of an empty gate. Do not enumerate or publish private host names.
+    """
+    for key in _PROVIDER_SOURCE_GATE_MAPS:
+        if key in control:
+            value = control[key]
+            if not isinstance(value, Mapping) or value:
+                return True
+    return ('unverified_robots_origins_overflow' in control
+            and control['unverified_robots_origins_overflow'] is not False)
+
+
+def _provider_precise_gate_evidence_invalid(control: Mapping[str, Any]) -> bool:
+    """Check present control evidence before trusting a saved precise scope.
+
+    This is used only for the provider with an explicit URL-scope projection.
+    Match the owner's bounded gate contract without exposing its private keys.
+    Missing legacy fields stay compatible; invalid or overflowed evidence is
+    not a proof that the queue is unaffected.
+    """
+    for key in _PROVIDER_SOURCE_GATE_MAPS:
+        if key not in control:
+            continue
+        value = control[key]
+        if not isinstance(value, Mapping) or len(value) > 32:
+            return True
+        for origin, deadline in value.items():
+            if (not isinstance(origin, str) or not 0 < len(origin) <= 320
+                    or type(deadline) not in {int, float}
+                    or not 0 <= deadline <= 253402214400 or not math.isfinite(deadline)):
+                return True
+    return ('unverified_robots_origins_overflow' in control
+            and control['unverified_robots_origins_overflow'] is not False)
+
+
 def _states(value: Any) -> dict[str, int]:
     result: dict[str, int] = {}
     for key, count in _object(value).items():
@@ -1105,6 +1520,29 @@ def _states(value: Any) -> dict[str, int]:
             name = key if key in _STATES else "other"
             result[name] = result.get(name, 0) + number
     return result
+
+
+def _provider_states_reconcile(global_states: Any, raw_providers: Any) -> bool:
+    """Check the owner's exact state partition before public redaction.
+
+    Unknown names are intentionally published as ``other``, but comparing
+    those redacted buckets could hide different unknown states. Missing or
+    malformed counts must not silently become zero.
+    """
+    def valid_states(value: Any) -> bool:
+        return isinstance(value, dict) and all(
+            isinstance(key, str) and _count(count) is not None for key, count in value.items())
+
+    if not valid_states(global_states) or not isinstance(raw_providers, dict):
+        return False
+    totals: Counter[str] = Counter()
+    for identifier, provider in raw_providers.items():
+        if (not isinstance(identifier, str) or not _ID.fullmatch(identifier)
+                or not isinstance(provider, dict) or not valid_states(provider.get('states'))):
+            return False
+        totals.update(provider['states'])
+    return ({key: value for key, value in totals.items() if value}
+            == {key: value for key, value in global_states.items() if value})
 
 
 def news_snapshot_revision(repo_root: Path) -> str:
@@ -1119,15 +1557,19 @@ def news_snapshot_revision(repo_root: Path) -> str:
         paths.append(cna_path)
     try:
         paths.extend(configuration_paths(paths[1])[1:])
+        handoff_path = _retained_handoff_plan_path(repo_root, load_news_configuration(paths[1]))
+        if handoff_path is not None:
+            paths.append(handoff_path)
         review_path = planning_review_path(paths[1])
         if review_path is not None:
             paths.append(review_path)
     except (OSError, ValueError, KeyError, TypeError):
         pass
+    paths.extend(reference_paths(repo_root))
     for path in paths:
         try:
             stat = path.stat()
-            parts.append(f"{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_size}")
+            parts.append(f"{stat.st_dev}:{stat.st_ino}:{stat.st_mtime_ns}:{stat.st_ctime_ns}:{stat.st_size}")
         except OSError:
             parts.append("missing")
     return ":".join(parts)
@@ -1247,6 +1689,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         snapshot_owner_id=status.get('owner_id'), snapshot_at=observed, now=now)
     initializing = False
     lifecycle_stopped = False
+    local_sqlite_phase = False
     if lifecycle.get('available') and (lifecycle['snapshot_owner_matches'] or lifecycle['supersedes_snapshot']):
         lifecycle_stopped = not lifecycle['process_alive'] or lifecycle['state'] in {'closed', 'failed'}
         initializing = not lifecycle_stopped and (not lifecycle['snapshot_owner_matches']
@@ -1255,7 +1698,17 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             activity = 'initializing' if lifecycle['age_seconds'] <= MAX_AGE_SECONDS else 'initializing_stale'
         elif lifecycle_stopped and activity not in {'stopped', 'waiting_restart'}:
             activity = 'stopped'
-    if not initializing and not lifecycle_stopped and activity in {'running', 'idle', 'waiting', 'inventorying', 'waiting_disk'}:
+        lifecycle_at = _stamp(lifecycle.get('observed_at_utc'))
+        local_sqlite_phase = bool(not lifecycle_stopped and lifecycle_at
+            and (observed is None or lifecycle_at >= observed)
+            and lifecycle['phase'] in {'waiting_local_sqlite', 'local_sqlite_retry_finished'})
+        if local_sqlite_phase:
+            if lifecycle['phase'] == 'local_sqlite_retry_finished':
+                activity = 'waiting_local_snapshot'
+            else:
+                activity = ('waiting_local_database' if lifecycle['age_seconds'] <= LOCAL_SQLITE_WAIT_MAX_AGE_SECONDS
+                            else 'waiting_local_database_stale')
+    if not initializing and not lifecycle_stopped and not local_sqlite_phase and activity in {'running', 'idle', 'waiting', 'inventorying', 'waiting_disk'}:
         if 'disk_admission' in status and disk_admission is None and disk_verification is None:
             activity = 'unavailable'  # A current heartbeat cannot freshen an old admission sample.
         elif disk_verification or disk_admission and not disk_admission['fetch_allowed']:
@@ -1263,7 +1716,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     live = valid and fresh and activity in {"running", "idle", "waiting", "inventorying"}
     health = ("unavailable" if not status else "invalid" if not valid else "stale" if not fresh
               else "stopped" if activity == "stopped" else activity)
-    if initializing or lifecycle_stopped:
+    if initializing or lifecycle_stopped or local_sqlite_phase:
         health = activity
     if snapshot_read_state == 'too_large':
         # An alive owner plus unreadable telemetry is not a new worker starting
@@ -1291,8 +1744,14 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
     metric_providers = _object(metrics.get("providers"))
     elapsed = _number(metrics.get("owner_elapsed_seconds"))
     cooldowns = _object(status.get("provider_next_attempt_utc"))
-    capacity = _object(status.get("http_capacity")) if valid and fresh and not initializing else {}
-    runtime_controls = _object(capacity.get("providers"))
+    capacity_in_snapshot = valid and fresh and not initializing
+    capacity_raw = status.get("http_capacity")
+    capacity = _object(capacity_raw) if capacity_in_snapshot else {}
+    runtime_controls_raw = capacity.get("providers")
+    runtime_controls = _object(runtime_controls_raw)
+    malformed_runtime_controls = capacity_in_snapshot and (
+        'http_capacity' in status and not isinstance(capacity_raw, Mapping)
+        or 'providers' in capacity and not isinstance(runtime_controls_raw, Mapping))
     calibration = _object(_object(capacity.get("calibration")).get("providers"))
     calibration_version = _object(capacity.get('calibration')).get('measurement_contract_version')
     completion_owner_version = _object(capacity.get('calibration')).get('completion_window_owner_contract_version')
@@ -1404,6 +1863,14 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         cooldown = _stamp(cooldowns.get(identifier))
         cooling = bool(cooldown and cooldown > now)
         eta_remaining = body_coverage['queued_missing_body_urls'] if body_coverage else ready
+        control_raw = runtime_controls.get(identifier)
+        control = _object(control_raw)
+        malformed_control = malformed_runtime_controls or (
+            identifier in runtime_controls and not isinstance(control_raw, Mapping)) or (
+            request_scope_declared and _provider_precise_gate_evidence_invalid(control))
+        scope_eta_unknown = scope_eta_unknown or bool(
+            live and body_enabled and eta_remaining and (
+                malformed_control or not request_scope_declared and _provider_has_unscoped_source_gate(control)))
         eta = (eta_remaining / eta_rate if body_enabled and eta_remaining and eta_rate and not cooling and not scope_eta_unknown else
                0.0 if body_enabled and eta_remaining == 0 and live else None)
         if body_coverage and eta_remaining == 0 and body_coverage['missing_body_urls']:
@@ -1442,7 +1909,6 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         # Display names are configuration labels, never free-form source errors.
         if not isinstance(name, str) or len(name) > 160 or any(ord(char) < 32 for char in name):
             name = identifier.removeprefix("unregistered:")
-        control = _object(runtime_controls.get(identifier))
         sample = _object(measured_capacity.get("last_window"))
         capacity_state = measured_capacity.get("state")
         capacity_state = capacity_state if isinstance(capacity_state, str) and capacity_state in _CAPACITY_STATES else None
@@ -1486,12 +1952,14 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "outcome_progress": outcome_progress,
             "original_metadata": original_sources.get(identifier),
             "body_work_progress": body_work,
+            "native_lookup_recheck_progress": _native_lookup_recheck_progress(
+                raw.get('native_lookup_recheck_progress')) if identifier == 'cnyes' and valid else None,
             "local_replay_retries": local_replay_retries if identifier == 'cnyes' else None,
             "metadata_resource_waits": metadata_resource_waits if identifier == 'cnyes' else None,
             "metadata_large_replay": metadata_large_replay if identifier == 'cnyes' else None,
             "metadata_index_progress": metadata_index_progress if identifier == 'cnyes' else None,
             "body_request_scope_progress": request_scope,
-            "public_index_progress": _cnyes_public_index_progress(raw.get('public_index_progress')) if identifier == 'cnyes' else None,
+            "public_index_progress": _cnyes_public_index_progress(raw.get('public_index_progress'), now=now) if identifier == 'cnyes' else None,
             "manifest_phase_progress": _cnyes_manifest_phase_progress(raw.get('public_index_progress'), metrics,
                 now, live and raw.get('automatic_collection_enabled') is True, status.get('owner_id'),
                 provider_waiting=cooling) if identifier == 'cnyes' else None,
@@ -1503,6 +1971,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "owner_requests": requests, "owner_responses": responses,
             "owner_response_bytes": _count(http_counts.get("http_response_bytes")),
             "owner_accepted_versions": accepted, "owner_articles_per_second": rate,
+            "owner_local_sqlite_busy_commit_events": _count(http_counts.get("local_sqlite_busy_commit_events")),
             "owner_new_stored_url_heads": heads,
             "forecast_rate_basis": "new_stored_url_heads" if heads is not None else "legacy_version_proxy",
             "completion_forecast": forecast,
@@ -1510,7 +1979,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                                                'owner_new_stored_url_heads' if heads is not None else 'legacy_owner_version_proxy'),
             "conditional_eta_seconds": eta, "conditional_finish_at_utc": finish,
             "conditional_eta_unavailable_reason": ('source_request_scope_unknown'
-                if request_scope is None or not request_scope['available']
+                if malformed_control or request_scope is None or not request_scope['available']
                     or (not request_scope['source_paused_missing_body_urls'] and (rechecks is None or not rechecks['available']))
                 else 'source_request_scope_paused') if scope_eta_unknown else None,
             "conditional_eta_scope": 'queued_missing_body_urls' if body_coverage else 'legacy_active_url_states',
@@ -1538,16 +2007,14 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
             "transport_errors": _count(http_counts.get("transport_errors")), "http_errors": http_errors,
             "official_hourly_quota": None, "official_daily_quota": None,
         })
-    rank = {"running": 0, "backfilling": 1, 'rechecking': 2, "known_queue_clear": 2, 'finite_complete': 2, 'waiting_cohort': 2,
-            "cooldown": 3, "attention": 4}
-    providers.sort(key=lambda source: (not source["configured"], rank.get(source["state"], 5), -int(source["known_urls"] or 0), source["id"]))
     counts = _states(status.get("states")) if valid else {}
     known = _count(status.get("unique_articles")) if valid else None
     stored = _count(status.get("articles_with_stored_body")) if valid else None
     ratio = stored / known if known and stored is not None and stored <= known else None
+    state_totals_reconciled = (valid and _provider_states_reconcile(status.get('states'), status.get('providers')))
     consistency = (known is not None and known == sum(counts.values())
                    and known == sum(source["known_urls"] or 0 for source in providers)
-                   and stored is not None and stored <= known)
+                   and stored is not None and stored <= known and state_totals_reconciled)
     if stored_counter_declared:
         consistency = consistency and stored_counter_supported and all(
             source['stored_body_urls'] is not None for source in providers) and stored == sum(
@@ -1578,14 +2045,32 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         ratio = None
         for source in providers:
             source["conditional_eta_seconds"] = source["conditional_finish_at_utc"] = None
-            source['stored_body_progress_ratio'] = None
+            source['progress_ratio'] = source['stored_body_progress_ratio'] = None
+            source['completion_forecast'] = None
+            source['finite_cohort'] = source['finite_supplements'] = None
+            # The two partitions disagree, so neither side can establish
+            # which provider's apparent completed/remaining counts are true.
+            # Keep the original heartbeat untouched for diagnosis.
+            for field in ('known_urls', 'complete_urls', 'remaining_urls', 'stored_body_urls',
+                          'blocked_urls', 'growth_waiting_urls', 'text_bytes', 'adapter_acceptance',
+                          'body_coverage', 'publisher_reference_coverage', 'outcome_progress',
+                          'body_work_progress', 'native_lookup_recheck_progress', 'body_request_scope_progress'):
+                source[field] = None
+            source['states'] = {}
+            if source['state'] in {'running', 'backfilling', 'rechecking', 'known_queue_clear',
+                                    'finite_complete', 'waiting_cohort', 'cooldown', 'attention',
+                                    'metadata_polling'}:
+                source['state'] = 'unavailable'
         body_coverage = None
+    rank = {"running": 0, "backfilling": 1, 'rechecking': 2, "known_queue_clear": 2, 'finite_complete': 2, 'waiting_cohort': 2,
+            "cooldown": 3, "attention": 4}
+    providers.sort(key=lambda source: (not source["configured"], rank.get(source["state"], 5), -int(source["known_urls"] or 0), source["id"]))
     eligible = [source for source in providers if source['automatic_fulltext_allowed'] and (
         source['body_coverage']['queued_missing_body_urls'] if source['body_coverage'] else source['remaining_urls'])]
     etas = [source["conditional_eta_seconds"] for source in eligible]
     eligible_eta = max(etas) if consistency and live and etas and all(eta is not None for eta in etas) else None
     outcome_totals = Counter()
-    if valid:
+    if valid and consistency:
         for source in providers:
             outcome_totals.update(source['outcome_progress']['categories'])
     outcome_progress = ({'contract_version': NEWS_OUTCOME_CLASSIFICATION_VERSION,
@@ -1593,7 +2078,7 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         'snapshot_consistent': consistency, 'grain': 'retained queue URL-head states',
         'origin_absence_is_not_all_paths_exhausted': True,
         'definitively_unavailable_urls': None, 'closure_progress_ratio': None,
-        'all_history_complete': False} if valid else None)
+        'all_history_complete': False} if valid and consistency else None)
     owner_requests = _object(status.get("http_requests_this_run"))
     requests = [_count(number) for number in owner_requests.values()]
     stages = []
@@ -1637,11 +2122,19 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
                       'owner_urls_per_second': rate, 'conditional_eta_seconds': remaining / rate if rate else None,
                       'body_completion_claimed': False, 'metadata_identity_verified': False,
                       'publisher_requests': 0}
+    corpus_quality, corpus_headline_quality = public_corpus_quality_statuses(repo_root, now=now)
+    metadata_inventory = _object(status.get('metadata_inventory'))
+    metadata_version = metadata_inventory.get('contract_version')
+    alias_pending = (_count(metadata_inventory.get('receipt_alias_retargets_pending'))
+                     if valid and type(metadata_version) is int and metadata_version == 7 else None)
+    metadata_selection_valid = (valid and ('contract_version' not in metadata_inventory
+        or (type(metadata_version) is int and (metadata_version < 7
+            or (metadata_version == 7 and alias_pending == 0)))))
     return {
         "schema_version": 1, "nonbody_source_outcome_progress_contract_version": 1,
         "snapshot_reader_contract_version": 3, "snapshot_read_state": snapshot_read_state,
         "snapshot_read_attempts": snapshot_read_attempts,
-        "worker_lifecycle_projection_contract_version": 2,
+        "worker_lifecycle_projection_contract_version": 3,
         "provider_state_owner_lifecycle_contract_version": 1,
         "disk_admission_projection_contract_version": 1,
         "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
@@ -1656,44 +2149,55 @@ def build_news_public_status(repo_root: Path, *, now: datetime | None = None) ->
         "original_source_inventory_contract_version": 1,
         "original_source_inventory": original_inventory,
         "url_metadata_inbox": _url_metadata_inbox(status.get('url_metadata_inbox')) if valid else None,
+        "finlab_cnyes_priority": _finlab_cnyes_priority(status.get('finlab_cnyes_priority'), observed) if valid else None,
+        "retained_link_handoff": _retained_handoff_projection(repo_root, config, status.get('retained_link_handoff') if valid else None),
         "candidate_diagnostic_progress": candidate_diagnostics,
         "source_policy_review_contract_version": 1,
         "source_reviews_state": source_reviews_state,
         "source_policy_review_counts": dict(Counter(source["source_policy_review"] for source in providers)),
         "source_review_followup_contract_version": 1,
         "source_review_followup_state_counts": dict(Counter(source["source_review_followup"] for source in providers)),
+        "corpus_quality": corpus_quality,
+        "corpus_headline_quality": corpus_headline_quality,
+        "sort_day_quality": public_sort_day_quality_status(repo_root, now=now),
         "generated_at_utc": now.isoformat(), "read_only": True,
         "production_control_possible": False, "health": health,
         "observed_at_utc": observed.isoformat() if observed else None,
         "status_age_seconds": max(0.0, age) if age is not None else None,
         "snapshot_consistent": consistency,
+        "provider_state_totals_reconciled": state_totals_reconciled if valid else None,
         "worker": {"activity": activity, "source_activity": source_activity,
                    "disk_admission": disk_admission,
                    "disk_verification": disk_verification,
-                   "fresh": fresh and not initializing and not lifecycle_stopped,
+                   "fresh": fresh and not initializing and not lifecycle_stopped and not local_sqlite_phase,
+                   "local_sqlite_wait_max_age_seconds": LOCAL_SQLITE_WAIT_MAX_AGE_SECONDS,
                    "lifecycle": lifecycle,
                    "owner_elapsed_seconds": lifecycle['elapsed_seconds'] if initializing else elapsed,
                    "owner_cpu_seconds": None if initializing else _number(metrics.get("owner_cpu_seconds")),
                    "requests": sum(requests) if not initializing and requests and all(value is not None for value in requests) else None,
                    "response_bytes": _count(status.get("http_response_bytes_this_run")) if valid and not initializing else None},
-        "acquisition": {"known_urls": known, "stored_body_articles": stored,
-                        "complete_state_urls": counts.get("complete", 0) if valid else None,
-                        "remaining_urls": sum(source["remaining_urls"] or 0 for source in providers if source["enabled"]) if valid else None,
-                        "awaiting_authorization_urls": counts.get("awaiting_authorization", 0) if valid else None,
-                        "inflight_urls": counts.get("inflight", 0) if valid else None,
-                        "retry_urls": sum(counts.get(key, 0) for key in ("retry", "retry_cooldown")) if valid else None,
-                        'growth_waiting_urls': counts.get('waiting_cohort', 0) if valid else None,
-                        "blocked_urls": sum(count for key, count in counts.items() if key not in _READY_STATES | {"complete", 'waiting_cohort'}) if valid else None,
-                        "progress_ratio": ratio, "text_bytes": _count(status.get("accepted_text_bytes")) if valid else None,
+        "acquisition": {"known_urls": known if consistency else None,
+                        "stored_body_articles": stored if consistency else None,
+                        "complete_state_urls": counts.get("complete", 0) if consistency else None,
+                        "remaining_urls": sum(source["remaining_urls"] or 0 for source in providers if source["enabled"]) if consistency else None,
+                        "awaiting_authorization_urls": counts.get("awaiting_authorization", 0) if consistency else None,
+                        "inflight_urls": counts.get("inflight", 0) if consistency else None,
+                        "retry_urls": sum(counts.get(key, 0) for key in ("retry", "retry_cooldown")) if consistency else None,
+                        'growth_waiting_urls': counts.get('waiting_cohort', 0) if consistency else None,
+                        "blocked_urls": sum(count for key, count in counts.items() if key not in _READY_STATES | {"complete", 'waiting_cohort'}) if consistency else None,
+                        "progress_ratio": ratio, "text_bytes": _count(status.get("accepted_text_bytes")) if consistency else None,
                         "eligible_eta_seconds": eligible_eta, "all_sources_eta_seconds": None,
                         "discovery_due": _count(status.get("discovery_pending")) if valid else None,
                         "discovery_errors": _count(status.get("discovery_errors")) if valid else None,
-                        "metadata_partitions": _count(status.get("metadata_partitions")) if valid else None,
-                        "metadata_association_rows": _count(status.get("metadata_association_rows")) if valid else None,
+                        "metadata_partitions": _count(status.get("metadata_partitions")) if metadata_selection_valid else None,
+                        "metadata_association_rows": _count(status.get("metadata_association_rows")) if metadata_selection_valid else None,
                         "metadata_errors": _count(status.get("metadata_partition_errors")) if valid else None,
+                        "metadata_selection_pending": alias_pending,
+                        "finmind_catalog_errors": _source_catalog_errors(status, 'finmind') if valid else None,
+                        "finlab_catalog_errors": _source_catalog_errors(status, 'finlab') if valid else None,
                         "disabled_bulk_pages": _count(status.get("bulk_api_pages_disabled")) if valid else None,
                         "temporarily_blocked_bulk_pages": _count(status.get("bulk_api_pages_temporarily_blocked")) if valid else None},
-        "states": counts, "providers": providers, "stages": stages,
+        "states": counts if consistency else {}, "providers": providers, "stages": stages,
         "original_url_resolution": resolution,
         "scope": {"historical_completeness_verified": False, "body_exported": False,
                   "source_reviews_grant_capture_permission": False,

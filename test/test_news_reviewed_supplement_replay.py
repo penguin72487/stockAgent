@@ -49,6 +49,15 @@ def test_retained_original_uses_zero_http_preserves_clock_and_recovers(config, t
         assert result["publisher_requests_this_command"] == 0
         head = dict(q.db.execute("SELECT * FROM articles WHERE url=?", (URL,)).fetchone())
         row = pq.read_table(q.root / head["parquet_path"]).to_pylist()[0]
+        from downloader.news_fulltext_queue import parse_article_capture_witness, verify_bodies
+        assert parse_article_capture_witness(row) is not None
+        assert verify_bodies(q.root)['accepted']
+        corrupted = dict(row)
+        corrupted_head = json.loads(corrupted['retained_supplement_head_json'])
+        corrupted_head['attempts'] += 1
+        corrupted['retained_supplement_head_json'] = json.dumps(corrupted_head)
+        with pytest.raises(ValueError, match='incompatible_article_capture_witnesses'):
+            parse_article_capture_witness(corrupted)
         assert row["captured_at_utc"] == row["source_observed_at_utc"] == OBSERVED
         assert head["captured_at_utc"] == head["last_checked_at_utc"] == OBSERVED
         assert row["reparsed_at_utc"] != OBSERVED
@@ -220,6 +229,88 @@ def test_durable_receipt_recovers_without_overwriting_later_source_check(config,
         else:
             assert row["state"] == "complete" and row["captured_at_utc"] == OBSERVED
             assert row["body_sha256"]
+    finally:
+        q.close()
+
+
+def test_durable_supplement_cannot_replace_a_newer_abandoned_lease(config, tmp_path, monkeypatch):
+    from downloader import news_fulltext_queue as queue_module
+    q, registry, _, _ = approved(config, tmp_path)
+    root = q.root
+    monkeypatch.setattr(queue_module.time, 'time', lambda: 2000000000.0)
+    monkeypatch.setattr(q, '_accept_records',
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError('durable crash')))
+    try:
+        with pytest.raises(RuntimeError, match='durable crash'):
+            materialize_reviewed_supplements(q, [URL], lease_seconds=300)
+        old = dict(q.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+        with q.db:
+            q.db.execute("UPDATE articles SET state='retry',due=0,attempts=attempts-1,"
+                         "lease_owner=NULL,lease_until=NULL,lease_token=NULL WHERE url=?", (URL,))
+        new_claim = q.claim_url(URL, 300)
+        current = dict(q.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+        assert new_claim['_article_claim_token'] != old['lease_token']
+        assert (current['lease_owner'], current['lease_until'], current['attempts']) == (
+            old['lease_owner'], old['lease_until'], old['attempts'])
+    finally:
+        q.close()
+    q = NewsQueue(root, registry)
+    try:
+        restored = dict(q.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+        assert restored['state'] == 'retry' and restored['body_sha256'] is None
+        assert restored['recovery_lease_token'] == new_claim['_article_claim_token']
+        assert q.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+    finally:
+        q.close()
+
+
+@pytest.mark.parametrize('newer_claim', [False, True])
+def test_legacy_supplement_receipt_recovers_only_without_a_newer_token(config, tmp_path, monkeypatch, newer_claim):
+    from downloader import news_fulltext_queue as queue_module
+    q, registry, _, _ = approved(config, tmp_path)
+    root = q.root
+    monkeypatch.setattr(queue_module, 'article_claim_witness', lambda _row: None)
+    monkeypatch.setattr(q, '_accept_records',
+                        lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError('legacy crash')))
+    try:
+        with pytest.raises(RuntimeError, match='legacy crash'):
+            materialize_reviewed_supplements(q, [URL], lease_seconds=300)
+        with q.db:
+            q.db.execute('UPDATE articles SET lease_token=NULL WHERE url=?', (URL,))
+        if newer_claim:
+            with q.db:
+                q.db.execute("UPDATE articles SET state='retry',due=0,attempts=attempts-1,"
+                             "lease_owner=NULL,lease_until=NULL WHERE url=?", (URL,))
+            claim = q.claim_url(URL, 300)
+        else:
+            claim = None
+    finally:
+        q.close()
+    q = NewsQueue(root, registry)
+    try:
+        head = dict(q.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+        if claim:
+            assert head['state'] == 'retry' and head['body_sha256'] is None
+            assert head['recovery_lease_token'] == claim['_article_claim_token']
+        else:
+            assert head['state'] == 'complete' and head['body_sha256']
+    finally:
+        q.close()
+
+
+def test_superseded_supplement_is_not_reported_as_materialized(config, tmp_path, monkeypatch):
+    q, _, _, _ = approved(config, tmp_path)
+    original = q._accept_records
+    def newer_claim(records, relative, receipt, **kwargs):
+        with q.db:
+            q.db.execute("UPDATE articles SET lease_token='new-token' WHERE url=?", (URL,))
+        return original(records, relative, receipt, **kwargs)
+    monkeypatch.setattr(q, '_accept_records', newer_claim)
+    try:
+        result = materialize_reviewed_supplements(q, [URL], lease_seconds=300)
+        assert result['materialized_bodies'] == 0
+        assert result['superseded_urls'] == [URL]
+        assert q.db.execute('SELECT body_sha256 FROM articles WHERE url=?', (URL,)).fetchone()[0] is None
     finally:
         q.close()
 

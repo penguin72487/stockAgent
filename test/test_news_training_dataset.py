@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime
 from pathlib import Path
 import re
 import sqlite3
@@ -13,6 +14,7 @@ import pytest
 
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
 from stockagent.data import news_dataset as corpus
+from stockagent.data.news_clock import globalvoices_monthly_feed_clock_mismatch
 from stockagent.data.news_dataset_sources import source_metadata_record, url_article_id
 
 
@@ -471,6 +473,68 @@ def test_cnyes_market_page_and_literal_pointer_stay_metadata_not_headlines(tmp_p
     assert any(r["stock_id"] == "6472" and r["article_id"] == url_article_id(legacy).hex() for r in links)
 
 
+def test_cmnews_tag_reference_and_literal_pointer_remain_unverified_metadata(tmp_path):
+    import base64
+
+    source, output = source_fixture(tmp_path), tmp_path / "data_news"
+    tag = "https://cmnews.com.tw/tag/6650"
+    envelope = b"\x08\x13\x22" + bytes([len(tag)]) + tag.encode()
+    alias = "https://news.google.com/rss/articles/" + base64.urlsafe_b64encode(envelope).decode().rstrip("=")
+    article = "https://cmnews.com.tw/article/known-candidate"
+    path = source / "metadata/finmind.parquet"
+    metadata = [
+        {"link": tag, "stock_id": "6650", "title": "6650 文章集合"},
+        {"link": alias, "stock_id": "6650", "title": "6650 文章集合"},
+        {"link": article, "stock_id": "0050", "title": "已知文章候選標題"},
+    ]
+    atomic_write_parquet(path, pa.Table.from_pylist(metadata))
+    with sqlite3.connect(source / "queue.sqlite3") as db:
+        db.executemany("INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?,?)", [
+            (url_article_id(url), url, provider, title, "2026-01-01", CAPTURED, CAPTURED,
+             None, None, None, "unsupported_article_path")
+            for url, provider, title in (
+                (tag, "cmnews", "6650 文章集合"),
+                (alias, "unregistered:news.google.com", "6650 文章集合"),
+                (article, "cmnews", "已知文章候選標題"))
+        ])
+        db.execute("UPDATE state_metrics SET articles=articles+3")
+        db.execute("UPDATE origins SET sha256=?,rows=3 WHERE id=2", (sha256_file(path),))
+
+    corpus.build_news_dataset(source, output, batch_rows=2)
+    manifest = json.loads((output / "manifest.json").read_text())
+    counts = manifest["source_snapshot"]["counts"]
+    assert counts["metadata_only_market_heads"] == 0
+    assert counts["metadata_only_cmnews_tag_heads"] == 2
+    assert counts["metadata_only_heads"] == 2
+    articles = read_table(output, "articles")
+    assert not {tag, alias} & {row["url"] for row in articles}
+    assert any(row["url"] == article and row["text_kind"] == "headline" for row in articles)
+    observations = [r for r in read_table(output, "metadata_observations") if r["metadata_provider"] == "finmind"]
+    assert {r["url_raw"] for r in observations} == {tag, alias, article}
+    assert all(r["resolved_article_id"] is None for r in observations if r["url_raw"] in {tag, alias})
+    links = read_table(output, "article_stocks")
+    assert not any(r["stock_id"] == "6650" for r in links)
+    assert any(r["stock_id"] == "0050" and r["article_id"] == url_article_id(article).hex() for r in links)
+
+
+def test_cmnews_tag_with_existing_body_is_not_filtered(tmp_path):
+    from stockagent.data.news_dataset_sources import freeze_inputs
+
+    source = source_fixture(tmp_path)
+    tag = "https://cmnews.com.tw/tag/2330"
+    with sqlite3.connect(source / "queue.sqlite3") as db:
+        db.execute("INSERT INTO articles VALUES (?,?,?,?,?,?,?,?,?,?,?)", (
+            url_article_id(tag), tag, "cmnews", "來源已保存正文", "2026-01-01", CAPTURED, CAPTURED,
+            CAPTURED, "declared-body-sha", "bodies/current.parquet", "complete"))
+        db.execute("UPDATE state_metrics SET articles=articles+1")
+        db.execute("UPDATE stored_body_metrics SET heads=heads+1")
+    frozen = tmp_path / "snapshot"
+    plan = freeze_inputs(source, frozen)
+    with sqlite3.connect(frozen / "snapshot.sqlite3") as db:
+        assert db.execute("SELECT count(*) FROM metadata_only_heads WHERE id=?", (url_article_id(tag),)).fetchone()[0] == 0
+    assert plan["counts"]["fulltext_articles"] == 3
+
+
 @pytest.mark.parametrize("url,expected", [
     ("https://www.cnyes.com/twstock/6689/company/--", "cnyes_market_route"),
     ("http://www.cnyes.com/twstock/2330", "cnyes_market_route"),
@@ -478,6 +542,10 @@ def test_cnyes_market_page_and_literal_pointer_stay_metadata_not_headlines(tmp_p
     ("https://news.cnyes.com/news/id/479014", None),
     ("https://news.cnyes.com/20160510/20160510110007000909372.shtml", None),
     ("https://news.google.com/rss/articles/opaque", None),
+    ("https://cmnews.com.tw/tag/2330", "cmnews_tag_route_unverified"),
+    ("http://cmnews.com.tw/tag/%E5%8F%B0%E8%82%A1", "cmnews_tag_route_unverified"),
+    ("https://cmnews.com.tw.evil.example/tag/2330", None),
+    ("https://cmnews.com.tw/article/example", None),
     (None, None),
 ])
 def test_market_metadata_filter_does_not_infer_other_url_identity(url, expected):
@@ -503,7 +571,8 @@ def test_existing_body_is_not_dropped_by_market_metadata_filter(tmp_path):
     assert plan["counts"]["fulltext_articles"] == 3
 
 
-def test_new_headline_scope_requires_separate_root_and_current_snapshot(tmp_path):
+@pytest.mark.parametrize("previous_scope", [None, "cnyes_market_route_metadata_only_v1"])
+def test_new_headline_scope_requires_separate_root_and_current_snapshot(tmp_path, previous_scope):
     from stockagent.data.news_dataset_sources import reuse_snapshot
 
     source, output = source_fixture(tmp_path), tmp_path / "data_news"
@@ -513,16 +582,73 @@ def test_new_headline_scope_requires_separate_root_and_current_snapshot(tmp_path
     frozen = output / manifest["generation"]
     snapshot_path = frozen / "snapshot.json"
     snapshot = json.loads(snapshot_path.read_text())
-    snapshot.pop("headline_scope_contract")
+    if previous_scope is None:
+        snapshot.pop("headline_scope_contract")
+    else:
+        snapshot["headline_scope_contract"] = previous_scope
     atomic_write_json(snapshot_path, snapshot)
     with pytest.raises(ValueError, match="incompatible headline scope"):
         reuse_snapshot(source, tmp_path / "new_frozen", frozen)
-    manifest.pop("headline_scope_contract")
+    if previous_scope is None:
+        manifest.pop("headline_scope_contract")
+    else:
+        manifest["headline_scope_contract"] = previous_scope
     atomic_write_json(manifest_path, manifest)
     before = sha256_file(manifest_path)
     with pytest.raises(ValueError, match="separate output root"):
         corpus.build_news_dataset(source, output, refresh=True)
     assert sha256_file(manifest_path) == before
+
+
+@pytest.mark.parametrize('old_scope', [None, 'explicit_current_origin_or_legacy_inference_v1'])
+def test_metadata_selection_scope_rejects_old_snapshot_and_output_root(tmp_path, old_scope):
+    from stockagent.data.news_dataset_sources import reuse_snapshot
+
+    source, output = source_fixture(tmp_path), tmp_path / "data_news"
+    corpus.build_news_dataset(source, output)
+    manifest_path = output / "manifest.json"
+    manifest = json.loads(manifest_path.read_text())
+    assert manifest['source_snapshot']['metadata_selection_evidence'] == {'explicit': 0, 'legacy_inferred': 2}
+    frozen = output / manifest['generation']
+    snapshot_path = frozen / 'snapshot.json'
+    snapshot = json.loads(snapshot_path.read_text())
+    if old_scope is None:
+        snapshot.pop('metadata_selection_scope_contract')
+    else:
+        snapshot['metadata_selection_scope_contract'] = old_scope
+    atomic_write_json(snapshot_path, snapshot)
+    with pytest.raises(ValueError, match='incompatible metadata selection scope'):
+        reuse_snapshot(source, tmp_path / 'new_frozen', frozen)
+    if old_scope is None:
+        manifest.pop('metadata_selection_scope_contract')
+    else:
+        manifest['metadata_selection_scope_contract'] = old_scope
+    atomic_write_json(manifest_path, manifest)
+    before = sha256_file(manifest_path)
+    with pytest.raises(ValueError, match='separate output root'):
+        corpus.build_news_dataset(source, output, refresh=True)
+    assert sha256_file(manifest_path) == before
+
+
+def test_incremental_corpus_replaces_prior_metadata_after_receipt_reversion(tmp_path):
+    source, output = source_fixture(tmp_path), tmp_path / 'data_news'
+    new_path = source / 'metadata/new-finlab.parquet'
+    new_row = {'date': '2014-03-31', 'url': URLS[0], 'stock_ids': '2330',
+               'title': '第二個版本', 'key_date': '2026-02-26'}
+    atomic_write_parquet(new_path, pa.Table.from_pylist([new_row]))
+    with sqlite3.connect(source / 'queue.sqlite3') as db:
+        db.execute('CREATE TABLE metadata_current_origins(receipt_path TEXT PRIMARY KEY, '
+                   'origin_id INTEGER NOT NULL,selected_at_utc TEXT NOT NULL)')
+        db.execute('INSERT INTO origins VALUES (4,?,?,?,?,?,?)',
+                   ('finlab', str(new_path), sha256_file(new_path), 1, 'finlab-receipt.json', CAPTURED))
+        db.execute('INSERT INTO metadata_current_origins VALUES (?,?,?)', ('finlab-receipt.json', 1, CAPTURED))
+    for origin, expected in ((1, '來源標題'), (4, '第二個版本'), (1, '來源標題')):
+        with sqlite3.connect(source / 'queue.sqlite3') as db:
+            db.execute('UPDATE metadata_current_origins SET origin_id=? WHERE receipt_path=?',
+                       (origin, 'finlab-receipt.json'))
+        corpus.build_news_dataset(source, output, refresh=origin != 1 or (output / 'manifest.json').exists())
+        metadata = [row for row in read_table(output, 'metadata_observations') if row['metadata_provider'] == 'finlab']
+        assert len(metadata) == 1 and metadata[0]['title_raw'] == expected
 
 
 def test_inconsistent_source_counters_are_not_accepted_as_coverage(tmp_path):
@@ -539,6 +665,7 @@ def test_inconsistent_source_counters_are_not_accepted_as_coverage(tmp_path):
     ("provider", "another-provider", "provider/URL"),
     ("requested_url", "https://news.example.com/wrong", "provider/URL"),
     ("captured_at_utc", "2026-10-16 09:00:00", "observation clock"),
+    ("captured_at_utc", "2026-10-16T02:00:00+00:00", "observation clock"),
 ])
 def test_invalid_body_evidence_is_not_silently_exported(tmp_path, field, value, message):
     source, output = source_fixture(tmp_path), tmp_path / "data_news"
@@ -624,12 +751,190 @@ def test_independent_readback_rejects_a_title_substituted_for_missing_body(tmp_p
     ("2014-03-31T08:59:00+08:00", "source_timezone_aware", True),
     ("Mon, 31 Mar 2014 08:59:00 +0800", "source_timezone_aware", True),
     ("2014-03-31 08:59:00", "naive_timezone_unverified", False),
+    ("2026-10-08 11:34 (更新：2026-10-08 11:36)", "naive_timezone_unverified", False),
+    ("2026-10-08 11:34 (更新：2026-10-08 11:33)", "invalid", False),
+    ("2026-02-30 11:34 (更新：2026-10-08 11:36)", "invalid", False),
     ("2014-03-31", "date_only", False), (None, "missing", False), ("bad", "invalid", False),
 ])
 def test_source_clock_does_not_invent_timezone(raw, status, aware):
     clock, _, result = corpus.source_clock(raw)
     assert result == status
     assert (clock is not None) is aware
+
+
+def test_combined_source_clock_preserves_raw_and_capture_availability():
+    raw = "2026-10-08 11:34 (更新：2026-10-08 11:36)"
+    head = {"id": url_article_id(URLS[0]), "provider": "cmnews", "url": URLS[0], "state": "complete"}
+    document = corpus.document_record("保留原文", "fulltext")
+    record = corpus.article_record(head, document, body={"published_at_raw": raw, "captured_at_utc": CAPTURED})
+    assert record["published_at_raw"] == raw
+    assert str(record["publication_date"]) == "2026-10-08"
+    assert record["published_at_utc"] is None
+    assert record["publication_clock_status"] == "naive_timezone_unverified"
+    assert record["available_at_utc"] == record["observed_at_utc"]
+    assert record["available_at_utc"].isoformat() == CAPTURED
+
+
+@pytest.mark.parametrize("changes, expected", [
+    ({}, True),
+    ({"published_utc": datetime.fromisoformat("2006-06-27T04:59:59+00:00")}, False),
+    ({"published_utc": datetime.fromisoformat("2006-05-31T00:00:00+00:00")}, False),
+    ({"published_utc": datetime.fromisoformat("2006-07-01T23:59:59+00:00")}, False),
+    ({"published_utc": datetime.fromisoformat("2006-07-02T00:00:00+00:00")}, True),
+    ({"published_utc": datetime.fromisoformat("1970-01-01T04:59:59")}, False),
+    ({"provider": "other"}, False),
+    ({"article_url": "https://globalvoices.org/2006/07/01/example/"}, False),
+    ({"request_url": "https://other.example/2006/06/feed/"}, False),
+    ({"request_url": "https://globalvoices.org/feed/"}, False),
+    ({"method": "rss_content_encoded_v9"}, False),
+    ({"basis": "other_source"}, False),
+])
+def test_monthly_feed_scope_can_flag_clock_conflict_without_inference(changes, expected):
+    values = {"provider": "globalvoices", "article_url": "https://globalvoices.org/2006/06/27/example/",
+              "request_url": "https://globalvoices.org/2006/06/feed/?paged=16", "method": "rss_content_encoded_v1",
+              "basis": "publisher_RSS_pubDate_with_timezone; original_string_preserved",
+              "published_utc": datetime.fromisoformat("1970-01-01T04:59:59+00:00")}
+    values.update(changes)
+    assert globalvoices_monthly_feed_clock_mismatch(**values) is expected
+
+
+def test_article_record_quarantines_conflicting_feed_clock_without_rewriting_source():
+    url = "https://globalvoices.org/2006/06/27/example/"
+    raw = "Thu, 01 Jan 1970 04:59:59 +0000"
+    head = {"id": url_article_id(url), "provider": "globalvoices", "url": url, "state": "complete"}
+    body = {"published_at_raw": raw, "captured_at_utc": CAPTURED,
+            "source_request_url": "https://globalvoices.org/2006/06/feed/?paged=16",
+            "extraction_method": "rss_content_encoded_v1",
+            "published_time_basis": "publisher_RSS_pubDate_with_timezone; original_string_preserved"}
+    record = corpus.article_record(head, corpus.document_record("原文", "fulltext"), body=body)
+    assert record["published_at_raw"] == raw
+    assert record["published_at_utc"] is None and record["publication_date"] is None
+    assert record["publication_clock_status"] == "source_feed_scope_clock_conflict"
+    assert record["available_at_utc"] == record["observed_at_utc"]
+    assert record["available_at_utc"].isoformat() == CAPTURED
+    # An unscoped or unsupported feed is not silently treated as proven bad.
+    unknown = corpus.article_record(head, corpus.document_record("原文", "fulltext"),
+                                   body={**body, "source_request_url": None})
+    assert unknown["publication_clock_status"] == "source_timezone_aware"
+    assert unknown["published_at_utc"].isoformat() == "1970-01-01T04:59:59+00:00"
+
+
+def test_unrelated_provider_does_not_read_feed_scope_column(tmp_path, monkeypatch):
+    source = source_fixture(tmp_path)
+    body_path = source / "bodies/current.parquet"
+    rows = pq.read_table(body_path).to_pylist()
+    for row in rows:
+        row["source_request_url"] = "https://news.example.com/feed/"
+    atomic_write_parquet(body_path, pa.Table.from_pylist(rows))
+    receipt_path = source / "receipts/current.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["sha256"] = sha256_file(body_path)
+    atomic_write_json(receipt_path, receipt)
+    with sqlite3.connect(source / "queue.sqlite3") as db:
+        db.row_factory = sqlite3.Row
+        head = dict(db.execute("SELECT * FROM articles WHERE id=?", (url_article_id(URLS[0]),)).fetchone())
+    parquet_file = corpus.pq.ParquetFile
+    projections = []
+
+    class ObserveParquet:
+        def __init__(self, path):
+            self.original = parquet_file(path)
+
+        def __getattr__(self, name):
+            return getattr(self.original, name)
+
+        def iter_batches(self, **kwargs):
+            projections.append(kwargs["columns"])
+            return self.original.iter_batches(**kwargs)
+
+    monkeypatch.setattr(corpus.pq, "ParquetFile", ObserveParquet)
+    result = corpus._load_body_input((source, "bodies/current.parquet", "receipts/current.json", [head]))
+    assert len(result) == 1 and result[0][0]["publication_clock_status"] == "source_timezone_aware"
+    assert len(projections) == 1 and "source_request_url" not in projections[0]
+
+
+def test_incremental_refresh_projects_feed_scope_and_preserves_old_generation(tmp_path, monkeypatch):
+    source, output = source_fixture(tmp_path), tmp_path / "dataset"
+    url = "https://globalvoices.org/2006/06/27/example/"
+    raw = "Thu, 01 Jan 1970 04:59:59 +0000"
+    body_path = source / "bodies/current.parquet"
+    rows = pq.read_table(body_path).to_pylist()
+    rows[0].update(article_id=url_article_id(url).hex(), provider="globalvoices", requested_url=url,
+                   published_at_raw=raw, source_request_url="https://globalvoices.org/2006/06/feed/?paged=16",
+                   extraction_method="rss_content_encoded_v1",
+                   published_time_basis="publisher_RSS_pubDate_with_timezone; original_string_preserved")
+    atomic_write_parquet(body_path, pa.Table.from_pylist(rows))
+    receipt_path = source / "receipts/current.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["sha256"] = sha256_file(body_path)
+    atomic_write_json(receipt_path, receipt)
+    with sqlite3.connect(source / "queue.sqlite3") as db:
+        db.execute("UPDATE articles SET id=?,url=?,provider='globalvoices' WHERE id=?",
+                   (url_article_id(url), url, url_article_id(URLS[0])))
+    with monkeypatch.context() as old:
+        old.setattr(corpus, "globalvoices_monthly_feed_clock_mismatch", lambda **kwargs: False)
+        old.setattr(corpus, "builder_fingerprint", lambda: "older-feed-clock-builder")
+        corpus.build_news_dataset(source, output)
+    old_manifest = json.loads((output / "manifest.json").read_text())
+
+    def selected(manifest):
+        return next(row for part in manifest["parts"] if part["table_name"] == "articles"
+                    for row in pq.read_table(corpus.news_part_path(output, manifest, part)).to_pylist()
+                    if row["article_id"] == url_article_id(url).hex())
+
+    old_record = selected(old_manifest)
+    assert old_record["publication_clock_status"] == "source_timezone_aware"
+    assert str(old_record["publication_date"]) == "1970-01-01"
+    corpus.build_news_dataset(source, output, refresh=True)
+    new_manifest = json.loads((output / "manifest.json").read_text())
+    record = selected(new_manifest)
+    assert new_manifest["builder_fingerprint"] != old_manifest["builder_fingerprint"]
+    assert record["published_at_raw"] == raw and record["published_at_utc"] is None
+    assert record["publication_date"] is None and record["publication_clock_status"] == "source_feed_scope_clock_conflict"
+    assert record["available_at_utc"] == old_record["available_at_utc"]
+    assert selected(old_manifest) == old_record
+
+
+def test_dataset_fingerprint_includes_combined_clock_parser(monkeypatch):
+    before = corpus.builder_fingerprint()
+    original = corpus.sha256_file
+    monkeypatch.setattr(corpus, "sha256_file", lambda path: "0" * 64 if Path(path).name == "news_clock.py" else original(path))
+    assert corpus.builder_fingerprint() != before
+
+
+def test_incremental_corpus_rewrites_combined_clock_without_changing_old_generation(tmp_path, monkeypatch):
+    source, output = source_fixture(tmp_path), tmp_path / "dataset"
+    raw = "2026-10-08 11:34 (更新：2026-10-08 11:36)"
+    body_path = source / "bodies/current.parquet"
+    rows = pq.read_table(body_path).to_pylist()
+    rows[0]["published_at_raw"] = raw
+    atomic_write_parquet(body_path, pa.Table.from_pylist(rows))
+    receipt_path = source / "receipts/current.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["sha256"] = sha256_file(body_path)
+    atomic_write_json(receipt_path, receipt)
+    real_clock = corpus.source_clock
+    with monkeypatch.context() as old:
+        old.setattr(corpus, "source_clock", lambda value: (None, None, "invalid") if value == raw else real_clock(value))
+        old.setattr(corpus, "builder_fingerprint", lambda: "older-clock-builder")
+        corpus.build_news_dataset(source, output)
+    old_manifest = json.loads((output / "manifest.json").read_text())
+
+    def articles(manifest):
+        return [row for part in manifest["parts"] if part["table_name"] == "articles"
+                for row in pq.read_table(corpus.news_part_path(output, manifest, part)).to_pylist()]
+
+    old_record = next(row for row in articles(old_manifest) if row["article_id"] == url_article_id(URLS[0]).hex())
+    assert old_record["publication_clock_status"] == "invalid" and old_record["publication_date"] is None
+    corpus.build_news_dataset(source, output, refresh=True)
+    new_manifest = json.loads((output / "manifest.json").read_text())
+    new_record = next(row for row in articles(new_manifest) if row["article_id"] == url_article_id(URLS[0]).hex())
+    assert new_manifest["builder_fingerprint"] != old_manifest["builder_fingerprint"]
+    assert new_record["published_at_raw"] == raw and new_record["published_at_utc"] is None
+    assert str(new_record["publication_date"]) == "2026-10-08"
+    assert new_record["publication_clock_status"] == "naive_timezone_unverified"
+    assert new_record["available_at_utc"] == old_record["available_at_utc"]
+    assert next(row for row in articles(old_manifest) if row["article_id"] == url_article_id(URLS[0]).hex()) == old_record
 
 
 def test_ids_preserve_leading_zeroes_and_text_kind_is_explicit():

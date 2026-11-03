@@ -23,6 +23,7 @@ REPO = Path(__file__).resolve().parents[1]
 ROOT = REPO / 'data_finmind/sponsor'
 OWNER_FILES = (REPO / 'downloader/download_finmind_sponsor.py',
                REPO / 'downloader/download_finmind_complement.py',
+               REPO / 'downloader/finmind_errors.py',
                REPO / 'downloader/finmind_corrections.py',
                REPO / 'downloader/finmind_option_daily_conflicts.py',
                REPO / 'downloader/provider_priority.py',

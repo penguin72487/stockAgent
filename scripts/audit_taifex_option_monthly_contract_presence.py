@@ -83,12 +83,13 @@ def audit(summary_path: Path, root: Path, workers: int = 4) -> tuple[list[dict],
     rows = [item[0] for item in readbacks]
     missing = [entry for _, entries in readbacks for entry in entries]
     return rows, missing, {
-        'contract': 'taifex_option_monthly_open_contract_vs_finmind_v1',
+        'contract': 'taifex_option_monthly_open_contract_vs_finmind_v2',
         'observed_at_utc': datetime.now(timezone.utc).isoformat(),
         'source_readback': str(summary_path.resolve()),
         'source_readback_sha256': hashlib.sha256(summary_bytes).hexdigest(),
         'finmind_root': str(root), 'audit_sha256': sha256_file(Path(__file__)),
         'official_parser_sha256': sha256_file(Path('scripts/audit_taifex_option_contract_presence.py')),
+        'series_normalizer_sha256': sha256_file(Path('downloader/finmind_option_contract_keys.py')),
         'date_count': len(rows), 'source_states': dict(sorted(Counter(row['source_status'] for row in rows).items())),
         'verified_dates_with_missing_contracts': sum(row['missing_contracts'] > 0 for row in rows),
         'verified_missing_contract_day_keys': sum(row['missing_contracts'] for row in rows),
@@ -96,6 +97,7 @@ def audit(summary_path: Path, root: Path, workers: int = 4) -> tuple[list[dict],
         'limitations': ['Only positive daily opening and volume in day or unreported session are included.',
                         'Unreported sessions are not day-session proof; natural-day vendor keys can include night trades.',
                         'Contract presence or absence is not a decision-clock fill, PIT or tick-completeness proof.',
+                        'Vendor monthly YYYYMM.0 is compared as YYYYMM; weekly series and other decimals are not converted.',
                         'Strike keys use vendor float32 precision; distinct original strikes could collide.']}
 
 

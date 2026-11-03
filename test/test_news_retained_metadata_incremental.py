@@ -5,6 +5,7 @@ import sqlite3
 from types import SimpleNamespace
 
 import pytest
+import pyarrow.parquet as pq
 
 from downloader.artifact_io import sha256_file
 from downloader.news_fulltext import fetch_article
@@ -12,7 +13,7 @@ from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_metadata_index import advance_metadata_index_scan, begin_metadata_index_scan, register_metadata_head
 from downloader.news_fulltext_metadata_replay import _ensure_cohort, replay_retained_cnyes_metadata, retained_metadata_next_wake_delay
 from downloader.news_fulltext_policy import PolicyRegistry
-from downloader.news_fulltext_queue import NewsQueue, verify_bodies
+from downloader.news_fulltext_queue import NewsQueue, unleased_article_head_witness, verify_bodies
 from test_cnyes_news_bulk import cfg
 from test_news_cnyes_canonical_alias import mobile_page
 
@@ -20,11 +21,14 @@ from test_news_cnyes_canonical_alias import mobile_page
 CAPTURED = '2026-10-01T00:00:00+00:00'
 
 
-def captured(queue, number, *, incomplete=True, accept=True):
+def captured(queue, number, *, incomplete=True, accept=True, claim=False):
     number = str(number)
     url = 'https://m.cnyes.com/news/id/' + number
     queue.add_articles([{'url': url}])
     head = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone())
+    if claim:
+        head = queue.claim_url(url, 300, refresh=True)
+        assert head is not None
     payload = mobile_page().replace(b'42', number.encode())
     http = SimpleNamespace(registry=queue.registry,
         get=lambda *_a, **_kw: Response(url, 200, {'content-type': 'text/html'}, payload))
@@ -87,12 +91,13 @@ def test_new_version_archives_prior_checkpoint_without_reopening_same_head(cfg, 
         assert sha256_file(tmp_path / old_path) == digest and verify_bodies(tmp_path)['accepted']
 
 
-def test_interrupted_acceptance_recovers_checkpoint_and_source_receipt_together(cfg, tmp_path):
+@pytest.mark.parametrize('with_claim', [False, True])
+def test_interrupted_acceptance_recovers_checkpoint_and_source_receipt_together(cfg, tmp_path, with_claim):
     registry = PolicyRegistry(cfg, base=tmp_path)
     with closing(NewsQueue(tmp_path, registry)) as queue:
         key, _ = captured(queue, 104)
         _ensure_cohort(queue, queue.registry.sources['cnyes'])
-        _, record = captured(queue, 104, accept=False)
+        _, record = captured(queue, 104, accept=False, claim=with_claim)
         old, old_checkpoint = current(queue, key), checkpoint(queue, key)
         with queue.db:
             queue.db.execute('''CREATE TRIGGER inject_metadata_archive_failure BEFORE INSERT
@@ -104,11 +109,71 @@ def test_interrupted_acceptance_recovers_checkpoint_and_source_receipt_together(
         with queue.db:
             queue.db.execute('DROP TRIGGER inject_metadata_archive_failure')
     with closing(NewsQueue(tmp_path, registry)) as queue:
-        assert current(queue, key)['parquet_path'] != old['parquet_path']
+        if with_claim:
+            assert current(queue, key)['parquet_path'] != old['parquet_path']
+        else:
+            # An equal-clock legacy receipt without a claim cannot replace a
+            # previously accepted body merely because it was replayed later.
+            assert current(queue, key)['parquet_path'] == old['parquet_path']
         assert checkpoint(queue, key)['original_path'] == current(queue, key)['parquet_path']
-        assert queue.db.execute('SELECT count(*) FROM retained_metadata_checkpoint_history').fetchone()[0] == 1
+        assert queue.db.execute('SELECT count(*) FROM retained_metadata_checkpoint_history').fetchone()[0] == int(with_claim)
         assert replay_retained_cnyes_metadata(queue, maximum_wall_seconds=1)['repaired_versions'] == 1
         assert verify_bodies(tmp_path)['accepted']
+
+
+@pytest.mark.parametrize('witness', ['claim', 'unleased'])
+def test_metadata_replay_uses_a_new_head_witness_and_preserves_original(cfg, tmp_path, witness):
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
+        if witness == 'claim':
+            key, _ = captured(queue, 120, claim=True)
+            witness_field = 'article_claim_witness_json'
+        else:
+            key, record = captured(queue, 120, accept=False)
+            witness_field = 'unleased_article_head_witness_json'
+            record[witness_field] = unleased_article_head_witness(current(queue, key), request_started_at_utc=CAPTURED)
+            queue.accept([record])
+        old = current(queue, key)
+        original = tmp_path / old['parquet_path']
+        original_sha = sha256_file(original)
+        raw, = pq.ParquetFile(original).read().to_pylist()
+        assert raw[witness_field]
+        result = replay_retained_cnyes_metadata(queue, maximum_wall_seconds=1)
+        assert result['repaired_versions'] == 1 and result['http_requests'] == 0
+        repaired = current(queue, key)
+        version, = pq.ParquetFile(tmp_path / repaired['parquet_path']).read().to_pylist()
+        assert version.get(witness_field) is None and version['retained_metadata_head_json']
+        assert version['metadata_replay_contract_version'] == 3
+        assert version['replay_source_parquet'] == old['parquet_path']
+        assert repaired['last_checked_at_utc'] == old['last_checked_at_utc']
+        assert sha256_file(original) == original_sha
+        assert pq.ParquetFile(original).read().to_pylist()[0][witness_field] == raw[witness_field]
+        assert checkpoint(queue, key)['state'] == 'verified_repair' and verify_bodies(tmp_path)['accepted']
+        # Older valid witness contracts remain readable; bool is not a
+        # contract version even though Python equates True and 1.
+        for compatible in (1, 2, 3):
+            assert queue._metadata_head_matches({**version, 'metadata_replay_contract_version': compatible}) is False
+        with pytest.raises(ValueError, match='invalid retained metadata acceptance contract'):
+            queue._metadata_head_matches({**version, 'metadata_replay_contract_version': True})
+
+
+def test_unadopted_metadata_receipt_stays_pending_and_retries_locally(cfg, tmp_path, monkeypatch):
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
+        key, _ = captured(queue, 121, claim=True)
+        old = current(queue, key)
+        accept = queue._accept_records
+        def refused(records, relative, receipt, **kwargs):
+            with queue.db:
+                queue.db.execute("UPDATE articles SET state='retry',error_code='http_429',due=4102444800 WHERE id=?", (key,))
+            return accept(records, relative, receipt, **kwargs)
+        monkeypatch.setattr(queue, '_accept_records', refused)
+        result = replay_retained_cnyes_metadata(queue, maximum_wall_seconds=1)
+        assert result['repaired_versions'] == 0 and result['local_acceptance_deferrals'] == 1
+        assert checkpoint(queue, key)['state'] == 'pending'
+        assert current(queue, key)['parquet_path'] == old['parquet_path']
+        assert current(queue, key)['error_code'] == 'http_429'
+        retry = queue.db.execute('SELECT last_error,not_before_epoch FROM retained_metadata_local_retries').fetchone()
+        assert retry['last_error'] == 'retained_metadata_acceptance_not_adopted' and retry['not_before_epoch'] > 0
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 2
 
 
 def test_legacy_scan_resumes_and_catches_state_movement_behind_cursor(cfg, tmp_path, monkeypatch):

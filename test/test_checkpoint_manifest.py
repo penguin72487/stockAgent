@@ -691,6 +691,45 @@ def test_checkpoint_manifest_blocks_semantic_training_changes() -> None:
         assert changed[expected_layer] != baseline[expected_layer]
 
 
+def test_explicit_patience_reference_is_checkpointed_and_cap_independent(tmp_path: Path) -> None:
+    config = _config()
+    config.training.epochs = 2000
+    config.training.enable_lr_scheduler = False
+    config.training.early_stopping_no_improve_ratio = 0.1
+    default = _checkpoint_manifest(_panel(), config)
+    assert "early_stopping_reference_epochs" not in default["contracts"]["training"]["validation_and_stopping"]
+    config.training.early_stopping_reference_epochs = 1000
+    explicit = _checkpoint_manifest(_panel(), config)
+    stopping = explicit["contracts"]["training"]["validation_and_stopping"]
+    assert stopping["early_stopping_reference_epochs"] == 1000
+    assert explicit["fingerprints"]["training"] != default["fingerprints"]["training"]
+    longer = copy.deepcopy(config)
+    longer.training.epochs = 3000
+    assert _checkpoint_manifest(_panel(), longer)["fingerprints"]["training"] == explicit["fingerprints"]["training"]
+    changed = copy.deepcopy(config)
+    changed.training.early_stopping_reference_epochs = 2000
+    changed_manifest = _checkpoint_manifest(_panel(), changed)
+    with pytest.raises(RuntimeError, match="training"):
+        _validate_checkpoint_manifest({"experiment_manifest": explicit}, changed_manifest,
+                                      checkpoint_path=tmp_path / "last.pt", scope="resume")
+    with pytest.raises(RuntimeError, match="early-stopping reference"):
+        _validate_checkpoint_manifest({}, explicit, checkpoint_path=tmp_path / "legacy.pt", scope="resume")
+
+
+def test_classical_patience_reference_is_not_a_silent_resume_change() -> None:
+    from stockagent.training.checkpoint_contract import _training_checkpoint_contract
+
+    config = _config()
+    config.training.model_name = "classical"
+    assert "validation_and_stopping" not in _training_checkpoint_contract(config)
+    config.training.early_stopping_reference_epochs = 1000
+    config.training.early_stopping_no_improve_ratio = 0.1
+    assert _training_checkpoint_contract(config)["validation_and_stopping"] == {
+        "early_stopping_reference_epochs": 1000,
+        "early_stopping_no_improve_ratio": 0.1,
+    }
+
+
 def test_inactive_flat_cash_guard_is_schema4_checkpoint_compatible(
     tmp_path: Path,
 ) -> None:

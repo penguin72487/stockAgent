@@ -379,7 +379,8 @@ def load_option_contract_conflicts(root: Path, now: datetime, *, sidecar: Path):
         raise ValueError('duplicate option contract-conflict audit date')
     if coverage.get('contract') == 'tw_option_all_product_monthly_range_readback_v1':
         from downloader.finmind_option_monthly_evidence import validate_sources
-        if (summary.get('contract') != 'taifex_option_monthly_open_contract_vs_finmind_v1'
+        if (summary.get('contract') not in {'taifex_option_monthly_open_contract_vs_finmind_v1',
+                                            'taifex_option_monthly_open_contract_vs_finmind_v2'}
                 or summary.get('source_readback_sha256') != plan['coverage_summary_sha256']
                 or _within(workspace, summary['source_readback']) != _within(workspace, plan['coverage_summary_path'])
                 or Path(summary['finmind_root']).resolve() != root.resolve()):
@@ -391,7 +392,8 @@ def load_option_contract_conflicts(root: Path, now: datetime, *, sidecar: Path):
     else:
         if (coverage.get('contract') != 'taifex_option_annual_positive_days_finmind_receipts_v1'
                 or Path(coverage['finmind_root']).resolve() != root.resolve()
-                or summary.get('contract') != 'taifex_option_ordinary_open_contract_vs_finmind_v1'
+                or summary.get('contract') not in {'taifex_option_ordinary_open_contract_vs_finmind_v1',
+                                                   'taifex_option_ordinary_open_contract_vs_finmind_v2'}
                 or summary.get('coverage_summary_sha256') != plan['coverage_summary_sha256']):
             raise ValueError('option contract-conflict audit identity mismatch')
         if sha256_file(_within(workspace, coverage['source_manifest'])) != coverage['source_manifest_sha256']:

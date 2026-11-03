@@ -1,0 +1,12 @@
+[Unit]
+Description=Continue approved WSL verification and retirement without manual commands
+
+[Timer]
+OnBootSec=30s
+OnCalendar=*-*-* *:*:00
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-wsl-retirement-queue.service
+
+[Install]
+WantedBy=timers.target

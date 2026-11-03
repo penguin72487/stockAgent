@@ -23,9 +23,13 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     parser.add_argument("--inspect-only", action="store_true")
     parser.add_argument("--wait-for-owner", action="store_true")
+    parser.add_argument("--idle-preflight", action="store_true",
+                        help="Notify only: skip ledger work while the existing scanner is busy")
     parser.add_argument("--report", type=Path)
     parser.add_argument("--delivery", type=Path)
     args = parser.parse_args()
+    if args.idle_preflight and args.action != "notify-transport":
+        parser.error("--idle-preflight requires notify-transport")
     config = json.loads(args.config.read_bytes())
     if args.action == "inventory":
         if not args.output or args.output.exists():
@@ -51,7 +55,8 @@ def main() -> None:
         print(json.dumps(BackupStream(config).publish_recovery_requests(wait_for_owner=args.wait_for_owner)))
     elif args.action == "notify-transport":
         try:
-            print(json.dumps(BackupStream(config).notify_transport(wait_for_owner=args.wait_for_owner)))
+            print(json.dumps(BackupStream(config).notify_transport(wait_for_owner=args.wait_for_owner,
+                                                                  idle_preflight=args.idle_preflight)))
         except BlockingIOError:
             print(json.dumps({"state": "existing_source_owner_busy", "operation": "transport_notification",
                               "NAS_backup_verified": False}))

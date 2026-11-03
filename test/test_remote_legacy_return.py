@@ -32,6 +32,92 @@ def test_parallel_metadata_tree_preserves_rows_links_and_fingerprint(tmp_path):
     assert metadata_tree(root, file_workers=8) == metadata_tree(root)
 
 
+@pytest.mark.parametrize('changed_field', ['st_nlink', 'st_blocks'])
+def test_metadata_tree_rejects_shared_inode_changed_during_scan(tmp_path, monkeypatch, changed_field):
+    from stockagent.data_sync import remote_legacy_return as module
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+
+    root = tmp_path / 'archive'
+    root.mkdir()
+    first = root / 'first'
+    first.write_bytes(b'original')
+    os.link(first, root / 'second')
+    actual = module._iter_lstat_bounded
+
+    def changed(paths, executor):
+        for path, info in actual(paths, executor):
+            if path.name == 'second':
+                fields = {name: getattr(info, name) for name in (
+                    'st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns',
+                    'st_mode', 'st_nlink', 'st_blocks')}
+                fields[changed_field] += 1
+                info = SimpleNamespace(**fields)
+            yield path, info
+
+    monkeypatch.setattr(module, '_iter_lstat_bounded', changed)
+    with pytest.raises(SnapshotError, match='source inode mutated during inventory'):
+        module.metadata_tree(root)
+    assert first.read_bytes() == (root / 'second').read_bytes() == b'original'
+
+
+def test_metadata_tree_preserves_double_slash_root_relative_name(tmp_path, monkeypatch):
+    from stockagent.data_sync import remote_legacy_return as module
+
+    reference = tmp_path / 'reference'
+    reference.write_bytes(b'content')
+    info = reference.lstat()
+    monkeypatch.setattr(module.os, 'walk', lambda *args, **kwargs: iter([('//', [], ['entry'])]))
+    monkeypatch.setattr(module, '_iter_lstat_bounded',
+                        lambda paths, executor: ((path, info) for path in paths))
+    result = module.metadata_tree(Path('//'))
+    assert [row['path'] for row in result['rows']] == ['entry']
+
+
+def test_metadata_tree_preserves_same_root_relative_name(tmp_path, monkeypatch):
+    from stockagent.data_sync import remote_legacy_return as module
+
+    root = tmp_path / 'archive'
+    root.mkdir()
+    (root / 'member').write_bytes(b'content')
+    monkeypatch.setattr(module, '_iter_lstat_bounded',
+                        lambda paths, executor: iter([(root, root.lstat())]))
+    assert module.metadata_tree(root)['rows'][0]['path'] == '.'
+
+
+def test_metadata_tree_rejects_double_slash_entry_under_single_slash_root(tmp_path, monkeypatch):
+    from stockagent.data_sync import remote_legacy_return as module
+
+    reference = tmp_path / 'reference'
+    reference.write_bytes(b'content')
+    info = reference.lstat()
+    monkeypatch.setattr(module.os, 'walk', lambda *args, **kwargs: iter([('/', [], ['entry'])]))
+    monkeypatch.setattr(module, '_iter_lstat_bounded',
+                        lambda paths, executor: iter([(Path('//entry'), info)]))
+    with pytest.raises(ValueError) as expected:
+        Path('//entry').relative_to(Path('/'))
+    with pytest.raises(ValueError) as observed:
+        module.metadata_tree(Path('/'))
+    assert str(observed.value) == str(expected.value)
+
+
+def test_metadata_tree_rejects_entry_outside_observed_root(tmp_path, monkeypatch):
+    from stockagent.data_sync import remote_legacy_return as module
+
+    root = tmp_path / 'archive'
+    root.mkdir()
+    (root / 'member').write_bytes(b'original')
+    outside = tmp_path / 'archive-other'
+    outside.write_bytes(b'preserved')
+    monkeypatch.setattr(module, '_iter_lstat_bounded',
+                        lambda paths, executor: iter([(outside, outside.lstat())]))
+    with pytest.raises(ValueError) as expected:
+        outside.relative_to(root)
+    with pytest.raises(ValueError) as observed:
+        module.metadata_tree(root)
+    assert str(observed.value) == str(expected.value)
+    assert outside.read_bytes() == b'preserved'
+
+
 def test_metadata_tree_rejects_unreadable_subdirectory(tmp_path, monkeypatch):
     from stockagent.data_sync.remote_legacy_return import metadata_tree
 
@@ -79,13 +165,16 @@ del old_reader._verified_packed_inventory
 from stockagent.data_sync.legacy_artifact_archive import _verified_packed_inventory
 from stockagent.data_sync.packed_snapshots import _verified_packed_inventory as reader
 from stockagent.data_sync.desync_snapshots import scan_tree, SnapshotError
+import hashlib
 import tempfile
 from pathlib import Path
 assert _verified_packed_inventory is reader
 assert SnapshotError is old_error
 with tempfile.TemporaryDirectory() as dirname:
     Path(dirname, 'one').write_text('x')
-    assert scan_tree(Path(dirname), file_workers=4)['files'] == 1
+    observed = scan_tree(Path(dirname), file_workers=4)
+    expected = hashlib.sha256(b'F' + bytes([0]) + b'one' + bytes([0]) + b'1' + bytes([0, 10])).hexdigest()
+    assert observed['files'] == 1 and observed['portable_fingerprint_sha256'] == expected
 '''
     result = subprocess.run([sys.executable, '-'], input=program, text=True,
                             capture_output=True, timeout=60)

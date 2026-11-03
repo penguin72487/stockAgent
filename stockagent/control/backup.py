@@ -8,6 +8,35 @@ from stockagent.runtime_identity import identity_sha256
 STATE_CONTRACT = "all_user_table_columns_sorted_jsonb_rows_utc_v1"
 
 
+def control_backup_capacity(*, free_bytes: int, required_growth_bytes: int, configuration: dict) -> dict:
+    """Admit only SQL backup scratch into an explicitly enrolled backup pool.
+
+    General source acquisition keeps its original reserve. This maintenance
+    class retains the native D writer's 32 GiB floor and rechecks real free
+    space before each dump is written. It never grants retirement or NAS ACK.
+    """
+    normal = configuration['reserve_bytes']
+    if any(type(value) is not int or value < 0 for value in (free_bytes, required_growth_bytes, normal)):
+        raise ValueError('control backup capacity requires nonnegative integer bytes')
+    policy = configuration.get('lifecycle_sql_backup_capacity', {})
+    if not isinstance(policy, dict) or type(policy.get('use_backup_reserve', False)) is not bool:
+        raise ValueError('invalid lifecycle SQL backup capacity policy')
+    reserve = normal
+    if policy.get('use_backup_reserve'):
+        if (policy.get('contract') != 'lifecycle_sql_backup_reserve_v1'
+                or not isinstance(policy.get('user_instruction'), str)
+                or not policy['user_instruction'].strip() or normal < 32 * 1024**3):
+            raise ValueError('SQL backup reserve use needs its explicit local enrollment')
+        reserve = 32 * 1024**3
+    required = reserve + required_growth_bytes
+    return {'contract': 'stockagent.lifecycle_sql_capacity.v1',
+        'state': 'admitted' if free_bytes >= required else 'waiting_capacity',
+        'physical_free_bytes': free_bytes, 'required_growth_bytes': required_growth_bytes,
+        'operational_floor_bytes': reserve, 'ordinary_reserve_bytes': normal,
+        'using_backup_reserve': reserve < normal, 'required_free_bytes': required,
+        'source_retirement': False, 'nas_acceptance': False}
+
+
 def logical_database_state(connection, *, schemas: tuple[str, ...] | None = None) -> dict:
     """Fingerprint actual rows and columns, using the caller's MVCC snapshot.
 

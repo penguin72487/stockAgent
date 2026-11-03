@@ -1,6 +1,10 @@
 import json
 from datetime import time as datetime_time
+import os
 from pathlib import Path
+import subprocess
+import sys
+import time
 
 import pytest
 
@@ -14,6 +18,198 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def _read(relative: str) -> str:
     return (ROOT / relative).read_text(encoding="utf-8")
+
+
+def test_runtime_ack_and_ledger_integrity_are_distinct_without_weakening_gate():
+    markets = list(guardian.EXPECTED_MARKETS)
+    engine = {"simulation_only": True, "production_order_possible": False,
+              "enabled_markets": markets, "ledger_integrity_ready": False}
+    discord = {"simulation_only": True, "production_order_possible": False,
+               "discord_connected": True, "day_trade_markets": markets,
+               "scheduled_day_trade_markets": markets}
+    checks = guardian._runtime_sync_checks(
+        engine, discord, engine_age=1.0, discord_age=1.0,
+        acknowledgement={"matched": True},
+    )
+    assert checks["revision_acknowledged"] is True
+    assert checks["ledger_integrity"] is False
+    assert not all(checks.values())
+    engine["ledger_integrity_ready"] = True
+    assert all(guardian._runtime_sync_checks(
+        engine, discord, engine_age=1.0, discord_age=1.0,
+        acknowledgement={"matched": True},
+    ).values())
+
+
+@pytest.mark.parametrize("changed", [
+    {"engine_age": None}, {"engine_age": 21.0}, {"discord_age": None},
+    {"discord_age": 21.0}, {"acknowledgement": {"matched": False}},
+])
+def test_runtime_readiness_still_fails_closed_for_stale_or_unmatched_services(changed):
+    markets = list(guardian.EXPECTED_MARKETS)
+    engine = {"simulation_only": True, "production_order_possible": False,
+              "enabled_markets": markets, "ledger_integrity_ready": True}
+    discord = {"simulation_only": True, "production_order_possible": False,
+               "discord_connected": True, "day_trade_markets": markets,
+               "scheduled_day_trade_markets": markets}
+    values = {"engine_age": 1.0, "discord_age": 1.0,
+              "acknowledgement": {"matched": True}, **changed}
+    assert not all(guardian._runtime_sync_checks(engine, discord, **values).values())
+
+
+def test_dashboard_reachability_does_not_hide_unverified_ledger():
+    status = {"ready": True, "payload": {"simulation_only": True,
+              "production_order_possible": False, "ledger_integrity": {"ready": False}}}
+    checks = guardian._public_surface_checks(status, {"ready": True})
+    assert checks == {"endpoints_reachable": True, "paper_contract": True,
+                      "ledger_integrity": False}
+    assert not all(checks.values())
+    status["payload"]["ledger_integrity"] = {"ready": True}
+    assert all(guardian._public_surface_checks(status, {"ready": True}).values())
+
+
+@pytest.mark.parametrize("ledger", [None, {}, [], "invalid"])
+def test_dashboard_missing_or_malformed_ledger_integrity_fails_closed(ledger):
+    status = {"ready": True, "payload": {"simulation_only": True,
+              "production_order_possible": False, "ledger_integrity": ledger}}
+    checks = guardian._public_surface_checks(status, {"ready": True})
+    assert checks["endpoints_reachable"] is True
+    assert checks["ledger_integrity"] is False
+    assert not all(checks.values())
+
+
+def test_host_clock_uses_validated_bridge_without_changing_parent_environment(monkeypatch):
+    signature = ("/verified/interop", 1, 2)
+    monkeypatch.setenv("WSL_INTEROP", "/unverified/inherited")
+    monkeypatch.setattr(time_sync, "_powershell_path", lambda: "host-clock")
+    monkeypatch.setattr(time_sync, "_windows_interop_candidates", lambda: [signature])
+    monkeypatch.setattr(time_sync, "_interop_signature", lambda _path: signature)
+    real_popen = subprocess.Popen
+    observed = []
+
+    def spawn_clock(_command, **kwargs):
+        observed.append(kwargs["env"]["WSL_INTEROP"])
+        script = (
+            "import sys,time\n"
+            "print('READY',flush=True)\n"
+            "for line in sys.stdin:\n"
+            " print(int(time.time()*1000),flush=True)\n"
+        )
+        return real_popen([sys.executable, "-u", "-c", script], **kwargs)
+
+    monkeypatch.setattr(time_sync.subprocess, "Popen", spawn_clock)
+    result = time_sync._sample_windows_host_offset(samples=3)
+    assert result["sample_count"] == 3
+    assert abs(result["offset_seconds"]) < 0.1
+    assert observed == [signature[0]]
+    assert os.environ["WSL_INTEROP"] == "/unverified/inherited"
+
+
+def test_host_clock_candidate_discovery_rejects_untrusted_and_deduplicates(
+    monkeypatch, tmp_path,
+):
+    from stockagent.data_sync import windows_cold_io
+
+    monkeypatch.setattr(windows_cold_io, "_INTEROP_DIRECTORY", tmp_path)
+    monkeypatch.setenv("WSL_INTEROP", "/untrusted/inherited")
+    for name in ("1_interop", "2_interop", "3_interop"):
+        (tmp_path / name).touch()
+    first = (str(tmp_path / "2_interop"), 1, 2)
+    second = (str(tmp_path / "3_interop"), 1, 3)
+    identities = {
+        tmp_path / "1_interop": first,
+        tmp_path / "2_interop": first,
+        tmp_path / "3_interop": second,
+    }
+    monkeypatch.setattr(time_sync, "_interop_signature", lambda path: identities.get(Path(path)))
+    assert time_sync._windows_interop_candidates() == [first, second]
+    assert os.environ["WSL_INTEROP"] == "/untrusted/inherited"
+
+
+def test_host_clock_retries_only_failed_bridge_handshake(monkeypatch):
+    dead, good = ("/verified/dead", 1, 2), ("/verified/good", 1, 3)
+    monkeypatch.setattr(time_sync, "_powershell_path", lambda: "host-clock")
+    monkeypatch.setattr(time_sync, "_windows_interop_candidates", lambda: [dead, good])
+    attempted = []
+
+    def sample(**kwargs):
+        attempted.append(kwargs["signature"])
+        if kwargs["signature"] == dead:
+            raise time_sync._WindowsClockHandshakeError("process exited")
+        return {"offset_seconds": 0.0, "sample_count": kwargs["samples"]}
+
+    monkeypatch.setattr(time_sync, "_sample_windows_clock_process", sample)
+    assert time_sync._sample_windows_host_offset(samples=3)["sample_count"] == 3
+    assert attempted == [dead, good]
+
+
+def test_host_clock_retries_an_exited_process_with_another_bridge(monkeypatch):
+    dead, good = ("/verified/dead", 1, 2), ("/verified/good", 1, 3)
+    monkeypatch.setattr(time_sync, "_powershell_path", lambda: "host-clock")
+    monkeypatch.setattr(time_sync, "_windows_interop_candidates", lambda: [dead, good])
+    monkeypatch.setattr(time_sync, "_interop_signature", lambda path: dead if path == dead[0] else good)
+    real_popen = subprocess.Popen
+    attempted = []
+
+    def spawn_clock(_command, **kwargs):
+        bridge = kwargs["env"]["WSL_INTEROP"]
+        attempted.append(bridge)
+        script = (
+            "import sys,time\n"
+            "print('READY',flush=True)\n"
+            "for line in sys.stdin:\n"
+            " print(int(time.time()*1000),flush=True)\n"
+        ) if bridge == good[0] else "raise SystemExit(7)"
+        return real_popen([sys.executable, "-u", "-c", script], **kwargs)
+
+    monkeypatch.setattr(time_sync.subprocess, "Popen", spawn_clock)
+    assert time_sync._sample_windows_host_offset(samples=2)["sample_count"] == 2
+    assert attempted == [dead[0], good[0]]
+
+
+def test_host_clock_never_hides_measurement_failure_by_trying_another_bridge(monkeypatch):
+    candidates = [("/verified/one", 1, 2), ("/verified/two", 1, 3)]
+    monkeypatch.setattr(time_sync, "_powershell_path", lambda: "host-clock")
+    monkeypatch.setattr(time_sync, "_windows_interop_candidates", lambda: candidates)
+    attempted = []
+
+    def sample(**kwargs):
+        attempted.append(kwargs["signature"])
+        raise RuntimeError("local clock changed during host clock sample")
+
+    monkeypatch.setattr(time_sync, "_sample_windows_clock_process", sample)
+    with pytest.raises(RuntimeError, match="local clock changed"):
+        time_sync._sample_windows_host_offset(samples=3)
+    assert attempted == candidates[:1]
+
+
+def test_missing_trusted_bridge_fails_closed_without_clock_adjustment(monkeypatch):
+    monkeypatch.setattr(time_sync, "_is_wsl", lambda: True)
+    monkeypatch.setattr(time_sync, "_chrony_tracking", lambda: {})
+    monkeypatch.setattr(time_sync, "_powershell_path", lambda: "host-clock")
+    monkeypatch.setattr(time_sync, "_windows_interop_candidates", lambda: [])
+    monkeypatch.setattr(time_sync.time, "clock_settime", lambda *_args: pytest.fail(
+        "unverified Windows interop must never cause a clock step"
+    ))
+    result = time_sync.evaluate_time_sync(
+        repair=True, max_offset_ms=500.0, max_repair_offset_seconds=300.0, samples=3,
+    )
+    assert result["ready"] is False
+    assert result["repaired"] is False
+    assert any("no trusted local WSL interop" in reason for reason in result["failures"])
+
+
+def test_changed_bridge_identity_rejects_sample(monkeypatch):
+    signature = ("/verified/interop", 1, 2)
+    monkeypatch.setattr(time_sync, "_interop_signature", lambda _path: None)
+    monkeypatch.setattr(time_sync.subprocess, "Popen", lambda *_a, **_k: pytest.fail(
+        "must revalidate bridge identity before starting Windows"
+    ))
+    with pytest.raises(time_sync._WindowsClockHandshakeError, match="identity changed"):
+        time_sync._sample_windows_clock_process(
+            executable="host-clock", command="test", signature=signature,
+            samples=3, deadline=time.monotonic() + 2.0,
+        )
 
 
 def test_wsl_host_clock_is_authoritative_even_when_chrony_is_unsynchronised(

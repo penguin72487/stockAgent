@@ -2,6 +2,7 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 import sys
+import threading
 
 import pytest
 
@@ -24,7 +25,8 @@ def intent(**changes):
 
 
 @pytest.fixture
-def journal(tmp_path):
+def journal(tmp_path, monkeypatch):
+    monkeypatch.setenv("STOCKAGENT_SHIOAJI_SIMULATION_OWNER_DIR", str(tmp_path / "owner"))
     store = StockSimulationJournal(tmp_path / "sim.sqlite", account_key=ACCOUNT)
     store._test_sessions = []
     yield store
@@ -219,13 +221,44 @@ def fake_sdk(monkeypatch):
             self.accounts = [account]
             self.on_place = lambda order: None
             self.contracts = SimpleNamespace(get=lambda symbol: contract, info=lambda base: info)
+            self.logins = 0
+            self.logouts = 0
+            self.subscriptions = 0
+            self.status_updates = 0
+            self.health = SimpleNamespace(state="Healthy", reasons=[])
+            self.authenticated = False
+            self.steps = []
         def set_order_callback(self, callback):
+            if not self.authenticated:
+                raise RuntimeError("Not authenticated")
+            self.steps.append("callback")
             self.callback = callback
+        def clear_order_callback(self):
+            self.callback = None
         def login(self, **kwargs):
-            assert kwargs["subscribe_trade"] is True
+            assert kwargs["subscribe_trade"] is False
+            assert kwargs["force_refresh"] is True
+            self.logins += 1
+            self.authenticated = True
+            self.steps.append("login")
             return self.accounts
         def logout(self):
-            pass
+            self.logouts += 1
+            self.authenticated = False
+        def list_accounts(self):
+            return self.accounts
+        def subscribe_trade(self, account, timeout):
+            assert account is self.accounts[0]
+            assert timeout == 5000
+            self.subscriptions += 1
+            self.steps.append("subscribe")
+            return True
+        def trade_cache_health(self, account):
+            assert account is self.accounts[0]
+            return self.health
+        def update_status(self, account, timeout):
+            assert account is self.accounts[0] and timeout == 5000
+            self.status_updates += 1
         def place_order(self, contract, order, **kwargs):
             assert kwargs["timeout"] == 0
             self.submissions.append(order)
@@ -250,8 +283,325 @@ def logged_session(journal):
     return session
 
 
+@pytest.fixture
+def shared_quote(fake_sdk, monkeypatch):
+    from stockagent.live import quote_provider
+    api = fake_sdk[0].Shioaji(simulation=True)
+    api.authenticated = True  # A previously logged-in quote owner.
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", api)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_SIMULATION_API", api)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_ORDER_OWNER", None)
+    return api
+
+
+def shared_session(journal):
+    session = ShioajiStockSimulationSession.from_existing_quote_owner(journal)
+    journal._test_sessions.append(session)
+    return session
+
+
+def test_enumerate_hashed_signed_accounts_without_login_or_callback(shared_quote):
+    assert execution.existing_quote_simulation_stock_accounts() == (ACCOUNT,)
+    assert shared_quote.logins == shared_quote.logouts == shared_quote.subscriptions == 0
+    assert not hasattr(shared_quote, "callback")
+
+
+def test_shared_quote_owner_reuses_client_and_never_logs_it_out(journal, shared_quote):
+    session = shared_session(journal)
+    assert shared_quote.logins == 0
+    assert shared_quote.subscriptions == 1
+    with pytest.raises(ExecutionEvidenceError, match="never log in"):
+        session.login(api_key="no", secret_key="no")
+    session.logout()
+    assert shared_quote.logouts == 0
+    assert shared_quote.callback is None
+
+
+@pytest.mark.parametrize("present,proven", [(False, False), (True, False)])
+def test_shared_quote_requires_proven_existing_simulation_no_new_binding(
+        journal, shared_quote, monkeypatch, tmp_path, present, proven):
+    from stockagent.live import quote_provider
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", shared_quote if present else None)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_SIMULATION_API", shared_quote if proven else None)
+    with pytest.raises(RuntimeError, match="not proven"):
+        shared_session(journal)
+    assert not (tmp_path / "owner" / "account-journals.sqlite").exists()
+    assert shared_quote.logins == shared_quote.subscriptions == 0
+
+
+def test_shared_callback_lease_is_exclusive(journal, shared_quote, tmp_path):
+    first = shared_session(journal)
+    second_journal = StockSimulationJournal(tmp_path / "other.sqlite", account_key=ACCOUNT)
+    try:
+        with pytest.raises(RuntimeError, match="callback already has an owner"):
+            ShioajiStockSimulationSession.from_existing_quote_owner(second_journal)
+        assert shared_quote.subscriptions == 1
+    finally:
+        first.logout()
+        second_journal.close()
+
+
+def test_account_writer_is_exclusive_and_binding_survives_restart(journal, fake_sdk, tmp_path):
+    first = logged_session(journal)
+    other = StockSimulationJournal(tmp_path / "other.sqlite", account_key=ACCOUNT)
+    try:
+        with pytest.raises(ExecutionEvidenceError, match="account already has a writer"):
+            ShioajiStockSimulationSession(other)
+        first.logout()
+        with pytest.raises(ExecutionEvidenceError, match="bound to a different journal"):
+            ShioajiStockSimulationSession(other)
+        again = logged_session(journal)
+        again.logout()
+    finally:
+        other.close()
+
+
+def test_account_registry_rejects_non_private_directory(journal, fake_sdk, tmp_path):
+    root = tmp_path / "owner"
+    root.mkdir(mode=0o755)
+    root.chmod(0o755)
+    with pytest.raises(ExecutionEvidenceError, match="private owned directory"):
+        ShioajiStockSimulationSession(journal)
+
+
+def test_replaced_journal_at_same_path_cannot_reuse_account_tags(tmp_path, fake_sdk, monkeypatch):
+    monkeypatch.setenv("STOCKAGENT_SHIOAJI_SIMULATION_OWNER_DIR", str(tmp_path / "owner"))
+    path = tmp_path / "canonical.sqlite"
+    original = StockSimulationJournal(path, account_key=ACCOUNT)
+    original_id = original.journal_id
+    owner = ShioajiStockSimulationSession(original)
+    owner.logout()
+    original.close()
+    path.rename(tmp_path / "preserved-original.sqlite")
+    replacement = StockSimulationJournal(path, account_key=ACCOUNT)
+    try:
+        assert replacement.journal_id != original_id
+        with pytest.raises(ExecutionEvidenceError, match="bound to a different journal"):
+            ShioajiStockSimulationSession(replacement)
+    finally:
+        replacement.close()
+
+
+def test_shared_subscription_failure_does_not_logout_quote_owner(journal, shared_quote, monkeypatch):
+    from stockagent.live import quote_provider
+    monkeypatch.setattr(shared_quote, "subscribe_trade", lambda *_args, **_kwargs: False)
+    with pytest.raises(ExecutionEvidenceError, match="subscription was not accepted"):
+        shared_session(journal)
+    assert shared_quote.logouts == 0
+    assert shared_quote.callback is None
+    assert quote_provider._SHIOAJI_STOCK_ORDER_OWNER is None
+
+
+def test_shared_subscription_is_not_started_in_protected_opening(journal, shared_quote, monkeypatch, tmp_path):
+    monkeypatch.setattr(execution, "_now", lambda: NOW.replace(minute=0))
+    with pytest.raises(ExecutionEvidenceError, match="protected opening"):
+        shared_session(journal)
+    assert shared_quote.subscriptions == 0
+    assert not (tmp_path / "owner" / "account-journals.sqlite").exists()
+
+
+def test_shared_baseline_query_is_not_started_in_protected_opening(journal, shared_quote, monkeypatch):
+    session = shared_session(journal)
+    monkeypatch.setattr(execution, "_now", lambda: NOW.replace(minute=0))
+    with pytest.raises(ExecutionEvidenceError, match="protected opening"):
+        session.refresh_shared_report_baseline()
+    assert shared_quote.status_updates == 0
+    session.logout()
+
+
+def test_shared_cache_health_must_not_have_contradictory_reasons(journal, shared_quote):
+    session = shared_session(journal)
+    shared_quote.health = SimpleNamespace(state="Healthy",
+        reasons=[SimpleNamespace(event_type="StockOrder", reason="SequenceGap")])
+    assert not session.shared_readiness()["preflight_ready"]
+    with pytest.raises(ExecutionEvidenceError, match="preflight is not ready"):
+        session.submit(intent())
+    assert shared_quote.submissions == []
+    session.logout()
+
+
+def test_failed_callback_install_must_clear_or_retain_exclusive_lease(journal, shared_quote, monkeypatch):
+    from stockagent.live import quote_provider
+    def uncertain_install(callback):
+        shared_quote.callback = callback
+        raise RuntimeError("setter outcome uncertain")
+    monkeypatch.setattr(shared_quote, "set_order_callback", uncertain_install)
+    monkeypatch.setattr(shared_quote, "clear_order_callback", lambda: (_ for _ in ()).throw(RuntimeError("clear failed")))
+    with pytest.raises(RuntimeError, match="setter outcome uncertain"):
+        shared_session(journal)
+    assert quote_provider._SHIOAJI_STOCK_ORDER_OWNER is not None
+    with pytest.raises(RuntimeError, match="callback already has an owner"):
+        shared_session(journal)
+    assert shared_quote.logouts == 0
+
+
+@pytest.mark.parametrize("state", ["Unknown", "Degraded"])
+def test_shared_report_cache_must_be_healthy_before_order(journal, shared_quote, state):
+    session = shared_session(journal)
+    shared_quote.health = SimpleNamespace(state=state,
+        reasons=[SimpleNamespace(event_type="StockDeal", reason="NoBaseline")])
+    readiness = session.shared_readiness()
+    assert readiness["report_cache_state"] == state
+    assert readiness["report_cache_reasons"] == [{"event_type": "StockDeal", "reason": "NoBaseline"}]
+    assert not readiness["preflight_ready"] and not readiness["actual_callback_or_fill_verified"]
+    with pytest.raises(ExecutionEvidenceError, match="preflight is not ready"):
+        session.submit(intent())
+    assert journal.status()["orders"] == [] and shared_quote.submissions == []
+    session.logout()
+
+
+def test_shared_baseline_refresh_preserves_connection_and_rechecks_health(journal, shared_quote, monkeypatch):
+    session = shared_session(journal)
+    shared_quote.health = SimpleNamespace(state="Unknown", reasons=[])
+    def refresh(account, timeout):
+        assert account is shared_quote.accounts[0] and timeout == 5000
+        shared_quote.health = SimpleNamespace(state="Healthy", reasons=[])
+    monkeypatch.setattr(shared_quote, "update_status", refresh)
+    result = session.refresh_shared_report_baseline()
+    assert result["preflight_ready"]
+    assert not result["actual_callback_or_fill_verified"]
+    assert shared_quote.logins == shared_quote.logouts == 0
+    session.logout()
+
+
+def test_shared_baseline_from_replaced_generation_cannot_authorize_order(journal, shared_quote, monkeypatch):
+    from stockagent.live import quote_provider
+    session = shared_session(journal)
+    def refresh(_account, timeout):
+        monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", object())
+    monkeypatch.setattr(shared_quote, "update_status", refresh)
+    with pytest.raises(ExecutionEvidenceError, match="session changed"):
+        session.refresh_shared_report_baseline()
+    assert shared_quote.submissions == []
+    session.logout()
+
+
+def test_shared_reconnect_before_intent_blocks_without_order(journal, shared_quote, monkeypatch):
+    from stockagent.live import quote_provider
+    session = shared_session(journal)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", object())
+    with pytest.raises(ExecutionEvidenceError, match="session changed"):
+        session.submit(intent())
+    assert journal.status()["orders"] == []
+    assert shared_quote.submissions == []
+    session.logout()
+    assert shared_quote.logouts == 0
+
+
+def test_shared_reconnect_after_claim_proves_nothing_was_sent(journal, shared_quote, fake_sdk, monkeypatch):
+    from stockagent.live import quote_provider
+    session = shared_session(journal)
+    def change_generation(**kwargs):
+        monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", object())
+        return SimpleNamespace(**kwargs)
+    monkeypatch.setattr(fake_sdk[0], "StockOrder", change_generation)
+    with pytest.raises(ExecutionEvidenceError, match="nothing sent"):
+        session.submit(intent())
+    assert journal.status()["orders"][0]["state"] == "rejected"
+    assert shared_quote.submissions == []
+    session.logout()
+
+
+def test_shared_report_health_rechecked_after_claim_before_send(journal, shared_quote, fake_sdk, monkeypatch):
+    session = shared_session(journal)
+    def degrade(**kwargs):
+        shared_quote.health = SimpleNamespace(state="Degraded", reasons=[])
+        return SimpleNamespace(**kwargs)
+    monkeypatch.setattr(fake_sdk[0], "StockOrder", degrade)
+    with pytest.raises(ExecutionEvidenceError, match="nothing sent"):
+        session.submit(intent())
+    assert journal.status()["orders"][0]["state"] == "rejected"
+    assert shared_quote.submissions == []
+    session.logout()
+
+
+def test_shared_callback_cannot_detach_while_order_unresolved(journal, shared_quote):
+    session = shared_session(journal)
+    session.submit(intent())
+    with pytest.raises(ExecutionEvidenceError, match="reconciliation before detach"):
+        session.logout()
+    shared_quote.callback("SDEAL", deal(shared_quote.submissions[0].custom_field, quantity=2))
+    assert session.drain() == 1
+    session.logout()
+    assert shared_quote.logouts == 0
+
+
+def test_shared_unknown_submit_keeps_callback_and_never_resends(journal, shared_quote):
+    session = shared_session(journal)
+    def timeout(_order):
+        raise TimeoutError("unknown transport outcome")
+    shared_quote.on_place = timeout
+    with pytest.raises(ExecutionEvidenceError, match="outcome unknown"):
+        session.submit(intent())
+    assert journal.status()["orders"][0]["state"] == "unknown"
+    with pytest.raises(ExecutionEvidenceError, match="reconciliation before detach"):
+        session.logout()
+    with pytest.raises(ExecutionEvidenceError, match="preflight is not ready"):
+        session.submit(intent(key="different-key"))
+    assert len(shared_quote.submissions) == 1
+    shared_quote.callback("SDEAL", deal(shared_quote.submissions[0].custom_field, quantity=2))
+    assert session.drain() == 1
+    assert journal.status()["orders"][0]["state"] == "filled"
+    session.logout()
+
+
+def test_shared_reconnect_fences_old_owner_until_explicit_detach(journal, shared_quote, monkeypatch):
+    from stockagent.live import quote_provider
+    session = shared_session(journal)
+    replacement = object()
+    monkeypatch.setattr(quote_provider, "_shioaji_stock_api", lambda: replacement)
+    assert quote_provider._reconnect_shioaji_stock_quote_client(shared_quote) is replacement
+    assert shared_quote.logouts == 1  # The quote owner, not the shared session, reconnected.
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", replacement)
+    monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_SIMULATION_API", replacement)
+    with pytest.raises(RuntimeError, match="callback already has an owner"):
+        quote_provider._claim_existing_shioaji_simulation_order_owner()
+    with pytest.raises(ExecutionEvidenceError, match="session changed"):
+        session.submit(intent())
+    session.logout()
+    api, token = quote_provider._claim_existing_shioaji_simulation_order_owner()
+    quote_provider._release_existing_shioaji_simulation_order_owner(api, token, clear_callback=False)
+
+
+def test_shared_send_fences_quote_generation_change(journal, shared_quote, monkeypatch):
+    from stockagent.live import quote_provider
+    session = shared_session(journal)
+    entered, allow_return, changed = threading.Event(), threading.Event(), threading.Event()
+    def place(order):
+        entered.set()
+        assert allow_return.wait(2)
+        shared_quote.callback("SDEAL", deal(order.custom_field, quantity=2))
+    shared_quote.on_place = place
+    errors = []
+    def submit():
+        try:
+            session.submit(intent())
+        except Exception as exc:
+            errors.append(exc)
+    def replace_quote():
+        with quote_provider._SHIOAJI_STOCK_LIFECYCLE_LOCK:
+            with quote_provider._SHIOAJI_STOCK_LOCK:
+                monkeypatch.setattr(quote_provider, "_SHIOAJI_STOCK_API", object())
+                changed.set()
+    worker = threading.Thread(target=submit)
+    worker.start()
+    assert entered.wait(2)
+    replacer = threading.Thread(target=replace_quote)
+    replacer.start()
+    assert not changed.wait(0.05)
+    assert quote_provider._SHIOAJI_STOCK_LOCK.acquire(timeout=0.2)
+    quote_provider._SHIOAJI_STOCK_LOCK.release()
+    allow_return.set()
+    worker.join(2)
+    replacer.join(2)
+    assert changed.is_set() and not worker.is_alive() and not errors
+    assert journal.status()["orders"][0]["state"] == "filled"
+    session.logout()
+
+
 def test_sdk_session_literal_simulation_and_no_inferred_fill(journal, fake_sdk):
     session = logged_session(journal)
+    assert session._api.steps == ["login", "callback", "subscribe"]
     session.submit(intent())
     assert session._api.submissions[0].quantity == 2
     assert session._api.submissions[0].order_lot == "Common"
@@ -259,6 +609,14 @@ def test_sdk_session_literal_simulation_and_no_inferred_fill(journal, fake_sdk):
     with pytest.raises(ExecutionEvidenceError):
         session.submit(intent())
     assert len(session._api.submissions) == 1
+
+
+def test_native_sdk_session_constructor_never_registers_before_login(journal):
+    pytest.importorskip("shioaji")
+    session = ShioajiStockSimulationSession(journal)
+    journal._test_sessions.append(session)
+    assert session._account is None
+    session.logout()  # No SDK logout is attempted on an unlogged client.
 
 
 def test_session_early_deal_and_network_timeout_never_double_send(journal, fake_sdk):

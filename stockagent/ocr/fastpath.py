@@ -8,6 +8,7 @@ import time
 @dataclass(frozen=True)
 class Optimizations:
     det_normalize_lut: bool = False
+    avoid_det_upscale: bool = False
     gpu_det_normalize: bool = False
     direct_pixels: bool = False
     compact_ctc: bool = False
@@ -33,6 +34,30 @@ class Optimizations:
             raise ValueError('bounded recognition microbatches require compact CTC')
         if self.arena_shrink_per_page and not self.arena_shrink:
             raise ValueError('page arena reclamation requires arena_shrink')
+
+
+class AvoidDetUpscale:
+    """Avoid enlarging small pages, while retaining large-page resolution.
+
+    RapidOCR creates one preprocess operation per page. Restore its configured
+    value after the call, including on exceptions, so later uses do not inherit
+    a previous page's size. Spatial rounding still follows the native resize.
+    """
+    def __init__(self, operation, native):
+        self.operation, self.native = operation, native
+
+    def __call__(self, image):
+        previous = self.native.limit_side_len
+        try:
+            if self.native.limit_type == 'min' and image.ndim >= 2:
+                short_side = min(image.shape[:2])
+                if 0 < short_side < previous:
+                    # The detector requires dimensions rounded to 32; very
+                    # small images still need that minimum valid input size.
+                    self.native.limit_side_len = min(previous, max(32, short_side))
+            return self.operation(image)
+        finally:
+            self.native.limit_side_len = previous
 
 
 class ExactDetPreprocess:

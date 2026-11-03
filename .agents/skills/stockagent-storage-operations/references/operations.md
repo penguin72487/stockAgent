@@ -60,9 +60,13 @@ NTFS hash／copy 門檻與批次的實測範圍見 `docs/nas_send_verify_paralle
 | 節點 | 排程／owner | 主要設定或契約 |
 | --- | --- | --- |
 | penguin | `stockagent-backup-stream.timer` | `configs/data_sync/backup_stream.json`；來源封閉批次與 NAS ACK 消費 |
+| penguin | `stockagent-private-cold-backup.timer` | 同一 BackupStream owner／ledger；每 30 秒有界接續私有封閉波次，不等待公開清冊掃描 |
+| penguin | `stockagent-backup-notify.timer` | 每分鐘補送原 dispatch；可登錄單筆 busy scan 接續，逾時未確認時只讀小型 intent 等 idle，不堆積請求 |
+| penguin | `stockagent-wsl-retirement-queue.timer` | 每分鐘接續 `wsl_retirement_queue.json` 的固定清冊；原 wave／retirement owner 與完整 gates |
 | penguin | `stockagent-temporal.service`／`stockagent-storage-lifecycle.service` | PG persistence/visibility；catalog/source 兩條持久 workflows；私有 `/etc/stockagent/lakehouse-control.json` |
 | penguin | `stockagent-lifecycle-control-backup.timer` | 三個 lifecycle DB 的一致性 SQL dump → 原 Restic relay |
 | penguin | `stockagent-lake-transport-gc.timer` | 每次一批 NAS 已驗收暫存；canonical gates／每批鎖，保留 primary D/NAS |
+| penguin | `stockagent-e-workspace-mount.service`／`stockagent-transport-relocation.timer` | C 留應用服務、E 留進冷庫前工作、D 留主冷庫；依固定 volume／UUID、原 owner、完整 SHA 與 alias 交接，見 `docs/storage_c_e_d_layout_2026-11-02.md`；不能由 timer 存在推定全部來源已遷移 |
 | penguin | `stockagent-control-release-verification.timer`／`stockagent-control-backup.timer` | 固定程式碼驗證／private same-MVCC logical backup；`docs/control_plane_workflow.md` |
 | penguin | `stockagent-remote-cold-artifact-ingress.timer` | `configs/data_sync/training_return.json`；新完成訓練成果 |
 | penguin | `stockagent-legacy-return@main.timer`／`@partitions.timer` | `configs/data_sync/vastai_legacy_archive_return.json`；既存一次性歷史 cohort |
@@ -85,6 +89,18 @@ backup owner／ledger，不必等待完整 catalog／容量盤點。先驗證原
 
 用本機 unit／drop-in 和 runtime receipt 確認目前 schedule，runbook 的五分鐘或其他
 間隔是部署紀錄。大型工作可能占用數個週期，不是固定完成 ETA。
+2026-10-31 起，已授權的固定 WSL cohort 不再需要每次手動命令。queue 狀態在
+`service_data/storage-retirement/status.json`；只讀取這個檔案不會啟動回收。
+原 owner 忙碌、容量不足時等待；實際失敗採有界重試，三次後保留
+`needs_attention` 與原始失敗證據，其他獨立 cohort 繼續。只有原 acceptance
+與當前 source absence 都符合才記為完成；不能以 queue service exit 0 判定已刪。
+原執行程式版本修復後自動重試，失敗紀錄保留，不需手動清 retry 或下新命令。
+新增已審核的 cohort 更新固定設定即可，timer 自動載入，不能放任意 shell 或根目錄。
+`private_history_schedule: independent_timer` 把私有派工移至原 private-cycle
+入口；公開 cycle 只讀其最新小型狀態，不重做私有 capture。兩條排程仍共用
+private-capture／publication locks、ledger、原接收端與所有配額／容量條件。
+初次安裝／修復這兩組排程使用既有
+`scripts/install_enrolled_artifact_retirement.sh --automation-only`；日常無需重跑。
 核對某個正式 service 的精確狀態與最近退出碼：
 
 ```bash

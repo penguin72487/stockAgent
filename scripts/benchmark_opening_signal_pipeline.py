@@ -38,7 +38,7 @@ if str(ROOT) not in sys.path:
 from services.discord_bot import bot as bot_mod
 from downloader.artifact_io import atomic_write_json
 from stockagent import config as config_module
-from stockagent.live import opening_price_acquisition, quote_provider, signal_engine
+from stockagent.live import opening_price_acquisition, portfolio_state, quote_provider, signal_engine
 from stockagent.live.opening_execution_latency import call_with_opening_stage_timing as _call_with_stage_timing
 from stockagent.data import factorized_panel
 from stockagent.models import factorized_input
@@ -90,6 +90,24 @@ def _reference_row_functions(path: Path, *, nullable_column: bool = False):
         raise ValueError("row reference changed during loading")
     return namespace, {"path": str(path.resolve()), "sha256": hashlib.sha256(raw).hexdigest(),
                        "functions": sorted(names), "other_benchmark_globals_shared": True}
+
+
+def _reference_rebalance_function(path: Path):
+    """Load only the comparison's trusted rebalance formatter, not its module startup."""
+    raw = path.read_bytes()
+    tree = ast.parse(raw, filename=str(path))
+    selected = [node for node in tree.body if isinstance(node, ast.FunctionDef)
+                and node.name == "build_rebalance_rows"]
+    if len(selected) != 1 or selected[0].decorator_list:
+        raise ValueError("rebalance reference requires one undecorated canonical function")
+    namespace = {}
+    exec(compile(ast.Module(body=selected, type_ignores=[]), str(path), "exec"),
+         vars(portfolio_state), namespace)
+    if path.read_bytes() != raw:
+        raise ValueError("rebalance reference changed during loading")
+    return namespace["build_rebalance_rows"], {"path": str(path.resolve()),
+        "sha256": hashlib.sha256(raw).hexdigest(), "function": "build_rebalance_rows",
+        "other_benchmark_globals_shared": True}
 
 
 def _reference_live_materialize(path: Path):
@@ -360,7 +378,12 @@ def _write_benchmark_manifest(output: Path) -> Path:
             "model_owner_stages_ms": row.get("model_owner_stages_ms"),
             "model_owner_thread_cpu_ms": row.get("model_owner_thread_cpu_ms"),
             "stages": {key: value for key, value in (row.get("stages") or {}).items()
-                       if value is None or isinstance(value, (str, int, float, bool))},
+                       if value is None or isinstance(value, (str, int, float, bool))
+                       or (key in {"pre_quote_local_prepare_steps_ms", "post_quote_prepare_steps_ms"}
+                           and isinstance(value, dict)
+                           and all(isinstance(phase, str) and
+                                   (span is None or type(span) in (int, float))
+                                   for phase, span in value.items()))},
             "factorized_input_transport": (row.get("stages") or {}).get("factorized_input_transport"),
             "input_reference_evidence": {key: value for key, value in
                 (row.get("input_reference_evidence") or {}).items() if key != "rows"},
@@ -374,7 +397,7 @@ def _write_benchmark_manifest(output: Path) -> Path:
         "source_artifact": {"path": str(output.resolve()), "bytes": after.st_size, "sha256": digest},
         "status": payload.get("status", "completed_offline_parity_run"),
         **{key: payload.get(key) for key in ("scope", "session", "feature_date", "input_observation_clock",
-            "comparison", "candidate_first", "opening_reference_policy", "live_transport_axis", "live_transport_reference", "row_format_reference", "row_format_candidate", "mounted_code_reference", "compute_runtime",
+            "comparison", "candidate_first", "opening_reference_policy", "live_transport_axis", "live_transport_reference", "row_format_reference", "row_format_candidate", "rebalance_reference", "mounted_code_reference", "compute_runtime",
             "native_opening_to_completion_claim", "broker_fill_claim", "network_requests", "production_writes",
             "all_warmup_passes_ms", "stage_clock_contract", "measurement_summary", "contracts", "error_type", "error", "stage")},
         "preopen_preparation": {"panel_only": preparation.get("panel_only"),
@@ -434,6 +457,8 @@ def main() -> None:
                         help="Compare current row formatting against these exact two functions in a frozen source release; no other reference code runs")
     parser.add_argument("--row-format-candidate", type=Path,
                         help="Explicit candidate definitions inside the qualified owner's compatible source namespace")
+    parser.add_argument("--rebalance-reference", type=Path,
+                        help="Compare only the trusted rebalance formatter against the mounted candidate")
     parser.add_argument("--candidate-first", action="store_true", help="Start a paired ABBA comparison with the candidate, retaining first-opening and steady results separately")
     parser.add_argument("--live-transport-reference", type=Path,
         help="Single-axis complete six-mode comparison with a trusted original FactorizedLiveWindow.materialize; no module startup is executed")
@@ -490,8 +515,15 @@ def main() -> None:
             args.compare_model_contract, args.compare_candle_aux, args.compare_member_signatures,
             args.compare_validation, args.compare_layout, args.compare_input_scheduling,
             args.compare_publication, args.compare_config_reuse, args.compare_full_shape_prefix,
-            args.row_format_reference, args.live_transport_reference)):
+            args.row_format_reference, args.live_transport_reference, args.rebalance_reference)):
         parser.error("candidate-first requires a paired comparison")
+    if args.rebalance_reference and any((args.compare_source_scans, args.compare_prefetch_preparation,
+            args.compare_model_contract, args.compare_candle_aux, args.compare_member_signatures,
+            args.compare_validation, args.compare_layout, args.compare_input_scheduling,
+            args.compare_publication, args.compare_config_reuse, args.compare_full_shape_prefix,
+            args.row_format_reference, args.row_format_candidate, args.live_transport_reference,
+            args.legacy_validation_control, args.legacy_control)):
+        parser.error("rebalance formatting requires a separate single-axis comparison")
     if args.row_format_reference and any((args.compare_source_scans, args.compare_prefetch_preparation,
             args.compare_model_contract, args.compare_candle_aux, args.compare_member_signatures,
             args.compare_validation, args.compare_layout, args.compare_input_scheduling,
@@ -531,6 +563,9 @@ def main() -> None:
         if args.live_transport_reference else (None, None))
     reference_functions, row_reference = (_reference_row_functions(args.row_format_reference)
                                          if args.row_format_reference else ({}, None))
+    reference_rebalance, rebalance_reference = (_reference_rebalance_function(args.rebalance_reference)
+                                                if args.rebalance_reference else (None, None))
+    candidate_rebalance = signal_engine.build_rebalance_rows
     candidate_generate = signal_engine.generate_live_signal
     candidate_decisions = signal_engine._build_decision_rows
     candidate_functions, row_candidate = (_reference_row_functions(args.row_format_candidate, nullable_column=True)
@@ -610,6 +645,8 @@ def main() -> None:
             full_shape_prefix_forward if args.compare_full_shape_prefix else candle_forward))
         stack.enter_context(patch.object(signal_engine, "generate_live_signal", candidate_generate))
         stack.enter_context(patch.object(signal_engine, "_build_decision_rows", candidate_decisions))
+        if rebalance_reference:
+            stack.enter_context(patch.object(signal_engine, "build_rebalance_rows", candidate_rebalance))
         if row_candidate:
             stack.enter_context(patch.object(signal_engine, "_finite_float_column",
                                             candidate_functions["_finite_float_column"], create=True))
@@ -840,7 +877,7 @@ def main() -> None:
         profiler = cProfile.Profile() if args.profile else None
         if profiler:
             profiler.enable()
-        variants = (False, True) if args.compare_validation or args.compare_layout or args.compare_input_scheduling or args.compare_publication or args.compare_member_signatures or args.compare_candle_aux or args.compare_model_contract or args.compare_prefetch_preparation or args.compare_source_scans or args.compare_config_reuse or args.compare_full_shape_prefix or args.row_format_reference or args.live_transport_reference else (not args.legacy_validation_control,)
+        variants = (False, True) if args.compare_validation or args.compare_layout or args.compare_input_scheduling or args.compare_publication or args.compare_member_signatures or args.compare_candle_aux or args.compare_model_contract or args.compare_prefetch_preparation or args.compare_source_scans or args.compare_config_reuse or args.compare_full_shape_prefix or args.row_format_reference or args.live_transport_reference or args.rebalance_reference else (not args.legacy_validation_control,)
         if args.candidate_first:
             variants = tuple(reversed(variants))
         repetitions = [(repetition, use_cached) for repetition in range(args.repeats)
@@ -852,6 +889,8 @@ def main() -> None:
             if row_reference:
                 signal_engine.generate_live_signal = candidate_generate if use_cached else reference_functions["generate_live_signal"]
                 signal_engine._build_decision_rows = candidate_decisions if use_cached else reference_functions["_build_decision_rows"]
+            if rebalance_reference:
+                signal_engine.build_rebalance_rows = candidate_rebalance if use_cached else reference_rebalance
             # Schema-validation comparisons must still execute the canonical
             # parser on BOTH sides; parsed reuse would hide their workload.
             signal_engine.load_config, config_module._strict_bool_config_fields = _config_variant_loaders(
@@ -981,6 +1020,8 @@ def main() -> None:
             if prefetch_pool is not None:
                 prefetch_pool.shutdown(wait=True)
             variant = ("coordinated_cpu_preparation" if use_cached else "unbounded_cpu_preparation") if args.compare_prefetch_preparation else ("model_scope_contract" if use_cached else "full_resume_contract") if args.compare_model_contract else ("metadata_only_diagnostics" if use_cached else "full_diagnostics") if args.compare_candle_aux else ("per_scan_parent_resolve" if use_cached else "per_member_resolve") if args.compare_member_signatures else ("compact_durable_json" if use_cached else "pretty_durable_json") if args.compare_publication else ("parallel_inputs" if use_cached else "sequential_inputs") if args.compare_input_scheduling else ("C_order" if use_cached else "K_order") if args.compare_layout else ("cached" if use_cached else "uncached")
+            if rebalance_reference:
+                variant = "rebalance_candidate" if use_cached else "rebalance_reference"
             if args.compare_source_scans:
                 variant = "shared_read_generation_scans" if use_cached else "independent_source_scans"
             if args.compare_config_reuse:
@@ -1002,7 +1043,7 @@ def main() -> None:
                     raise RuntimeError("transport comparison did not execute the selected assembly")
             records.append({"variant": variant,
                             "sample_phase": "first_opening_after_panel_only_preparation" if args.preopen_panel_warmup and not records else "steady_opening_repeat",
-                            "schema_validation_cached": use_cached or args.compare_layout or args.compare_input_scheduling or args.compare_publication or args.compare_member_signatures or args.compare_candle_aux or args.compare_model_contract or args.compare_prefetch_preparation or args.compare_source_scans or args.compare_config_reuse or bool(transport_reference),
+                            "schema_validation_cached": use_cached or args.compare_layout or args.compare_input_scheduling or args.compare_publication or args.compare_member_signatures or args.compare_candle_aux or args.compare_model_contract or args.compare_prefetch_preparation or args.compare_source_scans or args.compare_config_reuse or bool(transport_reference) or bool(row_reference) or bool(rebalance_reference),
                             "source_scan_stages": scan_samples[scan_start:],
                             "prewarmed_c_layout": use_cached if args.compare_layout else None,
                             "all_published_ms": published_ms,
@@ -1018,6 +1059,8 @@ def main() -> None:
             raise ValueError("row reference changed during paired measurement")
         if row_candidate and hashlib.sha256(args.row_format_candidate.read_bytes()).hexdigest() != row_candidate["sha256"]:
             raise ValueError("row candidate changed during paired measurement")
+        if rebalance_reference and hashlib.sha256(args.rebalance_reference.read_bytes()).hexdigest() != rebalance_reference["sha256"]:
+            raise ValueError("rebalance reference changed during paired measurement")
         if transport_reference and hashlib.sha256(args.live_transport_reference.read_bytes()).hexdigest() != transport_reference["sha256"]:
             raise ValueError("transport reference changed during paired measurement")
         payload = {"scope": "offline_warm_receipt_replay_not_live_opening_latency",
@@ -1048,6 +1091,7 @@ def main() -> None:
                    "broker_fill_claim": False,
                    "stage_clock_contract": {
                        "elapsed": "same_host_perf_counter_at_canonical_progress_boundaries",
+                       "progress_phase_label": "span_after_named_progress_event_until_next_event_not_work_ending_at_label",
                        "cpu": "time.thread_time_owner_thread_only_not_native_worker_or_gpu_time",
                        "difference": "elapsed_minus_owner_cpu_is_not_pure_provider_or_io_wait",
                        "callbacks": "observation_only_no_work_skipped_no_timing_overhead_subtracted",
@@ -1055,11 +1099,12 @@ def main() -> None:
                    },
                    "legacy_redundant_work_control": args.legacy_control,
                    "legacy_validation_control": args.legacy_validation_control,
-                   "comparison": "preopen_prefix_original_full_candle_shape" if args.compare_full_shape_prefix else ("preopen_immutable_host_packet_reuse_same_cache_budget" if args.live_transport_axis == "prepared_host_packets" else "owned_full_window_destination_no_second_dense_copy") if transport_reference else "same_inference_nullable_columns_and_weight_row_reuse" if row_reference else "inherited_source_fenced_config_snapshots" if args.compare_config_reuse else "stock_member_scans_only_with_overlapping_canonical_OS_read_leases" if args.compare_source_scans else "cpu_metadata_preparation_not_source_concurrency" if args.compare_prefetch_preparation else "canonical_model_scope_contract_construction" if args.compare_model_contract else "unused_candle_diagnostic_materialization" if args.compare_candle_aux else "full_member_generation_scan" if args.compare_member_signatures else "compact_vs_pretty_same_durable_publication" if args.compare_publication else "parallel_readonly_inputs_serial_model_owner" if args.compare_input_scheduling else "prewarmed_memory_layout" if args.compare_layout else "static_schema_validation",
+                   "comparison": "rebalance_scalar_finite_only" if rebalance_reference else "preopen_prefix_original_full_candle_shape" if args.compare_full_shape_prefix else ("preopen_immutable_host_packet_reuse_same_cache_budget" if args.live_transport_axis == "prepared_host_packets" else "owned_full_window_destination_no_second_dense_copy") if transport_reference else "same_inference_nullable_columns_and_weight_row_reuse" if row_reference else "inherited_source_fenced_config_snapshots" if args.compare_config_reuse else "stock_member_scans_only_with_overlapping_canonical_OS_read_leases" if args.compare_source_scans else "cpu_metadata_preparation_not_source_concurrency" if args.compare_prefetch_preparation else "canonical_model_scope_contract_construction" if args.compare_model_contract else "unused_candle_diagnostic_materialization" if args.compare_candle_aux else "full_member_generation_scan" if args.compare_member_signatures else "compact_vs_pretty_same_durable_publication" if args.compare_publication else "parallel_readonly_inputs_serial_model_owner" if args.compare_input_scheduling else "prewarmed_memory_layout" if args.compare_layout else "static_schema_validation",
                    "live_transport_axis": args.live_transport_axis if transport_reference else None,
                    "live_transport_reference": transport_reference,
                    "row_format_reference": row_reference,
                    "row_format_candidate": row_candidate,
+                   "rebalance_reference": rebalance_reference,
                    "mounted_code_reference": mounted_code_reference,
                    "compute_runtime": {**compute_runtime,
                        "process_memory_at_readback": [line for line in Path("/proc/self/status").read_text().splitlines()

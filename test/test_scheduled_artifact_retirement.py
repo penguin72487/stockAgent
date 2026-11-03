@@ -14,6 +14,36 @@ from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.packed_retention import RetentionConfig
 
 
+def test_pinned_retired_encoding_continues_with_original_recovery_and_is_idempotent(tmp_path, monkeypatch):
+    from test_legacy_archive_stage_prune import reviewed_legacy_fixture
+    from stockagent.data_sync.legacy_artifact_archive import verify_cold_archive
+    spec, packed, options, _policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    rows = scheduled.prune_retired_stages([spec], packed, **options, apply=True)
+    assert rows[0]['action'] == 'encoding-stage-pruned'
+    assert rows[0]['reclaimed_allocated_file_bytes'] > 0
+    rows = scheduled.prune_retired_stages([spec], packed, **options, apply=True)
+    assert rows == [{'dataset': spec.dataset, 'action': 'already-pruned', 'deleted': False}]
+    assert verify_cold_archive(spec, packed)['decoded_originals_verified']
+
+
+def test_failed_stage_does_not_block_disjoint_stage_and_retries_are_bounded(tmp_path, monkeypatch):
+    from test_legacy_archive_stage_prune import reviewed_legacy_fixture
+    spec, packed, options, _policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    other = SimpleNamespace(dataset='unregistered', stage_root=tmp_path/'never-delete', relative_root='other')
+    monkeypatch.setattr(scheduled, 'plan_archive_stage_prune',
+                        lambda *a, **kw: (_ for _ in ()).throw(SnapshotError('source corruption')))
+    now = time.time()
+    monkeypatch.setattr(scheduled.time, 'time', lambda: now)
+    for attempt in range(3):
+        rows = scheduled.prune_retired_stages([spec, other], packed, **options, apply=True)
+        assert rows[0]['action'] == 'deferred' and rows[0]['attempts'] == attempt + 1
+        now += 301
+    rows = scheduled.prune_retired_stages([spec, other], packed, **options, apply=True)
+    assert rows[0]['blockers'] == ['stage-prune-retry-limit']
+    assert (spec.stage_root / spec.dataset).is_dir()
+    assert len(list((options['state_root']/'stage-pruning'/spec.dataset).glob('failure-*.json'))) == 3
+
+
 def _retention_config(tmp_path: Path) -> RetentionConfig:
     return RetentionConfig(
         sync_root=tmp_path / "sync",

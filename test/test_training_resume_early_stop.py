@@ -83,6 +83,31 @@ def test_rejected_candidates_follow_configured_patience_and_epoch_cap(
         assert receipt["epoch"] == 1 and receipt["reason"] == "no_feasible_policy_step"
 
 
+def test_longer_epoch_cap_preserves_ratio_patience_and_resumed_counter(
+    epoch_stopping_code, tmp_path,
+):
+    config = load_config(
+        "configs/markets/tw_futures_v8_margin_verified_2011_capital100m_tx_front_roll_benchmark_risk_v10.yaml"
+    )
+    config.training.epochs = 2000
+    config.training.early_stopping_reference_epochs = 1000
+    config.training.futures_training_stop_on_rejected_step = False
+    namespace = {
+        "config": config, "np": np, "json": json,
+        "early_stop_ratio": config.training.early_stopping_no_improve_ratio,
+        "no_improve_epochs": 5, "epoch_pbar": range(1001, 2001),
+        "improvement_epochs": {1050}, "early_stop_improvement_label": "improvement",
+        "train_years": [2025], "output_path": tmp_path,
+        "_group_dir": lambda *_: tmp_path, "_distributed_should_write": lambda: True,
+        "policy_step_payload": {"train_policy_update_accepted": False},
+    }
+    exec(epoch_stopping_code, namespace)
+    assert config.training.early_stopping_no_improve_ratio == 0.1
+    assert namespace["early_stop_patience"] == 100
+    assert namespace["no_improve_epochs"] == 100
+    assert namespace["epoch"] == 1150
+
+
 def _write_curve_rows(path: Path, rows: list[dict[str, object]]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as handle:

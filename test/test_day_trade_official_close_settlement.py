@@ -12,6 +12,104 @@ from test_day_trade_margin_carry import setup_account
 from test_tw_day_trade_simulation import _now
 
 
+def interrupted_account(tmp_path):
+    engine, spec = setup_account(tmp_path)
+    engine._event("signal_commit_started", recorded_at=_now(9, 5), market=spec.market,
+                  session_date="2026-08-13", signal_id="unwritten-revision")
+    from stockagent.live.tw_day_trade_simulation import TwDayTradeSimulationEngine
+    engine = TwDayTradeSimulationEngine(engine.state_dir)
+    engine._persist(_now(18, 0))
+    return engine, spec
+
+
+def test_unwritten_abort_requires_explicit_scope_then_preserves_originals_and_restarts(tmp_path):
+    engine, spec = interrupted_account(tmp_path)
+    raw = reports(tmp_path)
+    with pytest.raises(ValueError, match="ledger divergence"):
+        make_plan(engine.state_dir, raw, _now(18, 0).date())
+    plan = make_plan(engine.state_dir, raw, _now(18, 0).date(), abort_unwritten_for=[spec.market])
+    proof = plan["unwritten_commit_aborts"][0]
+    assert proof["signal_id"] == "unwritten-revision"
+    assert proof["positions"][0]["fees_and_pnl_verified"] is True
+    before = engine.state_path.read_bytes()
+    result = apply_plan(engine.state_dir, plan, recorded_at=_now(18, 1))
+    assert result["remaining_count"] == 0
+    assert (Path(result["rollback_directory"]) / "state.json").read_bytes() == before
+    from stockagent.live.tw_day_trade_simulation import TwDayTradeSimulationEngine
+    restarted = TwDayTradeSimulationEngine(engine.state_dir)
+    mode = restarted.state["modes"][spec.market]
+    assert not mode.get("ledger_state_divergence")
+    assert mode["signal_id"] == proof["previous_signal_id"]
+    assert mode["open_position_count"] == 0
+    events = [json.loads(line) for line in restarted.events_path.read_text().splitlines()]
+    assert sum(e["event"] == "signal_commit_started" and e["signal_id"] == "unwritten-revision"
+               for e in events) == 1
+    assert not any(e["event"] == "signal_registered" and e["signal_id"] == "unwritten-revision"
+                   for e in events)
+    assert any(e["event"] == "signal_commit_aborted_unwritten" for e in events)
+    from scripts.audit_tw_day_trade_restart import audit
+    assert audit(engine.state_dir, tmp_path / "independent-restart.json")["status"] == "accepted"
+
+
+@pytest.mark.parametrize("journal", ["signals.jsonl", "orders.jsonl", "fills.jsonl"])
+def test_unwritten_abort_rejects_even_one_partial_financial_row(tmp_path, journal):
+    engine, spec = interrupted_account(tmp_path)
+    with (engine.state_dir / journal).open("a") as stream:
+        stream.write(json.dumps({"signal_id": "unwritten-revision", "market": spec.market}) + "\n")
+    with pytest.raises(ValueError, match="durable financial rows"):
+        make_plan(engine.state_dir, reports(tmp_path), _now(18, 0).date(), abort_unwritten_for=[spec.market])
+
+
+@pytest.mark.parametrize("journal", ["signals.jsonl", "orders.jsonl", "fills.jsonl"])
+def test_unwritten_abort_rejects_a_torn_tail_before_signal_id_was_written(tmp_path, journal):
+    engine, spec = interrupted_account(tmp_path)
+    with (engine.state_dir / journal).open("ab") as stream:
+        stream.write(b'{"interrupted_before_identity":')
+    with pytest.raises(ValueError, match="partial financial journal tail"):
+        make_plan(engine.state_dir, reports(tmp_path), _now(18, 0).date(), abort_unwritten_for=[spec.market])
+
+
+@pytest.mark.parametrize("field, delta", [("signed_shares", 1000), ("entry_price", 1),
+                                          ("remaining_entry_fee_twd", 1), ("realized_net_pnl_twd", 1)])
+def test_unwritten_abort_reconciles_quantities_prices_fees_and_realized_pnl(tmp_path, field, delta):
+    engine, spec = interrupted_account(tmp_path)
+    p = next(iter(engine.state["modes"][spec.market]["positions"].values()))
+    p[field] = float(p.get(field) or 0) + delta
+    engine._persist(_now(18, 0))
+    with pytest.raises(ValueError, match="inventory differs|accounting mismatch"):
+        make_plan(engine.state_dir, reports(tmp_path), _now(18, 0).date(), abort_unwritten_for=[spec.market])
+
+
+def test_abort_without_valid_receipt_does_not_bypass_quarantine(tmp_path):
+    engine, spec = interrupted_account(tmp_path)
+    engine._event("signal_commit_aborted_unwritten", recorded_at=_now(18, 0), market=spec.market,
+                  session_date="2026-08-13", signal_id="unwritten-revision",
+                  receipt_path="../state.json", receipt_sha256="0" * 64)
+    from stockagent.live.tw_day_trade_simulation import TwDayTradeSimulationEngine
+    restarted = TwDayTradeSimulationEngine(engine.state_dir)
+    assert restarted.state["modes"][spec.market]["ledger_state_divergence"]["signal_id"] == "unwritten-revision"
+
+
+def test_abort_receipt_cannot_hide_a_later_interrupted_commit(tmp_path):
+    engine, spec = interrupted_account(tmp_path)
+    plan = make_plan(engine.state_dir, reports(tmp_path), _now(18, 0).date(), abort_unwritten_for=[spec.market])
+    apply_plan(engine.state_dir, plan, recorded_at=_now(18, 0))
+    from stockagent.live.tw_day_trade_simulation import TwDayTradeSimulationEngine
+    recovered = TwDayTradeSimulationEngine(engine.state_dir)
+    recovered._event("signal_commit_started", recorded_at=_now(18, 2), market=spec.market,
+                     session_date="2026-08-13", signal_id="another-interruption")
+    restarted = TwDayTradeSimulationEngine(engine.state_dir)
+    assert restarted.state["modes"][spec.market]["ledger_state_divergence"]["signal_id"] == "another-interruption"
+
+
+def test_unwritten_abort_rejects_account_cumulative_pnl_mismatch(tmp_path):
+    engine, spec = interrupted_account(tmp_path)
+    engine.state["modes"][spec.market]["cumulative_realized_net_pnl_twd"] += 1
+    engine._persist(_now(18, 0))
+    with pytest.raises(ValueError, match="account cumulative realized PnL"):
+        make_plan(engine.state_dir, reports(tmp_path), _now(18, 0).date(), abort_unwritten_for=[spec.market])
+
+
 def reports(tmp_path, *, close="999", day="2026-08-13", volume="10"):
     root = tmp_path / "raw"
     for exchange in ("twse", "tpex"):

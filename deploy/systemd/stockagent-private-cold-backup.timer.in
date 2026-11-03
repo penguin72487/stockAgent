@@ -1,0 +1,12 @@
+[Unit]
+Description=Resume bounded private NAS waves every thirty seconds without duplicate capture
+
+[Timer]
+OnBootSec=45s
+OnCalendar=*-*-* *:*:00/30
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-private-cold-backup.service
+
+[Install]
+WantedBy=timers.target

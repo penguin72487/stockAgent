@@ -716,6 +716,11 @@ def test_final_arm_invalidated_by_global_panel_clear_and_rearmed(monkeypatch, tm
         preopen_prepare_time="08:30", open_time="09:00", schedule_interval_minutes=None,
         day_trade_simulation_enabled=True, holidays=())
     now = datetime.now(ZoneInfo("Asia/Taipei")).replace(hour=8, minute=55, second=0)
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return now
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
     today = now.date().isoformat()
     summary = {"panel_cache_epoch": 11, "live_latency": {
         "panel_cache_hit": True, "checkpoint_cache_hit": True,
@@ -729,8 +734,8 @@ def test_final_arm_invalidated_by_global_panel_clear_and_rearmed(monkeypatch, tm
     epoch[0] = 12
     assert not _preopen_market_final_armed_for_session(cfg, today)
     key = _preopen_prepare_key(cfg, now)
-    assert key == f"{today}:tw_day_trade:epoch-12:preopen-final-arm"
-    assert key != f"{today}:tw_day_trade:epoch-11:preopen-final-arm"
+    assert key == f"{today}:tw_day_trade:epoch-12:late:preopen-final-arm"
+    assert key != f"{today}:tw_day_trade:epoch-11:late:preopen-final-arm"
     summary["panel_cache_epoch"] = 12
     _write_preopen_final_arm(cfg, status="ready", started_at=now.isoformat(),
                              elapsed_seconds=.2, summary=summary)

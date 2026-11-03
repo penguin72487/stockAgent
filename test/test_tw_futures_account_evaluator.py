@@ -464,13 +464,15 @@ def test_report_uses_account_dates_for_risk_and_equity_curve(monkeypatch, tmp_pa
     assert report.compute_metrics_by_year(result, dates)[2016]["max_drawdown"] == pytest.approx(-.525, abs=1e-6)
     assert "-52.50%" in report.generate_annual_report(result, dates)
     lines = []
-    original = report._plot_finite_line
+    from matplotlib.axes import Axes
+    original = Axes.plot
 
-    def capture(ax, x, y, **kwargs):
-        lines.append((np.asarray(x).copy(), np.asarray(y).copy(), kwargs.get("label")))
-        return original(ax, x, y, **kwargs)
+    def capture(ax, *args, **kwargs):
+        if len(args) >= 2 and kwargs.get("label") in {"Strategy", "Benchmark"}:
+            lines.append((np.asarray(args[0]).copy(), np.asarray(args[1]).copy(), kwargs["label"]))
+        return original(ax, *args, **kwargs)
 
-    monkeypatch.setattr(report, "_plot_finite_line", capture)
+    monkeypatch.setattr(Axes, "plot", capture)
     report.plot_equity_curve(result, dates, tmp_path / "equity.png")
     assert (tmp_path / "equity.png").read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
     strategy = next(line for line in lines if line[2] == "Strategy")
@@ -509,3 +511,106 @@ def test_annual_report_attributes_account_event_to_its_actual_year(monkeypatch):
     assert annual[2017]["cumulative_return"] == pytest.approx(1.075 / .475 - 1., rel=1e-5)
     assert annual[2016]["cumulative_benchmark"] == pytest.approx(.1, rel=1e-6)
     assert annual[2017]["cumulative_benchmark"] == pytest.approx(.2, rel=1e-6)
+
+
+def test_tx_one_contract_report_keeps_account_day_marks_and_funding_out_of_return(monkeypatch, tmp_path):
+    from matplotlib.axes import Axes
+    from downloader.artifact_io import atomic_write_json
+    from stockagent.data.tw_futures_benchmark import (
+        TxOneContractReplayContext, tx_one_contract_replay_payload,
+        tx_one_contract_replay_from_payload, tx_one_contract_replay_input_fingerprint,
+        tx_one_contract_continuous_report_segment,
+    )
+
+    monkeypatch.setenv("STOCKAGENT_EVAL_BACKTEST_COMPILE", "0")
+    calendar = build_futures_account_calendar(
+        ["2016-12-29", "2017-01-03"],
+        ["2016-12-29", "2016-12-30", "2017-01-03"],
+        [False, True, False],
+    )
+    source, weights, decisions = _case(calendar)
+    tensor, _ = _evaluate(source, weights, decisions, chunk_rows=1, history=True,
+                          benchmark_returns=torch.log(torch.tensor([1.1, 1.2])))
+    context = FuturesAccountArtifactContext(
+        universe=source.universe, event_source_fingerprint=source.fingerprint,
+        execution_release_fingerprint="2" * 64, expected_calendar_fingerprint=calendar.fingerprint,
+        initial_capital=1000., initial_equity_scale=1., initial_alive=True,
+        initial_quantities=(0,) * len(source.universe),
+    )
+    result = tensor.to_numpy(futures_account_context=context)
+    events = [
+        dict(time="2016-12-29T09:00:00+08:00", event="open", contract="201701", price=100,
+             price_evidence="synthetic", margin_twd=100, margin_evidence="synthetic", cost_twd=0),
+        dict(time="2016-12-29T13:45:00+08:00", event="mark", contract="201701", price=105,
+             price_evidence="synthetic", margin_twd=100, margin_evidence="synthetic", cost_twd=0),
+        dict(time="2016-12-30T13:45:00+08:00", event="mark", contract="201701", price=102,
+             price_evidence="synthetic", margin_twd=150, margin_evidence="synthetic", cost_twd=0),
+        dict(time="2017-01-03T13:45:00+08:00", event="mark", contract="201701", price=102,
+             price_evidence="synthetic", margin_twd=150, margin_evidence="synthetic", cost_twd=0),
+    ]
+    replay_context = TxOneContractReplayContext("a" * 64, "b" * 64, calendar.fingerprint,
+        tx_one_contract_replay_input_fingerprint(events, initial_capital_twd=100,
+            multiplier_twd_per_point=1))
+    payload = tx_one_contract_replay_payload(
+        events, calendar=calendar, context=replay_context, initial_capital_twd=100,
+        multiplier_twd_per_point=1,
+    )
+    replay_path = tmp_path / "tx_one_contract_benchmark.json"
+    atomic_write_json(replay_path, payload)
+    replay = tx_one_contract_replay_from_payload(
+        json.loads(replay_path.read_text()), context=replay_context,
+    )
+    assert replay["external_deposit_twd"].tolist() == [0, 48, 0]
+    assert replay["account_scope"] == "continuous_from_first_supplied_event"
+    metrics = report.compute_metrics(result, futures_benchmark_replay=replay)
+    assert metrics["cumulative_benchmark"] == pytest.approx(.02)
+    assert report.compute_metrics(result)["cumulative_benchmark"] == pytest.approx(.32, rel=1e-6)
+    annual = report.compute_metrics_by_year(result, calendar.decision_dates, futures_benchmark_replay=replay)
+    assert annual[2016]["cumulative_benchmark"] == pytest.approx(.02)
+    assert annual[2017]["cumulative_benchmark"] == pytest.approx(0.)
+    segment, segment_context = _slice_backtest_rows(
+        result, 1, 2, futures_account_context=context, return_futures_context=True,
+    )
+    replay_segment = tx_one_contract_continuous_report_segment(
+        payload, context=replay_context, start=1, stop=2,
+    )
+    assert segment_context.expected_calendar_fingerprint == replay_segment["account_calendar_fingerprint"]
+    segment_metrics = report.compute_metrics(segment, futures_benchmark_replay=replay_segment)
+    assert segment_metrics["cumulative_benchmark"] == pytest.approx(102 / 105 - 1)
+    assert replay_segment["external_deposit_twd"].tolist() == [48, 0]
+    text_report = report.generate_annual_report(result, calendar.decision_dates,
+                                                futures_benchmark_replay=replay)
+    assert "2.00%" in text_report
+    assert report.TX_ONE_CONTRACT_BENCHMARK_LABEL in text_report
+
+    lines = []
+    original = Axes.plot
+    def capture(ax, *args, **kwargs):
+        if len(args) >= 2 and kwargs.get("label") == report.TX_ONE_CONTRACT_BENCHMARK_LABEL:
+            lines.append((np.asarray(args[0]).copy(), np.asarray(args[1]).copy()))
+        return original(ax, *args, **kwargs)
+    monkeypatch.setattr(Axes, "plot", capture)
+    report.plot_equity_curve(result, calendar.decision_dates, tmp_path / "equity.png",
+                             benchmark_label="legacy 1x gross",
+                             futures_benchmark_replay=replay)
+    report.plot_equity_curve_log(result, calendar.decision_dates, tmp_path / "equity-log.png",
+                                 benchmark_label="legacy 1x gross",
+                                 futures_benchmark_replay=replay)
+    report.plot_configured_leverage_equity_curve(
+        result, calendar.decision_dates, tmp_path / "leverage.png",
+        benchmark_label="legacy 1x gross", futures_benchmark_replay=replay,
+    )
+    assert len(lines) == 3
+    for x, y in lines:
+        np.testing.assert_array_equal(x, calendar.dates)
+        np.testing.assert_allclose(y, [1.05, 1.02, 1.02])
+
+    for changed in (
+        {"account_calendar_fingerprint": "0" * 64},
+        {"decision_dates": calendar.decision_dates[:1]},
+        {"market_session_mask": np.ones(3, dtype=bool)},
+        {"benchmark_log_returns": np.array([0., np.nan, 0.])},
+        {"decision_log_returns": np.zeros(2)},
+    ):
+        with pytest.raises(ValueError, match="dated TX benchmark replay"):
+            report.compute_metrics(result, futures_benchmark_replay={**replay, **changed})

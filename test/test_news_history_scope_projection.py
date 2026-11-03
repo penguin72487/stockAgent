@@ -9,12 +9,14 @@ from test_news_dashboard_cnyes_list_progress import history_snapshot, gaps_snaps
 
 @pytest.mark.parametrize('state,group', [
     ('inconsistent_source_snapshot', 'inconsistent_source_scopes'),
-    ('inconsistent_original_page_ID_reference', 'inconsistent_source_scopes'),
+    ('inconsistent_original_page_ID_reference', 'original_page_reference_scopes'),
     ('inconsistent_source_identity_or_date', 'inconsistent_source_scopes'),
     ('inconsistent_partition_evidence', 'inconsistent_source_scopes'),
     ('waiting_original_page_recheck', 'waiting_list_scopes'),
     ('waiting_child_evidence', 'waiting_list_scopes'),
     ('source_page_cap_exceeded', 'page_cap_exceeded_scopes'),
+    ('invalid_page_evidence', 'invalid_page_evidence_scopes'),
+    ('invalid_scope_evidence', 'invalid_scope_evidence_scopes'),
 ])
 def test_all_canonical_noncomplete_scopes_preserve_verified_counts(state, group):
     raw = history_snapshot()
@@ -24,6 +26,9 @@ def test_all_canonical_noncomplete_scopes_preserve_verified_counts(state, group)
     assert result['verified_list_scopes'] == 4007
     assert result[group] == (10 if group == 'waiting_list_scopes' else 7)
     assert result['current_source_contract_scope_states'][state] == 7
+    if state == 'invalid_page_evidence':
+        assert result['inconsistent_source_scopes'] == 0
+        assert result['waiting_list_scopes'] == 3
     assert result['unresolved_category_scopes'] == 1518
     assert result['list_coverage_is_not_body_coverage'] and not result['all_history_complete']
     assert result['finish_eta_utc'] is result['progress_ratio'] is None
@@ -31,7 +36,8 @@ def test_all_canonical_noncomplete_scopes_preserve_verified_counts(state, group)
 
 
 @pytest.mark.parametrize('value', [True, -1, '1', None, 2**53, 1.0])
-@pytest.mark.parametrize('state', ['inconsistent_source_snapshot', 'waiting_child_evidence', 'source_page_cap_exceeded'])
+@pytest.mark.parametrize('state', ['inconsistent_source_snapshot', 'waiting_child_evidence', 'source_page_cap_exceeded',
+                                  'invalid_page_evidence'])
 def test_failed_scopes_keep_the_same_strict_count_guard(state, value):
     raw = history_snapshot()
     raw['current_source_contract_scope_states'][state] = value

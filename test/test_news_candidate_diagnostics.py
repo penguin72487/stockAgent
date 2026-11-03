@@ -1,7 +1,9 @@
 """Finite candidate requests share the live owner, not another downloader."""
 from copy import deepcopy
+from contextlib import closing
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+import errno
 import hashlib
 import json
 from pathlib import Path
@@ -120,7 +122,7 @@ def test_no_input_has_no_new_schema_or_writes(queue):
     assert not (queue.root/'reviewed_repairs').exists()
 
 
-def test_expired_admission_slice_leaves_pending_input_for_next_tick(queue, settings, monkeypatch):
+def test_expired_admission_slice_still_admits_one_input(queue, settings, monkeypatch):
     from downloader.news_fulltext_wake import OwnerMailboxWake
 
     submitted = submit(queue, settings)
@@ -133,17 +135,10 @@ def test_expired_admission_slice_leaves_pending_input_for_next_tick(queue, setti
 
     monkeypatch.setattr(diagnostic, '_schema', slow_first_schema)
     diagnostic.pump_candidates(queue)
-    assert diagnostic.has_unadmitted_candidates(queue)
-    assert mailbox.has_pending()
-    assert request_path(queue, submitted).exists()
-    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 0
-    monkeypatch.setattr(diagnostic, '_schema', original_schema)
-    deadline = time.monotonic() + 3
-    while diagnostic.has_unadmitted_candidates(queue) and time.monotonic() < deadline:
-        diagnostic.pump_candidates(queue)
-        time.sleep(.005)
     assert not diagnostic.has_unadmitted_candidates(queue)
     assert not mailbox.has_pending()
+    assert request_path(queue, submitted).exists()
+    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 1
     assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'ready'
 
 
@@ -202,6 +197,171 @@ def test_candidate_progress_deduplicates_registered_observations_without_merging
     assert after['request_files'] == after['already_registered'] == 2
     assert after['pending_unadmitted'] == 0 and after['jobs']['ready'] == 1
     assert after['providers']['videoland']['ready'] == 1
+    assert not diagnostic.has_unadmitted_candidates(queue)
+
+
+def test_duplicate_wake_cache_revalidates_changed_request(queue, settings, monkeypatch):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    request = json.loads(path.read_bytes())
+    request['reason'] = 'A concurrent submission of the same observation'
+    payload = diagnostic._bytes(request)
+    other = path.with_name(hashlib.sha256(payload).hexdigest()+'.json')
+    atomic_write_bytes(other, payload, mode=0o600)
+    pump_until(queue, lambda: diagnostic.candidate_progress(queue)['already_registered'] == 2)
+    registered = queue.db.execute('SELECT request_id FROM native_candidate_jobs').fetchone()[0]
+    duplicate = other if other.stem != registered else path
+    queue._candidate_progress_cache = {}
+    original_load = diagnostic._load
+    loaded = []
+    def counted(candidate):
+        loaded.append(candidate)
+        return original_load(candidate)
+    monkeypatch.setattr(diagnostic, '_load', counted)
+    assert not diagnostic.has_unadmitted_candidates(queue)
+    assert not diagnostic.has_unadmitted_candidates(queue)
+    # Registered files also need one validated identity: their filename alone
+    # cannot prove that the retained input still has the sealed content.
+    assert sorted(loaded) == sorted([path, other])
+    atomic_write_bytes(duplicate, duplicate.read_bytes()+b' ', mode=0o600)
+    assert diagnostic.has_unadmitted_candidates(queue)
+    pump_until(queue, lambda: not duplicate.exists())
+    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 1
+
+
+def test_registered_request_changed_on_disk_wakes_owner_for_quarantine(queue, settings):
+    submitted = admit(queue, settings)
+    path = request_path(queue, submitted)
+    assert not diagnostic.has_unadmitted_candidates(queue)
+    atomic_write_bytes(path, path.read_bytes() + b' ', mode=0o600)
+    assert diagnostic.has_unadmitted_candidates(queue)
+    diagnostic.pump_candidates(queue)
+    assert not path.exists()
+    assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'ready'
+
+
+def test_transient_candidate_read_error_retains_request_for_retry(queue, settings, monkeypatch):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    original = diagnostic._load
+    unavailable, now, attempts = [True], [100.0], []
+
+    def transient(candidate):
+        attempts.append(candidate)
+        if candidate == path and unavailable[0]:
+            raise OSError(errno.EIO, 'synthetic transient read failure')
+        return original(candidate)
+
+    monkeypatch.setattr(diagnostic, '_load', transient)
+    monkeypatch.setattr(diagnostic, '_local_retry_now', lambda: now[0])
+    before = head(queue)
+    diagnostic.pump_candidates(queue)
+    assert path.exists()
+    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 0
+    assert head(queue) == before
+    assert not diagnostic.has_unadmitted_candidates(queue)
+    assert diagnostic.candidate_local_retry_delay(queue, 60) == 1
+    diagnostic.pump_candidates(queue)
+    assert attempts == [path]  # Other owner cycles must not busy-retry it.
+    assert diagnostic.candidate_progress(queue)['local_retry'] == {'request_io': 1, 'quarantine': 0, 'archive': 0}
+    now[0] += 1
+    assert diagnostic.has_unadmitted_candidates(queue)
+    diagnostic.pump_candidates(queue)
+    assert diagnostic.candidate_local_retry_delay(queue, 60) == 2
+    unavailable[0] = False
+    now[0] += 2
+    pump_until(queue, lambda: diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'ready')
+    assert path.exists() and head(queue) == before and not diagnostic.has_unadmitted_candidates(queue)
+    assert diagnostic.candidate_local_retry_delay(queue, 60) == 60
+
+
+def test_changed_candidate_releases_local_retry_wait(queue, settings, monkeypatch):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    original = diagnostic._load
+    monkeypatch.setattr(diagnostic, '_load', lambda candidate: (_ for _ in ()).throw(OSError(errno.EIO, 'synthetic')))
+    diagnostic.pump_candidates(queue)
+    assert not diagnostic.has_unadmitted_candidates(queue)
+    monkeypatch.setattr(diagnostic, '_load', original)
+    atomic_write_bytes(path, path.read_bytes(), mode=0o600)
+    assert diagnostic.has_unadmitted_candidates(queue)
+    pump_until(queue, lambda: diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'ready')
+    assert not diagnostic.has_unadmitted_candidates(queue)
+
+
+@pytest.mark.parametrize('removed', ['request', 'directory'])
+def test_removed_candidate_clears_local_retry_without_idle_spin(queue, settings, monkeypatch, removed):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    now = [100.0]
+    monkeypatch.setattr(diagnostic, '_local_retry_now', lambda: now[0])
+    monkeypatch.setattr(diagnostic, '_load', lambda candidate: (_ for _ in ()).throw(OSError(errno.EIO, 'synthetic')))
+    diagnostic.pump_candidates(queue)
+    assert diagnostic.candidate_local_retry_delay(queue, 60) == 1
+    path.unlink()
+    if removed == 'directory':
+        path.parent.rmdir()
+    now[0] += 2
+    assert not diagnostic.has_unadmitted_candidates(queue)
+    assert diagnostic.candidate_local_retry_delay(queue, 60) == 60
+
+
+def test_candidate_local_failure_does_not_block_other_request(queue, settings, monkeypatch):
+    first = submit(queue, settings)
+    second_url = URL.replace('123456789abc', '123456789abd')
+    with queue.db:
+        queue.add_articles([{'url': second_url}])
+        queue.db.execute("UPDATE articles SET state='article_identity_not_verified', "
+            "error_code='article_identity_not_verified',attempts=7,due=?,last_checked_at_utc=? WHERE url=?",
+            (time.time()-60, '2026-01-01T00:00:00+00:00', second_url))
+    second = diagnostic.submit_candidate(queue.root, settings, queue.registry, second_url, LAYOUT,
+                                         reason='Independent candidate remains available')
+    paths = [request_path(queue, first), request_path(queue, second)]
+    blocked = min(paths)
+    original = diagnostic._load
+
+    def transient(candidate):
+        if candidate == blocked:
+            raise OSError(errno.EIO, 'synthetic temporary read failure')
+        return original(candidate)
+
+    monkeypatch.setattr(diagnostic, '_load', transient)
+    pump_until(queue, lambda: queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 1)
+    assert blocked.exists()
+    assert queue.db.execute('SELECT request_id FROM native_candidate_jobs').fetchone()[0] == max(paths).stem
+    assert not diagnostic.has_unadmitted_candidates(queue)
+
+
+def test_candidate_with_invalid_url_is_quarantined_without_stopping_owner(queue, settings):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    request = json.loads(path.read_bytes())
+    request['target']['url'] = 'not a valid URL'
+    path = seal_request(path, request)
+    before = head(queue)
+    diagnostic.pump_candidates(queue)
+    assert not path.exists()
+    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 0
+    assert head(queue) == before
+
+
+def test_failed_candidate_quarantine_is_visible_and_recovers_locally(queue, settings, monkeypatch):
+    submitted = submit(queue, settings)
+    path = request_path(queue, submitted)
+    request = json.loads(path.read_bytes())
+    request['target']['url'] = 'not a valid URL'
+    path = seal_request(path, request)
+    original, now = diagnostic._quarantine, [100.0]
+    monkeypatch.setattr(diagnostic, '_local_retry_now', lambda: now[0])
+    monkeypatch.setattr(diagnostic, '_quarantine', lambda *args: (_ for _ in ()).throw(OSError(errno.EIO, 'synthetic')))
+    diagnostic.pump_candidates(queue)
+    assert path.exists() and not diagnostic.has_unadmitted_candidates(queue)
+    assert diagnostic.candidate_progress(queue)['local_retry'] == {'request_io': 0, 'quarantine': 1, 'archive': 0}
+    monkeypatch.setattr(diagnostic, '_quarantine', original)
+    now[0] += 1
+    assert diagnostic.has_unadmitted_candidates(queue)
+    pump_until(queue, lambda: not path.exists())
+    assert diagnostic.candidate_progress(queue)['local_retry'] == {'request_io': 0, 'quarantine': 0, 'archive': 0}
 
 
 def test_candidate_progress_cache_rechecks_file_identity_and_keeps_invalid_unknown(queue, settings, monkeypatch):
@@ -455,12 +615,131 @@ def test_candidate_deadline_wake_uses_bounded_provider_index(settings, generic_c
                     (request_id, due, 'provider_cooldown', '2026-01-01T00:00:00+00:00'))
         queue.native_candidate_ready_providers = {'videoland', 'publisher'}
         assert 1 < diagnostic.candidate_next_wake_delay(queue, {}, {}, 60) <= 2
+        assert 7 < diagnostic.candidate_next_wake_delay(
+            queue, {}, {}, 60, provider_ids={'videoland'}) <= 8
+        assert diagnostic.candidate_next_wake_delay(
+            queue, {}, {}, 60, provider_ids={'publisher'}, dispatch_after=now + 3) == 60
+        assert 1 < diagnostic.candidate_next_wake_delay(
+            queue, {}, {}, 60, provider_ids={'publisher'}, dispatch_after=now + 1) <= 2
         plan = queue.db.execute('EXPLAIN QUERY PLAN SELECT j.request_json,w.not_before_epoch '
             'FROM native_candidate_jobs AS j LEFT JOIN native_candidate_wait AS w ON w.request_id=j.request_id '
             "WHERE j.state='ready' AND j.provider=? ORDER BY j.created_at_utc LIMIT ?", ('videoland', 16)).fetchall()
         details = ' '.join(row[3] for row in plan)
         assert 'native_candidate_ready' in details and 'TEMP B-TREE' not in details
     finally:
+        queue.close()
+
+
+def test_candidate_due_while_other_provider_response_is_inflight(settings, generic_config, tmp_path, monkeypatch):
+    from protego import Protego
+    from downloader import news_fulltext as main
+
+    settings['providers'].extend(generic_config['providers'])
+    publisher_url = 'https://publisher.test/slow'
+    http, session = http_fixture(settings, tmp_path, {
+        publisher_url: FakeResponse(article_html()), URL: FakeResponse(description_defect_page()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    candidate_started, slow_saw_candidate, due = threading.Event(), [], []
+    original_get, original_claim, original_finish = session.get, queue.claim, diagnostic.finish_candidate
+    try:
+        before = fail_head(queue)
+        submitted = admit(queue, settings)
+        with queue.db:
+            queue.add_articles([{'url': publisher_url}])
+            queue.db.execute('INSERT INTO native_candidate_wait VALUES (?,?,?,?,1)',
+                             (submitted['request_id'], time.time() + 60, 'provider_cooldown',
+                              '2026-01-01T00:00:00+00:00'))
+
+        def claim(provider, *args, **kwargs):
+            row = original_claim(provider, *args, **kwargs)
+            if provider == 'publisher' and row and not due:
+                due.append(time.monotonic() + .25)
+                with queue.db:
+                    queue.db.execute('UPDATE native_candidate_wait SET not_before_epoch=? WHERE request_id=?',
+                                     (time.time() + .25, submitted['request_id']))
+            return row
+
+        def get(url, **kwargs):
+            if url == publisher_url:
+                slow_saw_candidate.append(candidate_started.wait(.9))
+            elif url == URL:
+                assert time.monotonic() >= due[0] - .01
+                candidate_started.set()
+            return original_get(url, **kwargs)
+
+        def finish(*args, **kwargs):
+            result = original_finish(*args, **kwargs)
+            http.stop.set()  # The in-flight publisher response still drains.
+            return result
+
+        monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+        monkeypatch.setattr(queue, 'claim', claim)
+        monkeypatch.setattr(session, 'get', get)
+        monkeypatch.setattr(diagnostic, 'finish_candidate', finish)
+        parser = Protego.parse('User-agent: *\nAllow: /')
+        http.robots_parsers.update({origin: (time.time(), parser)
+            for origin in ('https://publisher.test', 'https://news.videoland.com.tw')})
+        run_service(queue, http, settings, max_articles=1, max_discovery_requests=0, duration_seconds=4)
+        assert slow_saw_candidate == [True]
+        assert diagnostic.candidate_status(tmp_path, submitted['request_id'])['state'] == 'observed'
+        assert head(queue) == before
+        assert queue.db.execute('SELECT state FROM articles WHERE url=?', (publisher_url,)).fetchone()[0] == 'complete'
+        assert verify_bodies(tmp_path)['errors'] == []
+    finally:
+        http.close()
+        queue.close()
+
+
+@pytest.mark.parametrize('priority_cooling', [False, True])
+def test_priority_candidate_gets_free_worker_before_other_provider_history(settings, generic_config, tmp_path, monkeypatch,
+                                                                          priority_cooling):
+    from protego import Protego
+    from downloader import news_fulltext as main
+
+    settings['providers'].extend(generic_config['providers'])
+    settings.update(workers=1, provider_priority=['videoland'])
+    publisher_url = 'https://publisher.test/history'
+    http, session = http_fixture(settings, tmp_path, {
+        publisher_url: FakeResponse(article_html()), URL: FakeResponse(description_defect_page()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    original_finish, original_accept = diagnostic.finish_candidate, queue.accept
+    try:
+        before = fail_head(queue)
+        submitted = admit(queue, settings)
+        with queue.db:
+            queue.add_articles([{'url': publisher_url}])
+
+        def finish(*args, **kwargs):
+            result = original_finish(*args, **kwargs)
+            http.stop.set()
+            return result
+
+        def accept(records, **kwargs):
+            result = original_accept(records, **kwargs)
+            if priority_cooling:
+                http.stop.set()
+            return result
+
+        monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+        monkeypatch.setattr(diagnostic, 'finish_candidate', finish)
+        monkeypatch.setattr(queue, 'accept', accept)
+        parser = Protego.parse('User-agent: *\nAllow: /')
+        http.robots_parsers.update({origin: (time.time(), parser)
+            for origin in ('https://publisher.test', 'https://news.videoland.com.tw')})
+        if priority_cooling:
+            http.defer('videoland', 120)
+        run_service(queue, http, settings, max_articles=1, max_discovery_requests=0, duration_seconds=4)
+        assert [url for url, _ in session.calls] == [publisher_url if priority_cooling else URL]
+        assert diagnostic.candidate_status(tmp_path, submitted['request_id'])['state'] == (
+            'ready' if priority_cooling else 'observed')
+        assert head(queue) == before
+        remaining = queue.db.execute('SELECT state,attempts FROM articles WHERE url=?', (publisher_url,)).fetchone()
+        assert tuple(remaining) == (('complete', 1) if priority_cooling else ('pending', 0))
+        assert verify_bodies(tmp_path)['errors'] == []
+    finally:
+        http.close()
         queue.close()
 
 
@@ -556,6 +835,47 @@ def test_resident_candidate_wait_wakes_after_presend_gate(settings, tmp_path, mo
         queue.close()
 
 
+def test_candidate_finishes_at_deadline_and_archives_next_cycle_without_refetch(settings, tmp_path, monkeypatch):
+    from downloader import news_fulltext as main
+    from test_news_provider_cooperation import AdvancingCycleClock
+
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(description_defect_page()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    clock, original_fetch = AdvancingCycleClock(), diagnostic.fetch_candidate
+
+    def finish_after_deadline(client, job):
+        result = original_fetch(client, job)
+        clock.advance += 10
+        return result
+
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+    monkeypatch.setattr(diagnostic, 'fetch_candidate', finish_after_deadline)
+    try:
+        before = fail_head(queue)
+        submitted = submit(queue, settings)
+        main.run_cycle(queue, http, settings, max_articles=0, max_discovery_requests=0,
+                       continuous_budgets=True, max_run_seconds=2, defer_final_status=True)
+        assert diagnostic.candidate_status(tmp_path, submitted['request_id'])['state'] == 'observed'
+        assert request_path(queue, submitted).is_file()
+        assert head(queue) == before
+
+        main.run_cycle(queue, http, settings, max_articles=0, max_discovery_requests=0,
+                       continuous_budgets=True, max_run_seconds=2, defer_final_status=True)
+        assert not request_path(queue, submitted).exists()
+        archived = tmp_path/'reviewed_repairs/candidate_diagnostics/processed'
+        assert (archived/(submitted['request_id']+'.outcome.json')).is_file()
+        assert diagnostic.candidate_status(tmp_path, submitted['request_id'])['state'] == 'observed'
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt', URL]
+        assert head(queue) == before
+    finally:
+        http.close()
+        queue.close()
+
+
 def test_restart_never_retries_a_reserved_unknown_outcome(queue, settings):
     submitted = admit(queue, settings)
     assert diagnostic.claim_candidate(queue, http_stub(queue), settings, 'videoland')
@@ -636,6 +956,64 @@ def test_commit_then_archive_failure_resumes_with_zero_get(queue, settings, monk
         reopened.close()
 
 
+def test_archive_failure_waits_then_recovers_without_another_get(queue, settings, monkeypatch):
+    submitted = admit(queue, settings)
+    http = http_stub(queue)
+    job = diagnostic.claim_candidate(queue, http, settings, 'videoland')
+    diagnostic.finish_candidate(queue, job, result=diagnostic.fetch_candidate(http, job))
+    path, now, calls = request_path(queue, submitted), [100.0], []
+    original = diagnostic._archive
+
+    def temporary_failure(*args, **kwargs):
+        calls.append(1)
+        raise OSError(errno.EIO, 'synthetic archive failure')
+
+    monkeypatch.setattr(diagnostic, '_local_retry_now', lambda: now[0])
+    monkeypatch.setattr(diagnostic, '_archive', temporary_failure)
+    diagnostic.pump_candidates(queue)
+    assert path.exists() and not diagnostic.has_unadmitted_candidates(queue)
+    assert diagnostic.candidate_progress(queue)['local_retry'] == {'request_io': 0, 'quarantine': 0, 'archive': 1}
+    diagnostic.pump_candidates(queue)
+    assert calls == [1] and diagnostic.candidate_local_retry_delay(queue, 60) == 1
+    monkeypatch.setattr(diagnostic, '_archive', original)
+    now[0] += 1
+    assert diagnostic.has_unadmitted_candidates(queue)
+    pump_until(queue, lambda: not path.exists())
+    assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'observed'
+    assert diagnostic.claim_candidate(queue, http, settings, 'videoland') is None
+    assert http.calls == [URL] and diagnostic.candidate_local_retry_delay(queue, 60) == 60
+
+
+def test_idle_service_retries_transient_candidate_read_without_new_submission(settings, tmp_path, monkeypatch):
+    settings['service_idle_max_seconds'] = 30
+    http, session = http_fixture(settings, tmp_path, {
+        'https://news.videoland.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /\n'),
+        URL: FakeResponse(description_defect_page()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        before = fail_head(queue)
+        submitted = submit(queue, settings)
+        original, failures = diagnostic._load, []
+
+        def fail_once(path):
+            if path.stem == submitted['request_id'] and not failures:
+                failures.append(1)
+                raise OSError(errno.EIO, 'synthetic transient read failure')
+            return original(path)
+
+        monkeypatch.setattr(diagnostic, '_load', fail_once)
+        monkeypatch.setattr(diagnostic, '_LOCAL_RETRY_INITIAL_SECONDS', .05)
+        run_service(queue, http, settings, max_articles=0, max_discovery_requests=0, duration_seconds=1.5)
+        assert failures == [1]
+        assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'observed'
+        assert [url for url, _ in session.calls] == ['https://news.videoland.com.tw/robots.txt', URL]
+        assert head(queue) == before
+    finally:
+        http.close()
+        queue.close()
+
+
 @pytest.mark.parametrize('error', [RuntimeError('PRIVATE TRACE AND SOURCE'), NewsError('http_429', retry=True, delay=700)])
 def test_worker_failure_is_finite_private_and_never_resets_article(queue, settings, error):
     submitted, before = admit(queue, settings), head(queue)
@@ -694,17 +1072,44 @@ def test_bad_mailbox_is_quarantined_without_http_or_head_changes(queue, settings
         assert outside.exists()
 
 
-def test_stop_and_soft_slice_defer_without_reserving(queue, settings, monkeypatch):
+def test_stop_wins_and_expired_soft_slice_rotates_one_request(queue, settings, monkeypatch):
     submitted = submit(queue, settings)
+    # A second bounded but invalid request is processed on the next slice;
+    # a ready first question must not monopolize every slow slice.
+    other = request_path(queue, submitted).with_name('f' * 64 + '.json')
+    assert request_path(queue, submitted).name < other.name
+    atomic_write_bytes(other, b'invalid private request', mode=0o600)
     stop = threading.Event()
     stop.set()
     diagnostic.pump_candidates(queue, stop=stop)
     assert request_path(queue, submitted).exists()
     assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 0
-    ticks = iter([0, .1])
-    monkeypatch.setattr(diagnostic.time, 'monotonic', lambda: next(ticks))
-    diagnostic.pump_candidates(queue, max_seconds=.05)
-    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs').fetchone()[0] == 0
+    with monkeypatch.context() as clock:
+        ticks = iter([0, .1])
+        clock.setattr(diagnostic.time, 'monotonic', lambda: next(ticks, .1))
+        diagnostic.pump_candidates(queue, max_seconds=.05)
+    assert queue.db.execute('SELECT COUNT(*) FROM native_candidate_jobs WHERE state=\'ready\'').fetchone()[0] == 1
+    assert other.exists() and head(queue)['state'] == 'article_identity_not_verified'
+    assert queue.db.execute('SELECT value FROM native_candidate_schedule WHERE key=?',
+                            (diagnostic._CANDIDATE_CURSOR_KEY,)).fetchone()[0] == request_path(queue, submitted).name
+    root, registry = queue.root, queue.registry
+    queue.close()
+    with closing(NewsQueue(root, registry)) as restarted:
+        with monkeypatch.context() as clock:
+            ticks = iter([0, .1])
+            clock.setattr(diagnostic.time, 'monotonic', lambda: next(ticks, .1))
+            diagnostic.pump_candidates(restarted, max_seconds=.05)
+        assert not other.exists() and request_path(restarted, submitted).exists()
+        assert restarted.db.execute('SELECT COUNT(*) FROM native_candidate_jobs WHERE state=\'ready\'').fetchone()[0] == 1
+
+
+def test_repeated_ready_candidate_does_not_rewrite_cursor(queue, settings):
+    submitted = submit(queue, settings)
+    pump_until(queue, lambda: diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'ready')
+    before = queue.db.total_changes
+    diagnostic.pump_candidates(queue)
+    assert queue.db.total_changes == before
+    assert diagnostic.candidate_status(queue.root, submitted['request_id'])['state'] == 'ready'
 
 
 @pytest.mark.parametrize('kind', ['redirect', 'mime', 'http'])

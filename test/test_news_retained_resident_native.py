@@ -207,9 +207,10 @@ def test_durable_resident_receipt_recovers_only_its_own_owner_restart_witness(ap
     original = queue._accept_records
     def restarted(records, relative, receipt):
         with queue.db:
-            queue.db.execute("UPDATE articles SET state='retry',due=0,error_code='owner_restart',lease_owner=NULL,lease_until=NULL WHERE url=?", (requested,))
+            queue.db.execute("UPDATE articles SET state='retry',due=0,error_code='owner_restart',"
+                             "recovery_lease_token=lease_token,lease_owner=NULL,lease_until=NULL,lease_token=NULL WHERE url=?", (requested,))
         assert reviewed_native_head_matches(queue, records[0])
-        return original(records, relative, receipt)
+        return original(records, relative, receipt, recovering=True)
     monkeypatch.setattr(queue, '_accept_records', restarted)
     assert replay(approved)['materialized_bodies'] == 1
     assert head(queue, requested)['state'] == 'complete'

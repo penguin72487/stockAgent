@@ -4258,6 +4258,11 @@ def cmnews_visible_article(soup, *, page_url):
             continue
     if len(set(matched)) == 1:
         result["datePublished"], result["dateModified"] = matched[0]
+        # The publication clock now comes from the matched NewsArticle
+        # declaration, not just the visible minute. Keep the source's exact
+        # precision/offset; a declaration without timezone remains naive.
+        result['published_time_basis'] = (
+            'publisher_NewsArticle_matches_visible_minute; source_declared_clock_preserved_without_timezone_inference')
     result['_cmnews_short_table_announcement_verified'] = _cmnews_short_table_announcement(
         scope, bodies[0], result, profile=profile, visible_clock_verified=clock_parts is not None)
     # CMNews's editor wraps data tables in <figure class="table">. The

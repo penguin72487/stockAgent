@@ -611,6 +611,15 @@
       const serverTiming = String(response.headers?.get?.("Server-Timing") || "");
       const appDuration = serverTiming.match(/(?:^|,)\s*app;dur=([0-9.]+)/i);
       serverMs = appDuration ? finiteNumber(appDuration[1]) : null;
+      // A 304 has no response body. Conditional readers correctly retain
+      // their existing representation without calling readText/JsonResponse.
+      // Finish here, otherwise every successful unchanged poll leaks its
+      // cancellation listener and is later misreported as a timeout.
+      if (response.status === 304) {
+        bodyAt = headersAt;
+        finish("ok");
+        return response;
+      }
       // fetch resolves at headers, not at the end of the body. Keep both the
       // timeout and caller cancellation alive through JSON/text consumption.
       responseLifetimes.set(response, {

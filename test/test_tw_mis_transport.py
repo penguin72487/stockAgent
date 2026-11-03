@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import timedelta
 from http.client import RemoteDisconnected
 import threading
+import time
 
 import numpy as np
 import pytest
@@ -14,6 +15,7 @@ from stockagent.live import quote_provider as quotes
 @pytest.fixture(autouse=True)
 def isolated_transport(monkeypatch):
     monkeypatch.setattr(quotes, "_TW_MIS_HTTP_LOCAL", threading.local())
+    monkeypatch.setattr(quotes, "_TW_MIS_BATCH_LIMITS", {})
     monkeypatch.setattr(quotes, "_TW_MIS_BOOTSTRAP_COOKIES", {})
     monkeypatch.setattr(quotes, "_TW_MIS_BOOTSTRAP_AT", 0.)
     monkeypatch.setattr(quotes, "load_symbol_yahoo_map", lambda _: {})
@@ -107,6 +109,113 @@ def test_reported_source_error_never_becomes_a_price_or_no_first_trade(monkeypat
     assert np.isnan(snapshot.open_prices).all()
     assert not quotes.tw_session_no_open_print_mask(snapshot).any()
     assert snapshot.transport_timing["mis_failure_types"] == ["ValueError"]
+
+
+def test_timeout_shape_is_reduced_after_probe_without_losing_scope(monkeypatch, tmp_path):
+    calls = []
+
+    def get(params, _timeout):
+        names = [channel.split("_")[1].split(".")[0] for channel in params["ex_ch"].split("|")]
+        calls.append(names)
+        if len(names) > 40:
+            raise requests.ReadTimeout("sensitive URL must not persist")
+        return response([row(name) for name in names])
+
+    install_session(monkeypatch, get)
+    symbols = [str(1000 + i) for i in range(400)]
+
+    def fetch(names):
+        return quotes.fetch_tw_mis_last_prices(names, np.ones(len(names)),
+            parquet_root=tmp_path, max_parallel_requests=4, request_timeout_seconds=4,
+            empty_chunk_retry_attempts=0, on_progress=lambda *_: None)
+
+    failed = fetch(symbols)
+    assert failed.available_count == 0
+    assert failed.transport_timing["mis_request_count"] == 4
+    assert failed.transport_timing["mis_next_transport_chunk_size"] == 40
+    assert failed.transport_timing["mis_deferred_channel_count"] == 80
+    assert "sensitive" not in str(failed.transport_timing)
+    assert fetch([symbols[0]]).available_count == 1
+    calls.clear()
+    recovered = fetch(symbols)
+    assert recovered.available_count == len(symbols)
+    assert recovered.requested_count == len(symbols)
+    assert recovered.transport_timing["mis_effective_chunk_size"] == 40
+    assert sorted(name for batch in calls for name in batch) == symbols
+    np.testing.assert_array_equal(recovered.open_prices, np.full(len(symbols), 100.))
+
+
+@pytest.mark.parametrize("kind", ["permission", "quota", "schema", "isolated", "small_tail"])
+def test_batch_geometry_does_not_learn_from_unrelated_failures(kind):
+    key, used = quotes._tw_mis_batch_geometry(80, 4.)
+    sample = {"channel_count": 80, "failure_phase": "connect_tls_or_response_headers",
+              "error_chain_types": ["ReadTimeout", "TimeoutError"]}
+    samples = [dict(sample) for _ in range(4)]
+    if kind in {"permission", "quota"}:
+        for sample in samples:
+            sample["http_status"] = 403 if kind == "permission" else 429
+    elif kind == "schema":
+        for sample in samples:
+            sample["failure_phase"] = "schema_validation"
+    elif kind == "isolated":
+        samples = samples[:1]
+    else:
+        for sample in samples:
+            sample["channel_count"] = 1
+    assert quotes._tw_mis_learn_batch_geometry(key, used, samples, stopped=True) == 80
+
+
+def test_geometry_old_jobs_cannot_over_reduce_or_restore_smaller_shape(monkeypatch):
+    key, _ = quotes._tw_mis_batch_geometry(80, 4.)
+
+    def learn(size):
+        rows = [{"channel_count": size, "failure_phase": "connect_tls_or_response_headers",
+                 "error_chain_types": ["ReadTimeout"]} for _ in range(4)]
+        return quotes._tw_mis_learn_batch_geometry(key, size, rows, stopped=True)
+
+    assert learn(80) == 40
+    assert learn(80) == 40
+    assert learn(40) == 20
+    assert learn(80) == 20
+    assert quotes._tw_mis_learn_batch_geometry(key, 1, [], stopped=False) == 20
+    assert quotes._tw_mis_batch_geometry(8, 4.)[1] == 8
+    assert quotes._tw_mis_batch_geometry(80, 8.)[1] == 80
+
+
+def test_geometry_learns_from_four_late_timeouts_with_successful_split_retry():
+    key, used = quotes._tw_mis_batch_geometry(80, 4.)
+    failure = {"channel_count": 80, "failure_phase": "connect_tls_or_response_headers",
+               "error_chain_types": ["ReadTimeout"]}
+    split = {"channel_count": 40, "request_role": "soft_retry", "http_status": 200,
+             "response_row_count": 40}
+    assert quotes._tw_mis_learn_batch_geometry(key, used, [failure] * 4 + [split], stopped=False) == 40
+
+
+def test_geometry_new_session_and_owner_do_not_inherit_failures(monkeypatch):
+    key, _ = quotes._tw_mis_batch_geometry(80, 4.)
+    quotes._TW_MIS_BATCH_LIMITS[key] = 10
+    assert quotes._tw_mis_batch_geometry(80, 4.)[1] == 10
+    monkeypatch.setattr(quotes.os, "getpid", lambda: key[0] + 1)
+    assert quotes._tw_mis_batch_geometry(80, 4.)[1] == 80
+    assert key not in quotes._TW_MIS_BATCH_LIMITS
+
+
+def test_geometry_new_trading_day_does_not_inherit_failures(monkeypatch):
+    from datetime import datetime, timedelta
+
+    observed = datetime.now(quotes.ZoneInfo("Asia/Taipei"))
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed.astimezone(tz) if tz else observed.replace(tzinfo=None)
+
+    monkeypatch.setattr(quotes, "datetime", Clock)
+    key, _ = quotes._tw_mis_batch_geometry(80, 4.)
+    quotes._TW_MIS_BATCH_LIMITS[key] = 10
+    observed += timedelta(days=1)
+    assert quotes._tw_mis_batch_geometry(80, 4.)[1] == 80
+    assert key not in quotes._TW_MIS_BATCH_LIMITS
 
 
 @pytest.mark.parametrize("failed", [False, True])
@@ -266,4 +375,96 @@ def test_opening_mis_budget_is_independent_of_the_model_quorum_wait(monkeypatch,
     provider = acquisition.configured_opening_providers(tmp_path)["official_mis"]
     provider(["2330"], np.array([99.]), lambda *_: None)
     assert seen[0]["request_timeout_seconds"] == 4.
+    assert seen[0]["soft_retry_seconds"] == 1.
     assert seen[0]["empty_chunk_retry_attempts"] == 0
+
+
+def test_soft_retry_splits_slow_batch_without_cancelling_original(monkeypatch, tmp_path):
+    original_release = threading.Event()
+    retry_received = threading.Event()
+    observed, calls, result = [], [], []
+
+    def get(params, timeout):
+        names = [channel.split("_")[1].split(".")[0] for channel in params["ex_ch"].split("|")]
+        calls.append(names)
+        assert timeout == 4.
+        if len(names) == 4:
+            assert original_release.wait(3.)
+        else:
+            retry_received.set()
+        return response([row(name) for name in names])
+
+    install_session(monkeypatch, get)
+    symbols = ["1000", "1001", "1002", "1003"]
+    def run():
+        result.append(quotes.fetch_tw_mis_last_prices(symbols, np.ones(4),
+            parquet_root=tmp_path, chunk_size=4, max_parallel_requests=1,
+            request_timeout_seconds=4., soft_retry_seconds=.05, empty_chunk_retry_attempts=0,
+            on_progress=lambda names, snapshot: observed.append((names, snapshot))))
+    worker = threading.Thread(target=run)
+    worker.start()
+    try:
+        assert retry_received.wait(1.)
+        deadline = time.monotonic() + 1.
+        while not observed and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert observed and worker.is_alive()  # hedge arrived while original still waits
+    finally:
+        original_release.set()
+        worker.join(4.)
+    assert not worker.is_alive()
+    assert calls[0] == symbols
+    assert sorted(len(names) for names in calls) == [2, 2, 4]
+    assert any(names == symbols for names, _snapshot in observed)  # late original accepted
+    assert result[0].available_count == 4
+    assert result[0].transport_timing["mis_soft_retry_requests"] == 2
+    assert result[0].transport_timing["mis_soft_retry_policy"] == "split_once_keep_original_running_v1"
+
+
+def test_soft_retry_never_bypasses_explicit_source_rate_limit(monkeypatch, tmp_path):
+    calls = []
+    def get(params, _timeout):
+        calls.append(params["ex_ch"])
+        denied = requests.Response()
+        denied.status_code = 429
+        raise requests.HTTPError(response=denied)
+
+    install_session(monkeypatch, get)
+    snapshot = quotes.fetch_tw_mis_last_prices(["2330", "2317"], np.ones(2),
+        parquet_root=tmp_path, chunk_size=1, max_parallel_requests=1,
+        request_timeout_seconds=4., soft_retry_seconds=.05, empty_chunk_retry_attempts=0,
+        on_progress=lambda *_: None)
+    assert len(calls) == 1
+    assert snapshot.transport_timing["mis_http_error_statuses"] == [429]
+    assert snapshot.transport_timing["mis_soft_retry_requests"] == 0
+
+
+def test_successful_soft_retries_free_next_priority_batch_without_closing_original(monkeypatch, tmp_path):
+    release = threading.Event()
+    next_batch = threading.Event()
+    seen, result = [], []
+    symbols = ["1000", "1001", "1002", "1003"]
+
+    def get(params, _timeout):
+        names = [channel.split("_")[1].split(".")[0] for channel in params["ex_ch"].split("|")]
+        seen.append(names)
+        if names == symbols[:2]:
+            assert release.wait(3.)
+        elif names == symbols[2:]:
+            next_batch.set()
+        return response([row(name) for name in names])
+
+    install_session(monkeypatch, get)
+    worker = threading.Thread(target=lambda: result.append(quotes.fetch_tw_mis_last_prices(
+        symbols, np.ones(4), parquet_root=tmp_path, chunk_size=2, max_parallel_requests=1,
+        request_timeout_seconds=4., soft_retry_seconds=.05, empty_chunk_retry_attempts=0,
+        on_progress=lambda *_: None)))
+    worker.start()
+    try:
+        assert next_batch.wait(1.), "slow original held the priority window after both retries returned"
+        assert worker.is_alive(), "original must still be accepted, not cancelled"
+    finally:
+        release.set()
+        worker.join(4.)
+    assert not worker.is_alive() and result[0].available_count == 4
+    assert seen[0] == symbols[:2] and symbols[2:] in seen

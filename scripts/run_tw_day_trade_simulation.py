@@ -81,6 +81,12 @@ TAIPEI = ZoneInfo("Asia/Taipei")
 _LATEST_SIGNAL_CACHE: dict[
     str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], dict[str, Any], list[dict[str, Any]]]
 ] = {}
+# A pre-open pointer is not today's executable opening decision. Remember its
+# stable file signature so the 09:00 poll does not repeatedly parse it or
+# enqueue a full-universe quote/eligibility/ledger pass while waiting for the
+# actual signal. This cache contains no financial state and changes to the
+# atomic pointer (including same-size replacements) invalidate it.
+_PREOPEN_POINTER_REJECTIONS: dict[str, tuple[tuple[int, ...], str]] = {}
 _ELIGIBILITY_CACHE: dict[
     tuple[str, str, str], tuple[set[str], dict[str, Any], dict[str, Any]]
 ] = {}
@@ -283,6 +289,23 @@ def _initial_opening_signal_proof(
     if (str(root_summary.get("signal_id") or "") != root_id
             or str(root_summary.get("market") or "") != str(spec.signal_market or spec.market)
             or str(root_summary.get("asof_date") or "")[:10] != detected_at.date().isoformat()):
+        return None
+    # Merely reading yesterday's or a pre-open warmup pointer after 09:00 is
+    # not proof that the underlying opening decision was published after the
+    # gate. In particular this also covers legacy summaries that do not carry
+    # execution_pointer_written_at. The artifact clock is only a necessary
+    # guard, not a substitute for the pointer-publication proof below.
+    try:
+        artifact_at = datetime.fromisoformat(
+            str(root_summary.get("artifact_published_at") or "").replace("Z", "+00:00")
+        )
+        if artifact_at.utcoffset() is None:
+            return None
+        artifact_at = artifact_at.astimezone(TAIPEI)
+        if (artifact_at.date() != detected_at.date()
+                or artifact_at.timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE):
+            return None
+    except (TypeError, ValueError):
         return None
     value = root_summary.get("execution_pointer_written_at")
     if value:
@@ -865,6 +888,9 @@ def _latest_signal(
     try:
         signature = _signal_file_signature(pointer_path)
         cache_key = str(pointer_path.resolve())
+        session_date = now.date().isoformat()
+        if _PREOPEN_POINTER_REJECTIONS.get(cache_key) == (signature, session_date):
+            return None
         cached = _LATEST_SIGNAL_CACHE.get(cache_key)
         if (cached and cached[0] == signature
                 and _signal_file_signature(Path(cached[3]["summary_path"])) == cached[1]
@@ -890,6 +916,20 @@ def _latest_signal(
         ready_at = datetime.fromisoformat(str(pointer["signal_ready_at"]).replace("Z", "+00:00"))
         published_at = datetime.fromisoformat(str(pointer["artifact_published_at"]).replace("Z", "+00:00"))
         if published_at < ready_at:
+            return None
+        if published_at.astimezone(TAIPEI).timetz().replace(tzinfo=None) < LIVE_ENTRY_GATE:
+            # Keep a single observation in the service journal without
+            # manufacturing a rejected ledger transaction or blocking the
+            # opening owner on a durable write. Recheck the pointer before
+            # caching the rejection to handle concurrent atomic publication.
+            if _signal_file_signature(pointer_path) == signature:
+                _PREOPEN_POINTER_REJECTIONS[cache_key] = (signature, session_date)
+                print(
+                    "[tw-day-trade-sim] opening_pointer=waiting_actual_opening_signal "
+                    f"market={market} signal={signal_id} "
+                    f"artifact_published_at={published_at.isoformat(timespec='microseconds')}",
+                    flush=True,
+                )
             return None
         summary_path = Path(str(pointer.get("summary_path") or ""))
         weights_path = Path(str(pointer.get("weights_path") or ""))

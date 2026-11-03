@@ -1,13 +1,19 @@
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
-$config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:STOCKAGENT_BINARY_IO_CONFIG)) | ConvertFrom-Json
+$config = $stockagentBinaryBatchConfig
+if ($null -eq $config) {
+    $config = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($env:STOCKAGENT_BINARY_IO_CONFIG)) | ConvertFrom-Json
+}
 $path = [IO.Path]::GetFullPath([string]$config.path)
 $completedStageRead = $config.mode -eq 'read' -and (
     $path.StartsWith('D:\stockagent-completed-benchmark-scratch\', [StringComparison]::OrdinalIgnoreCase) -or
-    $path.StartsWith('D:\stockagent-completed-offline-scratch\', [StringComparison]::OrdinalIgnoreCase))
+    $path.StartsWith('D:\stockagent-completed-offline-scratch\', [StringComparison]::OrdinalIgnoreCase) -or
+    $path.StartsWith('D:\stockagent-legacy-archive-stage\', [StringComparison]::OrdinalIgnoreCase))
+$retiredEncodingHash = $config.mode -eq 'hash' -and
+    $path.StartsWith('D:\stockagent-legacy-archive-stage\', [StringComparison]::OrdinalIgnoreCase)
 if ((!$path.StartsWith('D:\stockagent-cold-primary\', [StringComparison]::OrdinalIgnoreCase) -and
      !$path.StartsWith('D:\stockagent-backup-ingress-lab203\', [StringComparison]::OrdinalIgnoreCase) -and
-     !$completedStageRead) -or $path -ne [string]$config.path) {
+     (!$completedStageRead -and !$retiredEncodingHash)) -or $path -ne [string]$config.path) {
     throw 'Fixed D cold namespace required'
 }
 $stream = $null
@@ -32,6 +38,34 @@ try {
         $sha = ([BitConverter]::ToString($hash.ComputeHash($stream))).Replace('-', '').ToLowerInvariant()
         if ($stream.Position -ne [long]$config.expected_bytes) { throw 'Truncated full hash member' }
         @{bytes=$stream.Position; sha256=$sha; io='windows-filestream-hash-v1'} | ConvertTo-Json -Compress
+    } elseif ($config.mode -eq 'hash-chunks') {
+        if (!$path.StartsWith('D:\stockagent-cold-primary\', [StringComparison]::OrdinalIgnoreCase) -or
+            @($config.chunks).Count -lt 1 -or @($config.chunks).Count -gt 2048 -or
+            [long]$config.expected_bytes -gt 16GB) { throw 'Bounded immutable chunk reconstruction required' }
+        $hash = [Security.Cryptography.SHA256]::Create()
+        $total = [long]0
+        foreach ($chunk in $config.chunks) {
+            $chunkPath = [IO.Path]::GetFullPath([string]$chunk.path)
+            if (!$chunkPath.StartsWith('D:\stockagent-cold-primary\', [StringComparison]::OrdinalIgnoreCase) -or
+                $chunkPath -ne [string]$chunk.path) { throw 'Fixed immutable chunk path required' }
+            $stream = New-Object IO.FileStream($chunkPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read, 1MB, [IO.FileOptions]::SequentialScan)
+            if ($stream.Length -ne [long]$chunk.bytes) { throw 'Exact chunk size differs' }
+            $prefix = [Security.Cryptography.SHA256]::Create()
+            while (($count = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+                [void]$prefix.TransformBlock($buffer, 0, $count, $buffer, 0)
+                [void]$hash.TransformBlock($buffer, 0, $count, $buffer, 0)
+                $total += $count
+            }
+            [void]$prefix.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+            $chunkSha = ([BitConverter]::ToString($prefix.Hash)).Replace('-', '').ToLowerInvariant()
+            if ($stream.Position -ne [long]$chunk.bytes -or $chunkSha -ne [string]$chunk.sha256) { throw 'Full original chunk SHA differs' }
+            $stream.Dispose(); $stream = $null
+            $prefix.Dispose(); $prefix = $null
+        }
+        [void]$hash.TransformFinalBlock((New-Object byte[] 0), 0, 0)
+        $sha = ([BitConverter]::ToString($hash.Hash)).Replace('-', '').ToLowerInvariant()
+        if ($total -ne [long]$config.expected_bytes) { throw 'Full chunked original size differs' }
+        @{bytes=$total; sha256=$sha; chunks=@($config.chunks).Count; io='windows-chunk-original-sha-v1'} | ConvertTo-Json -Compress
     } elseif ($config.mode -eq 'copy') {
         $source = [IO.Path]::GetFullPath([string]$config.source)
         if (!$source.StartsWith('D:\stockagent-cold-primary\', [StringComparison]::OrdinalIgnoreCase) -or

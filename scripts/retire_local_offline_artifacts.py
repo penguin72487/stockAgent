@@ -23,6 +23,7 @@ import stat
 import sys
 import tempfile
 import time
+import traceback
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -49,15 +50,19 @@ from stockagent.data_sync.legacy_artifact_archive import (
     C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT,
     reviewed_offline_scratch_root,
     OPAQUE_SYMLINK_POLICY, _archive_symlinks, _opaque_symlinks_enabled,
+    _symlink_plan_matches_device_renumber, legacy_process_scope,
 )
 from stockagent.data_sync.legacy_artifact_retirement import (
     plan_legacy_retirement, apply_legacy_retirement, plan_legacy_quarantine_resume,
-    LegacyQuarantineTransportPending,
+    LegacyQuarantineAuditRequired, LegacyQuarantineTransportPending,
+    LegacyQuarantineProofExpired,
+    _idle_only_transport,
 )
 from stockagent.data_sync.packed_retention import RetentionConfig
 from stockagent.data_sync.packed_snapshots import resolve_latest_packed
 from stockagent.data_sync.syncthing_scan import CANONICAL_ROOT as D_PRIMARY_ROOT
 from stockagent.data_sync.remote_legacy_return import active_configuration_references, active_configuration_references_many, metadata_tree, real
+from stockagent.data_sync.materialized_cache import process_references
 
 COMMON_OWNER = Path('/run/lock/stockagent-remote-cold-artifact-ingress.lock')
 _PHASE_STACK = ContextVar('manual_retirement_phase_stack', default=())
@@ -157,7 +162,7 @@ def require_existing_fixed_d_stage(spec, sync_root: Path, target: Path, *, expec
 
 def prepare_or_resume_publication(spec, artifact_root, sync_root, target, *, repo_root,
                                   fixed_d_stage_only=False, expected_fixed_manifest_sha256=None,
-                                  d_stage_recovery_only=False):
+                                  d_stage_recovery_only=False, use_backup_reserve=False):
     """Resume a fixed commit, not an acceptance or a cached byte audit.
 
     The caller must still perform independent D recovery, the fresh complete
@@ -175,10 +180,18 @@ def prepare_or_resume_publication(spec, artifact_root, sync_root, target, *, rep
     if not (archive / 'legacy_archive_manifest.json').exists():
         with phase(target, 'prepare-exact-source-archive'):
             from stockagent.data_sync.legacy_artifact_archive import recover_complete_archive_manifest
+            def preparation_progress(observation):
+                atomic_write_json(target / 'preparation-progress.json', {
+                    'contract': 'manual-retirement-preparation-progress-v1',
+                    'observed_at_epoch': time.time(), **observation, 'acceptance': False,
+                })
             resumed = recover_complete_archive_manifest(
-                spec, artifact_root, manual_capture=True, repo_root=repo_root)
+                spec, artifact_root, manual_capture=True, repo_root=repo_root,
+                progress=preparation_progress)
             if resumed is None:
-                prepare_archive(spec, artifact_root, manual_capture=True, repo_root=repo_root)
+                prepare_archive(spec, artifact_root, manual_capture=True, repo_root=repo_root,
+                                progress=preparation_progress,
+                                **({'use_backup_reserve': True} if use_backup_reserve else {}))
     if published is None:
         # A complete uncommitted stage is fully verified inside the canonical
         # publisher before any commit, and again afterwards. Repeating that
@@ -350,21 +363,44 @@ def uniform_device_renumber_drift(before: dict, after: dict):
     if not isinstance(old, list) or not isinstance(current, list) or not old or len(old) != len(current):
         return None
     devices = set()
+    link_paths = set()
     for left, right in zip(old, current, strict=True):
-        if (left.get('kind') not in ('file', 'directory')
+        if (left.get('kind') not in ('file', 'directory', 'unsupported')
                 or any(left.get(key) != right.get(key) for key in ('path', 'kind'))
                 or left.get('cross_filesystem') is not False or right.get('cross_filesystem') is not False):
             return None
         first, second = left.get('signature'), right.get('signature')
         if (not isinstance(first, list) or not isinstance(second, list)
                 or len(first) != 7 or len(second) != 7 or first[1:] != second[1:]
+                or any(type(value) is not int for value in first + second)
                 or type(first[0]) is not int or type(second[0]) is not int
                 or first[0] < 0 or second[0] < 0 or first[0] == second[0]):
             return None
+        if left['kind'] == 'unsupported':
+            if not stat.S_ISLNK(first[5]) or first[6] != 1:
+                return None
+            link_paths.add(left['path'])
         devices.add((first[0], second[0]))
     if len(devices) != 1:
         return None
     original_device, current_device = next(iter(devices))
+    if link_paths:
+        if (before.get('symlink_policy') != OPAQUE_SYMLINK_POLICY
+                or after.get('symlink_policy') != OPAQUE_SYMLINK_POLICY
+                or not _symlink_plan_matches_device_renumber(
+                    before.get('symlinks'), after.get('symlinks'), (original_device, current_device))):
+            return None
+        for observations, links in ((old, before['symlinks']), (current, after['symlinks'])):
+            links_by_path = {link['path']: link['source'] for link in links}
+            if set(links_by_path) != link_paths:
+                return None
+            for row in observations:
+                if row['path'] in link_paths:
+                    sig = row['signature']
+                    if links_by_path[row['path']] != dict(zip(
+                            ('device', 'inode', 'size', 'mtime_ns', 'ctime_ns', 'mode'),
+                            (*sig[:5], stat.S_IMODE(sig[5])))):
+                        return None
     return {'contract': 'uniform-device-renumber-admission-v1',
             'original_device': original_device, 'current_device': current_device,
             'unchanged_other_observation_rows': len(old), 'source_bytes_verified': False,
@@ -484,7 +520,11 @@ def stage_profile(inventory: dict) -> tuple[Path, bool]:
 
 def apply(inventory_path: Path, receipt_dir: Path, *, wait_for_owner: bool = False,
           expected_inventory_sha256: str | None = None, fixed_d_stage_only: bool = False,
-          expected_fixed_manifest_sha256: str | None = None, d_stage_recovery_only: bool = False) -> dict:
+          expected_fixed_manifest_sha256: str | None = None, d_stage_recovery_only: bool = False,
+          use_backup_reserve: bool = False) -> dict:
+    if type(use_backup_reserve) is not bool or (use_backup_reserve and not (
+            fixed_d_stage_only or d_stage_recovery_only)):
+        raise SnapshotError('backup reserve use requires an explicit guarded-D recovery mode')
     before = inventory_path.read_bytes()
     if d_stage_recovery_only and (fixed_d_stage_only or expected_inventory_sha256 is None):
         raise SnapshotError('D recovery mode requires a pinned inventory and a single resource mode')
@@ -502,9 +542,11 @@ def apply(inventory_path: Path, receipt_dir: Path, *, wait_for_owner: bool = Fal
         fcntl.flock(owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
         if fixed_d_stage_only:
             return _apply(inventory_path, before, receipt_dir, fixed_d_stage_only=True,
-                          expected_fixed_manifest_sha256=expected_fixed_manifest_sha256)
+                          expected_fixed_manifest_sha256=expected_fixed_manifest_sha256,
+                          **({'use_backup_reserve': True} if use_backup_reserve else {}))
         if d_stage_recovery_only:
-            return _apply(inventory_path, before, receipt_dir, d_stage_recovery_only=True)
+            return _apply(inventory_path, before, receipt_dir, d_stage_recovery_only=True,
+                          **({'use_backup_reserve': True} if use_backup_reserve else {}))
         return _apply(inventory_path, before, receipt_dir)
 
 
@@ -585,19 +627,95 @@ def verified_retained_benchmark(target, original_source):
     return saved
 
 
-def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict):
-    """Wait for transient scans without discarding or extending a full audit.
+def audit_quarantine_resume(spec, prior_plan: dict, options: dict, target: Path, attempt: int):
+    """Expose bounded live audit observations, separate from retirement proof."""
+    started = time.monotonic()
+    last_report = None
+    last_value: dict = {}
 
-    Only transport observations may change while queued. The canonical apply
-    still refreshes every gate and rejects changed generations or expired proof.
-    Return None only when the caller must repeat its full audit outside the lock.
+    def report(value, *, force=False):
+        nonlocal last_report, last_value
+        now = time.monotonic()
+        step = (value.get('audit_step'), value.get('stage'), value.get('state', 'running'))
+        previous = (last_value.get('audit_step'), last_value.get('stage'), last_value.get('state'))
+        complete = ('total_items' in value and value['total_items'] is not None
+                    and value.get('completed_items') == value['total_items'])
+        if not force and last_report is not None and now - last_report < 5 and step == previous and not complete:
+            return
+        record = {
+            'contract': 'manual-quarantine-audit-progress-v1',
+            'dataset': spec.dataset, 'snapshot_id': prior_plan['snapshot_id'],
+            'manifest_sha256': prior_plan['manifest_sha256'], 'attempt': attempt,
+            'state': 'running', **value, 'checked_at_epoch': time.time(),
+            'elapsed_seconds': now - started, 'acceptance_proof': False,
+        }
+        atomic_write_json(target / 'quarantine-audit-progress.json', record, durable=False)
+        print(json.dumps({'event': 'quarantine-audit-progress', **record}), flush=True)
+        last_report, last_value = now, record
+
+    report({'audit_step': 'starting'}, force=True)
+    try:
+        result = plan_legacy_quarantine_resume(spec, prior_plan, progress=report, **options)
+    except BaseException as error:
+        report({**last_value, 'state': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
+                'error_type': type(error).__name__}, force=True)
+        raise
+    report({'audit_step': 'full-audit-complete', 'state': 'verified'}, force=True)
+    return result
+
+
+def _wait_for_artifact_process_references(spec, options: dict, seconds: int = 30) -> bool:
+    """Boundedly wait outside the mutation owner for a real process to leave."""
+    artifact_root = Path(options['artifact_root'])
+    source = artifact_root / spec.relative_root
+    hot_tree = Path(options['hot_root']) / spec.relative_root
+    deadline = time.monotonic() + seconds
+    while True:
+        references = artifact_process_references(source, legacy_process_scope(spec, artifact_root))
+        if hot_tree.is_dir():
+            references.extend(process_references(hot_tree))
+        if not references:
+            return True
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        time.sleep(min(2, remaining))
+
+
+def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict,
+                             *, separate_quarantine_audit: bool = False):
+    """Wait for transient scans and readers without extending a full audit.
+
+    The canonical apply still refreshes every gate and rejects changed
+    generations or expired proof. Return None only when the caller must repeat
+    its full audit outside the lock.
     """
+    if type(separate_quarantine_audit) is not bool:
+        raise SnapshotError('separate quarantine audit must be an explicit boolean')
     transport_blockers = {'cold-peer-not-converged', 'peer-proof-stale',
                           'peer-proof-missing-timestamp'}
-    if set(plan['blockers']) - transport_blockers or not plan.get('full_verification'):
+    process_blocker = 'artifact-has-process-references'
+    pending_process = process_blocker in plan['blockers'] and not plan.get('quarantine_resume')
+    allowed = transport_blockers | ({process_blocker} if pending_process else set())
+    if set(plan['blockers']) - allowed or not plan.get('full_verification'):
         raise SnapshotError('canonical retirement blocked: ' + str(plan['blockers']))
     verified_at = plan['full_verification']['verified_at_epoch']
     for attempt in range(3):
+        if pending_process:
+            if not 0 <= time.time() - verified_at <= 1500:
+                return None
+            with phase(target, 'wait-for-artifact-process-references'):
+                clear = _wait_for_artifact_process_references(spec, options)
+            atomic_write_json(target / 'retirement-process-wait.json', {
+                'references_cleared': clear, 'checked_at_epoch': time.time(),
+                'original_verified_at_epoch': verified_at, 'proof_time_extended': False,
+                'preflight_attempt': attempt + 1,
+            })
+            if not 0 <= time.time() - verified_at <= 1500:
+                return None
+            if not clear:
+                raise SnapshotError('canonical retirement blocked: artifact-has-process-references')
+            pending_process = False
         while True:
             age = time.time() - verified_at
             if not 0 <= age <= 1500:
@@ -616,6 +734,7 @@ def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict)
                 return None
             if peer.get('ok') is True:
                 break
+        audit_quarantine = False
         with phase(target, 'wait-for-retirement-owner'):
             with COMMON_OWNER.open('a') as common:
                 fcntl.flock(common, fcntl.LOCK_EX)
@@ -624,33 +743,108 @@ def retire_after_convergence(spec, cfg, target: Path, plan: dict, options: dict)
                 if Path(spec.relative_root).parts[0] == 'benchmarks':
                     verified_retained_benchmark(target, options['artifact_root'] / spec.relative_root)
                 try:
-                    with phase(target, 'verify-and-retire-hot-source'):
+                    phase_name = ('quarantine-before-independent-audit'
+                                  if separate_quarantine_audit and not plan.get('quarantine_resume')
+                                  else 'verify-and-retire-hot-source')
+                    with phase(target, phase_name):
                         apply_options = dict(options)
                         if (plan.get('quarantine_resume') is True
                                 and plan['full_verification'].get('contract') ==
                                     'owned-legacy-quarantine-resume-v2'):
                             apply_options['defer_quarantine_transport'] = True
-                        return apply_legacy_retirement(spec,
-                            expected_fingerprint=plan['plan_fingerprint'],
-                            owned_verified_plan=plan, **apply_options)
+                        if separate_quarantine_audit and not plan.get('quarantine_resume'):
+                            apply_options['defer_owned_post_rename_audit'] = True
+                        try:
+                            return apply_legacy_retirement(spec,
+                                expected_fingerprint=plan['plan_fingerprint'],
+                                owned_verified_plan=plan, **apply_options)
+                        except LegacyQuarantineAuditRequired:
+                            if not separate_quarantine_audit or plan.get('quarantine_resume'):
+                                raise
+                            audit_quarantine = True
                 except SnapshotError as error:
+                    if (isinstance(error, LegacyQuarantineProofExpired)
+                            and plan.get('quarantine_resume') is True):
+                        # This typed outcome proves no unlink started and the
+                        # complete quarantine generation still matches. Release
+                        # both owners; the caller runs its existing bounded full
+                        # audit loop. Never renew the old verification timestamp.
+                        atomic_write_json(target / f'quarantine-audit-expired-{time.time_ns()}.json', {
+                            'state': 'fresh_full_quarantine_audit_required',
+                            'error': str(error), 'original_verified_at_epoch': verified_at,
+                            'checked_at_epoch': time.time(), 'proof_time_extended': False,
+                            'unlink_started': False,
+                        })
+                        return None
                     # The normal preflight precedes all mutation. Only the
                     # distinct owned-resume outcome additionally proves its
                     # already existing quarantine has not started unlink.
                     # Never retry a partial unlink or a combined/new blocker.
                     safe_resume_wait = (isinstance(error, LegacyQuarantineTransportPending)
                                         and plan.get('quarantine_resume') is True)
+                    safe_process_wait = (str(error) ==
+                        'legacy retirement blocked: artifact-has-process-references'
+                        and plan.get('quarantine_resume') is not True)
                     if ((str(error) != 'legacy retirement blocked: cold-peer-not-converged'
-                            and not safe_resume_wait)
-                            or attempt == 2):
+                            and not safe_resume_wait and not safe_process_wait) or attempt == 2):
                         raise
+                    pending_process = safe_process_wait
                     atomic_write_json(target / f'transport-preflight-retry-{time.time_ns()}.json', {
-                        'state': ('retry_owned_quarantine_transport_before_unlink' if safe_resume_wait
+                        'state': ('retry_process_preflight_without_mutation' if safe_process_wait else
+                                  'retry_owned_quarantine_transport_before_unlink' if safe_resume_wait
                                   else 'retry_transport_preflight_without_mutation'),
                         'attempt': attempt + 1, 'error': str(error),
                         'original_verified_at_epoch': verified_at,
                         'checked_at_epoch': time.time(), 'proof_time_extended': False,
                     })
+        if audit_quarantine:
+            # Both original names are in the canonical quarantine. Perform
+            # the mandatory full cold and original-byte audit outside the
+            # shared mutation owner, then reacquire it through the existing
+            # owned-resume gates. An expired audit is repeated, never renewed.
+            for audit_attempt in range(3):
+                with phase(target, 'full-quarantine-resume-audit'):
+                    resumed = audit_quarantine_resume(spec, plan, options, target, audit_attempt + 1)
+                    atomic_write_json(target / 'quarantine-resume-plan.json', resumed)
+                result = retire_after_convergence(spec, cfg, target, resumed, options)
+                if result is not None:
+                    return result
+            raise SnapshotError('complete quarantine audit repeatedly expired before mutation')
+
+
+@contextmanager
+def stage_prune_progress(spec, target, retired):
+    """Report stage work without treating an observation as a deletion receipt."""
+    started = time.monotonic()
+    last_report = None
+    last_value = {}
+
+    def report(value, *, force=False):
+        nonlocal last_report, last_value
+        now = time.monotonic()
+        step = (value.get('prune_step'), value.get('stage'), value.get('state', 'running'))
+        previous = (last_value.get('prune_step'), last_value.get('stage'), last_value.get('state'))
+        complete = (value.get('total_items') is not None
+                    and value.get('completed_items') == value['total_items'])
+        if not force and last_report is not None and now - last_report < 5 and step == previous and not complete:
+            return
+        record = {'contract': 'manual-stage-prune-progress-v1', 'dataset': spec.dataset,
+                  'snapshot_id': retired['snapshot_id'], 'manifest_sha256': retired['manifest_sha256'],
+                  'state': 'running', **value, 'checked_at_epoch': time.time(),
+                  'elapsed_seconds': now - started, 'acceptance_proof': False}
+        atomic_write_json(target / 'stage-prune-progress.json', record, durable=False)
+        print(json.dumps({'event': 'stage-prune-progress', **record}), flush=True)
+        last_report, last_value = now, record
+
+    report({'prune_step': 'start'}, force=True)
+    try:
+        yield report
+    except BaseException as error:
+        report({**last_value, 'state': 'interrupted' if isinstance(error, KeyboardInterrupt) else 'failed',
+                'error_type': type(error).__name__}, force=True)
+        raise
+    else:
+        report({'prune_step': 'stage-prune-receipt-written', 'state': 'completed'}, force=True)
 
 
 def finish_retirement(spec, cfg, target, retired, *, source_origin=None, fixed_d_stage_only=False,
@@ -675,11 +869,16 @@ def finish_retirement(spec, cfg, target, retired, *, source_origin=None, fixed_d
                     state_root=states, owned_failed_plan=failed_plan,
                     journal=target / f'stage-quarantine-recovery-{time.time_ns()}.json')
         if stage.exists():
-            prune = plan_archive_stage_prune(spec, cfg.sync_root, artifact_root=artifact_root, state_root=states)
-            atomic_write_json(target / 'stage-prune-plan.json', prune)
-            pruned = apply_archive_stage_prune(spec, cfg.sync_root, artifact_root=artifact_root,
-                state_root=states, expected_fingerprint=prune['stage_fingerprint'], owned_verified_plan=prune)
-            atomic_write_json(target / 'stage-pruned.json', pruned)
+            with stage_prune_progress(spec, target, retired) as report:
+                with phase(target, 'plan-encoding-stage-prune'):
+                    prune = plan_archive_stage_prune(spec, cfg.sync_root, artifact_root=artifact_root,
+                                                     state_root=states, progress=report)
+                    atomic_write_json(target / 'stage-prune-plan.json', prune)
+                with phase(target, 'apply-encoding-stage-prune'):
+                    pruned = apply_archive_stage_prune(spec, cfg.sync_root, artifact_root=artifact_root,
+                        state_root=states, expected_fingerprint=prune['stage_fingerprint'],
+                        owned_verified_plan=prune, progress=report)
+                    atomic_write_json(target / 'stage-pruned.json', pruned)
         else:
             if fixed_d_stage_only or d_stage_recovery_only:
                 raise SnapshotError('D-stage mode cannot create a replacement recovery workspace')
@@ -705,18 +904,40 @@ def finish_retirement(spec, cfg, target, retired, *, source_origin=None, fixed_d
     return accepted
 
 
-def retirement_options(cfg, artifact_root, mirror_root, states, activations):
+def retirement_options(cfg, artifact_root, mirror_root, states, activations, *,
+                       allow_audit_during_idle_scan: bool = False):
+    """Refresh transport, without serializing a safe read-only resume audit.
+
+    An otherwise healthy local Syncthing scan may overlap the quarantine audit;
+    its result is still a pending blocker until the existing unlink gates see
+    fresh convergence. All other transport failures keep the original wait.
+    """
+    if type(allow_audit_during_idle_scan) is not bool:
+        raise SnapshotError('idle scan audit overlap must be an explicit boolean')
+    peer = _wait_for_convergence(cfg, 0 if allow_audit_during_idle_scan else 300)
+    if allow_audit_during_idle_scan and peer.get('ok') is not True and not _idle_only_transport(peer):
+        peer = _wait_for_convergence(cfg, 300)
     return dict(repo_root=ROOT, artifact_root=artifact_root,
         hot_root=mirror_root, sync_root=cfg.sync_root,
         materialized_root=cfg.materialized_root, state_root=states,
         activation_root=activations, backup_config=cfg.backup_config,
-        peer_proof=_wait_for_convergence(cfg, 300), peer_probe=lambda: _syncthing(cfg),
+        peer_proof=peer, peer_probe=lambda: _syncthing(cfg),
         bridge_inactive=_bridge_inactive(Path('/srv/stockagent-artifacts-hot')),
         manual_immediate=True, manual_capture=True)
 
 
+def _failure_diagnostics(error: BaseException) -> dict:
+    """Keep call sites for troubleshooting without serializing local variables."""
+    frames = traceback.extract_tb(error.__traceback__)[-12:]
+    return {'error_type': type(error).__name__,
+            'errno': error.errno if isinstance(error, OSError) else None,
+            'traceback_frames': [{'file': frame.filename, 'line': frame.lineno,
+                                  'function': frame.name} for frame in frames]}
+
+
 def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path, *, fixed_d_stage_only: bool = False,
-           expected_fixed_manifest_sha256: str | None = None, d_stage_recovery_only: bool = False) -> dict:
+           expected_fixed_manifest_sha256: str | None = None, d_stage_recovery_only: bool = False,
+           use_backup_reserve: bool = False) -> dict:
     inv = json.loads(raw)
     mode_options = ({'fixed_d_stage_only': True, 'expected_fixed_manifest_sha256': expected_fixed_manifest_sha256}
                     if fixed_d_stage_only else {})
@@ -845,10 +1066,11 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path, *, fixed_d_stage
                         raise SnapshotError('interrupted retirement fixed D identity differs')
                 atomic_write_json(target/'quarantine-cold-recovery.json',
                                   {k:v for k,v in proof.items() if k != 'manifest'})
-                options = retirement_options(cfg, artifact_root, mirror_root, states, activations)
+                options = retirement_options(cfg, artifact_root, mirror_root, states, activations,
+                                             allow_audit_during_idle_scan=True)
                 for attempt in range(3):
                     with phase(target, 'full-quarantine-resume-audit'):
-                        plan = plan_legacy_quarantine_resume(spec, original_plan, **options)
+                        plan = audit_quarantine_resume(spec, original_plan, options, target, attempt + 1)
                         atomic_write_json(target/'quarantine-resume-plan.json', plan)
                     retired = retire_after_convergence(spec, cfg, target, plan, options)
                     if retired is not None:
@@ -866,7 +1088,11 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path, *, fixed_d_stage
                    if current['fingerprint'] != row['fingerprint'] else [])
             renumber = (uniform_device_renumber_drift(row, current)
                         if current['fingerprint'] != row['fingerprint'] and drift is None else None)
-            if (current['blockers'] or (link_policy and current['symlinks'] != row['symlinks'])
+            links_compatible = (not link_policy or current['symlinks'] == row['symlinks']
+                                or (renumber is not None and _symlink_plan_matches_device_renumber(
+                                    row['symlinks'], current['symlinks'],
+                                    (renumber['original_device'], renumber['current_device']))))
+            if (current['blockers'] or not links_compatible
                     or (current['fingerprint'] != row['fingerprint'] and drift is None and renumber is None)):
                 raise SnapshotError('offline source changed or has current consumers: ' + str(current['blockers'][:3]))
             if drift:
@@ -898,7 +1124,8 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path, *, fixed_d_stage
             # publishers progressing while the canonical preparation completes.
             if not row.get('existing_dataset'):
                 published = prepare_or_resume_publication(spec, artifact_root, cfg.sync_root, target, repo_root=ROOT,
-                                                          **mode_options)
+                                                          **mode_options,
+                                                          **({'use_backup_reserve': True} if use_backup_reserve else {}))
             with phase(target, 'independent-D-original-recovery'):
                 proof = verify_for_retirement(spec, cfg.sync_root, target, **mode_options)
                 if not row.get('existing_dataset') and any(
@@ -910,7 +1137,9 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path, *, fixed_d_stage
                 with phase(target, 'full-source-mirror-D-retirement-audit'):
                     plan = plan_legacy_retirement(spec, **options)
                     atomic_write_json(target / 'retirement-plan.json', plan)
-                retired = retire_after_convergence(spec, cfg, target, plan, options)
+                retired = retire_after_convergence(
+                    spec, cfg, target, plan, options,
+                    separate_quarantine_audit=(fixed_d_stage_only or d_stage_recovery_only))
                 if retired is not None:
                     break
             else:
@@ -920,7 +1149,7 @@ def _apply(inventory_path: Path, raw: bytes, receipt_dir: Path, *, fixed_d_stage
             results.append(accepted)
         except (OSError, ValueError, SnapshotError) as error:
             results.append({'relative_root': relative, 'retired': False, 'error': str(error)})
-            atomic_write_json(target / 'failure.json', results[-1])
+            atomic_write_json(target / 'failure.json', {**results[-1], **_failure_diagnostics(error)})
         progress = {'contract': MANUAL_WSL_CAPTURE_CONTRACT, 'inventory_sha256': hashlib.sha256(raw).hexdigest(),
                     'checked_at_epoch': time.time(), 'items': results,
                     'reclaimed_allocated_bytes': sum(r.get('reclaimed_allocated_bytes', 0) for r in results),
@@ -966,6 +1195,8 @@ def main():
                         help='Require the existing exact D stage and fixed publication; never create a replacement workspace')
     parser.add_argument('--d-stage-recovery-only', action='store_true',
                         help='Prepare on guarded D and require its complete encoding for recovery; never recreate a C tree')
+    parser.add_argument('--use-backup-reserve', action='store_true',
+                        help='Use the pool earmarked for this explicitly selected guarded-D backup/recovery')
     parser.add_argument('--expected-fixed-manifest-sha256',
                         help='Pin the completed cold release used by fixed-stage capacity admission')
     parser.add_argument('--retry-rounds', type=int, default=1, choices=(1, 2, 3),
@@ -977,7 +1208,7 @@ def main():
     if args.command == 'inventory':
         if (args.wait_for_owner or args.retry_rounds != 1 or args.expected_inventory_sha256 is not None
                 or args.fixed_d_stage_only or args.expected_fixed_manifest_sha256 is not None
-                or args.d_stage_recovery_only):
+                or args.d_stage_recovery_only or args.use_backup_reserve):
             parser.error('owner wait and retries apply only to the frozen cleanup')
         if args.minute_view_name and (not args.minute_derived_view or args.relative_root or args.existing_dataset):
             parser.error('minute view names require only the separate minute-derived-view role')
@@ -1014,6 +1245,8 @@ def main():
             options['fixed_d_stage_only'] = True
         if args.d_stage_recovery_only:
             options['d_stage_recovery_only'] = True
+        if args.use_backup_reserve:
+            options['use_backup_reserve'] = True
         if args.expected_fixed_manifest_sha256 is not None:
             options['expected_fixed_manifest_sha256'] = args.expected_fixed_manifest_sha256
         result = apply(args.inventory, args.receipt_dir, **options)

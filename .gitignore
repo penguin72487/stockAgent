@@ -199,6 +199,7 @@ data_parquet/*
 data_yahoo/*
 data_peperstone/*
 artifacts/*
+/service_data/
 *.7z
 *.tar.zst
 artifacts_test/*

@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import json
+import threading
 import time
 from zoneinfo import ZoneInfo
 from types import SimpleNamespace
@@ -250,6 +251,27 @@ def test_durable_source_repair_retries_a_completely_missing_response(monkeypatch
     assert requests == [["B"], ["B"]]
     receipt = json.loads(quotes._tw_mis_opening_receipt_path(session).read_text())
     assert receipt["requested_count"] == 2 and receipt["missing_open_symbols"] == []
+
+
+def test_repair_observer_returns_while_the_original_source_keeps_listening(monkeypatch, tmp_path):
+    quotes.seed_tw_opening_snapshot_cache(["A"], snapshot([np.nan], available=[False]), parquet_root=tmp_path)
+    started, release = threading.Event(), threading.Event()
+    def slow_mis(requested, fallback, **kwargs):
+        started.set()
+        assert release.wait(3.)
+        return snapshot([101.])
+    monkeypatch.setattr(quotes, "fetch_tw_mis_last_prices", slow_mis)
+    session = datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        result = pool.submit(quotes.repair_tw_opening_snapshot_receipt, parquet_root=tmp_path, session_date=session)
+        try:
+            assert started.wait(1.)
+            assert result.result(timeout=1.5)["status"] == "waiting_source"
+        finally:
+            release.set()
+    assert acquisition.OPENING_FAN_IN.wait_idle(timeout_seconds=3.)
+    recovered = quotes.repair_tw_opening_snapshot_receipt(parquet_root=tmp_path, session_date=session)
+    assert recovered["status"] == "complete" and recovered["valid_open_count"] == 1
 
 
 def test_repair_cannot_backdate_current_quotes(tmp_path):

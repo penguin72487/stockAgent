@@ -132,6 +132,10 @@ def test_tx_front_roll_uses_new_contract_own_previous_close(tmp_path: Path) -> N
         load_tx_front_rolling_benchmark(
             path, np.append(dates, np.datetime64("2026-01-07"))
         )
+    # Both endpoints exist in TX, but dropping the middle session would lose
+    # its price move and draw a misleading continuous equity curve.
+    with pytest.raises(ValueError, match="panel is missing a TX source session: 2026-01-05"):
+        load_tx_front_rolling_benchmark(path, dates[[0, 2]])
 
 
 def _stock_panel(rows: int = 3, symbols: int = 2) -> PanelData:

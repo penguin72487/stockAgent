@@ -1,9 +1,12 @@
 import pytest
+import base64
+import hashlib
 
 from urllib.parse import parse_qs, urlsplit
 
 from scripts.verify_tw_day_trade_mode_browser import (
-    _expected_beacon_csp_denial, _failed_viewport_evidence, _is_cloudflare_beacon, _prepare_output_dir,
+    _expected_beacon_csp_denial, _expected_challenge_csp_denial,
+    _failed_viewport_evidence, _is_cloudflare_beacon, _prepare_output_dir,
     _signal_url, _verify_signal_boundary,
 )
 
@@ -136,3 +139,22 @@ def test_only_self_only_csp_denial_of_known_optional_beacon_is_security_evidence
     assert _expected_beacon_csp_denial(message.replace("The action has been blocked.", "Report only.")) is False
     assert _expected_beacon_csp_denial(message.replace("script-src 'self'", "script-src https:")) is False
     assert _expected_beacon_csp_denial("Uncaught TypeError: application crashed") is False
+
+
+def test_blocked_edge_script_requires_exact_dom_bytes_and_reviewed_full_wrapper(monkeypatch):
+    from scripts import verify_tw_day_trade_mode_browser as browser
+    source = "r:'0123456789abcdef',t:'MTc5MzI4MTg5Nw=='; /* controlled test wrapper */"
+    normalized = source.replace("0123456789abcdef", "<ray>").replace("MTc5MzI4MTg5Nw==", "<time>")
+    monkeypatch.setattr(browser, "_REVIEWED_CF_BOOTSTRAPS", {hashlib.sha256(normalized.encode()).hexdigest()})
+    digest = base64.b64encode(hashlib.sha256(source.encode()).digest()).decode()
+    message = ("Executing inline script violates the following Content Security Policy directive 'script-src 'self''. "
+               f"Either the 'unsafe-inline' keyword, a hash ('sha256-{digest}'), or a nonce is required. "
+               "The action has been blocked.")
+    assert _expected_challenge_csp_denial(message, [source]) is True
+    assert _expected_challenge_csp_denial(message, []) is False
+    assert _expected_challenge_csp_denial(message, [source + "alert(1)"]) is False
+    assert _expected_challenge_csp_denial(message.replace(digest, "wrong-hash"), [source]) is False
+    assert _expected_challenge_csp_denial(message.replace("script-src 'self'", "script-src https:"), [source]) is False
+    assert _expected_challenge_csp_denial("application crashed " + message, [source]) is False
+    monkeypatch.setattr(browser, "_REVIEWED_CF_BOOTSTRAPS", set())
+    assert _expected_challenge_csp_denial(message, [source]) is False

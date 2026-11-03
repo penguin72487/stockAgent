@@ -103,7 +103,7 @@ def test_public_projection_adds_validated_timing_without_promoting_old_snapshot(
     old, lifecycle = seed(tmp_path)
     lifecycle.snapshot_written()
     result = build_news_public_status(tmp_path)
-    assert result['worker_lifecycle_projection_contract_version'] == 2
+    assert result['worker_lifecycle_projection_contract_version'] == 3
     assert result['health'] == 'initializing' and not result['worker']['fresh']
     old.update(owner_id='b' * 32, activity='running', updated_at_utc=datetime.now(UTC).isoformat())
     _save(tmp_path, old)

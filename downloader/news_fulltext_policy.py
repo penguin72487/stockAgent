@@ -29,6 +29,7 @@ _GLOBALVOICES_HTML_BODY_CONTRACT_VERSION = 10
 GLOBALVOICES_PHOTO_CREDIT_OUTCOME_CONTRACT_VERSION = 1
 GLOBALVOICES_EMPTY_OUTCOME_CONTRACT_VERSION = 1
 GLOBALVOICES_FEED_BODY_CONTRACT_VERSION = 3
+CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION = 1
 CAPTURE_POLICY_VERSION = 2
 TRACKING_KEYS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})
 # Reviewed source revisions, not an unbounded parser or automatic upgrade.
@@ -212,6 +213,9 @@ def parser_repair_fingerprint(payload: dict[str, Any]) -> str:
     # This exact figure proof only changes locally retained HTML versions. It
     # must not requeue bulk/API failures or reset HTTP pacing/refusal evidence.
     normalized.pop('verified_outer_chart_caption_contract_version', None)
+    # CMNews clock provenance describes a successful extraction only. It does
+    # not change admission, rights, parser failure outcomes or HTTP scope.
+    normalized.pop('cmnews_schema_clock_basis_contract_version', None)
     entry = dict(payload['entry'])
     for field in ('acquisition_mode', 'private_known_url_scope', 'note',
                   'interval_seconds', 'parallelism', 'discovery_interval_seconds',
@@ -1317,6 +1321,8 @@ class PolicyRegistry:
                      "tainan_visible_news_v1": 2, "voa_reviewed_private_article_v2": 3,
                      "taichung_visible_news_v1": 2,
                      **MAX_LAYOUT_VERSIONS}.get(embedded, 1))
+            if cmnews_layout and CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION:
+                fingerprint_payload['cmnews_schema_clock_basis_contract_version'] = CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION
             if tainan_layout:
                 fingerprint_payload["verified_html_separator_request_alias_contract_version"] = 2
             if provider == "globalvoices":
@@ -1987,12 +1993,19 @@ class PolicyRegistry:
                 # ABI 8 admits a proved whole short native announcement table.
                 # HTTP/refusal identity remains ABI 6; only the exact preceding
                 # ABI 7 capture can reopen an observed missing-body failure.
+                # The separate schema-clock provenance label changes neither
+                # source HTTP nor the v7-to-v8 missing-body repair identity.
                 capacity_payload = dict(fingerprint_payload)
+                capacity_payload.pop('cmnews_schema_clock_basis_contract_version', None)
                 capacity_payload['embedded_article_adapter_contract_version'] = 6
                 capacity_fingerprint = hashlib.sha256(json.dumps(capacity_payload, sort_keys=True).encode()).hexdigest()
                 prior_payload = dict(fingerprint_payload)
+                prior_payload.pop('cmnews_schema_clock_basis_contract_version', None)
                 prior_payload['embedded_article_adapter_contract_version'] = 7
                 prior_capture_fingerprint = hashlib.sha256(json.dumps(prior_payload, sort_keys=True).encode()).hexdigest()
+                if CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION:
+                    prior_payload['embedded_article_adapter_contract_version'] = 8
+                    capture_history = (hashlib.sha256(json.dumps(prior_payload, sort_keys=True).encode()).hexdigest(),)
             elif max_layout and MAX_LAYOUT_VERSIONS[embedded] >= 2:
                 # Only the native body/metadata interpretation ABI changes.
                 # Bind recovery to the exact old source/auth/endpoint entry;

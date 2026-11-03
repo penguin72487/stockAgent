@@ -69,6 +69,97 @@ def test_outcome_keeps_economics_but_not_new_audit_identity():
     assert repair._outcome(first) != repair._outcome(second)
 
 
+def _published_fixture(tmp_path):
+    import hashlib
+    import polars as pl
+    from stockagent.live.opening_signal_revision import revision_fields
+    config, checkpoint = tmp_path / "config.yaml", tmp_path / "checkpoint.pt"
+    config.write_text("config")
+    checkpoint.write_bytes(b"checkpoint")
+    spec = SimpleNamespace(market="m", signal_market=None, config_path=str(config),
+                           checkpoint_path=str(checkpoint), live_output_dir=tmp_path / "signals")
+    previous = None
+    paths = []
+    for index, (clock, restart) in enumerate((("09:00:10", True), ("09:00:20", False),
+                                             ("09:02:10", True), ("13:19:10", False))):
+        if restart:
+            previous = None
+        signal_id = f"signal-{index}"
+        stamp = f"2026-10-29T{clock}+08:00"
+        summary = dict(signal_id=signal_id, market="m", execution_mode="tw_day_trade",
+            asof_date="2026-10-29", signal_started_at=stamp, generated_at=stamp,
+            artifact_published_at=stamp, execution_pointer_written_at=stamp,
+            config_fingerprint=repair.short_file_fingerprint(config),
+            checkpoint_fingerprint=repair.short_file_fingerprint(checkpoint))
+        summary.update(revision_fields(policy=repair.SIGNAL_UPDATE_PROGRESSIVE, signal_id=signal_id,
+            input_fingerprint=hashlib.sha256(signal_id.encode()).hexdigest(), previous=previous))
+        path = spec.live_output_dir / f"2026-10-29_{index}" / signal_id / "summary.json"
+        path.parent.mkdir(parents=True)
+        path.write_text(json.dumps(summary))
+        pl.DataFrame({"symbol": ["2330"], "target_weight": [.2]}).write_parquet(path.with_name("target_weights.parquet"))
+        previous = summary
+        paths.append(path)
+    return spec, paths
+
+
+def test_published_revision_plan_keeps_restarts_and_superseded_decisions(tmp_path):
+    spec, paths = _published_fixture(tmp_path)
+    plan = repair._published_revision_inventory(spec, date(2026, 10, 29))
+    assert plan["publication_count"] == 4 and plan["source_lineage_count"] == 2
+    assert plan["selected_revision_count"] == 3
+    assert [row["signal_id"] for row in plan["versions"]] == [f"signal-{i}" for i in range(4)]
+    assert plan["versions"][0]["effective_entry_at"].endswith("09:01:00+08:00")
+    assert plan["versions"][1]["effective_entry_at"].endswith("09:02:00+08:00")
+    assert plan["versions"][2]["effective_entry_at"].endswith("09:04:00+08:00")
+    assert plan["versions"][3]["effective_entry_at"] is None
+    assert [repair._sha256(path) for path in paths] == [row["summary_sha256"] for row in plan["versions"]]
+
+
+def test_published_revision_plan_rejects_missing_original_parent(tmp_path):
+    spec, paths = _published_fixture(tmp_path)
+    value = json.loads(paths[1].read_text())
+    value["opening_signal_revision"]["parent_signal_id"] = "missing"
+    paths[1].write_text(json.dumps(value))
+    with pytest.raises(RuntimeError, match="non-contiguous"):
+        repair._published_revision_inventory(spec, date(2026, 10, 29))
+
+
+def test_published_revision_clock_anomaly_is_retained_not_backdated(tmp_path):
+    spec, paths = _published_fixture(tmp_path)
+    value = json.loads(paths[1].read_text())
+    value["artifact_published_at"] = "2026-10-29T09:00:21+08:00"
+    paths[1].write_text(json.dumps(value))
+    version = repair._published_revision_inventory(spec, date(2026, 10, 29))["versions"][1]
+    assert version["execution_pointer_written_at"].endswith("09:00:20+08:00")
+    assert version["publication_upper_bound"].endswith("09:00:21+08:00")
+    assert version["publication_clock_anomalies"] == ["artifact_after_pointer"]
+
+
+def test_unconsumed_new_close_cache_does_not_invalidate_published_plan(tmp_path):
+    spec, _ = _published_fixture(tmp_path)
+    before = repair._published_revision_inventory(spec, date(2026, 10, 29))
+    path = spec.live_output_dir / "2026-10-29_close" / "close" / "summary.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({"execution_mode": "tw_day_trade", "generated_at": "2026-10-29T20:00:00+08:00"}))
+    after = repair._published_revision_inventory(spec, date(2026, 10, 29))
+    assert before["plan_sha256"] == after["plan_sha256"]
+    assert len(after["excluded_close_caches"]) == 1
+
+
+def test_compact_replay_summary_keeps_all_executor_consumed_fields():
+    import ast
+    import inspect
+    import textwrap
+    tree = ast.parse(textwrap.dedent(inspect.getsource(TwDayTradeSimulationEngine._register_signal_impl)))
+    keys = {call.args[0].value for call in ast.walk(tree) if isinstance(call, ast.Call)
+            and isinstance(call.func, ast.Attribute) and isinstance(call.func.value, ast.Name)
+            and call.func.value.id == "summary" and call.func.attr == "get" and call.args
+            and isinstance(call.args[0], ast.Constant) and isinstance(call.args[0].value, str)}
+    assert keys <= repair.REPLAY_SUMMARY_FIELDS
+    source = {key: key for key in keys} | {"large_unused_diagnostics": [1, 2, 3]}
+    assert repair._compact_replay_summary(source) == {key: key for key in keys}
+
+
 def _clock_failed_replay() -> dict:
     return {**_flat(), "entry_requested_shares": 4000, "entry_unfilled_shares": 4000,
             "simulation_replay": True, "counterfactual_open_replay": True,

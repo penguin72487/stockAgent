@@ -11,6 +11,9 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+# The protected source may use part of the physical backup reserve. The guest
+# reserve, full write budget and shared leases remain enforced.
+Environment="STOCKAGENT_TW_DAY_TRADE_PRIORITY_SOURCE=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_discord_artifact_maintenance.sh" --preopen-source-only
 # The supervisor allows needed input recovery through the opening, but stops
 # its entire producer process group before the 13:20 exit/flattening phase.

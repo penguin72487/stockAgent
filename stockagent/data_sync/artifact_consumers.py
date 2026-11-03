@@ -355,7 +355,8 @@ def service_artifact_paths(repo_root: Path) -> list[dict[str, str]]:
         # The service supervisor sets this default before launching the web
         # process. A storage command need not inherit that process environment.
         value = os.environ.get("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", "").strip()
-        path = Path(value) if value else repo_root / "artifacts/cache/tw_day_trade_dashboard_indexes"
+        from stockagent.service_layout import service_path
+        path = Path(value) if value else service_path("tw_day_trade_dashboard_indexes", area="cache", root=repo_root)
         if not path.is_absolute():
             path = repo_root / path
         paths.append({"market": "shared-day-trade-dashboard", "document": "scripts/run_tw_day_trade_services.sh",

@@ -65,6 +65,45 @@ def add_prior(batch, state="complete", request=None, priority=100):
     return task
 
 
+def test_priority_scan_releases_read_lock_before_consumer_processes_each_page(batch):
+    from downloader.tej_priority import _prior_rows
+    root, definition, _, _, _ = batch
+    task = add_prior(batch)
+    with closing(connect(root)) as reader:
+        rows = _prior_rows(reader, definition['table_id'], batch_size=1)
+        assert next(rows)['task_id'] == task
+        # DELETE journaling permits the writer to commit only if the page's
+        # read cursor is already exhausted and no long read transaction remains.
+        with closing(connect(root)) as writer, writer:
+            writer.execute('UPDATE tasks SET priority=priority+1 WHERE task_id=?', (task,))
+        assert list(rows) == []
+
+
+def test_concurrent_queue_commit_aborts_without_a_priority_mutation(batch, monkeypatch):
+    import downloader.tej_priority as priority
+    root, definition, plan, _, receipt = batch
+    unrelated = copy.deepcopy(plan['requests'][0]['request'])
+    unrelated['company_labels'] = ['BB1201112==>BB December']
+    task = add_prior(batch, 'pending', unrelated)
+    original = priority.retained_request
+    changed = []
+
+    def concurrent_change(row, table):
+        if not changed:
+            with closing(connect(root)) as writer, writer:
+                writer.execute('UPDATE tasks SET priority=priority+1 WHERE task_id=?', (task,))
+            changed.append(True)
+        return original(row, table)
+
+    monkeypatch.setattr(priority, 'retained_request', concurrent_change)
+    with pytest.raises(priority.PriorityQueueChanged):
+        submit(batch)
+    assert not receipt.exists()
+    with closing(connect(root)) as con:
+        assert con.execute('SELECT count(*) FROM tasks').fetchone()[0] == 1
+        assert con.execute("SELECT count(*) FROM meta WHERE key LIKE 'finite_priority_plan:%'").fetchone()[0] == 0
+
+
 def recheck_batch(batch):
     """A completed source and a different retained comparison observation."""
     root, definition, plan, _, _ = batch

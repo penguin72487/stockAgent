@@ -61,6 +61,7 @@ def _fixture(
         ),
         "FAKE_DASHBOARD_ALWAYS_EXIT": "1" if dashboard_always_exits else "0",
         "SHIOAJI_ENV_FILE": str(tmp_path / ".env"),
+        "TW_DAY_TRADE_STATE_DIR": str(tmp_path / "state"),
         "STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR": str(tmp_path / "cache"),
         "TEST_EVENTS": str(events),
     }

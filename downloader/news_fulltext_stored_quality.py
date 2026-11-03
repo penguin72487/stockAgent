@@ -127,13 +127,16 @@ def _native_error(source, row, record):
     raise ValueError('quality_review_current_native_validation_succeeded')
 
 
-def submit_stored_quality_reviews(root, registry, urls, *, reason, expected_error):
-    """Submit a bounded explicit review; never mutate SQLite from this caller."""
+def prepare_stored_quality_reviews(root, registry, urls, *, reason, expected_error):
+    """Build the exact bounded owner request without writing an inbox or DB.
+
+    Every head and original is validated as in submission. The owner must still
+    repeat that validation at admission; this is not a queue mutation or an
+    acceptance of the retained body as full text.
+    """
     from itertools import islice
     from downloader.news_fulltext_queue import utc_now
-    from downloader.news_fulltext_repairs import (
-        _bytes, _directory, _pending, _source, _write_once, MAX_PENDING, MAX_REQUEST_BYTES,
-    )
+    from downloader.news_fulltext_repairs import _bytes, _source, MAX_REQUEST_BYTES
     if not isinstance(reason, str) or not reason.strip() or len(reason) > 240 or expected_error not in ERRORS:
         raise ValueError('quality_review_requires_reason_and_expected_semantic_error')
     selected = list(islice(urls, MAX_TARGETS + 1))
@@ -162,13 +165,22 @@ def submit_stored_quality_reviews(root, registry, urls, *, reason, expected_erro
     payload = _bytes(request)
     if len(payload) > MAX_REQUEST_BYTES:
         raise ValueError('quality_review_request_unbounded')
+    return {'request': request, 'payload': payload, 'request_id': hashlib.sha256(payload).hexdigest(),
+            'publisher_requests': 0, 'queue_mutations': False, 'submitted': False}
+
+
+def submit_stored_quality_reviews(root, registry, urls, *, reason, expected_error):
+    """Submit a bounded explicit review; never mutate SQLite from this caller."""
+    from downloader.news_fulltext_repairs import _directory, _pending, _write_once, MAX_PENDING
+    prepared = prepare_stored_quality_reviews(root, registry, urls, reason=reason, expected_error=expected_error)
+    root = Path(root).resolve()
     directory = _directory(root, 'pending')
     if len(_pending(directory)) >= MAX_PENDING:
         raise ValueError('repair_inbox_full')
-    digest = hashlib.sha256(payload).hexdigest()
+    digest, payload = prepared['request_id'], prepared['payload']
     path = directory / (digest + '.json')
     _write_once(path, payload)
-    return {'contract_version': VERSION, 'submitted_targets': len(targets), 'request_id': digest,
+    return {'contract_version': VERSION, 'submitted_targets': len(prepared['request']['targets']), 'request_id': digest,
         'request_path': str(path), 'publisher_requests': 0, 'queue_mutations': False,
         'accepted_as_bodies': False}
 

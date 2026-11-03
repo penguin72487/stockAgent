@@ -13,7 +13,7 @@ from downloader import news_fulltext_publishers as publishers
 from downloader.news_fulltext_queue import NewsQueue
 from test_news_candidate_diagnostics import http_stub
 from test_news_cmnews_canonical_relation import (
-    finished_identity, relation, saved_literal_witness, stored_job,
+    finished_identity, relation, reviewed_previous_literal_witness, saved_literal_witness, stored_job,
 )
 from test_news_cmnews_resident_diagnostics import settings, queue, head, pump, response, submit, LAYOUT
 from test_news_cmnews_scope import URL, UUID, AUTHOR, TEXT, page
@@ -120,6 +120,58 @@ def test_reuses_normal_failure_literal_before_new_diagnostic(queue, settings):
     saved_literal_witness(queue)
     with pytest.raises(ValueError, match='cmnews_literal_canonical_already_recorded'):
         attribute(queue, settings)
+
+
+def test_reviewed_previous_capture_stops_repeat_question_without_admitting_url(queue, settings, monkeypatch):
+    source = queue.registry.sources['cmnews']
+    assert (source.data_fingerprint, source.authorization_fingerprint) == jobs._CMNEWS_CLOCK_BASIS_V1_LITERAL_ONLY_BINDING
+    witness = reviewed_previous_literal_witness(queue, monkeypatch)
+    target = jobs._head(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    before = head(queue)
+    # A predecessor stops a duplicate question only. The stricter reader used
+    # to approve a separate acquisition must still reject the old contract.
+    assert jobs.recorded_cmnews_canonical(queue.db, source, target) is None
+    assert jobs._cmnews_canonical_question_already_answered(queue.db, source, target)
+    with pytest.raises(ValueError, match='cmnews_literal_canonical_already_recorded'):
+        attribute(queue, settings)
+    assert head(queue) == before and witness.is_file()
+    assert not (queue.root/'reviewed_repairs/candidate_diagnostics/pending').exists()
+
+
+@pytest.mark.parametrize('change', ['source', 'auth', 'metadata_source', 'metadata_auth', 'old_check', 'bad_literal_hash',
+    'different_check', 'unreviewed_target'])
+def test_previous_capture_does_not_close_question_when_compatibility_is_unproved(queue, settings, change, monkeypatch):
+    source = queue.registry.sources['cmnews']
+    assert (source.data_fingerprint, source.authorization_fingerprint) == jobs._CMNEWS_CLOCK_BASIS_V1_LITERAL_ONLY_BINDING
+    witness = reviewed_previous_literal_witness(queue, monkeypatch)
+    target = jobs._head(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    if change == 'source':
+        source = replace(source, data_fingerprint='a'*64)
+    elif change == 'auth':
+        source = replace(source, authorization_fingerprint='b'*64)
+    elif change == 'different_check':
+        target = dict(target, last_checked_at_utc='2026-01-01T00:00:00.001000+00:00')
+    elif change == 'unreviewed_target':
+        monkeypatch.delitem(jobs._CMNEWS_V7_REVIEWED_LITERAL_CHECKS, target['id'])
+    else:
+        facts = json.loads(witness.read_bytes())
+        if change == 'metadata_source': facts['data_fingerprint'] = 'c'*64
+        elif change == 'metadata_auth': facts['authorization_fingerprint'] = 'd'*64
+        elif change == 'old_check': facts['observed_at_utc'] = '2025-12-31T23:58:58+00:00'
+        else: facts['facts']['canonical']['values'][0]['original_value_sha256'] = 'e'*64
+        witness.write_text(json.dumps(facts))
+    assert jobs.recorded_cmnews_canonical(queue.db, source, target) is None
+    assert not jobs._cmnews_canonical_question_already_answered(queue.db, source, target)
+
+
+def test_previous_capture_arriving_after_submission_is_rechecked_before_http(queue, settings, monkeypatch):
+    source = queue.registry.sources['cmnews']
+    assert (source.data_fingerprint, source.authorization_fingerprint) == jobs._CMNEWS_CLOCK_BASIS_V1_LITERAL_ONLY_BINDING
+    request = attribute(queue, settings); pump(queue)
+    reviewed_previous_literal_witness(queue, monkeypatch)
+    client = http_stub(queue, response=response())
+    assert jobs.claim_candidate(queue, client, settings, 'cmnews') is None and not client.calls
+    assert jobs.candidate_status(queue.root, request['request_id'])['state'] == 'skipped'
 
 
 @pytest.mark.parametrize('change', ['request', 'head', 'clock', 'state', 'scope', 'retained', 'native_shape', 'relation_shape'])

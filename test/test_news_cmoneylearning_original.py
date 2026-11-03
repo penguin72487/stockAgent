@@ -371,7 +371,7 @@ def test_durable_title_variant_provenance_is_replayed_not_just_self_consistent(s
             record['source_title_declarations_json']=json.dumps(evidence,ensure_ascii=False,sort_keys=True)
         queue.accept([record])
         proof=audit(tmp_path,[url],registry=http.registry)
-        assert proof['contract_version']==11
+        assert proof['contract_version']==12
         assert proof['accepted'] is (not tamper)
         if tamper:
             assert proof['errors'][0]['error']=='current_source_replay_changed_body_title_author_or_clock'

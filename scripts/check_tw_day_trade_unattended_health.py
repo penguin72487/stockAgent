@@ -749,6 +749,52 @@ def _public_endpoint(path: str) -> dict[str, Any]:
         }
 
 
+def _runtime_sync_checks(
+    engine: dict[str, Any], discord: dict[str, Any],
+    *, engine_age: float | None, discord_age: float | None,
+    acknowledgement: dict[str, Any],
+) -> dict[str, bool]:
+    """Keep link, runtime contract and ledger safety as separate facts."""
+
+    return {
+        "engine_contract": (
+            engine.get("simulation_only") is True
+            and engine.get("production_order_possible") is False
+            and set(engine.get("enabled_markets") or ()) == set(EXPECTED_MARKETS)
+        ),
+        "discord_contract": (
+            discord.get("simulation_only") is True
+            and discord.get("production_order_possible") is False
+            and discord.get("discord_connected") is True
+            and set(discord.get("day_trade_markets") or ()) == set(EXPECTED_MARKETS)
+            and set(discord.get("scheduled_day_trade_markets") or ()) == set(EXPECTED_MARKETS)
+        ),
+        "heartbeat_fresh": (
+            engine_age is not None and engine_age <= 20.0
+            and discord_age is not None and discord_age <= 20.0
+        ),
+        "revision_acknowledged": acknowledgement.get("matched") is True,
+        "ledger_integrity": engine.get("ledger_integrity_ready") is True,
+    }
+
+
+def _public_surface_checks(
+    status: dict[str, Any], revision: dict[str, Any],
+) -> dict[str, bool]:
+    payload = status.get("payload")
+    payload = payload if isinstance(payload, dict) else {}
+    ledger = payload.get("ledger_integrity")
+    ledger = ledger if isinstance(ledger, dict) else {}
+    return {
+        "endpoints_reachable": status.get("ready") is True and revision.get("ready") is True,
+        "paper_contract": (
+            payload.get("simulation_only") is True
+            and payload.get("production_order_possible") is False
+        ),
+        "ledger_integrity": ledger.get("ready") is True,
+    }
+
+
 def _disk_health(
     path: Path,
     *,
@@ -1029,26 +1075,19 @@ def main() -> int:
         discord_age = _age_seconds(discord_status.get("updated_at"), observed)
         modes = engine_sync.get("modes")
         modes = dict(modes) if isinstance(modes, dict) else {}
-        runtime_ready = bool(
-            engine_sync.get("simulation_only") is True
-            and engine_sync.get("production_order_possible") is False
-            and engine_sync.get("ledger_integrity_ready") is True
-            and set(engine_sync.get("enabled_markets") or ()) == set(EXPECTED_MARKETS)
-            and discord_status.get("simulation_only") is True
-            and discord_status.get("production_order_possible") is False
-            and discord_status.get("discord_connected") is True
-            and set(discord_status.get("day_trade_markets") or ())
-            == set(EXPECTED_MARKETS)
-            and set(discord_status.get("scheduled_day_trade_markets") or ())
-            == set(EXPECTED_MARKETS)
-            and engine_age is not None
-            and engine_age <= 20.0
-            and discord_age is not None
-            and discord_age <= 20.0
-            and ack_observation["matched"]
+        runtime_checks = _runtime_sync_checks(
+            engine_sync, discord_status, engine_age=engine_age,
+            discord_age=discord_age, acknowledgement=ack_observation,
         )
-        if not runtime_ready:
+        runtime_ready = all(runtime_checks.values())
+        if not runtime_checks["revision_acknowledged"]:
             failures.append("paper engine and Discord revisions are not synchronized")
+        if not all(runtime_checks[key] for key in (
+            "engine_contract", "discord_contract", "heartbeat_fresh",
+        )):
+            failures.append("paper engine or Discord runtime contract or heartbeat is not ready")
+        if not runtime_checks["ledger_integrity"]:
+            failures.append("paper ledger integrity is not verified")
         maintenance = discord_status.get("background_maintenance")
         maintenance = dict(maintenance) if isinstance(maintenance, dict) else {}
         maintenance_ready = bool(
@@ -1102,21 +1141,15 @@ def main() -> int:
 
         dashboard_status = _public_endpoint("/tw-day-trade/api/status")
         dashboard_revision = _public_endpoint("/tw-day-trade/api/revision")
-        public_surface_ready = bool(
-            dashboard_status.get("ready")
-            and dashboard_revision.get("ready")
-            and (dashboard_status.get("payload") or {}).get("simulation_only") is True
-            and (dashboard_status.get("payload") or {}).get(
-                "production_order_possible"
-            )
-            is False
-            and (dashboard_status.get("payload") or {})
-            .get("ledger_integrity", {})
-            .get("ready")
-            is True
-        )
-        if not public_surface_ready:
+        public_checks = _public_surface_checks(dashboard_status, dashboard_revision)
+        public_surface_ready = all(public_checks.values())
+        if not public_checks["endpoints_reachable"]:
             failures.append("read-only TW day-trade dashboard endpoint is unavailable")
+        else:
+            if not public_checks["paper_contract"]:
+                failures.append("dashboard paper-only safety contract is not verified")
+            if not public_checks["ledger_integrity"]:
+                failures.append("dashboard reports unverified paper ledger integrity")
 
         disks = {
             "repository": _disk_health(
@@ -1199,6 +1232,7 @@ def main() -> int:
                 },
                 "runtime_sync": {
                     "ready": runtime_ready,
+                    "checks": runtime_checks,
                     "engine_age_seconds": engine_age,
                     "discord_age_seconds": discord_age,
                     "revision_lag": revision_lag,
@@ -1226,6 +1260,7 @@ def main() -> int:
                 },
                 "public_dashboard": {
                     "ready": public_surface_ready,
+                    "checks": public_checks,
                     "status_endpoint": {
                         key: value
                         for key, value in dashboard_status.items()

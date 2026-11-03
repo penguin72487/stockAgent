@@ -1,4 +1,5 @@
 """Static GVM writing and exact resident-original reuse; synthetic HTML only."""
+from contextlib import closing
 import json
 import time
 from urllib.parse import urlencode
@@ -11,7 +12,7 @@ from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext_cohorts import RETAINED_SUPPLEMENT_HEAD_FIELDS
 from downloader.news_fulltext_gvm import GVM_STATIC_EDITOR_LAYOUT, GVM_V9_VERIFICATION
 from downloader.news_fulltext_policy import NewsError, PolicyRegistry, extract_article
-from downloader.news_fulltext_queue import utc_now
+from downloader.news_fulltext_queue import NewsQueue, utc_now
 from downloader.news_fulltext_retained_native import _article_digest, materialize_reviewed_native
 from test_news_fulltext import config
 from test_news_gvm_known_urls import extract
@@ -270,18 +271,37 @@ def test_changed_source_scope_cannot_inherit_the_original_transition(retained):
 
 
 def test_durable_GVM_original_recovery_revalidates_its_exact_restart_witness(retained, monkeypatch):
+    queue, path, *_ = retained
+    root, registry = queue.root, queue.registry
+    with monkeypatch.context() as crash:
+        def interrupted(*_args, **_kwargs):
+            raise OSError('simulated crash after durable receipt')
+        crash.setattr(queue, '_accept_records', interrupted)
+        with pytest.raises(OSError, match='simulated crash after durable receipt'):
+            materialize_reviewed_native(queue, [URL], path, lease_seconds=300)
+    inflight = head(queue)
+    assert inflight['state'] == 'inflight' and inflight['lease_token']
+    queue.close()
+    with closing(NewsQueue(root, registry)) as restarted:
+        recovered = head(restarted)
+        assert recovered['state'] == 'complete' and recovered['body_sha256']
+        assert recovered['lease_token'] is None and recovered['recovery_lease_token'] is None
+        assert restarted.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+
+
+def test_GVM_unwitnessed_restart_cannot_adopt_a_durable_original(retained, monkeypatch):
     from downloader.news_fulltext_retained_native import reviewed_native_head_matches
     queue, path, *_ = retained
     original = queue._accept_records
     def restarted(records, relative, receipt):
         with queue.db:
             queue.db.execute("UPDATE articles SET state='retry',due=0,error_code='owner_restart',"
-                "lease_owner=NULL,lease_until=NULL WHERE url=?", (URL,))
+                "lease_owner=NULL,lease_until=NULL,lease_token=NULL,recovery_lease_token=NULL WHERE url=?", (URL,))
         assert reviewed_native_head_matches(queue, records[0])
         return original(records, relative, receipt)
     monkeypatch.setattr(queue, '_accept_records', restarted)
-    assert materialize_reviewed_native(queue,[URL],path,lease_seconds=300)['materialized_bodies']==1
-    assert head(queue)['state']=='complete'
+    assert materialize_reviewed_native(queue,[URL],path,lease_seconds=300)['materialized_bodies']==0
+    assert head(queue)['state']=='retry' and head(queue)['body_sha256'] is None
 
 
 def test_racing_refusal_before_GVM_claim_preserves_source_deadline(retained, monkeypatch):

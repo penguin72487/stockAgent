@@ -10,7 +10,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import nullcontext
-from datetime import datetime, time as wall_time
+from datetime import date, datetime, time as wall_time
 import json
 from pathlib import Path
 import subprocess
@@ -156,20 +156,48 @@ def terminal_exit_priority_cancellation(order, mode, *, market, symbol, now):
     """Recognize the engine's settled, cancelled entry without erasing it.
 
     This status retains its unfilled quantity as audit evidence.  It is not an
-    active order once the same signal/session is flat and the engine has
-    recorded its closing settlement.  Unknown cancellations still block.
+    active order once the same committed session is flat and the engine has
+    recorded its closing settlement. A newer post-close cache can advance
+    signal_id; a retained order must still name an explicitly consumed signal.
+    Unknown cancellations still block.
     """
     if not isinstance(order, dict) or order.get("status") != "cancelled_exit_priority":
         return False
     template = order.get("position")
     remaining = order.get("remaining_shares")
+    consumed = mode.get("processed_signal_ids")
+    known_consumed = (isinstance(consumed, list) and all(isinstance(value, str) for value in consumed)
+                      and isinstance(template, dict) and bool(template.get("signal_id"))
+                      and template["signal_id"] in consumed)
+    # Readiness changes a fully settled prior session to waiting_09_00_signal
+    # at the next day's midnight. The status change does not reactivate its
+    # cancelled entries. Admit that later-day state only with the independent
+    # zero-risk/evidence fields; a same-day waiting state remains ambiguous.
+    try:
+        previous_session = date.fromisoformat(str(mode.get("session_date"))) < now.astimezone(TAIPEI).date()
+    except (TypeError, ValueError):
+        previous_session = False
+    overnight_flat = (mode.get("engine_status") == "waiting_09_00_signal" and previous_session and known_consumed
+                      and mode.get("execution_evidence_complete") is True
+                      and type(mode.get("pending_reduction_shares")) is int
+                      and mode["pending_reduction_shares"] == 0
+                      and type(mode.get("closing_auction_pending_count")) is int
+                      and mode["closing_auction_pending_count"] == 0
+                      and type(mode.get("unresolved_exit_count")) is int
+                      and mode["unresolved_exit_count"] == 0
+                      and isinstance(mode.get("positions"), dict)
+                      and all(isinstance(position, dict)
+                              and type(position.get("signed_shares")) is int
+                              and position["signed_shares"] == 0
+                              for position in mode["positions"].values()))
     if (not isinstance(template, dict) or type(remaining) is not int or remaining < 0
             or type(order.get("sizing_pending")) is not bool
             or type(mode.get("pending_entry_shares")) is not int
             or mode["pending_entry_shares"] != 0
-            or mode.get("engine_status") != "session_flat_after_exit"
+            or (mode.get("engine_status") != "session_flat_after_exit" and not overnight_flat)
             or template.get("market") != market or template.get("symbol") != symbol
-            or not mode.get("signal_id") or template.get("signal_id") != mode["signal_id"]
+            or not mode.get("signal_id")
+            or (template.get("signal_id") != mode["signal_id"] and not known_consumed)
             or not mode.get("session_date") or template.get("session_date") != mode["session_date"]):
         return False
     try:

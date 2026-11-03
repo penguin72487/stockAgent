@@ -39,6 +39,17 @@ def test_shared_single_owner_and_read_only_compaction():
     assert "finally {\n        if ($mountedByUs) { Dismount-VHD" in SCRIPT
 
 
+def test_compaction_only_reuses_graceful_owner_without_resizing_or_growth_reserve():
+    assert "'Expand', 'Compact', 'CompactIfStopped'" in SCRIPT
+    branch = SCRIPT.split("        if ($Mode -eq 'Compact') {", 1)[1].split("        } else {", 1)[0]
+    assert "offline-compaction-verified-without-resize" in branch
+    assert "virtual_bytes -ne $receipt.before.virtual_bytes" in branch
+    assert "--resize" not in branch
+    assert "$Mode -eq 'Compact' -and (Get-VhdObservation).host_free_bytes -lt 1GB" in SCRIPT
+    assert "$Mode -eq 'Expand' -and (Get-VhdObservation).host_free_bytes -lt 32GB" in SCRIPT
+    assert "Save-Receipt 'compacted-and-boot-verified'" in SCRIPT
+
+
 def test_automatic_branch_never_stops_or_starts_wsl():
     branch = SCRIPT.split("if ($Mode -eq 'CompactIfStopped') {", 1)[1].split("    } else {\n        $running", 1)[0]
     assert "skipped-running" in branch

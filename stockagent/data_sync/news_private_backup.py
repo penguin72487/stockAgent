@@ -102,7 +102,7 @@ def capture_plan(repository: Path, policy: dict, configuration: dict) -> dict:
     # pointer without observing or rewriting a moving latest pointer.
     add(policy["generation"] + "/manifest.json", "manifest.json", "original_manifest",
         policy["manifest_sha256"], len(raw))
-    for name in ("generation.json", "snapshot.json", "verification.json", "quality_report.json"):
+    for name in ("generation.json", "snapshot.json", "verification.json", "quality_report.json", "schema.json"):
         relative = policy["generation"] + "/" + name
         if (root / relative).exists():
             add(relative, relative, "original_control")

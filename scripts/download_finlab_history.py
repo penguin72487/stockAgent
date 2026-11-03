@@ -945,11 +945,44 @@ def record_core_acquisition_status(available: list[str], curated: dict[str, dict
     return receipt
 
 
+_ARROW_FAILURE_FRAME_MODULES = frozenset({
+    "__main__", "download_finlab_history", "scripts.download_finlab_history",
+    "scripts.finlab_incremental_refresh", "scripts.finlab_columnar",
+    "finlab.data.get", "finlab.data.feather_io", "finlab.data.recent_merge",
+    "finlab.data.storage", "finlab.data.storage_backend",
+})
+
+
+def _arrow_failure_origin(exc: Exception) -> list[dict]:
+    """Retain only allowlisted code locations, never provider text or paths.
+
+    Arrow errors can occur in the SDK download, its delta merge, or our own
+    normalization. Distinguishing those stages on the next permitted retry is
+    necessary before choosing a recovery; a forced full download also consumes
+    provider quota. Arbitrary frames, values, paths and messages are omitted.
+    """
+    if type(exc).__name__ != "ArrowNotImplementedError":
+        return []
+    frames = []
+    tb = exc.__traceback__
+    while tb is not None:
+        code = tb.tb_frame.f_code
+        module = tb.tb_frame.f_globals.get("__name__")
+        if (module in _ARROW_FAILURE_FRAME_MODULES
+                and (module != "__main__" or Path(code.co_filename).resolve() == Path(__file__).resolve())
+                and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]{0,79}", code.co_name)
+                and 0 < tb.tb_lineno < 1_000_000):
+            frames.append({"module": module, "function": code.co_name, "line": tb.tb_lineno})
+        tb = tb.tb_next
+    return frames[-12:]
+
+
 def record_attempt(key: str, output_root: Path, exc: Exception,
                    *, elapsed_seconds: float | None = None) -> str:
     # FinLab errors may include account-scoped URLs or credentials.
     reason = classify_provider_error(exc)
     streak = _next_failure_streak(key, output_root, reason)
+    origin = _arrow_failure_origin(exc)
     _atomic_json(output_root / "attempts" / f"{safe_stem(key)}.json", {
         "dataset": key,
         "attempted_at_utc": datetime.now(UTC).isoformat(),
@@ -960,6 +993,7 @@ def record_attempt(key: str, output_root: Path, exc: Exception,
         "exception_class": type(exc).__name__,
         "message_retained": False,
         "last_attempt_elapsed_seconds": round(elapsed_seconds, 3) if elapsed_seconds is not None else None,
+        **({"arrow_origin_frames": origin} if origin else {}),
         **(exc.evidence if isinstance(exc, EmptyProviderFrame) else {}),
     })
     return reason

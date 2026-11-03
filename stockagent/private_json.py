@@ -173,6 +173,64 @@ def ledger_lines_bytes(values) -> bytes:
     return b"".join(ledger_bytes(row) + b"\n" for row in rows)
 
 
+def _plain_compact_sorted_json(value: Any) -> bool:
+    """Witness trees whose native compact encoding matches the stdlib bytes.
+
+    Only exact builtin types enter the native path. In particular, native
+    encoding of a nonfinite float would silently produce null, and finite float
+    spellings can differ between encoders. Check those spellings individually;
+    mixed/legacy types and excessively deep trees keep the stdlib behavior.
+    """
+    pending = [(value, 0)]
+    while pending:
+        current, depth = pending.pop()
+        kind = type(current)
+        if current is None or kind in (str, bool, int):
+            continue
+        if kind is float:
+            if (not math.isfinite(current)
+                    or _native.json.encode(current).decode("ascii") != json.dumps(current)):
+                return False
+            continue
+        if depth >= 64:
+            return False
+        if kind is dict:
+            if not _plain_string_keys(current):
+                return False
+            children = current.values()
+        elif kind in (list, tuple):
+            children = current
+        else:
+            return False
+        for item in children:
+            item_kind = type(item)
+            if item_kind is float:
+                if (not math.isfinite(item)
+                        or _native.json.encode(item).decode("ascii") != json.dumps(item)):
+                    return False
+            elif item is not None and item_kind not in (str, bool, int):
+                pending.append((item, depth + 1))
+    return True
+
+
+def compact_sorted_bytes(value: Any) -> bytes:
+    """Encode private compact sorted JSON with the existing stdlib bytes.
+
+    This does not own a file, publication, canonical digest or public wire.
+    Unsupported native integers, invalid Unicode, mixed keys, nonfinite or
+    differently spelled floats and legacy values use the original encoder,
+    including its errors. The caller controls atomic publication and newline.
+    """
+    if _native is not None:
+        try:
+            if _plain_compact_sorted_json(value):
+                return _native.json.encode(value, order="sorted")
+        except (ValueError, TypeError, OverflowError, RecursionError):
+            pass
+    return json.dumps(value, ensure_ascii=False, sort_keys=True,
+                      separators=(",", ":")).encode("utf-8")
+
+
 def _plain_metadata(value: Any, depth: int = 0) -> bool:
     kind = type(value)
     if kind is str or kind is bool or value is None:

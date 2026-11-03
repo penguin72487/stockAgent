@@ -88,6 +88,7 @@ def main():
         subscription_right_policy=config.trading.tw_day_trade_subscription_right_policy,
         entry_remainder_policy=config.trading.tw_day_trade_entry_remainder_policy,
         terminal_liquidation_unlimited_capacity=config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity,
+        short_limit_up_penalty_rate=config.trading.tw_day_trade_short_limit_up_penalty_rate,
         sparse_event_slots=None)
     fold=next(value for value in build_expanding_year_folds(panel.dates,
         min_train_years=config.walk_forward.min_train_years,val_years=config.walk_forward.val_years,

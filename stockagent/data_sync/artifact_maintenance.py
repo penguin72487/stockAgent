@@ -110,15 +110,29 @@ def newest_activity_ns(root: Path) -> int:
 def artifact_process_references(source: Path, scope_root: Path) -> list[str]:
     """Find direct references plus orchestrators naming an ancestor suite."""
 
-    references = process_references(source)
-    return _ancestor_process_references((source,), scope_root, references)
+    return _fresh_process_references((source,), scope_root, lambda: process_references(source))
 
 
 def artifact_process_references_many(sources: Iterable[Path], scope_root: Path) -> list[str]:
     """Check a selected cleanup allowlist without treating sibling jobs as users."""
     sources = tuple(sources)
-    references = process_references_many(sources)
-    return _ancestor_process_references(sources, scope_root, references)
+    return _fresh_process_references(sources, scope_root, lambda: process_references_many(sources))
+
+
+class _ProcessArgumentResolutionChanged(SnapshotError):
+    """A process moved during a read-only reference pass; no no-use proof exists."""
+
+
+def _fresh_process_references(sources, scope_root, direct_probe):
+    for attempt in range(3):
+        # A cwd/alias change can introduce a new FD/cwd consumer too. Replay
+        # BOTH direct and ancestor observations, not just the cached paths.
+        references = direct_probe()
+        try:
+            return _ancestor_process_references(sources, scope_root, references)
+        except _ProcessArgumentResolutionChanged:
+            if attempt == 2:
+                raise
 
 
 def _ancestor_process_references(sources, scope_root: Path, references: list[str]) -> list[str]:
@@ -214,7 +228,7 @@ def _ancestor_process_references(sources, scope_root: Path, references: list[str
                     continue
                 if not any(source == current or current in source.parents for source in sources):
                     continue
-            raise SnapshotError('process argument resolution changed during reference scan')
+            raise _ProcessArgumentResolutionChanged('process argument resolution changed during reference scan')
     return references
 
 

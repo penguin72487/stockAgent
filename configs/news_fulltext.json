@@ -5,6 +5,19 @@
   "user_agent": "StockAgentNewsResearch/1.0 (private research; respects robots.txt)",
   "workers": 16,
   "exclusive_http_owner": true,
+  "provider_priority": ["cnyes", "cmoney", "udn", "globalvoices", "wantmedia", "money_link", "cmnews", "moneydj", "ltn"],
+  "retained_link_handoff": {
+    "path": "artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_links_handoff_v1_20261030.json",
+    "sha256": "7183adb0c3354a71efe3a32f6a0e326c066625589636f00b79b3fa4738bff684"
+  },
+  "cnyes_original_audit_priority_plan": {
+    "path": "artifacts/data_quality/news_offline_inventory_20261029/cnyes_original_audit_priority_20261029_v1.json",
+    "sha256": "9a1b70a4b3841bfa1ee34a1bd41cd9bb8566167febb702559c01b5492203c505"
+  },
+  "cnyes_accepted_batch_priority_plan": {
+    "path": "artifacts/data_quality/news_offline_inventory_20261029/cnyes_accepted_batch_priority_20261029_v1.json",
+    "sha256": "0d623f203965358c93f62d47d4763e6d8b8981d8b16f631488ba50b6701b665b"
+  },
   "cached_cnyes_replay_enabled": true,
   "cached_cnyes_metadata_replay_enabled": true,
   "retained_cnyes_failure_replay_enabled": true,

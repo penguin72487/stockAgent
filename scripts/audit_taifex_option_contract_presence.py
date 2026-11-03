@@ -25,6 +25,7 @@ import pyarrow.csv as arrow_csv
 import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json, sha256_file
+from downloader.finmind_option_contract_keys import vendor_option_series
 from scripts.audit_taifex_option_product_presence import _signature
 from scripts.audit_taifex_option_source_universe import _csv_column_names
 from stockagent.data.tw_index_futures import TAIFEX_DAY_SESSION_ALIASES, iter_taifex_daily_csv_streams
@@ -37,7 +38,7 @@ def compare_contracts(official: pl.DataFrame, vendor: pl.DataFrame) -> pl.DataFr
     expected = official.select(KEYS).unique()
     observed = vendor.select(
         pl.col('option_id').str.strip_chars().str.to_uppercase().alias('product'),
-        pl.col('contract_date').str.strip_chars().str.to_uppercase().alias('series'),
+        vendor_option_series(pl.col('contract_date')).alias('series'),
         pl.col('ExercisePrice').cast(pl.Float32).alias('strike'),
         pl.col('PutCall').str.strip_chars().str.to_uppercase().alias('right'),
     ).unique()
@@ -179,15 +180,18 @@ def audit(coverage_path: Path, years: list[int], workers: int) -> tuple[list[dic
     if coverage_path.read_bytes() != coverage_bytes or inventory.read_bytes() != inventory_bytes:
         raise ValueError('coverage evidence changed during contract audit')
     return results, missing, {
-        'contract': 'taifex_option_ordinary_open_contract_vs_finmind_v1',
+        'contract': 'taifex_option_ordinary_open_contract_vs_finmind_v2',
         'observed_at_utc': datetime.now(UTC).isoformat(), 'elapsed_seconds': time.monotonic() - started,
         'coverage_summary': str(coverage_path.resolve()), 'coverage_summary_sha256': hashlib.sha256(coverage_bytes).hexdigest(),
-        'audit_script_sha256': sha256_file(Path(__file__)), 'workers': workers, 'by_year': year_stats,
+        'audit_script_sha256': sha256_file(Path(__file__)),
+        'series_normalizer_sha256': sha256_file(Path('downloader/finmind_option_contract_keys.py')),
+        'workers': workers, 'by_year': year_stats,
         'limitations': [
             'Only official positive opening price and volume in day or unreported session, and simple month/week outright keys, are compared.',
             'Unsupported rows are counted but never reported as covered; unreported sessions are not automatically classified as day.',
             'Natural-day vendor keys may include night events and can hide a day-session absence.',
             'Keys are compared after float32 strike conversion, which can merge distinct original decimal strikes.',
+            'FinMind monthly series YYYYMM.0 is compared as YYYYMM; weekly series and other decimals are not converted.',
             'A key presence does not prove matching opening event, event completeness, decision-clock fill or historical point-in-time access.',
             'A missing key is a source discrepancy, not proof of its cause or that the vendor can supply it.',
         ],

@@ -2,6 +2,49 @@
 
 Read before publication, synchronization, materialization, migration, or cleanup. The destructive-operation gates below remain mandatory; reorganizing instructions does not authorize deletion.
 
+2026-11-02 placement update: services, ledgers, SQL and control indexes remain
+in the existing C-backed WSL. E NVMe is the pre-cold download/increment/build/
+verify/restore/transport workspace; D remains the immutable main cold authority.
+Use the E VHD/volume/UUID and physical-capacity guard, retain original aliases
+and owners, and prove every cross-volume copy before retiring old names.
+Earlier C temporary/D transport placement examples describe older generations,
+not a direction to create new bulk work there. Historical fixed plans and D
+recovery identities remain unchanged. See
+[C/E/D layout and measured scope](../storage_c_e_d_layout_2026-11-02.md).
+
+The original D-to-E sender placement owner may hand off its exactly identified,
+unreachable legacy transport bind in an inherited service namespace. Pin the
+namespace FD, require a complete namespace census, singleton mount/parent peer
+groups, no submounts and the enrolled E inode/marker/physical guard. Use normal
+non-forced unmount (busy references defer), retain a durable per-namespace
+intent and resume an interrupted bind, preserve original VFS permissions and
+verify the same E alias and unchanged PID-1 placement. For a namespace without
+the E filesystem, pass an enrolled detached mount FD with its VFS permissions
+already applied; do not expose an initially writable bind. Do not restart services,
+change parent propagation, detach lazily, or remove reachable/unknown aliases.
+The original three writer locks, completion of every pending handoff intent,
+and a fresh zero-stale-namespace observation
+still precede any D transport retirement; every member retains its complete
+E readback, generation, process-reference and journal gates.
+
+After those aliases are verified, the existing placement timer may request its
+canonical drained worker reload before waiting for independent transport GC.
+The reload still acquires the complete original publication boundary, releases
+all partial acquisitions before waiting, and never interrupts an active owner.
+Bound each attempt to 600 seconds and report its real wait at most 30 seconds
+apart. Only `PublicationOwnerBusy` is a normal wait; admission/body errors count
+toward the original bounded retry budget. This observation never renews source
+progress or acceptance. Require the exact candidate/loaded code identity,
+preserved workflow chains, and unchanged PG/Temporal before reporting success.
+
+Existing canonical D CAS objects of 64 MiB through the native reader's 8-GiB
+member bound may use its full-SHA Windows reader for immutable-name reuse.
+Retain fresh authority and per-member generation guards; a missing proof,
+changed mount or checksum error preserves the incoming original and fails.
+Small, oversized and noncanonical objects keep their portable full-byte hash.
+This changes byte transport only, not an object identity, recovery or retirement
+contract. Measured scope is in the C/E/D layout report linked above.
+
 ## Data Storage And Syncthing Contract
 
 This section is a correctness contract for every agent and machine, not a
@@ -16,6 +59,117 @@ coordinated code, config, test, and documentation change.
 
 ### First-principles invariants
 
+- The exact retired D encoding workspaces in
+  `configs/data_sync/legacy_stage_retirement.json` bind their dataset, original
+  snapshot, manifest SHA and original retirement-receipt SHA. The existing
+  enrolled-artifact owner may prune these ignored temporary encodings only
+  after the canonical complete cold reconstruction, encoding/original hashes,
+  source absence, process/pin and quarantine gates. It retains the plan and
+  result, never deletes CAS objects or NAS snapshots, and never discovers
+  candidates from directory names. Transport convergence still gates source
+  retirement; it does not gate this separately proven disposable encoding.
+  Failed cohorts retain bounded retries and allow disjoint cohorts to advance.
+  The existing oneshot timer checks again 60 seconds after the owner exits,
+  avoiding overlapping workers. Its observed phase is not an acceptance or a
+  new full-verification timestamp.
+  For these individually enrolled versions, the v2 owned proof joins the
+  complete, freshly hashed encoding/original commitments to the exact cold
+  inventory, reconstructs every cold file independently, and checks portable
+  metadata and the unchanged stage generation. The original cooperative
+  Penguin/Vast verifier may perform that cold reconstruction when separately
+  enrolled; retain its fixed per-node execution evidence. Reuse the completed
+  encoding decode only within the original owner's 1,500-second proof window,
+  with the same generation before/after quarantine and all final gates. Do not
+  renew its timestamp. An expired proof requires complete verification again;
+  other stage roots retain their original verification contract.
+  Checkpoint preservation treats the existing D free-space floor as a
+  temporary admission wait (exit 75 to its original timer), distinct from
+  corrupt data, runtime or enrollment failures (exit 65). This changes no
+  reserve, source binding, owner lease or runtime-acceptance gate.
+  The original private encrypted-backup owner may separately enroll
+  `private_backup_capacity` under `private_closed_wave_backup_reserve_v1`.
+  The user's backup-reserve instruction permits only its bounded immutable
+  private waves to consume that pool, retaining at least the native 32-GiB
+  writer floor. Recheck physical D free space every wave; retain the complete
+  transport census, staging/pending limits, current receiver/NAS reserve,
+  source generations, full copy SHA/flush and independent delivery verification.
+  Carry the exact admitted floor to the native copy; a hidden 64-GiB copy floor
+  must not disagree with the owner's admission. Unenrolled/general downloads
+  and public transport retain their original reserve. No source, D CAS or NAS
+  deletion is enabled. See the
+  [current capacity and verification report](../storage_capacity_and_verification_2026-11-02.md).
+
+- Full fixed-D recovery can opt into cooperative pack compute lanes. Keep the
+  canonical inventory, per-object source generations and final counts on the
+  original owner; local and private Vast workers verify disjoint packs using
+  full object SHA, every stored ZIP CRC and ordered original SHA/size commitments.
+  Fill native D buffers serially, overlap decode/transfer, join every worker,
+  and retain remote failures before a local exact-buffer fallback. Amortize
+  native-process startup with bounded small-pack batches only after observed
+  RAM admission; expose no buffer before the native child's exit and complete
+  generation checks. Remote workers receive compressed jobs through a private
+  persistent SSH RPC on the enrolled endpoint, defaulting to anonymous buffers.
+  Explicit `remote_spool` enrollment may instead retain SHA-addressed compressed
+  jobs in a private, disposable Vast compute cache with physical reserve,
+  per-object locks and seven-day retention. Only owned cache pairs may expire;
+  no source or training tree is retired. Speculative jobs have no inventory
+  acceptance. Reuse requires a fresh full D encoded SHA and unchanged source
+  generations, a fresh remote encoded SHA, identical worker/helper code and boot,
+  and the exact final inventory's ordered original SHA/size commitment. Return
+  compact proofs; sending an unchanged payload back creates no recovery proof.
+  This creates no new cold authority or training lease and does not replace the
+  canonical rclone cold-payload transport owner. A per-pack receipt cannot authorize source retirement or
+  replace NAS acceptance. Worker code, boot and policy identities bind the
+  resulting execution evidence; existing recovery and retirement gates remain.
+  The separately scheduled compute consumer reads already sealed CAS packs;
+  it never publishes, adopts heads or replaces the original backup owner.
+  See [the measured staging pipeline](../vast_pack_staging_pipeline_2026-11-01.md).
+  A closed complete cohort may retain its original SHA/CRC computations only
+  after a fresh full encoded-object SHA pass and unchanged object generations.
+  Match the exact manifest, ordered original SHA/size commitments, worker,
+  adapter and policy, all individual owned receipts and the closed node totals;
+  partial or changed evidence cannot authorize reuse. Retain original receipts
+  and link the fresh computation summary. This does not retain acceptance:
+  blobs/chunks, final counts, source/process and retirement gates still run.
+  The existing full-SHA native blob adapter also applies to the exactly enrolled
+  private D history using its original marker, permissions and ignore checks.
+  It does not extend publication, export or NAS rights.
+  Fixed-release migration may explicitly select native ordered-original SHA
+  verification for chunked files. Read every extent in manifest order on D,
+  check each complete extent SHA and the complete concatenated original SHA,
+  and return bounded metadata rather than raw bytes over the WSL bridge.
+  A complete original may fill the existing 16-GiB/2,048-extent native batch;
+  do not impose a smaller per-original cutoff that sends an admissible large
+  original back through the raw-byte bridge. The byte bound counts repeated
+  extents and limits read work, not an in-memory allocation of the original.
+  Repeated extents count repeatedly in the original hash and byte-work bounds.
+  Retain both mount guards, no redirected paths, all before/after generations,
+  complete child exit/EOF/result counts, fixed verifier/script identities and
+  the owner's final whole-inventory checks. Oversized originals keep the
+  existing full streaming path. No derived tree, data rewrite or new storage
+  authority is created; this is explicit full-recovery policy, not a default
+  replacement for partial fetch, materialization or source retirement.
+  See [cooperative verification](../cooperative_packed_verification_2026-10-31.md).
+- The user's 2026-10-31 placement separates produced artifacts from running
+  services. Mutable ledgers/status, service caches and active worksets belong
+  under the checkout's `service_data/`; `artifacts/` holds produced results and
+  evidence. `stockagent.service_layout` resolves only explicitly enrolled old
+  compatibility roots and refuses independent duplicate state roots. The
+  placement operator preserves directory/file inodes and legacy readers with
+  an atomic exchange; it copies and deletes no payload. Active signed control
+  and restore journals wait for their original owner's explicit handoff.
+  Closed raw history and sealed recovery copies still belong on guarded D;
+  PostgreSQL, locks and mutable execution/control state remain on native SSD.
+  WSL's guest `df` capacity is distinct from its Windows backing disk. The
+  monitor shows guest availability separately from conservative new-allocation
+  headroom (the smaller of fresh guest/backing availability). Native Windows
+  VHD allocated sizes distinguish the current WSL, other WSL distributions,
+  Windows/other files and host free space. The current WSL's allocation plus
+  host free is an ownership ceiling including existing usage, never extra
+  free bytes or proven VHD block reuse. Unknown/stale allocation stays unknown.
+  These observations do not change raw capacities or application reserves. Offline
+  VHD compaction is separate and never represented as an online resize/free-space
+  equality. See [placement and backing capacity](../service_storage_layout_2026-10-31.md).
 - Storage roles follow the user's 2026-10-25 single-authority design: Penguin
   C/WSL holds resumable increments, mutable control/SQL/ledger and bounded
   active service/research worksets; D owns immutable source history. Existing
@@ -23,6 +177,38 @@ coordinated code, config, test, and documentation change.
   switched and exact cold recovery and retirement gates pass. A role target
   does not prove that old raw workspaces have migrated. See
   [role and tier acceptance](../storage_roles_and_tiers_2026-10-25.md).
+- Storage monitoring keeps three clocks separate: each minute's metadata check,
+  the original work counter/report, and fixed-version acceptance. A fresh
+  `checked_at_utc` is a new status read, not a worker heartbeat, rate sample,
+  full recovery or renewed deletion authorization. Keep the original
+  `observed_at_utc` and acceptance bytes unchanged. Old counters suspend ETA
+  while the current service state remains visible; confirmed fixed acceptance
+  does not expire merely because its completion date is old. A stale/failed
+  observer still warns and retains the previous clocks. HTTP reads only the
+  background projection. The visible foreground page polls every 60 seconds,
+  including when its storage section is offscreen, and refreshes on return
+  from a hidden tab. Source/ACK validity, capacity, pins and recovery gates
+  retain their original rules. See
+  [minute-clock evidence](../storage_automatic_continuation_2026-10-31.md).
+- The same minute observer projects the enrolled backup/return/maintenance
+  timers and continuous lifecycle owner, fixed-version phase dependencies,
+  service failures and observed kernel-lock waiters. Two bounded systemd
+  queries and the existing owner inodes replace per-card probes. Existing lock
+  files alone are not contention evidence; observed contention is not proof
+  of deadlock. Keep last failed receipts, unknown remote schedules and source
+  counter clocks visible. A scheduled check is not a promised start/finish.
+  Keep BackupStream envelope-cache retirement and immutable-lake transport GC
+  as distinct tasks with their own original owners. Waiting cards project
+  whitelisted blocker reasons, the original retry time, and the next minute's
+  metadata observation separately. Preserve elapsed short-timer checks as due;
+  do not discard them or invent a new worker heartbeat. An unavailable observer
+  cannot retain an old claim of live automatic continuation. Ctime-only source
+  drift may use a fresh complete content SHA instead of the metadata fast path
+  only when inode, size and mtime still match; check the exact freshly hashed
+  generation before continuing the original retirement gates. Preserve original
+  source/ACK receipts. See [waiting-state repair](../storage_waiting_recovery_2026-11-01.md).
+  Resolve only enrolled service-placement aliases before enforcing unchanged
+  private-cache/no-follow rules; arbitrary descendant redirects still fail.
 - Penguin's storage observer and supervised WSL-retirement waves coordinate
   their optional local census with the existing wave lock. A census takes a
   shared lease; a retirement takes the exclusive lease. Runnable queued waves
@@ -35,6 +221,57 @@ coordinated code, config, test, and documentation change.
   Taipei day in a local sidecar. Net disk changes include unrelated writers,
   deletion and compression, not only ingestion; WSL is contained in C. A
   missing, stale or partial sample is unknown, never zero.
+- The user's 2026-10-31 request enrolls automatic continuation of the exact
+  reviewed inventories in `configs/data_sync/wsl_retirement_queue.json`.
+  `stockagent-wsl-retirement-queue.timer` dispatches the existing wave runner,
+  not another publisher or deletion implementation. Pin each inventory SHA
+  and any already fixed manifest, retain the original receipt directory and
+  recheck actual acceptance/source absence after restart. A reappeared source
+  cannot borrow a completed entry. Busy owners/capacity defer without consuming
+  the bounded failure budget; exhausted failures remain visible while disjoint
+  cohorts continue. Never discover new deletion roots from directory names.
+  This extends execution of those frozen manual captures to a persistent timer;
+  it does not enroll unknown future benchmark generations or relax their
+  capture, completion, exact recovery, consumer, pin or retirement gates.
+  Mutable queue status belongs under `service_data/storage-retirement`, while
+  the original recovery/retirement receipts keep their fixed artifact paths.
+  The user's 2026-11-02 instruction separately waives preservation for reviewed
+  old performance-validation work copies. The fixed
+  `local_testing_artifact_disposition_20261102.json` names individual artifact
+  benchmark/operation roots; it never enrolls a whole namespace, new producer
+  generations, formal sources, D CAS or NAS deletion. The same queue's
+  `ExecStartPost` reuses the canonical artifact-discard transaction and shared
+  mutation owner, retaining bounded comparison/failure receipts and actual
+  last-link allocated-byte accounting. Busy owners defer; errors stop after
+  three attempts per target, without blocking disjoint targets. Current
+  configuration/service, FD/mmap/cwd inode aliases, pins, source-generation and
+  final unlink checks still apply. Opaque symlink and unused FIFO names may be
+  unlinked inside this testing-only private quarantine without opening a FIFO
+  as a byte stream; sockets, devices and cross-filesystem entries stay blocked.
+  Discard receipts escape undecodable POSIX names losslessly; source/packed
+  manifest serialization stays unchanged. Exhausted errors resume only after
+  a changed cleanup implementation, retaining the old error in a versioned
+  receipt before a new bounded attempt. Neither an out-of-root nor a dangling link authorizes
+  deleting its target. Quarantine must be on the source's exact mount, not
+  merely the same `st_dev` across bind mounts. Direct disposable deletion is
+  reported separately from independent recovery/NAS acceptance; a re-created
+  target is protected and cannot borrow the old disposal authorization.
+  The original source-replication owner may reuse a bounded four-field
+  scheduling projection of completed local transport-retirement audits. Each
+  hit rechecks inode/type/uid/link/size/mtime/ctime; changed or absent files
+  invalidate reuse, and unfinished audits are not cached. This cache supplies
+  neither fresh progress clocks nor payload recovery/deletion evidence; the
+  canonical GC's full original checks remain independent.
+  The user's 2026-11-01 clarification earmarks the existing 32-GiB maintenance
+  reserve for backup/verification/retirement itself. The explicitly enrolled
+  guarded-D queue may select `capacity_reserve_policy: use_backup_reserve`
+  with its purpose instruction. Admit the full forecast workspace against
+  fresh guest, Windows backing and guarded D space; do not demand the same
+  32-GiB pool remain unused after that work. Pass this policy through the
+  original planner, wave preflight and archive preparer. Unknown/insufficient
+  workspace still defers, normal callers retain their original reserve and
+  no source-sized C fallback is introduced. All identity, source/process,
+  exact reconstruction, transport and retirement gates remain unchanged.
 - The enrolled Penguin cold-tier owner records new blob intents after
   publication and consolidates stable cohorts during its daily window. NTFS
   physical encoding preserves original CAS bytes, paths and manifest ABI;
@@ -407,6 +644,60 @@ that every trainable view should be routinely generated and kept on penguin.
   file restore ACK. Keep the original private marker and shared publication
   flags unchanged. A private file ACK does not establish current-source parity,
   canonical runtime recovery or permission to retire original observations.
+  Size private waves from the minimum of the original configured/receiver
+  batch limits, pending bytes, staging room and physical free space after
+  reserves. Retain the envelope and file-count bounds; an additional fixed
+  512-MiB latency target must not strand available throughput. This does not
+  change either peer's configured limit or authorize another publisher.
+  Compare the smallest eligible file plus the existing envelope reserve with
+  every independent budget before an expensive transport census. If it cannot
+  fit, retain exact byte bounds and limiting factors; distinguish a transient
+  pending/physical-capacity wait from exceeding the negotiated per-batch limit.
+  Any allocating wave still needs the current complete transport census.
+  Penguin's pending-byte window uses the existing retained-transport ceiling
+  (256 GiB), rather than a separate 32-GiB stop while both peers have room.
+  This is an upper bound, not reserved or preallocated space: every wave still
+  takes the minimum of fresh sender/receiver limits, live staging and retained
+  bytes, physical free space and the original 64-GiB reserves. The 8-GiB batch
+  and 512-file bounds remain. Do not infer relay or NAS acceptance from room.
+  Notify the original Syncthing scanner after each durable closed wave, using
+  an independent immutable dispatch snapshot, while the next copy can run.
+  Network waits join after releasing the publication lock; reload the owner's
+  ledger before recording matching scan proofs. A scan request is never NAS
+  acceptance, and deferred/failed notifications retain their durable retry.
+  `stockagent-backup-notify.timer` retries that same `notify-transport` entrypoint
+  each minute independently of bulk catalog capture. Its explicit idle preflight
+  checks the paired folder before reading the ledger. Invalid state defers;
+  ordinary publishers defer to a busy scanner. With the explicitly enrolled
+  `busy_scan_notification_enabled`, the independent notifier may queue one
+  closed batch plus its control paths behind the current scanner. Persist the
+  exact intent before POST, serialize notifiers and release the publication
+  owner during the wait. A timed-out/crashed request remains uncertain: busy
+  retries read only its small intent and cannot enqueue another until idle is
+  observed. Never interrupt the scanner or infer indexing/NAS acceptance from
+  submission, an uncertain result or a transport percentage.
+  Publication contention defers, network waits release the original owner and
+  scan receipts merge into a freshly loaded ledger under that same owner.
+  `cold_transport_cache.allow_scanning_when_fully_converged` explicitly allows
+  the original transport-cache owner to retire an exact NAS-ACKed, reconstructible
+  batch while the paired folder is `scanning`. Default false preserves the idle
+  gate. All local/peer pending and error checks, paired full-restore ACK, retained
+  source proofs, immutable member signatures and process-reference checks still
+  apply. Busy scanning alone must not retain an already verified transport copy
+  and starve the next wave of physical space. Persist deleted-name scan intents;
+  do not enqueue another scan behind a busy scanner while holding publication.
+  The next idle original turn retries only those exact deleted batch paths.
+  This policy never retires D authority, NAS snapshots or original observations.
+  `maximum_retirements_per_cycle` sizes a producer turn in complete, journalled
+  cache transactions (default unbounded, enrolled Penguin value 4). After that
+  turn the same original owner can publish its next waves; failed candidates
+  do not consume the success count or block later candidates. This is pipeline
+  fairness, not a CPU/I/O quota or permission to interrupt a transaction. Old
+  active turns finish normally and timers load the policy on their next turn.
+  Within each proof pass, retain the exact source signature already checked by
+  the pinned reader instead of querying that same leaf twice. Pre-rename and
+  post-rename source checks remain distinct fresh observations; no proof is
+  reused across transactions, changed sources or process restarts.
   Current scope and unresolved gates are in
   [WSL/NAS progress](../wsl_storage_progress_2026-10-28.md).
 - Existing derived views, unique training results and D cold history remain
@@ -1022,6 +1313,28 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   the complete interface, while a component `READY` proves that component only.
   Preserve original absolute-link bytes as provenance. No shared/NAS export,
   source retirement, generic link-following or new source authority is granted.
+  Uncommitted migration failures caused by an exact unsafe absolute link may
+  wait on its bounded no-follow metadata observation instead of repeating the
+  full publication while it is unchanged. Preserve the original failed attempt;
+  a changed observation wakes the original publisher, which still performs all
+  source/recovery checks. Unknown observations do not clear the failure. Fixed
+  committed releases always resume recovery first. `local-tw-futures` waits for
+  the original recovered `local-tw-index-futures` binding without spending a
+  failed publication attempt, then wakes immediately when that binding exists.
+  The five reviewed vanished RAM code-build aliases (v128/153/157/165/175) have
+  an explicit inventory/SHA-bound repair, not a generic dangling-link cleanup.
+  `scripts/repair_futures_build_input_links.py` requires the unchanged migration
+  and original publisher owners, absent targets, exact inode/link metadata and
+  fresh consumer checks. It preserves link inodes in private service state and
+  writes portable source provenance before renaming; it neither deletes payload
+  nor claims to recover the absent worktree. Interrupted moves resume the same
+  inventory without overwriting either name. See the dated cooperative runbook.
+  That same explicit repair also inventories the fifteen reviewed pre-reboot
+  volatile validation-view leases; pin each complete original lease, preserve
+  absent-view evidence and never describe its output as recovered. One reviewed
+  internal v8q checkpoint alias may become relative only with the same existing
+  v8 target inode/manifest and safe in-root referent. These are fixed allowlists,
+  not permission to ignore missing source payload or change other generators.
   Public CEX publishers additionally acquire the original existing grain
   `.download.lock` in deterministic order through publication, then release it
   before cold recovery. A canonical collector still opening the same native
@@ -1242,6 +1555,20 @@ The 2026-10-05 selected deployment extends the canonical packed source contract:
   A nonblocking cycle guard permits only one full controller/capture at a time;
   it does not participate in closed-wave publication or replace the original
   journal owner. A second cycle is rejected even while capture yields that owner.
+  Before auxiliary source hashing or another full catalog capture, the same
+  owner may defer payload work when fresh physical free space cannot exceed
+  its existing reserve. Recover prepared intents, ingest paired ACKs and run
+  verified transport retirement first, so the deferral cannot block recovery
+  of accepted temporary copies. Preserve the last coverage identity, counters
+  and original observation clock; publish a separate current activity/capacity
+  clock with `coverage_recomputed: false`, and retain the last failed auxiliary
+  evidence. This negative check grants no allocation or deletion permission.
+  Once space returns, rebuild the full current catalog and repeat transport,
+  native allocation and independent recovery checks before publication. Explicit
+  read-only inventory still performs its full capture. Private receiver expiry
+  metadata likewise displays the original ready time and its original lifetime;
+  minute observers cannot renew that permit or replace the receiver's guards.
+  See [capacity-first live cycles](../storage_capacity_and_verification_2026-11-02.md).
   The mounted canonical D catalog reader may overlap at most four no-follow
   object signature queries in batches of 32, with descriptor headroom. Visit
   every unique declared object, preserve deterministic catalog/missing-object
@@ -1650,7 +1977,9 @@ catalog credentials or hard-code an interpreter path.
   `datasets`, `data_repair`, `maintenance` and `operations`. This one-shot scope
   requires `capture_contract: manual-wsl-artifact-preservation-v1`, an explicit
   manual capture with a 12-hour stability floor and manual immediate retirement;
-  it cannot enroll automatic publication or cache deletion. Use
+  it cannot enroll automatic candidate discovery or general cache deletion.
+  The 2026-10-31 frozen queue above may automatically resume only explicitly
+  enrolled captures through that same original execution path. Use
   `scripts/retire_local_offline_artifacts.py` through the authority namespace
   wrapper, retaining every source/mirror/D recovery, process/configuration,
   pin, transport and quarantine gate. Existing enrolled archives may be selected
@@ -1672,7 +2001,7 @@ catalog credentials or hard-code an interpreter path.
   borrow another producer's completion. Preserve its original receipt bytes;
   full original/cold recovery and every retirement gate remain independent.
   This is producer-declared completion, not a fresh numerical benchmark oracle.
-  The reviewed workflow-speed rounds 6, 7, 8 and 11 use their original
+  The reviewed workflow-speed rounds 6, 7, 8, 11 and 12 use their original
   `workflow_speed_roundN_scoped_acceptance_v1` ABI. Bind the exact dated suite
   and round, original acceptance SHA, independent readback/count/clock and
   explicitly scoped claims. Retain their three small completion/disposition
@@ -1683,6 +2012,23 @@ catalog credentials or hard-code an interpreter path.
   diagnostic/registry coverage and selected-variant bindings across its original
   three receipts. It does not use round 7's raw-sample key. Preserve historical
   maintained-code descriptors without rehashing today's code into old evidence.
+  Round 12 instead records `raw_complete_samples_verified` and
+  `full_collector_phases`, with `selected_source_verified` disposition. Bind its
+  complete-reader count, six-output parity and selected source, retaining the
+  original memory rejection and failed remote environment gate. This admits
+  only that closed comparison for archival; it does not establish remote
+  readiness. Full source/recovery/retirement checks remain.
+  Its 40,574-row original acceptance is 11.39 MiB: admit that producer's seal
+  up to 16 MiB within the unchanged 32 MiB total control budget. Other receipt
+  members remain bounded to 8 MiB; measurement payloads stay in the full archive.
+  Round 13 is separately reviewed under its original
+  `workflow_round13_scoped_optimization_acceptance_v1` ABI, not the earlier
+  rounds' seal format. Bind its three receipts, exact source disposition,
+  independent sealed-file/sample/readback counts and clocks. Preserve its one
+  failed trial, successful readback repair and explicit false claims for whole
+  collector speedup, all workflows and a proven hardware limit. This admits
+  only its completed static-inventory comparison to the same full archival,
+  consumer and recovery gates; it does not enroll later rounds or producers.
   A new single completed benchmark inventory may explicitly select
   `--native-ssd-scratch`: freeze the existing fixed native SSD stage and retain
   durable staging, virtual and Windows-backing capacity admission, full source
@@ -1802,6 +2148,11 @@ catalog credentials or hard-code an interpreter path.
   Include external sibling completion bytes in every binding; inline receipts
   are already part of the source tree. Recheck all usage/pin/transport gates
   and the full binding before unlink. Unknown/v1 reuse proofs are rejected.
+  If an otherwise unchanged owned quarantine proof expires during the final
+  gates, stop before unlink and return the distinct proof-expired outcome to
+  the existing bounded full-audit loop. Keep the failed attempt and original
+  timestamp; do not extend its 1500-second validity. Changed generations,
+  consumers or unknown failures remain fatal and cannot use this retry.
   This does not remove the first-rename or encoding-stage-rename byte audits.
   Large mutable SQLite work copies
   cannot share immutable-input hardlinks. A cold publication or copied report
@@ -1811,6 +2162,10 @@ catalog credentials or hard-code an interpreter path.
   one scan and must recheck reused names before acceptance. No result survives
   the scan. A newly relevant alias, changed cwd or lost visibility still defers;
   rotation between two unrelated paths is not a consumer of the selected root.
+  A transient resolution change may restart the whole read-only process guard
+  at most three times, including a fresh direct FD/cwd probe on every attempt.
+  Do not retry only ancestor paths: the new cwd can introduce a direct consumer.
+  Persistent churn or lost permissions remain unknown use and block retirement.
   Do not add a lexical-prefix filter that misses aliases outside the scope.
   Historical simulations require the separate
   `manual-wsl-offline-simulation-preservation-v1` contract and one explicit
@@ -2184,6 +2539,16 @@ catalog credentials or hard-code an interpreter path.
   hashing after quarantine. Expiration requires another full audit outside the
   mutation owner. No CLI accepts a saved proof to bypass a fresh audit, and
   automatic retention keeps its existing full verification path.
+  For the explicit guarded-D offline modes, a same-process manual transaction
+  may instead persist its ordinary retirement state, move the two exact names
+  into its original quarantine, and release the shared mutation owner before
+  the mandatory complete post-rename packed, archive and original-byte audit.
+  Reacquire the original owner and use the existing process-bound quarantine
+  resume contract, unchanged 1,500-second age and fresh generation, consumer,
+  pin, lease, cold and transport gates before unlink. A partial rename, changed
+  member, unknown state or failed audit remains quarantined; a proof is never
+  refreshed from metadata alone. This split applies only to the two explicit
+  guarded-D modes and does not grant deletion by itself.
   The original manual CLI may retry at most three transport preflights under
   that owner and original clock, only for the exact canonical
   `legacy retirement blocked: cold-peer-not-converged` error, which precedes

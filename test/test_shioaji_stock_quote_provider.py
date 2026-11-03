@@ -958,6 +958,7 @@ def test_prepare_tw_price_limits_persists_only_static_metadata(monkeypatch, tmp_
         parquet_root=tmp_path,
         trading_date="2026-08-12",
     )
+    cache_before = (tmp_path / "2026-08-12.parquet").stat()
     second = quote_provider.prepare_tw_price_limit_snapshot(
         ["2330", "2317"],
         np.asarray([100.0, 100.0]),
@@ -969,6 +970,97 @@ def test_prepare_tw_price_limits_persists_only_static_metadata(monkeypatch, tmp_
     assert first["prepared_count"] == 2
     assert second["missing_count"] == 0
     assert (tmp_path / "2026-08-12.parquet").is_file()
+    cache_after = (tmp_path / "2026-08-12.parquet").stat()
+    assert (cache_before.st_ino, cache_before.st_mtime_ns, cache_before.st_ctime_ns) == (
+        cache_after.st_ino, cache_after.st_mtime_ns, cache_after.st_ctime_ns
+    )
+
+
+def test_prepare_tw_price_limits_counts_only_requested_gaps(monkeypatch, tmp_path):
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    calls = []
+
+    def fake_mis(symbols, fallback_prices, **_kwargs):
+        calls.append(list(symbols))
+        # One unavailable requested symbol must not be hidden by unrelated
+        # entries already cached for the same trading day.
+        values = [np.nan if symbol == "9999" else 110.0 for symbol in symbols]
+        return quote_provider.PriceSnapshot(prices=np.asarray(fallback_prices),
+            source="twse_tpex:mis", available_count=len(symbols),
+            reference_prices=np.full(len(symbols), 100.0),
+            upper_limit_prices=np.asarray(values),
+            lower_limit_prices=np.full(len(symbols), 90.0))
+
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_mis)
+    quote_provider.prepare_tw_price_limit_snapshot(["2330", "2317", "2454"],
+        np.asarray([100.0, 100.0, 100.0]), parquet_root=tmp_path, trading_date="2026-08-12")
+    path = tmp_path / "2026-08-12.parquet"
+    before = path.stat()
+    receipt = quote_provider.prepare_tw_price_limit_snapshot(["2330", "9999", "9999"],
+        np.asarray([100.0, 100.0, 100.0]), parquet_root=tmp_path, trading_date="2026-08-12")
+    after = path.stat()
+    assert calls == [["2330", "2317", "2454"], ["9999"]]
+    assert receipt["missing_count"] == 1
+    assert (before.st_ino, before.st_mtime_ns, before.st_ctime_ns) == (
+        after.st_ino, after.st_mtime_ns, after.st_ctime_ns
+    )
+
+
+@pytest.mark.parametrize("upper,lower", [(None, 90.0), (110.0, None), (90.0, 110.0), (0.0, 90.0)])
+def test_prepare_tw_price_limits_retries_an_invalid_cached_pair(monkeypatch, tmp_path, upper, lower):
+    import polars as pl
+
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    pl.DataFrame([{"symbol": "2330", "reference_price": 100.0,
+                   "upper_limit_price": upper, "lower_limit_price": lower}]).write_parquet(
+                       tmp_path / "2026-08-12.parquet")
+    calls = []
+
+    def fake_mis(symbols, fallback_prices, **_kwargs):
+        calls.append(list(symbols))
+        return quote_provider.PriceSnapshot(prices=np.asarray(fallback_prices),
+            source="twse_tpex:mis", available_count=1,
+            reference_prices=np.asarray([100.0]), upper_limit_prices=np.asarray([110.0]),
+            lower_limit_prices=np.asarray([90.0]))
+
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_mis)
+    receipt = quote_provider.prepare_tw_price_limit_snapshot(["2330"], np.asarray([100.0]),
+        parquet_root=tmp_path, trading_date="2026-08-12")
+    loaded, _ = quote_provider._load_prepared_tw_price_limits("2026-08-12")
+    assert calls == [["2330"]]
+    assert receipt["missing_count"] == 0
+    assert loaded["2330"] == (100.0, 110.0, 90.0)
+
+
+def test_prepare_tw_price_limits_does_not_use_wrong_session_cache_rows(monkeypatch, tmp_path):
+    import polars as pl
+
+    monkeypatch.setenv("STOCKAGENT_TW_PRICE_LIMIT_ROOT", str(tmp_path))
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE_KEY", None)
+    monkeypatch.setattr(quote_provider, "_TW_LIMIT_CACHE", {})
+    pl.DataFrame([{"symbol": "2330", "trading_date": "2026-08-11", "reference_price": 100.0,
+                   "upper_limit_price": 110.0, "lower_limit_price": 90.0}]).write_parquet(
+                       tmp_path / "2026-08-12.parquet")
+    calls = []
+
+    def fake_mis(symbols, fallback_prices, **_kwargs):
+        calls.append(list(symbols))
+        return quote_provider.PriceSnapshot(prices=np.asarray(fallback_prices),
+            source="twse_tpex:mis", available_count=1,
+            reference_prices=np.asarray([105.0]), upper_limit_prices=np.asarray([115.5]),
+            lower_limit_prices=np.asarray([94.5]))
+
+    monkeypatch.setattr(quote_provider, "fetch_tw_mis_last_prices", fake_mis)
+    receipt = quote_provider.prepare_tw_price_limit_snapshot(["2330"], np.asarray([100.0]),
+        parquet_root=tmp_path, trading_date="2026-08-12")
+    loaded, _ = quote_provider._load_prepared_tw_price_limits("2026-08-12")
+    assert calls == [["2330"]]
+    assert receipt["missing_count"] == 0
+    assert loaded["2330"] == (105.0, 115.5, 94.5)
 
 
 def test_prepare_tw_price_limits_repairs_truncated_cache(monkeypatch, tmp_path):

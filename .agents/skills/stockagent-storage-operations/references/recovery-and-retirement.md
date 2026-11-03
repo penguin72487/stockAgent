@@ -70,6 +70,17 @@ NAS snapshots／repository prune、D object GC、source hot retirement、backup 
 
 ## Legacy 與共用鎖
 
+固定 D 版本的完整還原可由原 verifier 啟用本機／私人 Vast 的 pack 分工。
+同一 source 讀取器批次供料，遠端只在匿名記憶體核對，原 owner 彙整全部
+SHA／CRC／原值 commitments 後才寫 recovery receipt。沿用原 mount、generation、
+NAS 及退休條件；不能用單 pack 或遠端可連線當作刪除證明。設定、逐件證據與
+完整重測見 `docs/cooperative_packed_verification_2026-10-31.md`；預設沿原 worker
+自然邊界載入。使用者明確要求立即換版時，使用既有
+`rollout_lakehouse_source_policy.py --reload-code-only --restart-active-owner`，
+先固定候選 SHA、已驗證 releases 與 durable restart intent，再交由 systemd
+停止原 worker 並接手 journals；保留未封閉工作可能重跑的事實，不另啟 publisher、
+刪鎖或改寫已驗證收據。
+
 歷史保存沿 `configs/data_sync/vastai_legacy_archive_return.json` 或
 `vastai_bulk_preservation.json` 的**既存已註冊** cohort、policy、source fingerprints。
 一次性 tar/zstd 保存不是正常增量規則，也不是 completed-model 證明；不自動加入
@@ -93,6 +104,11 @@ current inode 的外部 FD／mmap、quarantine 後 metadata 與每次 nlink 減�
 ## 故障接手
 
 - **75／busy／資料未齊：** 記錄 deferred 原因，讓同一 timer 後續重試；不是備份成功。
+- **備份工作空間：** 依使用者 2026-11-01 的用途釐清，固定 guarded-D queue
+  可用 `use_backup_reserve` 動用原本給備份的預留池，不重複要求作業後仍保留
+  同一筆 32 GiB。仍按本輪完整工作量檢查 guest、Windows backing 與 D；一般
+  caller 預留量及所有恢復／退休 gate 不變。見
+  `docs/storage_automatic_continuation_2026-10-31.md` 的備份預留池段落。
 - **NAS unavailable／readiness 過期：** 保留來源與 sealed delivery，修既有 mount／
   owner，恢復後再驗 fixed snapshot；拒絕本機空目錄充當 NAS。
 - **SHA／READY／集合／Git 解析／runtime 不符：** 保留失敗證據，修精確根因；不發 ACK、

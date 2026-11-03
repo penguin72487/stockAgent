@@ -638,6 +638,41 @@ def _read_receipt(path: str, mtime_ns: int, size: int) -> dict:
     return payload
 
 
+def load_recorded_universe(session_date: str, *, expected_fingerprint: str) -> dict:
+    """Read the exact archived registry for diagnostics, never a live admission.
+
+    A later same-day refresh changes observation/source identity even when the
+    symbol count is unchanged. Do not join an opening journal to that new head,
+    or require today's date when investigating yesterday's recorded evidence.
+    Every selected member still passes the canonical raw-hash/policy checks.
+    """
+    if not re.fullmatch(r"[0-9a-f]{64}", expected_fingerprint):
+        raise ValueError("an exact recorded registry fingerprint is required")
+    current = receipt_path(session_date)
+    candidates = (current, *sorted((current.parent / "generations").glob("*.json")))
+    for path in candidates:
+        try:
+            before = path.stat()
+            candidate = json.loads(path.read_bytes())
+        except FileNotFoundError:
+            continue
+        if not isinstance(candidate, dict) or candidate.get("session_date") != session_date:
+            continue
+        if candidate.get("fingerprint") != expected_fingerprint:
+            continue
+        payload = _read_receipt(str(path.resolve()), before.st_mtime_ns, before.st_size)
+        after = path.stat()
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns)):
+            raise ValueError("recorded registry changed during read")
+        observed = datetime.fromisoformat(payload["observed_at_taipei"])
+        if (observed.tzinfo is None or observed.astimezone(TAIPEI).date().isoformat() != session_date
+                or observed > datetime.now(TAIPEI)):
+            raise ValueError("recorded registry observation clock mismatch")
+        return payload
+    raise TWTradingUniversePending("找不到與原始開盤收據相符的官方名冊版本；不以目前版本替代")
+
+
 def load_current_universe(session_date: str) -> dict:
     path = receipt_path(session_date)
     try:

@@ -13,6 +13,7 @@ import re
 import sqlite3
 import sys
 import time
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 if __package__ in {None, ''}:
@@ -24,10 +25,11 @@ import pyarrow.parquet as pq
 from downloader.artifact_io import atomic_write_bytes, sha256_file
 from downloader.news_fulltext import load_config
 from downloader.news_fulltext_bulk import wordpress_base
-from downloader.news_fulltext_cnyes_history import digest as post_digest
+from downloader.news_fulltext_cnyes_history import _read_accepted_batch_original, digest as post_digest
 from downloader.news_fulltext_policy import NewsError, cnyes_bulk_fingerprint
 from downloader.news_fulltext_queue import source_path
 from downloader.parquet_integrity import signature
+from scripts.audit_news_cached_replay import _check_history_envelope
 from scripts.audit_news_issuer_overlap import match_local_records, verified_finlab
 
 
@@ -107,35 +109,61 @@ def select_sources(by_source, uncovered):
 
 
 def _source_posts(root, registry, source, sha, source_evidence, pairs):
-    relative = 'quarantine/' + sha + '.parquet'
-    direct, direct_receipt = root / relative, root / (relative + '.receipt.json')
+    relative = source_evidence.get('artifact_path', 'quarantine/' + sha + '.parquet')
+    kind = source_evidence.get('artifact_kind', 'canonical_quarantine')
+    receipt_relative = source_evidence.get('receipt_path', relative + '.receipt.json')
+    if (kind not in {'canonical_quarantine', 'cnyes_history_source_envelope', 'accepted_body_batch'}
+            or kind == 'canonical_quarantine' and relative != 'quarantine/' + sha + '.parquet'):
+        raise ValueError('unsupported_cnyes_source_envelope')
+    if kind != 'accepted_body_batch' and receipt_relative != relative + '.receipt.json':
+        raise ValueError('unsupported_cnyes_source_receipt')
+    direct, direct_receipt = root / relative, root / receipt_relative
     if direct.is_symlink() or direct_receipt.is_symlink():
         raise ValueError('unsafe_source_symlink')
-    path, receipt_path = source_path(root, relative), source_path(root, relative + '.receipt.json')
+    path, receipt_path = source_path(root, relative), source_path(root, receipt_relative)
     before, receipt_before = signature(path), signature(receipt_path)
-    if before[2] > 16 << 20 or receipt_before[2] > 65536:
+    if kind != 'accepted_body_batch' and before[2] > 16 << 20 or receipt_before[2] > 65536:
         raise ValueError('source_envelope_oversized')
-    receipt = json.loads(receipt_path.read_bytes())
-    if (receipt.get('parquet_path') != relative or receipt.get('publish') is not False
-            or receipt.get('response_sha256') != sha or receipt.get('sha256') != source_evidence['parquet_sha256']
-            or sha256_file(path) != receipt.get('sha256')):
-        raise ValueError('source_receipt_mismatch')
-    parquet = pq.ParquetFile(path)
-    if (parquet.metadata.num_rows != 1 or parquet.metadata.num_row_groups != 1
-            or parquet.metadata.row_group(0).total_byte_size > 20 << 20):
-        raise ValueError('source_envelope_grain_or_size_invalid')
-    record, = parquet.read(use_threads=False).to_pylist()
+    if kind == 'accepted_body_batch':
+        request_sha = source_evidence.get('source_request_sha256')
+        if not isinstance(request_sha, str) or not HASH.fullmatch(request_sha):
+            raise ValueError('invalid_accepted_batch_request')
+        db_path = root / 'queue.sqlite3'
+        with closing(sqlite3.connect(db_path.as_uri() + '?mode=ro&immutable=1', uri=True)) as db:
+            db.execute('PRAGMA query_only=ON')
+            loaded = _read_accepted_batch_original(SimpleNamespace(root=root, db=db),
+                {'parquet_path': relative, 'receipt_path': receipt_relative}, source, None, sha,
+                request_sha256=request_sha)
+        if loaded is None or loaded['receipt']['sha256'] != source_evidence['parquet_sha256']:
+            raise ValueError('source_accepted_batch_invalid')
+        record, receipt = loaded['original'], loaded['receipt']
+    else:
+        receipt = json.loads(receipt_path.read_bytes())
+        if (receipt.get('parquet_path') != relative or receipt.get('publish') is not False
+                or receipt.get('response_sha256') != sha or receipt.get('sha256') != source_evidence['parquet_sha256']
+                or sha256_file(path) != receipt.get('sha256')):
+            raise ValueError('source_receipt_mismatch')
+        parquet = pq.ParquetFile(path)
+        if (parquet.metadata.num_rows != 1 or parquet.metadata.num_row_groups != 1
+                or parquet.metadata.row_group(0).total_byte_size > 20 << 20):
+            raise ValueError('source_envelope_grain_or_size_invalid')
+        record, = parquet.read(use_threads=False).to_pylist()
     raw = record['raw_response_body']
     if (not isinstance(raw, bytes) or len(raw) > 16 << 20 or hashlib.sha256(raw).hexdigest() != sha
             or record['response_sha256'] != sha or record['publish'] is not False
             or record['captured_at_utc'] != source_evidence['source_observed_at_utc']
             or record['authorization_fingerprint'] != source.authorization_fingerprint
-            or json.loads(record['authorization_json']) != source.authorization
+            or kind != 'accepted_body_batch' and json.loads(record['authorization_json']) != source.authorization
             or registry.require(record['request_url']).provider != 'cnyes'
-            or wordpress_base(record['request_url']) not in source.cnyes_apis):
+            or wordpress_base(record['request_url']) not in source.cnyes_apis
+            or source_evidence.get('source_request_sha256', hashlib.sha256(record['request_url'].encode()).hexdigest())
+                != hashlib.sha256(record['request_url'].encode()).hexdigest()):
         raise ValueError('source_response_identity_or_authorization_mismatch')
+    if kind == 'cnyes_history_source_envelope':
+        _check_history_envelope(relative, record, receipt, sha)
     posts = json.loads(raw)['items']['data']
-    if (not isinstance(posts, list) or len(posts) > 60 or len(posts) != receipt['article_count']
+    if (not isinstance(posts, list) or len(posts) > 60
+            or kind == 'canonical_quarantine' and len(posts) != receipt['article_count']
             or any(not isinstance(post, dict) or type(post.get('payment')) is not int or post['payment'] != 0 for post in posts)):
         raise ValueError('source_posts_invalid')
     wanted = set(pairs)
@@ -161,10 +189,18 @@ def audit(news_root, finlab_root, registry, checked, prior, *, batch_rows=8192):
     news_root, finlab_root = news_root.resolve(), finlab_root.resolve()
     source = registry.sources['cnyes']
     outcomes = checked.get('target_outcomes')
-    if (checked.get('contract') != 'cnyes_retained_missing_crosscheck_v1'
+    contract = checked.get('contract')
+    if (contract not in {'cnyes_retained_missing_crosscheck_v1', 'cnyes_retained_missing_crosscheck_v2',
+                         'cnyes_retained_missing_crosscheck_v3', 'cnyes_retained_missing_crosscheck_v4'}
             or checked.get('source_fingerprint') != cnyes_bulk_fingerprint(source)
             or checked.get('response_failures') or checked.get('unfinished_responses') != 0
-            or not isinstance(outcomes, list) or len(outcomes) != checked.get('candidate_pairs')):
+            or not isinstance(outcomes, list) or len(outcomes) != checked.get('candidate_pairs')
+            or contract in {'cnyes_retained_missing_crosscheck_v2', 'cnyes_retained_missing_crosscheck_v3',
+                            'cnyes_retained_missing_crosscheck_v4'} and (
+                checked.get('unresolved_matching_observations') != 0
+                or any(item.get('original_request_identity_checked') is not True for item in outcomes))
+            or contract in {'cnyes_retained_missing_crosscheck_v3', 'cnyes_retained_missing_crosscheck_v4'}
+                and checked.get('unfinished_source_envelopes') != 0):
         raise ValueError('invalid_cnyes_proof_scope')
     finlab_path, finlab_receipt_path, receipt, finlab_before, receipt_before, finlab_sha = verified_finlab(finlab_root)
     prior_pairs = previously_compared(prior, finlab_sha)
@@ -205,12 +241,32 @@ def audit(news_root, finlab_root, registry, checked, prior, *, batch_rows=8192):
             if (not isinstance(evidence['parquet_sha256'], str) or not HASH.fullmatch(evidence['parquet_sha256'])
                     or not isinstance(evidence['source_observed_at_utc'], str)):
                 raise ValueError('invalid_cnyes_source_evidence')
-            if sha in sources and sources[sha] != evidence:
+            if contract in {'cnyes_retained_missing_crosscheck_v3', 'cnyes_retained_missing_crosscheck_v4'}:
+                relative, kind, request_sha = (item.get('source_artifact_path'), item.get('source_artifact_kind'),
+                                               item.get('source_request_sha256'))
+                valid_kinds = {'canonical_quarantine', 'cnyes_history_source_envelope'}
+                if contract == 'cnyes_retained_missing_crosscheck_v4':
+                    valid_kinds.add('accepted_body_batch')
+                if (not isinstance(relative, str) or kind not in valid_kinds
+                        or not isinstance(request_sha, str) or not HASH.fullmatch(request_sha)):
+                    raise ValueError('invalid_cnyes_source_envelope_evidence')
+                evidence.update(artifact_path=relative, artifact_kind=kind, source_request_sha256=request_sha)
+                if contract == 'cnyes_retained_missing_crosscheck_v4':
+                    receipt_relative = item.get('source_receipt_path')
+                    if not isinstance(receipt_relative, str):
+                        raise ValueError('invalid_cnyes_source_envelope_evidence')
+                    evidence['receipt_path'] = receipt_relative
+                    source_key = (sha, relative, kind, receipt_relative, request_sha)
+                else:
+                    source_key = (sha, relative, kind)
+            else:
+                source_key = sha
+            if source_key in sources and sources[source_key] != evidence:
                 raise ValueError('conflicting_cnyes_response_evidence')
-            sources[sha] = evidence
+            sources[source_key] = evidence
             target = targets.setdefault(pair, {'head': head, 'observations': {}})
-            target['observations'][sha] = evidence['source_observed_at_utc']
-            by_source[sha].add(pair)
+            target['observations'][source_key] = evidence['source_observed_at_utc']
+            by_source[source_key].add(pair)
     if len(targets) > 20_000 or len(sources) > 20_000:
         raise ValueError('candidate_bound_exceeded')
     remaining, attempts, failures, selected_posts = set(targets), set(), [], {}
@@ -220,18 +276,20 @@ def audit(news_root, finlab_root, registry, checked, prior, *, batch_rows=8192):
         plan = select_sources(available, remaining)
         if not plan:
             break
-        for sha in plan:
-            wanted = by_source[sha] & remaining
+        for source_key in plan:
+            wanted = by_source[source_key] & remaining
             if not wanted:
                 continue
-            attempts.add(sha)
+            attempts.add(source_key)
+            sha = source_key[0] if isinstance(source_key, tuple) else source_key
             try:
-                posts = _source_posts(news_root, registry, source, sha, sources[sha], wanted)
+                posts = _source_posts(news_root, registry, source, sha, sources[source_key], wanted)
                 for pair, post in posts.items():
-                    selected_posts[pair] = (sha, post)
+                    selected_posts[pair] = (source_key, post)
                 remaining.difference_update(posts)
-            except (OSError, ValueError, TypeError, KeyError, NewsError, pa.ArrowException) as error:
-                failures.append({'response_sha256': sha, 'pairs': len(wanted),
+            except (OSError, ValueError, TypeError, KeyError, sqlite3.Error, NewsError, pa.ArrowException) as error:
+                failures.append({'response_sha256': sha, 'source_artifact_path': sources[source_key].get('artifact_path'),
+                                 'pairs': len(wanted),
                                  'error': error.code if isinstance(error, NewsError) else type(error).__name__ + ':' + str(error)[:100]})
             if len(attempts) % 100 == 0:
                 print(json.dumps({'source_envelopes_attempted': len(attempts),
@@ -246,9 +304,22 @@ def audit(news_root, finlab_root, registry, checked, prior, *, batch_rows=8192):
         raise ValueError('news_snapshot_changed_during_audit')
     rows, states = [], Counter()
     for pair, key in sorted(candidates.items()):
-        sha, post = selected_posts[pair]
+        source_key, post = selected_posts[pair]
+        sha = source_key[0] if isinstance(source_key, tuple) else source_key
+        observations = targets[pair]['observations']
+        if contract in {'cnyes_retained_missing_crosscheck_v3', 'cnyes_retained_missing_crosscheck_v4'}:
+            observations = [{'source_response_sha256': key[0], 'source_artifact_path': key[1],
+                             'source_artifact_kind': key[2], 'source_observed_at_utc': clock,
+                             **({'source_receipt_path': key[3], 'source_request_sha256': key[4]}
+                                if contract == 'cnyes_retained_missing_crosscheck_v4' else {})}
+                            for key, clock in sorted(observations.items())]
         row = {'news_id': pair[0], 'source_post_sha256': pair[1], 'selected_response_sha256': sha,
-               'source_observations': targets[pair]['observations'], 'source_publish_epoch': post.get('publishAt')}
+               'source_observations': observations, 'source_publish_epoch': post.get('publishAt')}
+        if contract in {'cnyes_retained_missing_crosscheck_v3', 'cnyes_retained_missing_crosscheck_v4'}:
+            row['selected_source_artifact_path'] = source_key[1]
+        if contract == 'cnyes_retained_missing_crosscheck_v4':
+            row['selected_source_receipt_path'] = source_key[3]
+            row['selected_source_request_sha256'] = source_key[4]
         if key is None:
             states['no_exact_issuer_key'] += 1
             rows.append({**row, 'symbol_candidate': None, 'publisher_day_taipei': None,
@@ -261,7 +332,10 @@ def audit(news_root, finlab_root, registry, checked, prior, *, batch_rows=8192):
         rows.append({**row, 'symbol_candidate': key[0],
             'publisher_day_taipei': key[1], 'literal_subject': key[2],
             'match_state': state, 'local_record_candidates': records})
-    return {'contract': 'cnyes_finlab_issuer_overlap_v1', 'completed_at_utc': datetime.now(timezone.utc).isoformat(),
+    return {'contract': ('cnyes_finlab_issuer_overlap_v3' if contract == 'cnyes_retained_missing_crosscheck_v4'
+                         else 'cnyes_finlab_issuer_overlap_v2' if contract == 'cnyes_retained_missing_crosscheck_v3'
+                         else 'cnyes_finlab_issuer_overlap_v1'),
+        'completed_at_utc': datetime.now(timezone.utc).isoformat(),
         'elapsed_seconds': round(time.monotonic() - started, 3), 'source_fingerprint': checked['source_fingerprint'],
         'finlab_receipt_sha256': finlab_sha, 'finlab_receipt_path': str(finlab_receipt_path),
         'finlab_receipt_status': receipt['status'], 'finlab_prior_version_identical': prior.get('finlab_receipt_sha256') == finlab_sha,
@@ -274,7 +348,8 @@ def audit(news_root, finlab_root, registry, checked, prior, *, batch_rows=8192):
         'source_body_text_exported': False, 'body_equivalence_verified': False,
         'publication_clock_verified_by_match': False, 'news_training_injection': False,
         'all_history_complete': False, 'accepted': not failures and not remaining,
-        'comparison_basis': 'same stock code, publisher Taipei day and literal issuer subject; independent sources'}
+        'comparison_basis': 'same stock code, publisher Taipei day and literal issuer subject; independent sources',
+        'source_envelope_count_semantics': 'distinct artifact and exact request for v4 proofs'}
 
 
 def complete_legacy_unkeyed_rows(checked, prior, completed, input_hashes):

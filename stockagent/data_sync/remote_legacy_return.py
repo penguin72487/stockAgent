@@ -234,7 +234,11 @@ def dataset_name(relative: str) -> str:
 
 
 def real(path: Path) -> Path:
-    path = path.absolute()
+    from stockagent.service_layout import canonical_service_path
+    try:
+        path = canonical_service_path(path)
+    except ValueError as exc:
+        raise SnapshotError("remote archive service alias differs") from exc
     if any(p.is_symlink() for p in (path, *path.parents)):
         raise SnapshotError("remote archive path is redirected")
     return path
@@ -292,23 +296,43 @@ def metadata_tree(source: Path, *, file_workers: int = 1) -> dict:
     source = real(source)
     device = source.stat().st_dev
     rows, inodes = [], {}
+    file_count = logical_bytes = 0
+    source_text = os.fspath(source)
+    source_prefix = source_text if source_text.endswith(os.sep) else source_text + os.sep
     pool = ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else contextlib.nullcontext(None)
     with pool as executor:
         for parent, dirs, files in os.walk(source, followlinks=False, onerror=_raise_walk_error):
             paths = (Path(parent) / name for name in sorted(dirs + files))
             for path, info in _iter_lstat_bounded(paths, executor):
                 kind = "file" if stat.S_ISREG(info.st_mode) else "directory" if stat.S_ISDIR(info.st_mode) else "unsupported"
-                rows.append({"path": path.relative_to(source).as_posix(), "kind": kind,
+                path_text = os.fspath(path)
+                if path_text == source_text:
+                    relative = '.'
+                elif path_text.startswith(source_prefix):
+                    relative = path_text[len(source_prefix):]
+                    if relative.startswith(os.sep):
+                        relative = path.relative_to(source).as_posix()
+                else:
+                    relative = path.relative_to(source).as_posix()
+                if os.sep != '/':
+                    relative = relative.replace(os.sep, '/')
+                rows.append({"path": relative, "kind": kind,
                              "signature": signature(info), "cross_filesystem": info.st_dev != device})
                 if kind == "file":
+                    logical_bytes += info.st_size
+                    file_count += 1
                     key = (info.st_dev, info.st_ino)
-                    value = inodes.setdefault(key, [info.st_nlink, info.st_blocks * 512, 0])
-                    if value[:2] != [info.st_nlink, info.st_blocks * 512]:
-                        raise SnapshotError("source inode mutated during inventory")
-                    value[2] += 1
+                    value = inodes.get(key)
+                    blocks = info.st_blocks * 512
+                    if value is None:
+                        inodes[key] = [info.st_nlink, blocks, 1]
+                    else:
+                        if value[0] != info.st_nlink or value[1] != blocks:
+                            raise SnapshotError("source inode mutated during inventory")
+                        value[2] += 1
     rows.sort(key=lambda r: r["path"])
-    return {"rows": rows, "logical_bytes": sum(r["signature"][2] for r in rows if r["kind"] == "file"),
-            "files": sum(r["kind"] == "file" for r in rows),
+    return {"rows": rows, "logical_bytes": logical_bytes,
+            "files": file_count,
             "allocated_unique_file_bytes": sum(v[1] for v in inodes.values()),
             "reclaimable_allocated_file_bytes": sum(v[1] for v in inodes.values() if v[0] == v[2]),
             "fingerprint": identity({"rows": rows})}

@@ -52,6 +52,14 @@ def saved_literal_witness(queue, **changes):
     return path
 
 
+def reviewed_previous_literal_witness(queue, monkeypatch):
+    witness = saved_literal_witness(queue, data_fingerprint=jobs._CMNEWS_V7_LITERAL_ONLY_DATA_FINGERPRINT)
+    target = jobs._head(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    monkeypatch.setitem(jobs._CMNEWS_V7_REVIEWED_LITERAL_CHECKS, target['id'],
+        (target['last_checked_at_utc'], hashlib.sha256(witness.read_bytes()).hexdigest()))
+    return witness
+
+
 def test_new_question_is_separate_fixed_and_provider_bound(queue, settings):
     finished_identity(queue, settings)
     source = queue.registry.sources['cmnews']; target = jobs._head(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
@@ -84,6 +92,28 @@ def test_completed_literal_evidence_from_original_failure_prevents_duplicate_que
     assert witness.read_bytes() == before and not result['article_or_alias_accepted']
 
 
+def test_reviewed_previous_capture_stops_the_older_relation_question(queue, settings, monkeypatch):
+    finished_identity(queue, settings)
+    source = queue.registry.sources['cmnews']
+    assert (source.data_fingerprint, source.authorization_fingerprint) == jobs._CMNEWS_CLOCK_BASIS_V1_LITERAL_ONLY_BINDING
+    reviewed_previous_literal_witness(queue, monkeypatch)
+    target = jobs._head(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    assert jobs.recorded_cmnews_canonical(queue.db, source, target) is None
+    with pytest.raises(ValueError, match='cmnews_literal_canonical_already_recorded'):
+        relation(queue, settings)
+
+
+def test_precise_clock_basis_successor_reuses_v8_failure_only_to_close_question(queue, settings):
+    finished_identity(queue, settings)
+    source = queue.registry.sources['cmnews']
+    saved_literal_witness(queue, data_fingerprint=jobs._CMNEWS_V8_LITERAL_ONLY_BINDING[0])
+    target = jobs._head(queue.db.execute('SELECT * FROM articles WHERE url=?', (URL,)).fetchone())
+    assert jobs.recorded_cmnews_canonical(queue.db, source, target) is None
+    assert jobs._cmnews_canonical_question_already_answered(queue.db, source, target)
+    with pytest.raises(ValueError, match='cmnews_literal_canonical_already_recorded'):
+        relation(queue, settings)
+
+
 def test_current_failure_writer_output_is_reused_without_a_second_request(queue, settings):
     from downloader.news_fulltext import fetch_article
     from downloader.news_fulltext_diagnostics import IDENTITY_METADATA_CONTRACT_VERSION
@@ -112,7 +142,7 @@ def test_current_failure_writer_output_is_reused_without_a_second_request(queue,
 
 @pytest.mark.parametrize('changes', [
     *({'contract_version': value} for value in [True, False, 1.0, 2.0, '2', 3, None]),
-    {'data_fingerprint': 'a'*64}, {'authorization_fingerprint': 'b'*64}, {'request_url': DECLARED},
+    {'data_fingerprint': 'a'*64}, {'data_fingerprint': None}, {'authorization_fingerprint': 'b'*64}, {'request_url': DECLARED},
     {'final_url': DECLARED}, {'request_url_sha256': 'a'*64}, {'diagnostic_only': False},
     {'raw_response_retained': True}, {'accepted_as_article': True}, {'http_status': 404},
     {'observed_at_utc': '2026-01-02T00:00:00+00:00'},

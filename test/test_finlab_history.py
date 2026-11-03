@@ -797,6 +797,33 @@ class FinLabHistoryTest(unittest.TestCase):
             record_attempt(key, root, ValueError("provider payload not usable"))
             assert json.loads(attempt_path.read_text())["failure_streak"] == 1
 
+    def test_arrow_failure_origin_is_bounded_and_omits_provider_message(self):
+        import pyarrow as pa
+        from scripts.finlab_incremental_refresh import checked_get
+
+        class BrokenSDK:
+            def get(self, *args, **kwargs):
+                raise pa.ArrowNotImplementedError("token=SECRET https://private.invalid")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            try:
+                checked_get("broken:key", sdk=BrokenSDK())
+            except pa.ArrowNotImplementedError as exc:
+                assert record_attempt("broken:key", root, exc) == "provider_error"
+            else:
+                self.fail("the provider error was not propagated")
+            attempt_path = root / "attempts" / f"{safe_stem('broken:key')}.json"
+            raw = attempt_path.read_text(encoding="utf-8")
+            attempt = json.loads(raw)
+            assert attempt["message_retained"] is False
+            assert "SECRET" not in raw and "private.invalid" not in raw
+            assert any(frame["module"] == "scripts.finlab_incremental_refresh"
+                       and frame["function"] == "checked_get"
+                       for frame in attempt["arrow_origin_frames"])
+            assert all(set(frame) == {"module", "function", "line"}
+                       for frame in attempt["arrow_origin_frames"])
+
     def test_empty_source_is_not_misreported_as_transport_failure(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

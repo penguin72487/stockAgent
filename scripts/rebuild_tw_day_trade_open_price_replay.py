@@ -2923,6 +2923,7 @@ def _replay_historical_intraday(
     trading_date: date,
     end_at: time = time(13, 30),
     terminal_close_quote_provider: Callable[[], Mapping[str, Mapping[str, Any]]] | None = None,
+    before_completed_minute: Callable[[datetime], None] | None = None,
 ) -> None:
     # 09:01 was already emitted atomically with the entry registration.  Every
     # following point is an exact right-labelled completed minute.
@@ -2932,6 +2933,8 @@ def _replay_historical_intraday(
     for offset in range(2, final_offset + 1):
         observed = session_open + timedelta(minutes=offset)
         if observed.time() < time(13, 20):
+            if before_completed_minute is not None:
+                before_completed_minute(observed)
             for market in markets:
                 _apply_historical_kbar_brackets(
                     engine,

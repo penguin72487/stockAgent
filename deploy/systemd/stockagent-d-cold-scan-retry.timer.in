@@ -4,7 +4,7 @@ Description=Retry enrolled cold-store and NAS notifications without source rebui
 [Timer]
 OnBootSec=3min
 OnActiveSec=5min
-OnUnitInactiveSec=5min
+OnUnitInactiveSec=1min
 Persistent=true
 Unit=stockagent-d-cold-scan-retry.service
 

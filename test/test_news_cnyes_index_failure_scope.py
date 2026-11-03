@@ -79,7 +79,6 @@ def test_failure_retires_only_when_its_own_page_has_real_valid_recovery(queue, m
     'source_access_denied', 'rate_limited', 'http_429', 'http_503', 'transport_error',
     'robots_unavailable', 'cnyes_index_unreviewed_metadata_fields',
     'cnyes_index_pagination_no_progress', 'bulk_pagination_totals_invalid',
-    'cnyes_index_original_receipt_unverified',
 ])
 def test_refusal_schema_pagination_and_unknown_failures_keep_endpoint_guard(queue, error):
     task, _, _ = fail_page(queue, error)
@@ -87,6 +86,25 @@ def test_refusal_schema_pagination_and_unknown_failures_keep_endpoint_guard(queu
     assert not queue.db.execute('SELECT 1 FROM queue_settings WHERE key=?',
                                (scope_key(queue.registry.sources['cnyes']),)).fetchone()
     assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (task['url'],)).fetchone()[0] == error
+
+
+@pytest.mark.parametrize('error', [
+    'cnyes_index_not_modified_without_evidence', 'cnyes_index_original_evidence_unverified',
+    'cnyes_index_original_receipt_unverified',
+])
+def test_local_index_evidence_failure_delays_only_its_page(queue, error):
+    task = register(queue, page=1)
+    same_day = register(queue, page=2)
+    other_day = register(queue, day=DAY + 1)
+    with queue.db:
+        queue.db.execute("UPDATE discovery SET etag='old',last_modified='old' WHERE url=?", (task['url'],))
+    fail_discovery(queue, task, NewsError(error, retry=True, delay=3600))
+    assert set(selection(queue)) == {same_day['url'], other_day['url']}
+    failed = queue.db.execute('SELECT due,error_code,etag,last_modified FROM discovery WHERE url=?',
+                              (task['url'],)).fetchone()
+    assert failed['due'] > time.time() + 3500 and failed['error_code'] == error
+    assert failed['etag'] is None and failed['last_modified'] is None
+    assert queue.db.execute('SELECT count(*) FROM bulk_endpoint_cooldowns').fetchone()[0] == 0
 
 
 @pytest.mark.parametrize('change', ['deadline', 'url', 'error', 'fingerprint'])

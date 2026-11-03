@@ -51,13 +51,17 @@ from downloader.news_fulltext_pdf import BOARD_PDF_ORIGINAL_LAYOUT, BOARD_PDF_OR
 from downloader.news_fulltext_queue import utc_now
 from downloader.news_fulltext_repairs import (
     HEAD_FIELDS, REPAIRABLE, SOURCE_FIELDS, _bytes, _clock, _directory, _head, _head_problem, _pending,
-    _quarantine, _read_private_request, _source, _source_contract, _write_once,
+    _record_turn, _rotation_order,
+    _quarantine, _read_private_request, _source, _source_contract, _unsafe_request_path, _write_once,
 )
 
 CONTRACT_VERSION = 1
 CANDIDATE_DEFERRAL_CONTRACT_VERSION = 1
 MAX_PENDING = 16
 PUMP_INTERVAL_SECONDS = 5
+_CANDIDATE_CURSOR_KEY = 'native_candidate_pump_cursor_v1'
+_LOCAL_RETRY_INITIAL_SECONDS = 1.0
+_LOCAL_RETRY_MAX_SECONDS = 30.0
 _KIND = 'reviewed_native_candidate_metadata'
 _SAFE_HASH = re.compile(r'[0-9a-f]{64}')
 _TERMINAL = frozenset({'observed', 'observed_error', 'skipped', 'uncertain_outcome'})
@@ -1563,7 +1567,7 @@ def _prior_cmnews_canonical_relation(db, source, identity, url):
             raise ValueError('unchanged canonical-mismatch witness required')
     except (KeyError, TypeError, ValueError, sqlite3.OperationalError):
         raise ValueError('prior_completed_cmnews_canonical_mismatch_required') from None
-    if recorded_cmnews_canonical(db, source, target):
+    if _cmnews_canonical_question_already_answered(db, source, target):
         raise ValueError('cmnews_literal_canonical_already_recorded')
 
 
@@ -1579,7 +1583,7 @@ def _unanswered_cmnews_canonical_attribute(db, source, identity, url):
     from downloader.news_fulltext_repairs import _unique
     row = db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone()
     target = _head(row)
-    if recorded_cmnews_canonical(db, source, target):
+    if _cmnews_canonical_question_already_answered(db, source, target):
         raise ValueError('cmnews_literal_canonical_already_recorded')
     if not db.execute("SELECT 1 FROM sqlite_master WHERE name='native_candidate_jobs' AND type='table'").fetchone():
         return
@@ -1625,6 +1629,53 @@ def _unanswered_cmnews_canonical_attribute(db, source, identity, url):
         raise ValueError(error) from None
 
 
+_CMNEWS_V7_LITERAL_ONLY_DATA_FINGERPRINT = '58422bd43af9a159846a87cd92f0e1bd078d50afac315eb35dc523842c997405'
+_CMNEWS_V8_LITERAL_ONLY_BINDING = (
+    '6a8e7c6375cc75d16dc29a8640e2172a964b77b76de59ff4b5d119403e2af986',
+    'fcf9934ef3ead98ebc10cd7569648dee7f83756f8dd8b716bfa1b0509a2c9d6c',
+)
+# The successor differs only in successful CMNews schema-clock provenance;
+# no URL, source scope, auth, HTTP behavior or identity failure changes.
+_CMNEWS_CLOCK_BASIS_V1_LITERAL_ONLY_BINDING = (
+    'a2d9e9762fae902d64969a54494dbf2c46ac44446d10499385b9e478bfeb16f2',
+    'fcf9934ef3ead98ebc10cd7569648dee7f83756f8dd8b716bfa1b0509a2c9d6c',
+)
+# Only these exact prior failed checks and retained metadata were reviewed.
+# A later head, modified receipt, or another v7 record needs its own proof.
+# See docs/news_all_source_repair_2026-10-09.md, 10/29 CMNews review.
+_CMNEWS_V7_REVIEWED_LITERAL_CHECKS = {
+    '8135c8d7e507b870e747f991a9de529afd01b32c7d22b0f55a4bdb8911a3d9aa': (
+        '2026-10-20T02:44:27.851622+00:00',
+        'ed628d6c62d0d7050e7558dd9477081b2c0d174f44ca17f4f9c8c3e1ff1a02cf'),
+    'e0d4076b6c06df4e8e30423a29e036f9010128d41ef50df90b39d86270a07d93': (
+        '2026-10-20T02:44:28.210776+00:00',
+        'b85a638ad20fb996ff4edac432f11ea72e2948c1484bdf1de6a66d04b19f1b98'),
+}
+
+
+def _cmnews_canonical_question_already_answered(db, source, target):
+    """Old literal evidence may stop a duplicate question, never admit a URL.
+
+    The v7 literal receipts remain individually pinned; the exact v8 to
+    clock-basis successor preserves identity failure semantics. Neither path
+    grants article admission. Other source/auth changes stay incompatible.
+    """
+    reviewed = _CMNEWS_V7_REVIEWED_LITERAL_CHECKS.get(target['id'])
+    binding = (source.data_fingerprint, source.authorization_fingerprint)
+    compatible = (binding in {_CMNEWS_V8_LITERAL_ONLY_BINDING, _CMNEWS_CLOCK_BASIS_V1_LITERAL_ONLY_BINDING}
+                  and source.provider == 'cmnews' and source.allowed
+                  and source.embedded_article_layout == 'cmnews_visible_article_v1'
+                  and reviewed is not None and target['last_checked_at_utc'] == reviewed[0])
+    equivalent_failure = (_CMNEWS_V8_LITERAL_ONLY_BINDING[0]
+                          if binding == _CMNEWS_CLOCK_BASIS_V1_LITERAL_ONLY_BINDING
+                          and source.provider == 'cmnews' and source.allowed
+                          and source.embedded_article_layout == 'cmnews_visible_article_v1' else None)
+    return _read_recorded_cmnews_canonical(db, source, target,
+        legacy=_CMNEWS_V7_LITERAL_ONLY_DATA_FINGERPRINT if compatible else None,
+        legacy_sha256=reviewed[1] if compatible else None,
+        equivalent_failure=equivalent_failure) is not None
+
+
 def recorded_cmnews_canonical(db, source, target):
     """Reuse exact prior failure metadata before asking a new HTTP question.
 
@@ -1634,6 +1685,11 @@ def recorded_cmnews_canonical(db, source, target):
     The display URL must hash to the original literal, excluding truncation
     and query/fragment redaction. Source identity and exact request also bind.
     """
+    return _read_recorded_cmnews_canonical(db, source, target)
+
+
+def _read_recorded_cmnews_canonical(db, source, target, *, legacy=None, legacy_sha256=None,
+                                    equivalent_failure=None):
     from datetime import UTC, datetime, timedelta
     main = next((Path(row[2]) for row in db.execute('PRAGMA database_list') if row[1] == 'main' and row[2]), None)
     if main is None or main.name != 'queue.sqlite3' or source.provider != 'cmnews':
@@ -1653,16 +1709,23 @@ def recorded_cmnews_canonical(db, source, target):
                     payload = stream.read(65537)
                 facts = json.loads(payload)
                 version = facts.get('contract_version')
+                data_fingerprint = facts.get('data_fingerprint')
                 if (type(version) is not int or version not in IDENTITY_METADATA_READ_VERSIONS
                         or facts.get('provider') != 'cmnews'
-                        or facts.get('data_fingerprint') != source.data_fingerprint
+                        or (data_fingerprint != source.data_fingerprint
+                            and (legacy is None or data_fingerprint != legacy)
+                            and (equivalent_failure is None or data_fingerprint != equivalent_failure))
                         or facts.get('authorization_fingerprint') != source.authorization_fingerprint
                         or facts.get('request_url') != target['url'] or facts.get('final_url') != target['url']
                         or facts.get('request_url_sha256') != target['id'] or facts.get('final_url_sha256') != target['id']
                         or facts.get('error_code') != 'article_identity_not_verified' or facts.get('http_status') != 200
                         or facts.get('diagnostic_only') is not True or facts.get('raw_response_retained') is not False
-                        or facts.get('accepted_as_article') is not False
-                        or _clock(facts.get('observed_at_utc')) > checked.timestamp()):
+                        or facts.get('accepted_as_article') is not False):
+                    continue
+                observed = _clock(facts.get('observed_at_utc'))
+                if (observed > checked.timestamp()
+                        or (legacy is not None and data_fingerprint == legacy
+                            and (checked.timestamp() - observed > 60 or legacy_sha256 is None))):
                     continue
                 canonical = facts['facts']['canonical']
                 if canonical['node_count'] != 1 or canonical['truncated'] is not False or len(canonical['values']) != 1:
@@ -1674,8 +1737,11 @@ def recorded_cmnews_canonical(db, source, target):
                         or parts.query or parts.fragment
                         or hashlib.sha256(literal.encode()).hexdigest() != value['original_value_sha256']):
                     continue
+                metadata_sha256 = hashlib.sha256(payload).hexdigest()
+                if legacy is not None and data_fingerprint == legacy and metadata_sha256 != legacy_sha256:
+                    continue
                 return {'canonical_url': literal, 'metadata_path': str(path),
-                    'metadata_sha256': hashlib.sha256(payload).hexdigest(),
+                    'metadata_sha256': metadata_sha256,
                     'observed_at_utc': facts['observed_at_utc'], 'article_or_alias_accepted': False}
             except (OSError, KeyError, TypeError, ValueError):
                 continue
@@ -2014,11 +2080,90 @@ def _schema(queue):
         queue.db.execute('CREATE TABLE IF NOT EXISTS native_candidate_wait('
             'request_id TEXT PRIMARY KEY,not_before_epoch REAL NOT NULL,last_gate_code TEXT NOT NULL,'
             'last_deferred_at_utc TEXT NOT NULL,deferral_count INTEGER NOT NULL)')
+        queue.db.execute('CREATE TABLE IF NOT EXISTS native_candidate_schedule('
+            'key TEXT PRIMARY KEY,value TEXT NOT NULL)')
         # A dispatch reservation is the unknown-outcome barrier, not permission
         # to send again. Committed results are archived below without any GET.
         queue.db.execute("UPDATE native_candidate_jobs SET state='uncertain_outcome',completed_at_utc=? "
             "WHERE state='reserved' AND owner_id<>?", (utc_now(), queue.owner))
     queue.native_candidate_schema_ready = True
+
+
+def _candidate_file_signature(path):
+    value = path.lstat()
+    return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
+            value.st_mtime_ns, value.st_ctime_ns)
+
+
+def _local_retry_now():
+    return time.monotonic()
+
+
+def _local_retry_signature(path):
+    try:
+        return _candidate_file_signature(path)
+    except OSError:
+        return None
+
+
+def _defer_candidate_local_io(queue, path, reason):
+    """Retry one local input without delaying unrelated publisher work."""
+    if reason not in {'request_io', 'quarantine', 'archive'}:
+        raise ValueError('invalid_candidate_local_retry_reason')
+    retries = getattr(queue, '_candidate_local_retries', None)
+    if retries is None:
+        retries = queue._candidate_local_retries = {}
+    signature = _local_retry_signature(path)
+    old = retries.get(path.name)
+    attempts = old[2] + 1 if old and old[0] == signature else 1
+    delay = min(_LOCAL_RETRY_MAX_SECONDS, _LOCAL_RETRY_INITIAL_SECONDS * 2 ** min(attempts - 1, 10))
+    retries[path.name] = (signature, _local_retry_now() + delay, attempts, reason)
+
+
+def _candidate_local_retry_state(queue, path):
+    retries = getattr(queue, '_candidate_local_retries', {})
+    retry = retries.get(path.name)
+    if retry is None:
+        return None
+    if _local_retry_signature(path) != retry[0]:
+        retries.pop(path.name, None)
+        return None
+    return 'waiting' if _local_retry_now() < retry[1] else 'due'
+
+
+def _prune_candidate_local_retries(queue, paths):
+    retries = getattr(queue, '_candidate_local_retries', {})
+    names = {path.name for path in paths}
+    for name in tuple(retries):
+        if name not in names:
+            del retries[name]
+
+
+def candidate_local_retry_delay(queue, maximum):
+    """Bring an idle owner back when retained local work is due."""
+    retries = getattr(queue, '_candidate_local_retries', {})
+    if not retries:
+        return maximum
+    remaining = min(value[1] for value in retries.values()) - _local_retry_now()
+    # An overdue accessible input wakes via has_unadmitted_candidates. If its
+    # mailbox is temporarily inaccessible, keep a bounded poll instead of a
+    # zero-delay service loop.
+    return min(maximum, remaining if remaining > 0 else PUMP_INTERVAL_SECONDS)
+
+
+def _candidate_file_identity(path, previous, cache):
+    """Reuse a validated identity only while the private file is unchanged."""
+    before = _candidate_file_signature(path)
+    cached = previous.get(path.name)
+    if cached is not None and cached[0] == before:
+        provider, observation_key = cached[1:]
+    else:
+        request = _load(path)
+        provider, observation_key = request['target']['provider'], request['observation_key']
+        if _candidate_file_signature(path) != before:
+            raise ValueError('candidate_request_changed_during_read')
+    cache[path.name] = (before, provider, observation_key)
+    return provider, observation_key
 
 
 def candidate_progress(queue):
@@ -2035,7 +2180,8 @@ def candidate_progress(queue):
     zero = lambda: {key: 0 for key in keys}
     result = {'contract_version': 1, 'available': True, 'request_files': 0,
               'pending_unadmitted': 0, 'already_registered': 0, 'invalid_or_unreadable': 0,
-              'jobs': {state: 0 for state in states}, 'providers': {}, 'unregistered': zero()}
+              'jobs': {state: 0 for state in states}, 'providers': {}, 'unregistered': zero(),
+              'local_retry': {'request_io': 0, 'quarantine': 0, 'archive': 0}}
 
     def bucket(provider):
         if (isinstance(provider, str) and re.fullmatch(r'[a-z][a-z0-9_]{0,63}', provider)
@@ -2073,23 +2219,15 @@ def candidate_progress(queue):
             raise ValueError('candidate_inbox_exceeds_limit')
         result['request_files'] = len(paths)
         previous = getattr(queue, '_candidate_progress_cache', {})
+        local_retries = getattr(queue, '_candidate_local_retries', {})
         cache = {}
         for path in paths:
+            local_retry = local_retries.get(path.name)
+            if (local_retry is not None and local_retry[0] == _local_retry_signature(path)
+                    and local_retry[3] in result['local_retry']):
+                result['local_retry'][local_retry[3]] += 1
             try:
-                def signature():
-                    value = path.lstat()
-                    return (value.st_dev, value.st_ino, value.st_mode, value.st_size,
-                            value.st_mtime_ns, value.st_ctime_ns)
-                before = signature()
-                cached = previous.get(path.name)
-                if cached is not None and cached[0] == before:
-                    provider, observation_key = cached[1:]
-                else:
-                    request = _load(path)
-                    provider, observation_key = request['target']['provider'], request['observation_key']
-                    if signature() != before:
-                        raise ValueError('candidate_request_changed_during_read')
-                cache[path.name] = (before, provider, observation_key)
+                provider, observation_key = _candidate_file_identity(path, previous, cache)
                 job = (queue.db.execute('SELECT provider FROM native_candidate_jobs WHERE observation_key=?',
                                         (observation_key,)).fetchone() if has_jobs else None)
                 if job is not None:
@@ -2137,34 +2275,71 @@ def pump_candidates(queue, *, stop=None, max_seconds=0.05):
         raise ValueError('invalid_candidate_slice_budget')
     started = time.monotonic()
     base = queue.root/'reviewed_repairs'/'candidate_diagnostics'
-    if not base.exists() and not base.is_symlink():
-        return
+    from downloader.news_fulltext_wake import clear_mailbox_scan_retry, defer_mailbox_scan_retry
     try:
+        try:
+            base.lstat()
+        except FileNotFoundError:
+            clear_mailbox_scan_retry(queue, 'candidate')
+            return
         paths = _pending(_inbox(queue.root))[:MAX_PENDING]
         _schema(queue)
-    except (OSError, ValueError):
+        paths = _rotation_order(queue, paths, cursor_key=_CANDIDATE_CURSOR_KEY,
+                                cursor_table='native_candidate_schedule')
+    except (OSError, ValueError, sqlite3.OperationalError):
+        defer_mailbox_scan_retry(queue, 'candidate')
         queue.metrics.count('local_repairs', 'candidate_inbox_unavailable')
         return
+    clear_mailbox_scan_retry(queue, 'candidate')
+    _prune_candidate_local_retries(queue, paths)
+    considered = 0
     for path in paths:
-        if time.monotonic()-started >= max_seconds or stop is not None and stop.is_set():
+        # Filesystem discovery can exceed the soft budget. Still process one
+        # bounded request, then rotate so a slow or already-ready question
+        # cannot starve the others. An explicit stop always wins.
+        if stop is not None and stop.is_set() or considered and time.monotonic()-started >= max_seconds:
             break
+        if _candidate_local_retry_state(queue, path) == 'waiting':
+            continue
+        considered += 1
         try:
             request = _load(path)
             provider = request['target']['provider']
             if (provider not in queue.registry.sources or not queue.registry.sources[provider].allowed
                     or not queue.registry.sources[provider].request_enabled):
                 raise ValueError('candidate_provider_no_longer_allowed')
-        except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError) as error:
+        except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError, NewsError) as error:
+            if stop is not None and stop.is_set():
+                break
+            if isinstance(error, OSError) and not _unsafe_request_path(path, error):
+                # An unreadable file is not evidence that its sealed payload
+                # is invalid. Keep it for a bounded local retry.
+                _defer_candidate_local_io(queue, path, 'request_io')
+                queue.metrics.count('local_repairs', 'candidate_request_io_deferred')
+                with queue.db:
+                    _record_turn(queue, path, stop, cursor_key=_CANDIDATE_CURSOR_KEY,
+                                 cursor_table='native_candidate_schedule')
+                continue
             try:
                 _quarantine(queue, path, error)
             except (OSError, ValueError):
                 queue.metrics.count('local_repairs', 'candidate_quarantine_deferred')
+                _defer_candidate_local_io(queue, path, 'quarantine')
+            else:
+                getattr(queue, '_candidate_local_retries', {}).pop(path.name, None)
+            with queue.db:
+                _record_turn(queue, path, stop, cursor_key=_CANDIDATE_CURSOR_KEY,
+                             cursor_table='native_candidate_schedule')
             continue
+        if stop is not None and stop.is_set():
+            break
         with queue.db:
             queue.db.execute('INSERT OR IGNORE INTO native_candidate_jobs '
                 '(request_id,observation_key,provider,state,request_json,created_at_utc,owner_id) VALUES (?,?,?,?,?,?,?)',
                 (path.stem, request['observation_key'], request['target']['provider'], 'ready',
                  _bytes(request).decode(), request['created_at_utc'], queue.owner))
+            _record_turn(queue, path, stop, cursor_key=_CANDIDATE_CURSOR_KEY,
+                         cursor_table='native_candidate_schedule')
         job = queue.db.execute('SELECT * FROM native_candidate_jobs WHERE observation_key=?',
             (request['observation_key'],)).fetchone()
         if job['state'] in _TERMINAL:
@@ -2172,28 +2347,67 @@ def pump_candidates(queue, *, stop=None, max_seconds=0.05):
                 _archive(queue, path, job, duplicate_of=job['request_id'] if job['request_id'] != path.stem else None)
             except (OSError, ValueError):
                 queue.metrics.count('local_repairs', 'candidate_archive_deferred')
+                _defer_candidate_local_io(queue, path, 'archive')
+            else:
+                getattr(queue, '_candidate_local_retries', {}).pop(path.name, None)
+        else:
+            getattr(queue, '_candidate_local_retries', {}).pop(path.name, None)
     queue.native_candidate_ready_providers = {row[0] for row in queue.db.execute(
         "SELECT DISTINCT provider FROM native_candidate_jobs WHERE state='ready'")}
 
 
-def has_unadmitted_candidates(queue):
+def has_unadmitted_candidates(queue, *, strict=False):
     """Wake an idle owner for NEW input, not for an already-paused ready job."""
     directory = queue.root/'reviewed_repairs'/'candidate_diagnostics'/'pending'
     try:
         for parent in (directory.parent.parent, directory.parent, directory):
             mode = parent.lstat().st_mode
             if not stat.S_ISDIR(mode) or mode & 0o077:
+                getattr(queue, '_candidate_local_retries', {}).clear()
                 return False
-        names = [path.stem for path in _pending(directory)[:MAX_PENDING]]
+        paths = _pending(directory)[:MAX_PENDING]
+        names = [path.stem for path in paths]
+    except FileNotFoundError:
+        getattr(queue, '_candidate_local_retries', {}).clear()
+        return False
     except OSError:
+        if strict:
+            raise
         return False
     if not names:
+        _prune_candidate_local_retries(queue, paths)
         return False
     if not getattr(queue, 'native_candidate_schema_ready', False):
         return True
-    registered = {row[0] for row in queue.db.execute(
-        'SELECT request_id FROM native_candidate_jobs WHERE request_id IN ('+','.join('?' for _ in names)+')', names)}
-    return any(name not in registered for name in names)
+    registered = {row[0]: (row[1], row[2], row[3]) for row in queue.db.execute(
+        'SELECT request_id,provider,observation_key,state FROM native_candidate_jobs WHERE request_id IN ('
+        +','.join('?' for _ in names)+')', names)}
+    # Concurrent submissions can have different file hashes but the same
+    # observation. They share the registered job, so they must not keep an
+    # idle owner awake while that job is paused. Invalid or changed input still
+    # wakes the owner to quarantine or admit it in the normal path.
+    _prune_candidate_local_retries(queue, paths)
+    previous = getattr(queue, '_candidate_progress_cache', {})
+    cache = {path.name: previous[path.name] for path in paths if path.name in previous}
+    for path in paths:
+        local_retry = _candidate_local_retry_state(queue, path)
+        if local_retry == 'waiting':
+            continue
+        if local_retry == 'due':
+            return True
+        try:
+            provider, observation_key = _candidate_file_identity(path, previous, cache)
+            row = registered.get(path.stem)
+            if row is None:
+                match = queue.db.execute('SELECT provider,observation_key,state FROM native_candidate_jobs '
+                                         'WHERE observation_key=?', (observation_key,)).fetchone()
+                row = tuple(match) if match is not None else None
+            if row is None or row[0] != provider or row[1] != observation_key or row[2] in _TERMINAL:
+                return True
+        except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError, NewsError):
+            return True
+    queue._candidate_progress_cache = cache
+    return False
 
 
 def claim_candidate(queue, http, config, provider):
@@ -2272,7 +2486,8 @@ def claim_candidate(queue, http, config, provider):
     return None
 
 
-def candidate_next_wake_delay(queue, provider_cooldowns, request_scope_cooldowns, maximum):
+def candidate_next_wake_delay(queue, provider_cooldowns, request_scope_cooldowns, maximum, *,
+                              provider_ids=None, dispatch_after=None):
     """Wake for bounded future candidate gates without spinning on ready jobs.
 
     Ready work has already had a dispatch opportunity in this cycle. Only a
@@ -2285,7 +2500,7 @@ def candidate_next_wake_delay(queue, provider_cooldowns, request_scope_cooldowns
     deadlines = []
     for provider in getattr(queue, 'native_candidate_ready_providers', ()):
         source = queue.registry.sources.get(provider)
-        if source is None or not source.request_enabled:
+        if source is None or not source.request_enabled or provider_ids is not None and provider not in provider_ids:
             continue
         # Equality on (state, provider) uses the existing ready index; bound
         # each provider separately so another publisher cannot be hidden by a
@@ -2302,11 +2517,12 @@ def candidate_next_wake_delay(queue, provider_cooldowns, request_scope_cooldowns
                 scope = request_scope_cooldowns.get(provider, {})
                 due = max(row['not_before_epoch'] or 0, provider_cooldowns.get(provider, 0),
                     scope.get('hosts', {}).get(parts.netloc, 0), scope.get('origins', {}).get(origin, 0))
-                if type(due) in (int, float) and math.isfinite(due) and due > now:
+                cutoff = now if dispatch_after is None else dispatch_after
+                if type(due) in (int, float) and math.isfinite(due) and due > cutoff:
                     deadlines.append(due)
             except (ValueError, TypeError, KeyError, AttributeError, RecursionError):
                 continue  # The normal claim path handles malformed or changed work.
-    return min(maximum, min(deadlines) - now) if deadlines else maximum
+    return min(maximum, max(0, min(deadlines) - now)) if deadlines else maximum
 
 
 def fetch_candidate(http, job):

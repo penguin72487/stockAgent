@@ -427,6 +427,23 @@ def test_continuous_owner_reuses_workers_and_skips_batch_idle(config, tmp_path):
         queue.close()
 
 
+def test_continuous_owner_pumps_retained_handoff_without_another_http_request(config, tmp_path, monkeypatch):
+    http, session = http_fixture(config, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    spec, calls = {'path': 'fixture', 'sha256': '0' * 64, 'artifacts': 'fixture'}, []
+    config['retained_link_handoff'] = spec
+    monkeypatch.setattr('downloader.news_fulltext.refresh_disk_admission', lambda *_: False)
+    monkeypatch.setattr('downloader.news_fulltext_retained_handoff.pump', lambda q, plan: calls.append((q, plan)))
+    try:
+        run_cycle(queue, http, config, max_articles=0, max_discovery_requests=0,
+                  continuous_budgets=True, max_run_seconds=.25)
+        assert calls == [(queue, spec)]
+        assert session.calls == []
+    finally:
+        http.close()
+        queue.close()
+
+
 def test_empty_diagnostic_has_bounded_duration_not_busy_loop(config, tmp_path):
     http, _ = http_fixture(config, tmp_path, {})
     queue = NewsQueue(tmp_path, http.registry)

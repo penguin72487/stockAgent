@@ -48,22 +48,18 @@ def submit(queue, config):
 def claim(queue, config, client):
     submitted = submit(queue, config)
     # These tests exercise retention, not the resident's wall-time budget.
-    # Schema/fsync scheduling can legitimately exhaust the first 50 ms tick.
     with patch.object(diagnostic.time, 'monotonic', return_value=0.0):
         diagnostic.pump_candidates(queue)
     return submitted, diagnostic.claim_candidate(queue, client, config, 'pocket')
 
 
-def test_budget_exhaustion_defers_same_request_until_next_tick(config, queue):
+def test_budget_exhaustion_admits_one_request_without_duplicate_fetch(config, queue):
     before, client = head(queue), http(queue, body=page().encode())
     submitted = submit(queue, config)
     with patch.object(diagnostic.time, 'monotonic', side_effect=[0.0, 0.1]):
         diagnostic.pump_candidates(queue)
-    assert diagnostic.has_unadmitted_candidates(queue)
-    assert diagnostic.claim_candidate(queue, client, config, 'pocket') is None
+    assert not diagnostic.has_unadmitted_candidates(queue)
     assert head(queue) == before and client.calls == []
-    with patch.object(diagnostic.time, 'monotonic', return_value=0.0):
-        diagnostic.pump_candidates(queue)
     job = diagnostic.claim_candidate(queue, client, config, 'pocket')
     assert job['request_id'] == submitted['request_id']
     result = diagnostic.fetch_candidate(client, job)

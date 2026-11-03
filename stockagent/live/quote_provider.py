@@ -41,7 +41,17 @@ _YAHOO_HEADERS = {
     )
 }
 _SHIOAJI_STOCK_LOCK = threading.RLock()
+# Serializes client replacement with the short non-blocking simulation order
+# call. It is separate from the quote-cache mutex so the experiment does not
+# hold up ordinary quote readers while an SDK operation is in progress.
+_SHIOAJI_STOCK_LIFECYCLE_LOCK = threading.RLock()
 _SHIOAJI_STOCK_API: object | None = None
+# The native client does not expose a reliable simulation flag. Only a
+# client constructed by our literal simulation=True factory receives this
+# process-local provenance. An order consumer must also hold the exclusive
+# callback lease; injecting an arbitrary client is never an execution boundary.
+_SHIOAJI_STOCK_SIMULATION_API: object | None = None
+_SHIOAJI_STOCK_ORDER_OWNER: object | None = None
 _SHIOAJI_STOCK_CONTRACTS: dict[str, object | None] = {}
 _SHIOAJI_STOCK_CACHE: dict[str, tuple[float, dict[str, float | int | None]]] = {}
 _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
@@ -85,7 +95,19 @@ _TW_MIS_HTTP_WORKERS = 16
 _TW_MIS_HTTP_POOL = ThreadPoolExecutor(
     max_workers=_TW_MIS_HTTP_WORKERS, thread_name_prefix="tw-mis-http"
 )
+# Soft-deadline retries need their own workers: an original request can still
+# be waiting for its response and must not occupy every retry worker. This is
+# scoped to MIS transport, not a limit on other providers or model work.
+_TW_MIS_HEDGE_WORKERS = 8
+_TW_MIS_HEDGE_POOL = ThreadPoolExecutor(
+    max_workers=_TW_MIS_HEDGE_WORKERS, thread_name_prefix="tw-mis-hedge"
+)
 _TW_MIS_HTTP_LOCAL = threading.local()
+_TW_MIS_BATCH_LOCK = threading.Lock()
+# A responding one-symbol probe cannot establish that the failed 80-channel
+# shape is healthy. Retain learned transport geometry for this owner/session;
+# this changes neither request cadence, concurrency nor the requested universe.
+_TW_MIS_BATCH_LIMITS: dict[tuple[Any, ...], int] = {}
 _TW_MIS_INFLIGHT_LOCK = threading.Lock()
 _TW_MIS_INFLIGHT: dict[tuple[Any, ...], list[tuple[tuple[str, ...], Future]]] = {}
 _TW_MIS_OPENING_LOCK = threading.RLock()
@@ -319,6 +341,7 @@ def _shioaji_stock_api() -> object:
     """Return one process-local, simulation-only Shioaji quote connection."""
 
     global _SHIOAJI_STOCK_API
+    global _SHIOAJI_STOCK_SIMULATION_API
     global _SHIOAJI_STOCK_LOGIN_FAILURES
     global _SHIOAJI_STOCK_LAST_LOGIN_ERROR
     global _SHIOAJI_STOCK_LOGIN_RETRY_AFTER
@@ -389,10 +412,57 @@ def _shioaji_stock_api() -> object:
                 pass
             raise
         _SHIOAJI_STOCK_API = api
+        _SHIOAJI_STOCK_SIMULATION_API = api
         _SHIOAJI_STOCK_LOGIN_FAILURES = 0
         _SHIOAJI_STOCK_LAST_LOGIN_ERROR = None
         _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
         return api
+
+
+def _claim_existing_shioaji_simulation_order_owner() -> tuple[object, object]:
+    """Claim the existing quote client without logging in or creating one.
+
+    The sole callback lease remains occupied across a quote reconnect until
+    the former consumer closes; a new generation cannot silently inherit an
+    unresolved order stream. This is deliberately private to the owner process.
+    """
+    global _SHIOAJI_STOCK_ORDER_OWNER
+    with _SHIOAJI_STOCK_LOCK:
+        api = _SHIOAJI_STOCK_API
+        if api is None or api is not _SHIOAJI_STOCK_SIMULATION_API:
+            raise RuntimeError("existing simulation quote client is not proven")
+        if _SHIOAJI_STOCK_ORDER_OWNER is not None:
+            raise RuntimeError("simulation order callback already has an owner")
+        token = object()
+        _SHIOAJI_STOCK_ORDER_OWNER = token
+        return api, token
+
+
+@contextmanager
+def _guard_existing_shioaji_simulation_order_owner(api: object, token: object):
+    """Fence a short non-blocking SDK operation against logout/reconnect."""
+    with _SHIOAJI_STOCK_LIFECYCLE_LOCK:
+        with _SHIOAJI_STOCK_LOCK:
+            if (api is not _SHIOAJI_STOCK_API or api is not _SHIOAJI_STOCK_SIMULATION_API
+                    or token is not _SHIOAJI_STOCK_ORDER_OWNER):
+                raise RuntimeError("shared simulation quote generation changed")
+        yield
+
+
+def _release_existing_shioaji_simulation_order_owner(
+    api: object, token: object, *, clear_callback: bool = True,
+) -> None:
+    """Release only our callback; never logout or unsubscribe shared quotes."""
+    global _SHIOAJI_STOCK_ORDER_OWNER
+    with _SHIOAJI_STOCK_LIFECYCLE_LOCK:
+        with _SHIOAJI_STOCK_LOCK:
+            if token is not _SHIOAJI_STOCK_ORDER_OWNER:
+                raise RuntimeError("simulation order callback lease is not owned")
+            if clear_callback and api is _SHIOAJI_STOCK_API and api is _SHIOAJI_STOCK_SIMULATION_API:
+                # On failure retain the lease rather than allowing a second writer
+                # to overwrite an uncertain callback.
+                api.clear_order_callback()
+            _SHIOAJI_STOCK_ORDER_OWNER = None
 
 
 def warm_shioaji_stock_quote_client(
@@ -449,41 +519,47 @@ def _reconnect_shioaji_stock_quote_client(failed_api: object) -> object:
     """Replace one known-broken cached session and perform one fresh login."""
 
     global _SHIOAJI_STOCK_API
-    with _SHIOAJI_STOCK_LOCK:
-        if _SHIOAJI_STOCK_API is not failed_api:
-            if _SHIOAJI_STOCK_API is not None:
-                return _SHIOAJI_STOCK_API
+    global _SHIOAJI_STOCK_SIMULATION_API
+    with _SHIOAJI_STOCK_LIFECYCLE_LOCK:
+        with _SHIOAJI_STOCK_LOCK:
+            if _SHIOAJI_STOCK_API is not failed_api:
+                if _SHIOAJI_STOCK_API is not None:
+                    return _SHIOAJI_STOCK_API
+                return _shioaji_stock_api()
+            _SHIOAJI_STOCK_API = None
+            _SHIOAJI_STOCK_SIMULATION_API = None
+            _SHIOAJI_STOCK_CONTRACTS.clear()
+            _SHIOAJI_STOCK_CACHE.clear()
+            try:
+                failed_api.logout()
+            except Exception:
+                pass
             return _shioaji_stock_api()
-        _SHIOAJI_STOCK_API = None
-        _SHIOAJI_STOCK_CONTRACTS.clear()
-        _SHIOAJI_STOCK_CACHE.clear()
-        try:
-            failed_api.logout()
-        except Exception:
-            pass
-        return _shioaji_stock_api()
 
 
 def close_shioaji_stock_quote_client() -> None:
     """Close the process-local quote connection, primarily for clean shutdowns/tests."""
 
     global _SHIOAJI_STOCK_API
+    global _SHIOAJI_STOCK_SIMULATION_API
     global _SHIOAJI_STOCK_LOGIN_FAILURES
     global _SHIOAJI_STOCK_LAST_LOGIN_ERROR
     global _SHIOAJI_STOCK_LOGIN_RETRY_AFTER
-    with _SHIOAJI_STOCK_LOCK:
-        api = _SHIOAJI_STOCK_API
-        _SHIOAJI_STOCK_API = None
-        _SHIOAJI_STOCK_LOGIN_FAILURES = 0
-        _SHIOAJI_STOCK_LAST_LOGIN_ERROR = None
-        _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
-        _SHIOAJI_STOCK_CONTRACTS.clear()
-        _SHIOAJI_STOCK_CACHE.clear()
-        if api is not None:
-            try:
-                api.logout()
-            except Exception:
-                pass
+    with _SHIOAJI_STOCK_LIFECYCLE_LOCK:
+        with _SHIOAJI_STOCK_LOCK:
+            api = _SHIOAJI_STOCK_API
+            _SHIOAJI_STOCK_API = None
+            _SHIOAJI_STOCK_SIMULATION_API = None
+            _SHIOAJI_STOCK_LOGIN_FAILURES = 0
+            _SHIOAJI_STOCK_LAST_LOGIN_ERROR = None
+            _SHIOAJI_STOCK_LOGIN_RETRY_AFTER = 0.0
+            _SHIOAJI_STOCK_CONTRACTS.clear()
+            _SHIOAJI_STOCK_CACHE.clear()
+            if api is not None:
+                try:
+                    api.logout()
+                except Exception:
+                    pass
 
 
 def fetch_shioaji_historical_stock_entry_books(
@@ -2253,14 +2329,25 @@ def _load_prepared_tw_price_limits(
         # contract supplies authoritative limits.
         return {}, path
     lookup: dict[str, tuple[float | None, float | None, float | None]] = {}
+    expected_date = trading_date or datetime.now(ZoneInfo("Asia/Taipei")).date().isoformat()
     for row in frame.iter_rows(named=True):
         symbol = str(row.get("symbol") or "").strip()
         if not symbol:
             continue
+        recorded_date = row.get("trading_date")
+        if recorded_date is not None and str(recorded_date) != expected_date:
+            continue
+        upper = _float_or_none(row.get("upper_limit_price"))
+        lower = _float_or_none(row.get("lower_limit_price"))
+        # An existing row is not evidence that both legal bounds are usable.
+        # Drop invalid cache entries from the lookup so the canonical source
+        # owner can retry them; never turn the reference price into a bound.
+        if upper is None or lower is None or upper < lower:
+            continue
         lookup[symbol] = (
             _float_or_none(row.get("reference_price")),
-            _float_or_none(row.get("upper_limit_price")),
-            _float_or_none(row.get("lower_limit_price")),
+            upper,
+            lower,
         )
     with _TW_LIMIT_CACHE_LOCK:
         _TW_LIMIT_CACHE_KEY = key
@@ -2290,7 +2377,9 @@ def _prepare_tw_price_limit_snapshot_locked(
         for idx, symbol in enumerate(symbols)
         if np.isfinite(fallback_prices[idx]) and float(fallback_prices[idx]) > 0.0
     }
-    missing = [str(symbol) for symbol in symbols if str(symbol) not in existing]
+    requested = set(map(str, symbols))
+    missing = [symbol for symbol in dict.fromkeys(map(str, symbols)) if symbol not in existing]
+    added = False
     if missing:
         fallback = np.asarray(
             [fallback_by_symbol.get(symbol, 1.0) for symbol in missing],
@@ -2318,10 +2407,23 @@ def _prepare_tw_price_limit_snapshot_locked(
                 if snapshot.lower_limit_prices is not None
                 else None
             )
-            if upper is not None and lower is not None:
+            if upper is not None and lower is not None and upper >= lower:
                 existing[symbol] = (reference, upper, lower)
+                added = True
     if not existing:
         raise RuntimeError("TWSE/TPEx returned no daily price-limit metadata")
+
+    if not added:
+        # A complete cache, or an unsuccessful retry, must not rewrite and
+        # invalidate an otherwise identical daily snapshot. Count only the
+        # requested symbols: unrelated cached symbols cannot cover a gap.
+        return {
+            "path": str(path),
+            "trading_date": date_text,
+            "requested_count": len(symbols),
+            "prepared_count": len(existing),
+            "missing_count": len(requested - existing.keys()),
+        }
 
     import polars as pl
 
@@ -2354,7 +2456,7 @@ def _prepare_tw_price_limit_snapshot_locked(
         "trading_date": date_text,
         "requested_count": len(symbols),
         "prepared_count": len(loaded),
-        "missing_count": max(0, len(set(symbols)) - len(loaded)),
+        "missing_count": len(requested - loaded.keys()),
     }
 
 
@@ -4858,7 +4960,9 @@ def repair_tw_opening_snapshot_receipt(
             missing, fallback, parquet_root=root, providers=configured_opening_providers(root), minimum_coverage=1,
             cache_reader=lambda: fetch_tw_mis_opening_snapshot(missing, fallback, parquet_root=root, allow_network=False),
             resolve_no_prints=False, force_refresh=True,
-            poll_opening_snapshots=True,
+            # The observer checks again promptly while admitted source jobs
+            # keep running; a slow peer never owns the next retry clock.
+            poll_opening_snapshots=True, timeout_seconds=.5,
         )
         source_timing = refreshed.transport_timing or {}
         rows = _load_tw_mis_opening_receipt(parquet_root=root, session_date=session_date)
@@ -5002,6 +5106,7 @@ def fetch_tw_mis_last_prices(
     empty_chunk_retry_delay_seconds: float | None = None,
     max_parallel_requests: int | None = None,
     request_timeout_seconds: float | None = None,
+    soft_retry_seconds: float | None = None,
     minimum_response_coverage: float = 1.0,
     on_progress: Callable[[list[str], PriceSnapshot], None] | None = None,
 ) -> PriceSnapshot:
@@ -5020,6 +5125,7 @@ def fetch_tw_mis_last_prices(
                   empty_chunk_retry_delay_seconds=empty_chunk_retry_delay_seconds,
                   max_parallel_requests=max_parallel_requests,
                   request_timeout_seconds=request_timeout_seconds,
+                  soft_retry_seconds=soft_retry_seconds,
                   minimum_response_coverage=minimum_response_coverage)
     if on_progress is not None:
         kwargs["on_progress"] = on_progress
@@ -5114,6 +5220,38 @@ def _tw_mis_transport_error_types(exc: BaseException) -> list[str]:
     return sorted(names)
 
 
+def _tw_mis_batch_geometry(requested: int, timeout: float) -> tuple[tuple[Any, ...], int]:
+    key = (os.getpid(), requests.Session, datetime.now(ZoneInfo("Asia/Taipei")).date(), timeout)
+    with _TW_MIS_BATCH_LOCK:
+        for old in list(_TW_MIS_BATCH_LIMITS):
+            if old[:3] != key[:3]:
+                del _TW_MIS_BATCH_LIMITS[old]
+        return key, min(requested, _TW_MIS_BATCH_LIMITS.get(key, requested))
+
+
+def _tw_mis_learn_batch_geometry(key, used: int, observations: list[dict], *, stopped: bool) -> int:
+    # Only a burst of pre-response timeouts can justify smaller requests. HTTP
+    # refusal/quota, bad JSON, missing rows and a lone timeout do not. A tiny
+    # successful probe must not erase the larger request's failure evidence.
+    timeout_types = {"ReadTimeout", "ReadTimeoutError", "ConnectTimeout", "TimeoutError"}
+    timed_out_sizes = [row["channel_count"] for row in observations
+        if row.get("http_status") is None
+        and row.get("failure_phase") == "connect_tls_or_response_headers"
+        and timeout_types.intersection(row.get("error_chain_types", ()))
+        and isinstance(row.get("channel_count"), int)]
+    split_recovered = any(row.get("request_role") == "soft_retry"
+        and isinstance(row.get("channel_count"), int) and 0 < row["channel_count"] < used
+        and row.get("http_status") == 200 and row.get("response_row_count", 0) > 0
+        for row in observations)
+    with _TW_MIS_BATCH_LOCK:
+        current = _TW_MIS_BATCH_LIMITS.get(key, used)
+        # Require the actual large shape to have failed, not just a short tail.
+        if (stopped or split_recovered) and sum(size == used for size in timed_out_sizes) >= 4 and used > 1:
+            current = min(current, max(1, used // 2))
+            _TW_MIS_BATCH_LIMITS[key] = current
+        return current
+
+
 def _assign_tw_mis_rows(rows, received, indices, prices, fields, timestamps, market_times, *, max_clocks):
     """Copy decoded columns in bulk when each destination occurs once.
 
@@ -5159,6 +5297,7 @@ def _fetch_tw_mis_last_prices(
     empty_chunk_retry_delay_seconds: float | None = None,
     max_parallel_requests: int | None = None,
     request_timeout_seconds: float | None = None,
+    soft_retry_seconds: float | None = None,
     minimum_response_coverage: float = 1.0,
     on_progress: Callable[[list[str], PriceSnapshot], None] | None = None,
 ) -> PriceSnapshot:
@@ -5170,6 +5309,10 @@ def _fetch_tw_mis_last_prices(
         if request_timeout_seconds is not None
         else float(os.getenv("STOCKAGENT_TW_MIS_REQUEST_TIMEOUT_SECONDS", "8") or "8"),
     )
+    if soft_retry_seconds is not None and (not math.isfinite(float(soft_retry_seconds))
+                                           or float(soft_retry_seconds) <= 0):
+        raise ValueError("MIS soft retry must be a positive finite duration")
+    soft_retry = float(soft_retry_seconds) if soft_retry_seconds is not None else None
     yahoo_map = load_symbol_yahoo_map(parquet_root)
     prices = np.asarray(fallback_prices, dtype=np.float64).copy()
     filled = np.zeros((len(symbols),), dtype=bool)
@@ -5196,7 +5339,8 @@ def _fetch_tw_mis_last_prices(
     # Keep larger batches for the ordinary 8s path, but publish smaller batches
     # promptly on the short-budget path. This does not reduce the symbol scope.
     channel_limit = min(20, max(1, int(request_timeout / .075))) if request_timeout <= 2.0 else 80
-    chunk_len = max(1, min(int(chunk_size), channel_limit))
+    requested_chunk_len = max(1, min(int(chunk_size), channel_limit))
+    batch_key, chunk_len = _tw_mis_batch_geometry(requested_chunk_len, request_timeout)
     chunks = [
         ex_channels[start : start + chunk_len]
         for start in range(0, len(ex_channels), chunk_len)
@@ -5204,6 +5348,8 @@ def _fetch_tw_mis_last_prices(
     chunk_failures: list[dict[str, Any]] = []
     chunk_failure_lock = threading.Lock()
     request_observations: list[dict[str, Any]] = []
+    successful_families: set[int] = set()
+    soft_retry_requests = 0
     stop_dispatch = threading.Event()
     consecutive_endpoint_failures = 0
     dispatch_stop_reason: str | None = None
@@ -5282,6 +5428,8 @@ def _fetch_tw_mis_last_prices(
         items: list[tuple[int, str]],
         enqueued_at: float | None = None,
         request_index: int | None = None,
+        family_index: int | None = None,
+        soft_retry_request: bool = False,
     ) -> list[
         tuple[
             int,
@@ -5313,6 +5461,8 @@ def _fetch_tw_mis_last_prices(
         spans = {"worker_queue_ms": round((request_started - enqueued_at) * 1000, 3)
                  if enqueued_at is not None else None,
                  "request_index": request_index,
+                 "request_role": "soft_retry" if soft_retry_request else "original",
+                 "request_family_index": family_index,
                  "enqueued_offset_ms": round((enqueued_at - fetch_started) * 1000, 3)
                  if enqueued_at is not None else None,
                  "request_started_offset_ms": round((request_started - fetch_started) * 1000, 3)}
@@ -5383,9 +5533,13 @@ def _fetch_tw_mis_last_prices(
                      "ReadTimeout", "ReadTimeoutError"}
                     .intersection(error_types) or status in {502, 503}
                 )
-                consecutive_endpoint_failures = (
-                    consecutive_endpoint_failures + 1 if endpoint_unavailable else 0
-                )
+                # An original can time out after its sibling already obtained
+                # a valid response. Keep its failure evidence, but do not open
+                # the source-wide circuit on a recovered request family.
+                if family_index not in successful_families:
+                    consecutive_endpoint_failures = (
+                        consecutive_endpoint_failures + 1 if endpoint_unavailable else 0
+                    )
                 if status in {401, 402, 403, 429} or consecutive_endpoint_failures >= 4:
                     # Drain already-running requests and preserve their results.
                     # Do not dispatch the rest of a sweep into a refused source;
@@ -5423,6 +5577,8 @@ def _fetch_tw_mis_last_prices(
         }
         with chunk_failure_lock:
             consecutive_endpoint_failures = 0
+            if family_index is not None:
+                successful_families.add(family_index)
             request_observations.append(observation)
         row_decode_started = time.perf_counter()
         rows: list[
@@ -5565,24 +5721,54 @@ def _fetch_tw_mis_last_prices(
         failures = []
 
         def pump() -> None:
+            nonlocal soft_retry_requests
             remaining = deque(indices)
-            pending = {}
+            pending = {}  # future -> (chunk index, is soft retry, deadline)
+            hedge_queue = deque()
+            hedged = set()
+            hedge_children_remaining = {}
+            released_original_slots = set()
             try:
-                while remaining or pending:
+                while remaining or pending or hedge_queue:
                     with chunk_failure_lock:
                         budget = 1 if consecutive_endpoint_failures else workers
-                    while (remaining and len(pending) < budget
+                    # Once both split replies finish, allow the next priority
+                    # batch to start while the original still waits. Retain
+                    # its future and accept any later response or failure.
+                    normal_pending = sum(not item[1] and item[0] not in released_original_slots
+                                         for item in pending.values())
+                    while (remaining and normal_pending < budget
                            and not stop_dispatch.is_set() and not cancelled.is_set()):
                         index = remaining.popleft()
                         submitted_indices.add(index)
-                        pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[index], time.perf_counter(), index)] = index
+                        enqueued = time.perf_counter()
+                        pending[_TW_MIS_HTTP_POOL.submit(fetch_chunk, chunks[index], enqueued, index, index)] = (
+                            index, False, enqueued + soft_retry if soft_retry is not None else None)
+                        normal_pending += 1
+                    hedge_pending = sum(item[1] for item in pending.values())
+                    while (hedge_queue and hedge_pending < _TW_MIS_HEDGE_WORKERS
+                           and not stop_dispatch.is_set() and not cancelled.is_set()):
+                        index, family = hedge_queue.popleft()
+                        submitted_indices.add(index)
+                        enqueued = time.perf_counter()
+                        pending[_TW_MIS_HEDGE_POOL.submit(fetch_chunk, chunks[index], enqueued, index, family, True)] = (
+                            index, True, family)
+                        soft_retry_requests += 1
+                        hedge_pending += 1
                     if not pending:
                         break
-                    completed, _ = wait(pending, return_when=FIRST_COMPLETED)
+                    deadlines = [due for index, is_hedge, due in pending.values()
+                                 if not is_hedge and due is not None and index not in hedged]
+                    timeout = max(0., min(deadlines) - time.perf_counter()) if deadlines else None
+                    completed, _ = wait(pending, timeout=timeout, return_when=FIRST_COMPLETED)
                     arrived = []
                     for future in completed:
-                        index = pending.pop(future)
+                        index, is_hedge, family = pending.pop(future)
                         rows = future.result()
+                        if is_hedge:
+                            hedge_children_remaining[family] -= 1
+                            if hedge_children_remaining[family] == 0:
+                                released_original_slots.add(family)
                         if rows:
                             chunk_results[index] = rows
                             chunk_received_ms[index] = int(time.time() * 1000)
@@ -5590,6 +5776,23 @@ def _fetch_tw_mis_last_prices(
                                 arrived.append((rows, chunk_received_ms[index]))
                     if arrived:
                         arrivals.put(arrived)
+                    if not stop_dispatch.is_set() and not cancelled.is_set():
+                        clock = time.perf_counter()
+                        for index, is_hedge, due in list(pending.values()):
+                            if is_hedge or due is None or index in hedged or clock < due:
+                                continue
+                            hedged.add(index)
+                            items = chunks[index]
+                            # Retain the original request. Split only its one
+                            # retry so a slow 80-channel shape can recover at 40.
+                            size = max(1, (len(items) + 1) // 2)
+                            hedge_children_remaining[index] = (len(items) + size - 1) // size
+                            for offset in range(0, len(items), size):
+                                child = len(chunks)
+                                chunks.append(items[offset:offset + size])
+                                chunk_results.append([])
+                                chunk_received_ms.append(0)
+                                hedge_queue.append((child, index))
             except BaseException as exc:
                 failures.append(exc)
             finally:
@@ -5678,8 +5881,13 @@ def _fetch_tw_mis_last_prices(
     unsubmitted_symbols = list(dict.fromkeys(
         symbols[index] for items in chunks for index, _ in items if index not in submitted_destinations
     )) if submitted_destinations is not None else []
-    final_rows = [row for rows in chunk_results for row in rows]
-    final_times = [chunk_received_ms[index] for index, rows in enumerate(chunk_results) for _row in rows]
+    final_chunks = list(range(len(chunk_results)))
+    if soft_retry_requests:
+        # Late originals and split retries overlap: preserve actual receipt
+        # order rather than treating append order as market/receipt time.
+        final_chunks.sort(key=lambda index: (chunk_received_ms[index], index))
+    final_rows = [row for index in final_chunks for row in chunk_results[index]]
+    final_times = [chunk_received_ms[index] for index in final_chunks for _row in chunk_results[index]]
     final_indices = [row[0] for row in final_rows]
     _assign_tw_mis_rows(final_rows, final_times, final_indices, prices,
         (open_prices, high_prices, low_prices, volumes, upper_limit_prices, lower_limit_prices,
@@ -5694,6 +5902,9 @@ def _fetch_tw_mis_last_prices(
         timestamp = datetime.fromtimestamp(
             last_timestamp_ms / 1000.0, tz=timezone.utc
         ).isoformat()
+    next_chunk_len = _tw_mis_learn_batch_geometry(
+        batch_key, chunk_len, request_observations,
+        stopped=dispatch_stop_reason == "consecutive_transport_failures")
     return PriceSnapshot(
         prices=prices,
         source="twse_tpex:mis",
@@ -5712,9 +5923,16 @@ def _fetch_tw_mis_last_prices(
             "mis_keep_alive_pool": True,
             "mis_minimum_response_coverage": minimum_coverage,
             "mis_request_timeout_seconds": request_timeout,
+            "mis_soft_retry_seconds": soft_retry,
+            "mis_soft_retry_requests": soft_retry_requests,
+            "mis_soft_retry_policy": "split_once_keep_original_running_v1" if soft_retry is not None else "disabled",
+            "mis_soft_retry_clock": "logical_enqueue_including_worker_queue_not_socket_timeout_v1",
             "mis_requested_chunk_size": int(chunk_size),
             "mis_effective_chunk_size": chunk_len,
             "mis_batch_policy": "deadline_compatible_channels_v1",
+            "mis_transport_batch_policy": "session_timeout_shape_halving_not_probe_reset_v1",
+            "mis_deadline_compatible_chunk_size": requested_chunk_len,
+            "mis_next_transport_chunk_size": next_chunk_len,
             "mis_request_count": len(request_observations),
             "mis_progress_batch_count": progress_batch_count,
             "mis_progress_spans": progress_spans,

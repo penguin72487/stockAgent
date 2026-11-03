@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import subprocess
 import urllib.error
 import urllib.parse
@@ -76,6 +76,7 @@ def queue_after_publish(
     dataset: str,
     *,
     new_object_paths: tuple[str, ...] = (),
+    new_manifest_paths: tuple[str, ...] | None = None,
 ) -> bool:
     """Durably merge scan intent without waiting for any network scan.
 
@@ -93,11 +94,12 @@ def queue_after_publish(
         for path in new_object_paths
     ):
         raise SnapshotError("unsafe Syncthing scan queue path")
+    manifests = _validate_manifest_paths(dataset, new_manifest_paths)
     with _exclusive_lock(sync_root / ".local-state" / "locks" / f"scan-queue-{dataset}.lock"):
         if _pending_path(sync_root, dataset) != pending:
             raise SnapshotError("D-primary disappeared before queue commit")
-        previous_paths, full_objects_scan = (
-            _load_pending(pending, dataset) if pending.is_file() else ((), False)
+        previous_paths, full_objects_scan, previous_manifests, full_manifests_scan = (
+            _load_pending(pending, dataset) if pending.is_file() else ((), False, (), False)
         )
         atomic_write_json(pending, {
             "schema_version": 1,
@@ -105,6 +107,10 @@ def queue_after_publish(
             "generation": uuid.uuid4().hex,
             "new_object_paths": sorted(set(previous_paths) | set(new_object_paths)),
             "full_objects_scan": full_objects_scan,
+            # Old or unscoped producers retain the full manifest-directory scan.
+            # Only exact committed manifest identities may narrow that scan.
+            "new_manifest_paths": sorted(set(previous_manifests) | set(manifests or ())),
+            "full_manifests_scan": full_manifests_scan or manifests is None,
         })
     return True
 
@@ -114,8 +120,10 @@ def scan_after_publish(
     dataset: str,
     *,
     new_object_paths: tuple[str, ...] = (),
+    new_manifest_paths: tuple[str, ...] | None = None,
     retry_full: bool = False,
     batch_object_paths: bool = False,
+    request_timeout_seconds: int = 120,
 ) -> bool:
     """Queue then immediately scan; a retry only drains existing intent.
 
@@ -128,11 +136,15 @@ def scan_after_publish(
 
     if type(batch_object_paths) is not bool:
         raise SnapshotError("batch_object_paths must be a boolean")
+    if type(request_timeout_seconds) is not int or not 1 <= request_timeout_seconds <= 480:
+        raise SnapshotError("Syncthing scan timeout must be between 1 and 480 seconds")
     pending = _pending_path(sync_root, dataset)
     if pending is None:
         return False
     if not retry_full:
-        queue_after_publish(sync_root, dataset, new_object_paths=new_object_paths)
+        queue_after_publish(sync_root, dataset, new_object_paths=new_object_paths,
+                            **({"new_manifest_paths": new_manifest_paths}
+                               if new_manifest_paths is not None else {}))
     queue_lock = sync_root / ".local-state" / "locks" / f"scan-queue-{dataset}.lock"
     with _exclusive_lock(sync_root / ".local-state" / "locks" / f"scan-{dataset}.lock"):
         with _exclusive_lock(queue_lock):
@@ -140,12 +152,15 @@ def scan_after_publish(
                 raise SnapshotError("D-primary disappeared before scan")
             if not pending.is_file():
                 return False
-            scan_paths, full_objects_scan = _load_pending(pending, dataset)
+            scan_paths, full_objects_scan, manifest_paths, full_manifests_scan = _load_pending(pending, dataset)
             observed = pending.read_bytes()
             observed_stat = pending.stat()
         _scan_pending(
             sync_root, dataset, scan_paths, full_objects_scan=full_objects_scan,
             **({"batch_object_paths": True} if batch_object_paths else {}),
+            **({"request_timeout_seconds": request_timeout_seconds}
+               if request_timeout_seconds != 120 else {}),
+            **({"new_manifest_paths": manifest_paths} if not full_manifests_scan else {}),
         )
         with _exclusive_lock(queue_lock):
             if _pending_path(sync_root, dataset) != pending:
@@ -165,7 +180,23 @@ def scan_after_publish(
     return True
 
 
-def _load_pending(pending: Path, dataset: str) -> tuple[tuple[str, ...], bool]:
+def _validate_manifest_paths(dataset: str, paths: tuple[str, ...] | None) -> tuple[str, ...] | None:
+    if paths is None:
+        return None
+    if not isinstance(paths, (tuple, list)) or not paths:
+        raise SnapshotError("exact manifest scan paths must be a nonempty sequence")
+    for path in paths:
+        if not isinstance(path, str):
+            raise SnapshotError("unsafe exact manifest scan path")
+        parsed = PurePosixPath(path)
+        if (parsed.as_posix() != path or len(parsed.parts) != 3
+                or parsed.parts[:2] != ("manifests", dataset)
+                or not parsed.name.endswith('.json') or parsed.name in ('.json', '..json')):
+            raise SnapshotError("unsafe exact manifest scan path")
+    return tuple(paths)
+
+
+def _load_pending(pending: Path, dataset: str) -> tuple[tuple[str, ...], bool, tuple[str, ...], bool]:
     try:
         payload = json.loads(pending.read_text(encoding="utf-8"))
         paths = payload["new_object_paths"]
@@ -179,10 +210,23 @@ def _load_pending(pending: Path, dataset: str) -> tuple[tuple[str, ...], bool]:
             )
         ):
             raise ValueError("invalid pending scan receipt")
-        return tuple(paths), bool(payload.get("full_objects_scan", False))
-    except (OSError, ValueError, KeyError, TypeError):
+        # Version-1 receipts without both fields predate exact manifest paths.
+        # Their unknown manifest changes must keep the whole-directory scan.
+        if 'new_manifest_paths' not in payload or 'full_manifests_scan' not in payload:
+            manifests, full_manifests = (), True
+        else:
+            manifests = payload['new_manifest_paths']
+            full_manifests = payload['full_manifests_scan']
+            if type(full_manifests) is not bool or not isinstance(manifests, list):
+                raise ValueError('invalid pending manifest scan')
+            if manifests:
+                manifests = _validate_manifest_paths(dataset, manifests)
+            elif not full_manifests:
+                raise ValueError('exact manifest scan has no paths')
+        return tuple(paths), bool(payload.get("full_objects_scan", False)), tuple(manifests), full_manifests
+    except (OSError, ValueError, KeyError, TypeError, SnapshotError):
         # A damaged receipt cannot prove which object paths were missed.
-        return (), True
+        return (), True, (), True
 
 
 def _scan_request_groups(
@@ -191,6 +235,7 @@ def _scan_request_groups(
     *,
     full_objects_scan: bool,
     batch_object_paths: bool = False,
+    new_manifest_paths: tuple[str, ...] | None = None,
 ) -> tuple[tuple[str, ...], ...]:
     """Keep exact object coverage and strict object -> manifest -> head phases."""
 
@@ -199,33 +244,40 @@ def _scan_request_groups(
         if full_objects_scan or (len(new_object_paths) > 256 and not batch_object_paths)
         else sorted(set(new_object_paths))
     )
-    metadata = [f"manifests/{dataset}", f"heads/{dataset}"]
+    manifests = _validate_manifest_paths(dataset, new_manifest_paths)
+    metadata = list(sorted(set(manifests))) if manifests is not None else [f"manifests/{dataset}"]
+    metadata.append(f"heads/{dataset}")
     for relative in [*paths, *metadata]:
         if not relative or relative.startswith("/") or ".." in Path(relative).parts:
             raise SnapshotError(f"unsafe Syncthing scan path: {relative}")
     if not batch_object_paths:
         return tuple((relative,) for relative in [*paths, *metadata])
     groups: list[tuple[str, ...]] = []
-    current: list[str] = []
     prefix_bytes = len(urllib.parse.urlencode({"folder": FOLDER_ID}))
-    query_bytes = prefix_bytes
-    for relative in paths:
-        # urlencode emits ASCII; include the separating '&' in the exact bound.
-        encoded_bytes = 1 + len(urllib.parse.urlencode({"sub": relative}))
-        if prefix_bytes + encoded_bytes > MAX_BATCH_QUERY_BYTES:
-            raise SnapshotError("Syncthing scan path exceeds the batch query limit")
-        if current and (
-            len(current) >= MAX_BATCH_SUB_PATHS
-            or query_bytes + encoded_bytes > MAX_BATCH_QUERY_BYTES
-        ):
+
+    def append_batches(members: list[str]) -> None:
+        current: list[str] = []
+        query_bytes = prefix_bytes
+        for relative in members:
+            # urlencode emits ASCII; include the separating '&' in the exact bound.
+            encoded_bytes = 1 + len(urllib.parse.urlencode({"sub": relative}))
+            if prefix_bytes + encoded_bytes > MAX_BATCH_QUERY_BYTES:
+                raise SnapshotError("Syncthing scan path exceeds the batch query limit")
+            if current and (
+                len(current) >= MAX_BATCH_SUB_PATHS
+                or query_bytes + encoded_bytes > MAX_BATCH_QUERY_BYTES
+            ):
+                groups.append(tuple(current))
+                current = []
+                query_bytes = prefix_bytes
+            current.append(relative)
+            query_bytes += encoded_bytes
+        if current:
             groups.append(tuple(current))
-            current = []
-            query_bytes = prefix_bytes
-        current.append(relative)
-        query_bytes += encoded_bytes
-    if current:
-        groups.append(tuple(current))
-    groups.extend((relative,) for relative in metadata)
+
+    append_batches(paths)
+    append_batches(metadata[:-1])
+    groups.append((metadata[-1],))
     return tuple(groups)
 
 
@@ -236,6 +288,8 @@ def _scan_pending(
     *,
     full_objects_scan: bool,
     batch_object_paths: bool = False,
+    request_timeout_seconds: int = 120,
+    new_manifest_paths: tuple[str, ...] | None = None,
 ) -> None:
     checker = Path(__file__).resolve().parents[2] / "scripts/mount_packed_d_cold.sh"
     mounted = subprocess.run(
@@ -253,19 +307,20 @@ def _scan_pending(
     groups = _scan_request_groups(
         dataset, new_object_paths, full_objects_scan=full_objects_scan,
         batch_object_paths=batch_object_paths,
+        new_manifest_paths=new_manifest_paths,
     )
     for group in groups:
         # Syncthing v2.1.5 postDBScan passes qs["sub"] (all repeated values)
         # to ScanFolderSubdirs; never combine metadata with the object phase.
         query = urllib.parse.urlencode({"folder": FOLDER_ID, "sub": group}, doseq=True)
-        label = group[0] if len(group) == 1 else f"object batch ({len(group)} paths)"
+        label = group[0] if len(group) == 1 else f"scan batch ({len(group)} paths)"
         request = urllib.request.Request(
             base + "/rest/db/scan?" + query,
             headers={"X-API-Key": key},
             method="POST",
         )
         try:
-            with urllib.request.urlopen(request, timeout=120) as response:
+            with urllib.request.urlopen(request, timeout=request_timeout_seconds) as response:
                 if response.status != 200:
                     raise SnapshotError(
                         f"Syncthing scan failed for {label}: HTTP {response.status}"

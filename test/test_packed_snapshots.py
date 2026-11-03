@@ -672,6 +672,38 @@ def test_pack_producer_digest_preserves_exact_zip_bytes_and_large_backpatch_fall
             assert archive.read(name) == (source / name).read_bytes()
 
 
+@pytest.mark.parametrize('source_workers', [1, 4])
+@pytest.mark.parametrize('compression_level', [0, 6, 9])
+def test_pack_member_boundaries_keep_fused_hash_across_many_windows(
+        tmp_path, monkeypatch, source_workers, compression_level):
+    source = tmp_path / 'source'
+    source.mkdir()
+    for index in range(61):
+        suffix = '.parquet' if index % 2 else '.json'
+        payload = (hashlib.sha256(str(index).encode()).digest() * 23
+                   if index % 3 else b'compressible raw -0.75, null\n' * 23)
+        (source / f'{index:03d}-原值{suffix}').write_bytes(payload)
+    native = packed_snapshots._SeekablePackBuffer
+    monkeypatch.setattr(packed_snapshots, '_SeekablePackBuffer',
+                        lambda stream: native(stream, capacity=4096))
+    entries, _ = packed_snapshots._collect_entries(source)
+    target = tmp_path / 'candidate.zip'
+    digest = packed_snapshots._write_pack(source, entries, target,
+        compression_level=compression_level, source_workers=source_workers)
+    reference = io.BytesIO()
+    with zipfile.ZipFile(reference, 'w', compression=zipfile.ZIP_DEFLATED,
+                         compresslevel=compression_level, allowZip64=True) as archive:
+        for entry in entries:
+            with archive.open(packed_snapshots._zip_info(entry), 'w', force_zip64=True) as member:
+                member.write((source / entry.path).read_bytes())
+    assert target.read_bytes() == reference.getvalue()
+    assert digest == hashlib.sha256(reference.getvalue()).hexdigest()
+    with zipfile.ZipFile(target) as archive:
+        assert archive.testzip() is None
+        for name in archive.namelist():
+            assert archive.read(name) == (source / name).read_bytes()
+
+
 @pytest.mark.parametrize('capacity,rehashes', [(1024**2, 0), (32, 1)])
 def test_publisher_fuses_sequential_pack_hash_but_falls_back_after_out_of_window_patch(
         tmp_path, monkeypatch, capacity, rehashes):
@@ -827,6 +859,35 @@ def test_summary_only_census_keeps_every_fingerprint_without_allocating_entries(
     assert events and all(event["acceptance"] is False for event in events)
 
 
+def test_census_relative_paths_preserve_names_and_link_identities(tmp_path, monkeypatch):
+    root = tmp_path / "source"
+    nested = root / "nested" / "資料"
+    nested.mkdir(parents=True)
+    (root / "root.txt").write_bytes(b"root")
+    (nested / "value.txt").write_bytes(b"value")
+    odd_name = os.fsdecode(b"bad-\xff.bin")
+    (nested / odd_name).write_bytes(b"non utf8 name")
+    (root / "file-link").symlink_to("nested/資料/value.txt")
+    (root / "directory-link").symlink_to("nested", target_is_directory=True)
+
+    absolute_entries, absolute_summary = packed_snapshots._collect_entries(root)
+    monkeypatch.chdir(tmp_path)
+    relative_entries, relative_summary = packed_snapshots._collect_entries(Path("source"))
+
+    assert relative_summary == absolute_summary
+    assert relative_entries == absolute_entries
+    by_path = {entry.path: entry for entry in relative_entries}
+    assert set(by_path) == {
+        "directory-link", "file-link", "nested", "nested/資料", "root.txt",
+        "nested/資料/value.txt", "nested/資料/" + odd_name,
+    }
+    assert by_path["directory-link"].target == "nested"
+    assert by_path["file-link"].target == "nested/資料/value.txt"
+    for name in ("root.txt", "nested/資料/value.txt", "nested/資料/" + odd_name):
+        assert by_path[name].source_stat == packed_snapshots._source_stat(os.lstat(root / name))
+    assert absolute_summary["files"] == 3 and absolute_summary["symlinks"] == 2
+
+
 @pytest.mark.parametrize("invalid", ["symlink", "fifo", "selected-directory"])
 def test_summary_only_census_preserves_path_type_and_symlink_guards(tmp_path, invalid):
     source = _source_tree(tmp_path)
@@ -891,6 +952,23 @@ def test_publication_releases_consumed_previous_file_rows_during_hashing(tmp_pat
     second = publish_packed_snapshot(cold, "memory-test", source)
     assert observed == [4, 3, 2, 1]
     assert not live and second.manifest_sha256 == first.manifest_sha256
+
+
+def test_publication_reports_previous_inventory_passes_without_claiming_acceptance(tmp_path):
+    source, cold = _source_tree(tmp_path), tmp_path / "cold"
+    first = publish_packed_snapshot(cold, "inventory-progress", source, node_id="node-a")
+    events = []
+    second = publish_packed_snapshot(cold, "inventory-progress", source, progress=events.append)
+    names = ("loading_previous_inventory", "validating_previous_inventory")
+    stages = [event["stage"] for event in events]
+    assert stages.index(names[0]) < stages.index(names[1]) < stages.index("routing_and_hashing")
+    expected = sum(first.manifest["source"][key] for key in ("files", "directories", "symlinks"))
+    for name in names:
+        observed = [event for event in events if event["stage"] == name]
+        assert [observed[0]["phase_completed_items"], observed[-1]["phase_completed_items"]] == [0, expected]
+        assert all(event["phase_total_items"] == expected and event["phase_unit"] == "previous_inventory_entries"
+                   and event["files_completed"] == 0 and event["acceptance"] is False for event in observed)
+    assert second.manifest_sha256 == first.manifest_sha256
 
 
 def test_bounded_census_benchmark_is_readonly_and_checks_every_summary_field(tmp_path):
@@ -1438,7 +1516,13 @@ def test_failed_object_hash_cannot_report_completed_verification(tmp_path):
     events = []
     with pytest.raises(SnapshotError, match='checksum mismatch'):
         verify_packed_snapshot(cold, resolved, progress=events.append)
-    assert events and all(event['completed_items'] == 0 for event in events)
+    metadata = [event for event in events if event['stage'] in {
+        'load-packed-inventory', 'validate-packed-inventory'}]
+    assert metadata and all(event['acceptance'] is False for event in metadata)
+    assert metadata[0]['completed_items'] == 0
+    assert any(event['completed_items'] == event['total_items'] for event in metadata)
+    verification = [event for event in events if event not in metadata]
+    assert verification and all(event['completed_items'] == 0 for event in verification)
     assert source.is_dir() and path.exists()
 
 
@@ -2171,6 +2255,7 @@ def test_transport_notification_releases_global_publish_locks_even_for_noop(tmp_
     assert first.manifest["snapshot_id"] == second.manifest["snapshot_id"]
     assert len(observed) == 2
     assert observed[0]["new_object_paths"]
+    assert observed[0]["new_manifest_paths"] == (first.manifest_path.relative_to(cold).as_posix(),)
 
 
 def test_independent_publishers_share_retention_but_same_dataset_stays_exclusive(tmp_path, monkeypatch):
@@ -2261,6 +2346,63 @@ def test_reused_cas_installer_durability_does_not_depend_on_its_peers(tmp_path, 
         assert flushed == [destination.parent]
 
 
+@pytest.mark.parametrize('outcome', ['valid', 'corrupt', 'missing_member', 'guard_failed'])
+def test_native_reused_cas_hash_keeps_complete_checksum_and_original_bytes(tmp_path, monkeypatch, outcome):
+    from stockagent.data_sync import windows_cold_io
+    cold = tmp_path / 'cold'
+    initialize_packed_layout(cold, node_id='fixture')
+    temporary = cold / '.local-state/staging/ours'
+    temporary.write_bytes(b'preserved exact source')
+    destination = cold / 'objects/blobs/aa/winner'
+    destination.parent.mkdir()
+    destination.write_bytes(temporary.read_bytes())
+    expected = packed_snapshots.sha256_file(destination)
+    inode = destination.stat().st_ino
+    calls = []
+    monkeypatch.setattr(packed_snapshots, '_NATIVE_IMMUTABLE_ROOTS', {cold})
+    monkeypatch.setattr(packed_snapshots, 'MIN_NATIVE_IMMUTABLE_HASH_BYTES', 1)
+    def guard(root):
+        calls.append(('guard', root))
+        if outcome == 'guard_failed':
+            raise SnapshotError('changed native authority')
+    def full_hash(paths):
+        calls.append(('hash', paths))
+        return {} if outcome == 'missing_member' else {
+            destination: '0' * 64 if outcome == 'corrupt' else packed_snapshots.sha256_file(destination)}
+    monkeypatch.setattr(packed_snapshots, '_check_native_pack_read_authority', guard)
+    monkeypatch.setattr(windows_cold_io, 'hash_many', full_hash)
+    if outcome == 'valid':
+        assert packed_snapshots._install_immutable_object(cold, temporary, destination,
+            expected_sha256=expected) is True
+        assert not temporary.exists()
+    else:
+        with pytest.raises(SnapshotError):
+            packed_snapshots._install_immutable_object(cold, temporary, destination,
+                expected_sha256=expected)
+        assert temporary.read_bytes() == b'preserved exact source'
+    assert destination.stat().st_ino == inode
+    assert destination.read_bytes() == b'preserved exact source'
+    assert calls[0] == ('guard', cold)
+    if outcome != 'guard_failed':
+        assert calls[1] == ('hash', [destination])
+
+
+def test_small_and_portable_cas_hash_does_not_start_native_IO(tmp_path, monkeypatch):
+    from stockagent.data_sync import windows_cold_io
+    cold = tmp_path / 'cold'
+    destination = cold / 'objects/blob'
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b'exact small bytes')
+    def reject_native(*args, **kwargs):
+        raise AssertionError('portable/small CAS object started native I/O')
+    monkeypatch.setattr(windows_cold_io, 'hash_many', reject_native)
+    monkeypatch.setattr(packed_snapshots, '_NATIVE_IMMUTABLE_ROOTS', {cold})
+    expected = packed_snapshots.sha256_file(destination)
+    assert packed_snapshots._installed_object_sha256(cold, destination) == expected
+    monkeypatch.setattr(packed_snapshots, 'MIN_NATIVE_IMMUTABLE_HASH_BYTES', 1)
+    assert packed_snapshots._installed_object_sha256(tmp_path, destination) == expected
+
+
 @pytest.mark.parametrize('rules', ['finmind_parquet_promote_v1', False, [None], [{}], ['unknown']])
 def test_private_staging_rules_fail_closed_before_source_publication(tmp_path, rules):
     source = _source_tree(tmp_path)
@@ -2268,6 +2410,52 @@ def test_private_staging_rules_fail_closed_before_source_publication(tmp_path, r
     with pytest.raises(SnapshotError, match='staging rules'):
         publish_packed_snapshot(cold, 'first', source, private_staging_file_rules=rules)
     assert not cold.exists()
+
+
+def test_e_workspace_stages_public_and_private_d_builds_fail_closed(tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_volume
+    enrollment = tmp_path / 'enrollment.json'
+    enrollment.touch()
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    monkeypatch.setattr(workspace_volume, 'admit', lambda *_: {})
+    monkeypatch.setattr(workspace_volume, 'path', lambda *_a, **_k: tmp_path / 'e-build')
+    primary = Path('/srv/stockagent-packed')
+    assert packed_snapshots._publication_staging_root(primary) == tmp_path / 'e-build/packed'
+    assert packed_snapshots._publication_staging_root(primary / '.local-state/private-history') == tmp_path / 'e-build/private-packed'
+    assert packed_snapshots._publication_staging_root(tmp_path / 'other') == tmp_path / 'other/.local-state/staging'
+    def reject(*_args, **_kwargs):
+        raise SnapshotError('enrolled E is unavailable')
+    monkeypatch.setattr(workspace_volume, 'admit', reject)
+    with pytest.raises(SnapshotError, match='E is unavailable'):
+        packed_snapshots._publication_staging_root(primary)
+
+
+def test_large_blob_uses_linux_io_for_e_staging_and_native_only_for_d(monkeypatch):
+    calls = []
+    monkeypatch.setattr(packed_snapshots, '_copy_and_hash', lambda *_: calls.append('linux') or 'sha')
+    monkeypatch.setattr(packed_snapshots, '_native_copy_and_hash', lambda *_: calls.append('native') or 'sha')
+    source = Path('/source')
+    size = 512 * 1024**2
+    packed_snapshots._copy_publication_blob(source, Path('/srv/stockagent-workspace/build/packed/blob'),
+                                            size=size, native_d=True)
+    packed_snapshots._copy_publication_blob(source, Path('/srv/stockagent-packed/.local-state/staging/blob'),
+                                            size=size, native_d=True)
+    assert calls == ['linux', 'native']
+
+
+def test_cross_volume_build_reconstructs_original_bytes(tmp_path, monkeypatch):
+    import tempfile
+    if not Path('/dev/shm').is_dir() or Path('/dev/shm').stat().st_dev == tmp_path.stat().st_dev:
+        pytest.skip('requires separate temporary filesystems')
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'original.txt').write_bytes(b'original values and source bytes' * 1024)
+    cold = tmp_path / 'cold'
+    with tempfile.TemporaryDirectory(dir='/dev/shm', prefix='stockagent-pack-test-') as workspace:
+        monkeypatch.setattr(packed_snapshots, '_publication_staging_root', lambda *_: Path(workspace) / 'build')
+        selected = publish_packed_snapshot(cold, 'original', source, node_id='test', pack_buckets=1)
+        restored = fetch_packed_snapshot(cold, tmp_path / 'restore', selected)
+        assert (restored / 'original.txt').read_bytes() == (source / 'original.txt').read_bytes()
 
 
 def test_known_private_staging_rules_cannot_change_shared_publication_scope(tmp_path):

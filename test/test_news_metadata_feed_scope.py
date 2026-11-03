@@ -195,6 +195,112 @@ def test_scoped_rss_durable_acceptance_clocks_and_no_body(config, tmp_path):
         http.close(); q.close()
 
 
+@pytest.mark.parametrize('status', [200, 304])
+def test_stale_metadata_feed_response_preserves_newer_heads_and_original(config, tmp_path, status):
+    q, http, _ = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        first = Response(url, 200, {'content-type': 'application/rss+xml', 'etag': 'old'}, xml())
+        assert accept_discovery(q, task(q), first, [], [], []) == 0
+        stale_task = task(q)
+        article_url = 'https://news.ltn.com.tw/news/business/breakingnews/123'
+        with q.db:
+            q.db.execute("UPDATE discovery SET error_code='http_429',attempts=5,due=?,"
+                         "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (time.time() + 7200, url))
+            q.db.execute("UPDATE articles SET title='較新的文章標題',last_seen_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                         (article_url,))
+        before_job = task(q)
+        before_head = dict(q.db.execute('SELECT * FROM metadata_feed_heads WHERE feed_url=?', (url,)).fetchone())
+        before_article = dict(q.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        if status == 200:
+            new_item = (b'<item><title>Another</title><link>https://news.ltn.com.tw/news/business/breakingnews/124</link>'
+                        b'<pubDate>Tue, 13 Oct 2026 20:00:00 +0800</pubDate><description>Summary</description></item>')
+            body = xml().replace(b'</channel>', new_item + b'</channel>')
+            response = Response(url, 200, {'content-type': 'application/rss+xml'}, body)
+        else:
+            response = Response(url, 304, {}, b'')
+        assert accept_discovery(q, stale_task, response, [], [], []) == 0
+        assert task(q) == before_job
+        assert dict(q.db.execute('SELECT * FROM metadata_feed_heads WHERE feed_url=?', (url,)).fetchone()) == before_head
+        assert dict(q.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone()) == before_article
+        if status == 200:
+            assert q.db.execute("SELECT state FROM articles WHERE url='https://news.ltn.com.tw/news/business/breakingnews/124'").fetchone()[0] == 'awaiting_authorization'
+            digest = hashlib.sha256(response.body).hexdigest()
+            observation = q.db.execute('SELECT receipt_path FROM metadata_feed_observations '
+                                       'WHERE feed_url=? AND response_sha256=?', (url, digest)).fetchone()
+            assert observation and (tmp_path / observation['receipt_path']).is_file()
+    finally:
+        http.close(); q.close()
+
+
+@pytest.mark.parametrize('observation', ['older', 'newer', 'missing', 'in_flight'])
+def test_current_metadata_feed_respects_independent_article_clock(config, tmp_path, observation):
+    q, http, _ = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        first = Response(url, 200, {'content-type': 'application/rss+xml'}, xml())
+        accept_discovery(q, task(q), first, [], [], [])
+        current = task(q)
+        article_url = 'https://news.ltn.com.tw/news/business/breakingnews/123'
+        with q.db:
+            q.db.execute('UPDATE articles SET title=?,last_seen_utc=? WHERE url=?',
+                         ('independent article title', '2000-01-01T00:00:00+00:00' if observation == 'newer'
+                          else '2026-01-02T00:00:00+00:00' if observation == 'in_flight'
+                          else '2099-01-01T00:00:00+00:00', article_url))
+        if observation != 'missing':
+            current['_discovery_request_started_at_utc'] = '2026-01-01T00:00:00+00:00'
+            current['_discovery_response_observed_at_utc'] = '2026-01-03T00:00:00+00:00'
+        new_item = (b'<item><title>Another</title><link>https://news.ltn.com.tw/news/business/breakingnews/124</link>'
+                    b'<pubDate>Tue, 13 Oct 2026 20:00:00 +0800</pubDate><description>Summary</description></item>')
+        raw = Response(url, 200, {'content-type': 'application/rss+xml'}, xml().replace(b'</channel>', new_item + b'</channel>'))
+        accept_discovery(q, current, raw, [], [], [])
+        article = q.db.execute('SELECT title,last_seen_utc FROM articles WHERE url=?', (article_url,)).fetchone()
+        assert article['title'] == ('標題' if observation == 'newer' else 'independent article title')
+        if observation != 'newer':
+            assert article['last_seen_utc'] == ('2026-01-02T00:00:00+00:00' if observation == 'in_flight'
+                                                else '2099-01-01T00:00:00+00:00')
+        assert q.db.execute("SELECT 1 FROM articles WHERE url='https://news.ltn.com.tw/news/business/breakingnews/124'").fetchone()
+    finally:
+        http.close(); q.close()
+
+
+def test_metadata_feed_head_and_schedule_rollback_together_then_reuse_original(config, tmp_path):
+    import sqlite3
+
+    q, http, _ = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        first = Response(url, 200, {'content-type': 'application/rss+xml'}, xml())
+        assert accept_discovery(q, task(q), first, [], [], []) == 0
+        next_task = task(q)
+        before_head = dict(q.db.execute('SELECT * FROM metadata_feed_heads WHERE feed_url=?', (url,)).fetchone())
+        body = xml(link='https://news.ltn.com.tw/news/business/breakingnews/124')
+        raw = Response(url, 200, {'content-type': 'application/rss+xml'}, body)
+        digest = hashlib.sha256(body).hexdigest()
+        with q.db:
+            q.db.execute("CREATE TEMP TRIGGER reject_metadata_schedule BEFORE UPDATE ON discovery "
+                         "BEGIN SELECT RAISE(ABORT,'simulated_schedule_write_failure'); END")
+        with pytest.raises(sqlite3.IntegrityError, match='simulated_schedule_write_failure'):
+            accept_discovery(q, next_task, raw, [], [], [])
+        assert task(q) == next_task
+        assert dict(q.db.execute('SELECT * FROM metadata_feed_heads WHERE feed_url=?', (url,)).fetchone()) == before_head
+        assert not q.db.execute('SELECT 1 FROM metadata_feed_observations WHERE feed_url=? AND response_sha256=?', (url, digest)).fetchone()
+        assert not q.db.execute("SELECT 1 FROM articles WHERE url='https://news.ltn.com.tw/news/business/breakingnews/124'").fetchone()
+        receipts = list((tmp_path / 'metadata_feeds').rglob(digest + '.parquet.receipt.json'))
+        assert len(receipts) == 1 and receipts[0].is_file()
+        original_bytes = (tmp_path / json.loads(receipts[0].read_bytes())['parquet_path']).read_bytes()
+        with q.db:
+            q.db.execute('DROP TRIGGER reject_metadata_schedule')
+        assert accept_discovery(q, next_task, raw, [], [], []) == 0
+        observation = q.db.execute('SELECT receipt_path FROM metadata_feed_observations WHERE feed_url=? AND response_sha256=?',
+                                   (url, digest)).fetchone()
+        assert observation and tmp_path / observation['receipt_path'] == receipts[0]
+        assert (tmp_path / json.loads(receipts[0].read_bytes())['parquet_path']).read_bytes() == original_bytes
+        assert q.db.execute("SELECT state FROM articles WHERE url='https://news.ltn.com.tw/news/business/breakingnews/124'").fetchone()[0] == 'awaiting_authorization'
+    finally:
+        http.close(); q.close()
+
+
 @pytest.mark.parametrize('body,mime,error', [(b'<html><p>login</p></html>', 'text/html', 'invalid_metadata_feed_representation'),
     (xml(extra='<content:encoded xmlns:content="x">full body</content:encoded>'), 'text/xml', 'unreviewed_metadata_feed_item_fields'),
     (xml(extra='<author>name</author>'), 'text/xml', 'unreviewed_metadata_feed_item_fields'),
@@ -332,6 +438,263 @@ def test_crash_before_receipt_replays_without_duplicate_body_or_forged_success(c
         http.close(); q.close()
 
 
+@pytest.mark.parametrize('crash_point', ['before_receipt', 'before_database_commit'])
+def test_metadata_feed_owner_recovers_durable_original_after_restart(config, tmp_path, monkeypatch, crash_point):
+    """The owner resumes local evidence without another publisher request."""
+    import sqlite3
+    import downloader.news_fulltext_metadata_feeds as module
+
+    q, http, session = setup(config, tmp_path, {})
+    registry = http.registry
+    response = Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml', 'etag': '"one"'}, xml())
+    initial = task(q)
+    try:
+        with monkeypatch.context() as patch:
+            if crash_point == 'before_receipt':
+                patch.setattr(module, 'atomic_write_json',
+                              lambda *a, **kw: (_ for _ in ()).throw(OSError('simulated receipt interruption')))
+                expected = OSError
+            else:
+                with q.db:
+                    q.db.execute("CREATE TEMP TRIGGER reject_metadata_schedule BEFORE UPDATE ON discovery "
+                                 "BEGIN SELECT RAISE(ABORT,'simulated schedule interruption'); END")
+                expected = sqlite3.IntegrityError
+            with pytest.raises(expected):
+                accept_discovery(q, initial, response, [], [], [])
+        assert task(q) == initial
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 0
+        assert len(list((tmp_path / 'metadata_feeds').rglob('*.parquet'))) == 1
+    finally:
+        http.close(); q.close()
+
+    from downloader.news_fulltext_metadata_checkpoint import recover
+    restored = NewsQueue(tmp_path, registry)
+    try:
+        result = recover(restored, limit=4, max_seconds=1)
+        assert result['outcomes'] == ['recovered']
+        head = restored.db.execute('SELECT * FROM metadata_feed_heads WHERE feed_url=?', (LTN_FEEDS[0],)).fetchone()
+        assert head['response_sha256'] == hashlib.sha256(response.body).hexdigest()
+        receipt = json.loads((tmp_path / head['receipt_path']).read_bytes())
+        original = pq.read_table(tmp_path / receipt['parquet_path']).to_pylist()[0]
+        assert original['raw_response_body'] == response.body
+        assert receipt['article_bodies_accepted'] == 0 and receipt['publish'] is False
+        assert restored.db.execute('SELECT count(*) FROM metadata_feed_observations').fetchone()[0] == 1
+        assert restored.db.execute('SELECT state,body_sha256 FROM articles').fetchone()[:] == ('awaiting_authorization', None)
+        assert session.calls == []
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize('case', ['missing_original', 'corrupt_original', 'policy_changed'])
+def test_metadata_checkpoint_never_promotes_missing_corrupt_or_revoked_original(config, tmp_path, monkeypatch, case):
+    import downloader.news_fulltext_metadata_feeds as module
+    from downloader.news_fulltext_metadata_checkpoint import recover
+
+    q, http, session = setup(config, tmp_path, {})
+    response = Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml'}, xml())
+    initial = task(q)
+    try:
+        with monkeypatch.context() as patch:
+            name = 'atomic_write_parquet' if case == 'missing_original' else 'atomic_write_json'
+            patch.setattr(module, name, lambda *a, **kw: (_ for _ in ()).throw(OSError('simulated interruption')))
+            with pytest.raises(OSError):
+                accept_discovery(q, initial, response, [], [], [])
+        if case == 'corrupt_original':
+            next((tmp_path / 'metadata_feeds').rglob('*.parquet')).write_bytes(b'not a parquet file')
+        if case == 'policy_changed':
+            source = q.registry.sources['ltn']
+            q.registry.sources['ltn'] = replace(source, metadata_feed_fingerprint='f' * 64)
+        expected = {'missing_original': 'original_missing', 'corrupt_original': 'invalid_original',
+                    'policy_changed': 'policy_changed'}[case]
+        assert recover(q, limit=4, max_seconds=1)['outcomes'] == [expected]
+        assert task(q) == initial
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 0
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_observations').fetchone()[0] == 0
+        assert q.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+        assert q.db.execute('SELECT state,outcome FROM metadata_feed_interrupted_checkpoints').fetchone()[:] == ('skipped', expected)
+        assert session.calls == []
+    finally:
+        http.close(); q.close()
+
+
+def test_metadata_checkpoint_preserves_newer_source_and_article_heads(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext_metadata_feeds as module
+    from downloader.news_fulltext_metadata_checkpoint import recover
+
+    q, http, _ = setup(config, tmp_path, {})
+    article = 'https://news.ltn.com.tw/news/business/breakingnews/123'
+    second = 'https://news.ltn.com.tw/news/business/breakingnews/124'
+    item = (f'<item><title>Other</title><link>{second}</link>'
+            '<pubDate>Tue, 13 Oct 2026 20:00:00 +0800</pubDate><description>Summary</description></item>').encode()
+    response = Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml'},
+                        xml().replace(b'</channel>', item + b'</channel>'))
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(module, 'atomic_write_json', lambda *a, **kw: (_ for _ in ()).throw(OSError('interrupted')))
+            with pytest.raises(OSError):
+                accept_discovery(q, task(q), response, [], [], [])
+        with q.db:
+            q.add_articles([{'url': article, 'title': 'newer independent title'}])
+            q.db.execute("UPDATE articles SET last_seen_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (article,))
+            q.db.execute("UPDATE discovery SET due=1234567890,error_code='http_429',attempts=4 WHERE url=?", (LTN_FEEDS[0],))
+        newer = task(q)
+        assert recover(q, limit=4, max_seconds=1)['outcomes'] == ['recovered']
+        assert task(q) == newer
+        assert q.db.execute('SELECT title,last_seen_utc FROM articles WHERE url=?', (article,)).fetchone()[:] == (
+            'newer independent title', '2099-01-01T00:00:00+00:00')
+        assert q.db.execute('SELECT state FROM articles WHERE url=?', (second,)).fetchone()[0] == 'awaiting_authorization'
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 0
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_observations').fetchone()[0] == 1
+    finally:
+        http.close(); q.close()
+
+
+def test_metadata_checkpoint_blocks_only_its_feed_and_owner_recovers_without_http(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext_metadata_feeds as module
+    from downloader.news_fulltext_metadata_checkpoint import defer_live_failure
+
+    q, http, session = setup(config, tmp_path, {})
+    response = Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml'}, xml())
+    initial = task(q)
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(module, 'atomic_write_json', lambda *a, **kw: (_ for _ in ()).throw(OSError('interrupted')))
+            with pytest.raises(OSError):
+                accept_discovery(q, initial, response, [], [], [])
+        other = Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml', 'etag': '"different"'}, response.body)
+        assert not defer_live_failure(q, initial, other, OSError('local write'))
+        assert defer_live_failure(q, initial, response, OSError('local write'))
+        assert task(q) == initial
+        clause, params = q.discovery_dispatch_filter(q.registry.sources['ltn'])
+        selectable = {row[0] for row in q.db.execute('SELECT url FROM discovery WHERE ' + clause, params)}
+        assert LTN_FEEDS[0] not in selectable and LTN_FEEDS[1] in selectable
+        feed_progress = progress(q.db, q.registry.sources['ltn'])
+        assert (feed_progress['pending_recovery_feeds'], feed_progress['pending_recovery_originals'],
+                feed_progress['local_recovery_ready']) == (1, 1, True)
+        with q.db:
+            q.db.execute('UPDATE discovery SET due=? WHERE url!=?', (time.time() + 3600, LTN_FEEDS[0]))
+        run_cycle(q, http, config, max_articles=1, max_discovery_requests=1, max_run_seconds=3)
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads WHERE feed_url=?', (LTN_FEEDS[0],)).fetchone()[0] == 1
+        assert not q.db.execute("SELECT 1 FROM metadata_feed_interrupted_checkpoints WHERE state='pending'").fetchone()
+        assert session.calls == []
+    finally:
+        http.close(); q.close()
+
+
+def test_metadata_checkpoint_keeps_original_observation_clock_for_next_poll(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext_metadata_feeds as module
+    import downloader.news_fulltext_queue as queue_module
+    from downloader.news_fulltext_metadata_checkpoint import recover
+
+    q, http, _ = setup(config, tmp_path, {})
+    response = Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml'}, xml())
+    original_clock = '2025-01-02T03:04:05+00:00'
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(queue_module, 'utc_now', lambda: original_clock)
+            patch.setattr(module, 'atomic_write_json', lambda *a, **kw: (_ for _ in ()).throw(OSError('interrupted')))
+            with pytest.raises(OSError):
+                accept_discovery(q, task(q), response, [], [], [])
+        assert recover(q, limit=1, max_seconds=1)['outcomes'] == ['recovered']
+        expected = datetime.fromisoformat(original_clock).timestamp() + q.registry.sources['ltn'].metadata_feed_interval_seconds
+        assert task(q)['due'] == expected
+        assert task(q)['last_checked_at_utc'] == original_clock
+        assert q.db.execute('SELECT checked_at_utc FROM metadata_feed_heads').fetchone()[0] == original_clock
+    finally:
+        http.close(); q.close()
+
+
+def test_live_metadata_commit_failure_wakes_local_recovery_without_second_http(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext_metadata_feeds as module
+
+    q, http, session = setup(config, tmp_path, {
+        'https://news.ltn.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        LTN_FEEDS[0]: FakeResponse(xml(), headers={'Content-Type': 'application/rss+xml'}),
+    })
+    writer = module.atomic_write_json
+    calls = []
+    def fail_once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('simulated local receipt failure')
+        return writer(*args, **kwargs)
+    try:
+        with q.db:
+            q.db.execute('UPDATE discovery SET due=? WHERE url!=?', (time.time() + 3600, LTN_FEEDS[0]))
+        monkeypatch.setattr(module, 'atomic_write_json', fail_once)
+        run_cycle(q, http, config, max_articles=1, max_discovery_requests=1, max_run_seconds=5)
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads WHERE feed_url=?', (LTN_FEEDS[0],)).fetchone()[0] == 1
+        assert not q.db.execute("SELECT 1 FROM metadata_feed_interrupted_checkpoints WHERE state='pending'").fetchone()
+        assert [url for url, _ in session.calls].count(LTN_FEEDS[0]) == 1
+        assert len(calls) == 2
+    finally:
+        http.close(); q.close()
+
+
+def test_metadata_checkpoint_bounds_local_failures_then_releases_only_original_feed(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext_metadata_feeds as module
+    from downloader.news_fulltext_metadata_checkpoint import MAX_LOCAL_IO_ATTEMPTS, recover
+
+    q, http, session = setup(config, tmp_path, {})
+    initial = task(q)
+    response = Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml'}, xml())
+    try:
+        monkeypatch.setattr(module, 'atomic_write_json', lambda *a, **kw: (_ for _ in ()).throw(OSError('disk failure')))
+        with pytest.raises(OSError):
+            accept_discovery(q, initial, response, [], [], [])
+        for attempt in range(1, MAX_LOCAL_IO_ATTEMPTS + 1):
+            result = recover(q, limit=1, max_seconds=1)
+            assert result['outcomes'] == ['local_io_retry' if attempt < MAX_LOCAL_IO_ATTEMPTS else 'local_io_exhausted']
+            assert task(q) == initial
+            if attempt < MAX_LOCAL_IO_ATTEMPTS:
+                assert result['next_local_retry_epoch'] > time.time()
+                with q.db:
+                    q.db.execute('UPDATE metadata_feed_interrupted_checkpoints SET not_before=0')
+        checkpoint = q.db.execute('SELECT state,outcome,attempts FROM metadata_feed_interrupted_checkpoints').fetchone()
+        assert checkpoint[:] == ('skipped', 'local_io_exhausted', MAX_LOCAL_IO_ATTEMPTS)
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 0
+        clause, params = q.discovery_dispatch_filter(q.registry.sources['ltn'])
+        assert LTN_FEEDS[0] in {row[0] for row in q.db.execute('SELECT url FROM discovery WHERE ' + clause, params)}
+        assert session.calls == []
+    finally:
+        http.close(); q.close()
+
+
+def test_metadata_checkpoint_survives_abrupt_process_exit(config, tmp_path):
+    import subprocess
+    import sys
+    from downloader.news_fulltext_metadata_checkpoint import recover
+
+    config_path = tmp_path / 'synthetic_config.json'
+    config_path.write_text(json.dumps(config), encoding='utf-8')
+    script = '''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, 'test')
+from test_news_metadata_feed_scope import setup, task, xml, LTN_FEEDS
+from downloader.news_fulltext import accept_discovery
+from downloader.news_fulltext_http import Response
+import downloader.news_fulltext_metadata_feeds as module
+root = Path(sys.argv[1])
+config = json.loads((root / 'synthetic_config.json').read_text())
+q, http, session = setup(config, root, {})
+module.atomic_write_json = lambda *args, **kwargs: os._exit(73)
+accept_discovery(q, task(q), Response(LTN_FEEDS[0], 200, {'content-type': 'text/xml'}, xml()), [], [], [])
+os._exit(74)
+'''
+    child = subprocess.run([sys.executable, '-c', script, str(tmp_path)], cwd=Path.cwd(), timeout=30,
+                           capture_output=True, text=True, check=False)
+    assert child.returncode == 73, child.stderr
+    registry = PolicyRegistry(config, base=tmp_path)
+    q = NewsQueue(tmp_path, registry)
+    try:
+        assert recover(q, limit=4, max_seconds=1)['outcomes'] == ['recovered']
+        assert q.db.execute('SELECT count(*) FROM metadata_feed_heads').fetchone()[0] == 1
+        assert q.db.execute('SELECT state,body_sha256 FROM articles').fetchone()[:] == ('awaiting_authorization', None)
+    finally:
+        q.close()
+
+
 def test_304_cannot_accept_missing_or_corrupt_durable_metadata(config, tmp_path):
     q, http, session = setup(config, tmp_path, {})
     try:
@@ -345,5 +708,169 @@ def test_304_cannot_accept_missing_or_corrupt_durable_metadata(config, tmp_path)
         with pytest.raises(NewsError, match='metadata_feed_receipt_mismatch'):
             accept_discovery(q, task(q), Response(LTN_FEEDS[0], 304, {}, b''), [], [], [])
         assert task(q)['due'] == old_due
+    finally:
+        http.close(); q.close()
+
+
+@pytest.mark.parametrize('status', [200, 304])
+@pytest.mark.parametrize('field', ['provider', 'feed_url', 'response_bytes', 'rows',
+                                   'contract_version', 'publish', 'remote_training_export'])
+def test_reused_metadata_receipt_requires_complete_identity_and_counts(config, tmp_path, status, field):
+    q, http, session = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        body = xml()
+        accept_discovery(q, task(q), Response(url, 200, {'content-type': 'text/xml'}, body), [], [], [])
+        head = dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone())
+        original_job = task(q)
+        receipt_path = tmp_path / head['receipt_path']
+        receipt = json.loads(receipt_path.read_bytes())
+        if field in {'provider', 'feed_url'}:
+            receipt[field] = 'different_source'
+        elif field in {'publish', 'remote_training_export'}:
+            receipt[field] = True
+        else:
+            receipt[field] += 1
+        receipt_path.write_text(json.dumps(receipt), encoding='utf-8')
+        altered_receipt = receipt_path.read_bytes()
+        response = Response(url, status, {'content-type': 'text/xml'}, body if status == 200 else b'')
+        with pytest.raises(NewsError, match='metadata_feed_receipt_mismatch'):
+            accept_discovery(q, original_job, response, [], [], [])
+        assert task(q) == original_job
+        assert dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone()) == head
+        assert receipt_path.read_bytes() == altered_receipt
+        assert session.calls == []
+    finally:
+        http.close(); q.close()
+
+
+@pytest.mark.parametrize('field', ['rows', 'response_bytes', 'first_publication_aware',
+                                   'last_publication_aware', 'receipt_path'])
+def test_304_does_not_advance_an_inconsistent_metadata_head(config, tmp_path, field):
+    q, http, session = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        accept_discovery(q, task(q), Response(url, 200, {'content-type': 'text/xml'}, xml()), [], [], [])
+        value = {'rows': 2, 'response_bytes': 1, 'first_publication_aware': None,
+                 'last_publication_aware': None, 'receipt_path': 'other/receipt.json'}[field]
+        with q.db:
+            q.db.execute('UPDATE metadata_feed_heads SET ' + field + '=? WHERE feed_url=?', (value, url))
+        head = dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone())
+        original_job = task(q)
+        with pytest.raises(NewsError, match='metadata_feed_receipt_mismatch'):
+            accept_discovery(q, original_job, Response(url, 304, {}, b''), [], [], [])
+        assert task(q) == original_job
+        assert dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone()) == head
+        assert session.calls == []
+    finally:
+        http.close(); q.close()
+
+
+def test_200_does_not_replace_missing_original_under_existing_receipt(config, tmp_path):
+    q, http, session = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        response = Response(url, 200, {'content-type': 'text/xml'}, xml())
+        accept_discovery(q, task(q), response, [], [], [])
+        head = dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone())
+        original_job = task(q)
+        receipt_path = tmp_path / head['receipt_path']
+        original = tmp_path / json.loads(receipt_path.read_bytes())['parquet_path']
+        original.unlink()
+        receipt_bytes = receipt_path.read_bytes()
+        with pytest.raises(NewsError, match='metadata_feed_receipt_mismatch'):
+            accept_discovery(q, original_job, response, [], [], [])
+        assert not original.exists()
+        assert receipt_path.read_bytes() == receipt_bytes
+        assert task(q) == original_job
+        assert dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone()) == head
+        assert session.calls == []
+    finally:
+        http.close(); q.close()
+
+
+def test_orphan_metadata_original_with_wrong_source_cannot_be_sealed(config, tmp_path):
+    from downloader.artifact_io import atomic_write_parquet, table_from_records
+
+    q, http, session = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        response = Response(url, 200, {'content-type': 'text/xml'}, xml())
+        accept_discovery(q, task(q), response, [], [], [])
+        head = dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone())
+        original_job = task(q)
+        receipt_path = tmp_path / head['receipt_path']
+        original = tmp_path / json.loads(receipt_path.read_bytes())['parquet_path']
+        row = pq.read_table(original).to_pylist()[0]
+        row['provider'] = 'different_provider'
+        receipt_path.unlink()
+        atomic_write_parquet(original, table_from_records([row]), durable=True)
+        altered = original.read_bytes()
+        with pytest.raises(NewsError, match='metadata_feed_receipt_mismatch'):
+            accept_discovery(q, original_job, response, [], [], [])
+        assert not receipt_path.exists()
+        assert original.read_bytes() == altered
+        assert task(q) == original_job
+        assert dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone()) == head
+        assert session.calls == []
+    finally:
+        http.close(); q.close()
+
+
+def test_missing_metadata_receipt_recovers_after_unconditional_retry(config, tmp_path):
+    from downloader.news_fulltext import _discovery_head_fields, fail_discovery
+
+    routes = {'https://news.ltn.com.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              LTN_FEEDS[0]: FakeResponse(xml(), headers={'Content-Type': 'text/xml', 'ETag': 'new-tag'})}
+    q, http, session = setup(config, tmp_path, routes)
+    try:
+        url = LTN_FEEDS[0]
+        response = Response(url, 200, {'content-type': 'text/xml', 'etag': 'old-tag',
+                                       'last-modified': 'old-clock'}, xml())
+        accept_discovery(q, task(q), response, [], [], [])
+        head = dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone())
+        receipt = tmp_path / head['receipt_path']
+        original = tmp_path / json.loads(receipt.read_bytes())['parquet_path']
+        original_bytes = original.read_bytes()
+        receipt.unlink()
+        failed = task(q)
+        with pytest.raises(NewsError, match='metadata_feed_receipt_mismatch') as caught:
+            accept_discovery(q, failed, Response(url, 304, {}, b''), [], [], [])
+        fail_discovery(q, failed, caught.value, expected_head_fields=_discovery_head_fields(failed))
+        retry = task(q)
+        assert retry['etag'] is None and retry['last_modified'] is None
+        assert retry['error_code'] == 'metadata_feed_receipt_mismatch'
+        result = fetch_discovery(http, retry)
+        assert session.calls[-1][0] == url
+        assert 'If-None-Match' not in session.calls[-1][1]['headers']
+        assert 'If-Modified-Since' not in session.calls[-1][1]['headers']
+        accept_discovery(q, retry, *result)
+        assert receipt.is_file() and original.read_bytes() == original_bytes
+        assert task(q)['error_code'] is None
+        assert len(session.calls) == 2  # Fake robots and fake feed; no network.
+    finally:
+        http.close(); q.close()
+
+
+def test_orphan_metadata_original_cannot_be_sealed_without_validation(config, tmp_path):
+    q, http, session = setup(config, tmp_path, {})
+    try:
+        url = LTN_FEEDS[0]
+        response = Response(url, 200, {'content-type': 'text/xml'}, xml())
+        accept_discovery(q, task(q), response, [], [], [])
+        head = dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone())
+        original_job = task(q)
+        receipt_path = tmp_path / head['receipt_path']
+        receipt = json.loads(receipt_path.read_bytes())
+        original = tmp_path / receipt['parquet_path']
+        receipt_path.unlink()
+        original.write_bytes(b'not a parquet original')
+        with pytest.raises(NewsError, match='metadata_feed_receipt_mismatch'):
+            accept_discovery(q, original_job, response, [], [], [])
+        assert not receipt_path.exists()
+        assert original.read_bytes() == b'not a parquet original'
+        assert task(q) == original_job
+        assert dict(q.db.execute('SELECT * FROM metadata_feed_heads').fetchone()) == head
+        assert session.calls == []
     finally:
         http.close(); q.close()

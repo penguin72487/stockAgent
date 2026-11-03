@@ -76,6 +76,7 @@ test("live view updates without status API, retains last committed version on fa
   assert.ok(optionsSeen.every(option => option.cadenceFromLastStart && option.refreshOnVisible === "overdue"));
   await scheduled[0]();
   assert.match(node("live-paper-body").html, /2330/);
+  assert.equal(context.StockAgentTwLivePaper.getSnapshot().data.rows[0].symbol, "2330");
   assert.deepEqual(requests.map(row => row.url), ["api/live-snapshot"]);
   await scheduled[0]();
   assert.equal(requests[1].headers["If-None-Match"], '"one"');
@@ -88,6 +89,8 @@ test("live view updates without status API, retains last committed version on fa
   await scheduled[0]();
   assert.match(node("live-paper-body").html, /2317/);
   assert.match(node("live-paper-status").html, /更新失敗，保留上次已確認快照/);
+  assert.equal(context.StockAgentTwLivePaper.getSnapshot().data.rows[0].symbol, "2317");
+  assert.match(context.StockAgentTwLivePaper.getSnapshot().error, /更新失敗/);
 });
 
 test("one-minute display cadence does not falsely mark a recent source stale", async () => {

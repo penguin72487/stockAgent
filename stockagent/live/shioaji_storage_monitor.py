@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from downloader.artifact_io import atomic_write_bytes
 from stockagent.live.shioaji_storage_epoch import history_storage_observation
+from stockagent.service_layout import canonical_service_path
 
 
 STORAGE_SCHEMA_VERSION: Final[int] = 1
@@ -589,7 +590,7 @@ def write_shioaji_storage_snapshot(
     now: datetime | None = None,
     force_full_scan: bool = False,
 ) -> dict[str, Any]:
-    selected = Path(output_path)
+    selected = canonical_service_path(output_path, root=repo_root)
     selected.parent.mkdir(parents=True, exist_ok=True)
     inventory_cache = selected.parent / '.inventory-epochs'
     inventory_cache.mkdir(mode=0o700, exist_ok=True)

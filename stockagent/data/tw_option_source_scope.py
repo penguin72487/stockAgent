@@ -1,4 +1,4 @@
-"""Provisional category annotations for the shared option daily source view.
+"""Provisional category annotations for shared option source views.
 
 This is a research-source annotation, not a dated listing, currency, execution
 or training universe.  All rows, including newly observed or unclassified
@@ -20,6 +20,7 @@ import polars as pl
 
 
 CONTRACT = 'tw_option_daily_provisional_source_scope_v1'
+TICK_CONTRACT = 'tw_option_tick_provisional_source_scope_v1'
 _CLASSES = frozenset({'index_option', 'security_option_candidate', 'etf_option_candidate',
                       'commodity_option', 'currency_option', 'unclassified'})
 _SCOPES = {
@@ -85,4 +86,30 @@ def annotate_option_source_scope(frame: pl.DataFrame, scope: OptionSourceScope) 
                                          return_dtype=pl.String).alias('source_scope_class'),
     ).with_columns(
         pl.col('source_scope_class').is_in(sorted(scope.selected_classes)).alias('source_scope_match'),
+    )
+
+
+def annotate_option_tick_source_scope(frame: pl.DataFrame, scope: OptionSourceScope) -> pl.DataFrame:
+    """Apply the shared provisional inventory to the pinned raw tick view.
+
+    Unknown products and nonselected classes remain visible. The extra
+    fingerprint binds this tick view to the exact inventory and scope; it is
+    still not a listing, currency, price-clock or execution decision.
+    """
+    from stockagent.data.tw_option_product_ticks import OPTION_TICK_SOURCE_CONTRACT
+
+    if ('product_raw' not in frame.columns or 'source_contract' not in frame.columns
+            or 'product' in frame.columns
+            or {'tick_scope_contract', 'tick_scope_fingerprint'} & set(frame.columns)):
+        raise ValueError('expected original unannotated option tick source rows')
+    if frame.filter(pl.col('source_contract').is_null()
+                    | (pl.col('source_contract') != OPTION_TICK_SOURCE_CONTRACT)).height:
+        raise ValueError('option tick source contract differs')
+    fingerprint = hashlib.sha256(json.dumps(
+        {'contract': TICK_CONTRACT, 'source_contract': OPTION_TICK_SOURCE_CONTRACT,
+         'scope_fingerprint': scope.fingerprint}, sort_keys=True, separators=(',', ':'),
+    ).encode()).hexdigest()
+    return annotate_option_source_scope(frame.with_columns(pl.col('product_raw').alias('product')), scope).with_columns(
+        pl.lit(TICK_CONTRACT).alias('tick_scope_contract'),
+        pl.lit(fingerprint).alias('tick_scope_fingerprint'),
     )

@@ -5,6 +5,7 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, time as daytime
+import fcntl
 import hashlib
 import json
 import math
@@ -120,6 +121,10 @@ def _record_source_events(key, provider, events) -> bool:
         with _TELEMETRY_LOCK:
             path.parent.mkdir(parents=True, exist_ok=True)
             with path.open("a", encoding="utf-8") as handle:
+                # The engine and Discord have separate process-local locks.
+                # Coordinate their append bundles on the journal inode too,
+                # without making readers hold a lock while scanning history.
+                fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
                 handle.write(encoded)
                 handle.flush()
                 os.fsync(handle.fileno())
@@ -1050,7 +1055,7 @@ def configured_opening_providers(parquet_root: str | Path, *, broker_fetch=None)
         # This is a provider-local measured default,
         # not a global request/throughput cap; explicit source tuning is kept.
         # Its read budget remains independent of the model quorum/other feeds.
-        return quotes.fetch_tw_mis_last_prices(symbols, fallback, parquet_root=parquet_root, empty_chunk_retry_attempts=0, max_parallel_requests=int(os.getenv("STOCKAGENT_TW_OPENING_PARALLEL_REQUESTS", "4") or "4"), request_timeout_seconds=float(os.getenv("STOCKAGENT_TW_OPENING_REQUEST_TIMEOUT_SECONDS", "4") or "4"), on_progress=progress)
+        return quotes.fetch_tw_mis_last_prices(symbols, fallback, parquet_root=parquet_root, empty_chunk_retry_attempts=0, max_parallel_requests=int(os.getenv("STOCKAGENT_TW_OPENING_PARALLEL_REQUESTS", "4") or "4"), request_timeout_seconds=float(os.getenv("STOCKAGENT_TW_OPENING_REQUEST_TIMEOUT_SECONDS", "4") or "4"), soft_retry_seconds=float(os.getenv("STOCKAGENT_TW_OPENING_MIS_SOFT_RETRY_SECONDS", "1") or "1"), on_progress=progress)
 
     return {"shioaji_shared": broker, "official_mis": mis, **optional_opening_providers()}
 

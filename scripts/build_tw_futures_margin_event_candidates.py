@@ -516,6 +516,22 @@ def reviewed_fixed_subscription_rights(facts, review):
     """Evaluate already vested rights from inspected operands, never future prices."""
     from decimal import Decimal, ROUND_FLOOR
     for component in review.get('fixed_subscription_rights', []):
+        if component.get('valuation_kind') == 'notice_declared_out_of_money_zero_v1':
+            from stockagent.data.tw_futures_margin_preparation import validate_notice_declared_zero_rights
+            if component.get('page') not in review['visually_reviewed_pages']:
+                raise ValueError('fixed rights need an inspected original page')
+            evidence = dict(component, derived_value_twd='0')
+            validate_notice_declared_zero_rights(evidence, product=component['product'],
+                                                 published_date=review['published_date'])
+            matches = [f for f in facts if f['product'] == component['product']]
+            if len(matches) != 1 or not matches[0]['subscription_rights_at_final_settlement']:
+                raise ValueError('fixed rights do not identify one adjusted contract')
+            fact = matches[0]
+            if fact.get('deliverable_cash_twd') != 0:
+                raise ValueError('fixed rights cannot overwrite another cash component')
+            fact['fixed_subscription_rights_twd'] = 0.0
+            fact['fixed_subscription_rights_evidence'] = evidence
+            continue
         if (component.get('rounding') != 'floor_twd'
                 or component.get('page') not in review['visually_reviewed_pages']
                 or component.get('observation_date', '9999') >= review['published_date']):

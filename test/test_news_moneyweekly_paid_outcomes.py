@@ -3,6 +3,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 import hashlib
+from itertools import chain, repeat
 import json
 from pathlib import Path
 import time
@@ -226,12 +227,17 @@ def test_closed_request_schema_rejects_unbounded_or_ambiguous_values(tmp_path, m
         assert head(queue) == before
 
 
-def test_expired_slice_defers_then_resumes_through_the_same_owner(tmp_path, monkeypatch):
+def test_expired_soft_slice_completes_one_then_resumes_through_the_same_owner(tmp_path, monkeypatch):
     with retained(tmp_path, monkeypatch) as (queue, ref, before, closed):
-        request = submit(queue, ref)
+        requests = [submit(queue, ref), paid.submit(queue.root, queue.registry, [MAGAZINE],
+            reason='Second bounded request for the same retained native notice', witnesses={MAGAZINE: ref})]
+        assert requests[0]['request_id'] != requests[1]['request_id']
         started = time.monotonic()
-        with patch.object(repairs.time, 'monotonic', side_effect=[started, started+2]):
+        with patch.object(repairs.time, 'monotonic', side_effect=chain([started], repeat(started+2))):
             result = repairs.consume_repairs(queue)
-        assert result['processed'] == 0 and head(queue) == before
-        assert consume(queue)['outcomes'] == {paid.OUTCOME: 1}
-        assert receipt(queue, request)['reclassified_targets'] == 1
+        assert result['processed'] == 1 and result['outcomes'] == {paid.OUTCOME: 1}
+        classified = head(queue)
+        assert classified == dict(before, state='paywall_or_login', error_code='paywall_or_login')
+        assert consume(queue)['outcomes'] == {'not_semantic_parser_failure': 1}
+        assert head(queue) == classified
+        assert sum(receipt(queue, request)['reclassified_targets'] for request in requests) == 1

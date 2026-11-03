@@ -194,6 +194,56 @@ def test_backing_volume_failure_does_not_trust_virtual_free_space(tmp_path, monk
         assert not capacity_status(control)["active_reservations"]
 
 
+def test_protected_trading_source_uses_only_its_own_physical_reserve(tmp_path, monkeypatch, policy):
+    from stockagent.data_sync.completed_forward_capacity import CONTROL_HEADROOM_BYTES
+    gib = 1024**3
+    trade = tmp_path / "trade"
+    trade.mkdir()
+    panel = tmp_path / "trade-panel"
+    panel.mkdir()
+    monkeypatch.setattr(capacity, "TRADING_PREPARED_ROOT", trade)
+    monkeypatch.setattr(capacity, "TRADING_PANEL_ROOT", panel)
+    monkeypatch.setenv(capacity.TRADING_PRIORITY_ENV, "1")
+    monkeypatch.setattr("stockagent.data_sync.completed_forward_capacity.os.statvfs",
+                        lambda _path: SimpleNamespace(f_bavail=100 * gib, f_frsize=1))
+    policy["minimum_free_bytes"] = 25 * gib
+    policy["panel_family_capacity_bytes"] = 2 * gib
+    observed = []
+
+    def admit(path, required):
+        observed.append(required)
+        if required > 38 * gib:
+            raise CapacityDeferred("physical_backing_reserve")
+        return {"physical_free_bytes": 38 * gib}
+
+    monkeypatch.setattr(capacity, "_admit_backing_volume", admit)
+    with capacity.reserve_cache_write(trade, key="trade", maximum_growth_bytes=16 * gib,
+                                     family="prepared", policy=policy) as accepted:
+        assert accepted["physical_reserve_bytes"] == 20 * gib
+        assert accepted["filesystem"]["minimum_free_bytes"] == 25 * gib
+        assert observed[-1] == 36 * gib + CONTROL_HEADROOM_BYTES
+        with capacity.reserve_cache_write(panel, key="trade-panel", maximum_growth_bytes=gib,
+                                         family="panel", policy=policy) as nested:
+            assert nested["physical_reserve_bytes"] == 20 * gib
+            assert observed[-1] == 37 * gib + 2 * CONTROL_HEADROOM_BYTES
+        # Another family still reserves the full 25 GiB and the trading lease;
+        # it cannot displace the in-progress protected source.
+        with pytest.raises(CapacityDeferred, match="physical_backing_reserve"):
+            with capacity.reserve_cache_write(tmp_path / "other", key="other", maximum_growth_bytes=gib,
+                                             family="panel", policy=policy):
+                pytest.fail("nonpriority writer displaced protected source")
+
+    # A different prepared path and the exact path without the unit opt-in
+    # cannot spend the trading reserve.
+    for root in (tmp_path / "other-prepared", trade):
+        if root == trade:
+            monkeypatch.delenv(capacity.TRADING_PRIORITY_ENV)
+        with pytest.raises(CapacityDeferred, match="physical_backing_reserve"):
+            with capacity.reserve_cache_write(root, key="normal", maximum_growth_bytes=16 * gib,
+                                             family="prepared", policy=policy):
+                pytest.fail("ordinary source used priority backing reserve")
+
+
 def test_unattended_backing_query_uses_explicit_authority_identity_without_mutating_environment(tmp_path, monkeypatch):
     import json
     import os
@@ -253,6 +303,52 @@ def test_public_panel_compatibility_writer_is_also_enrolled(tmp_path, monkeypatc
     configured = capacity.load_capacity_policy()
     assert capacity._enrolled_capacity(source / "stocks/panel_cache_v2", "panel", configured) == configured["panel_family_capacity_bytes"]
     assert capacity._enrolled_capacity(source / "stocks/other", "panel", configured) is None
+
+
+def test_registered_cache_alias_keeps_admission_and_one_lease_namespace(tmp_path, monkeypatch, policy):
+    from stockagent import service_layout
+
+    legacy, target = tmp_path / "artifacts/cache", tmp_path / "service_data/cache"
+    legacy.parent.mkdir(parents=True)
+    target.mkdir(parents=True)
+    legacy.symlink_to(target)
+    monkeypatch.setattr(service_layout, "service_moves", lambda _root: {legacy: target})
+    monkeypatch.setattr(capacity, "ARTIFACT_CACHE_ROOT", legacy)
+    monkeypatch.setattr(capacity.socket, "gethostname", lambda: "authority")
+    monkeypatch.setattr(capacity, "load_capacity_policy", lambda: {**policy, "nodes": ["authority"]})
+    admitted = []
+    monkeypatch.setattr(capacity, "_admit_backing_volume", lambda root, required:
+                        admitted.append((root, required)) or {"state": "verified"})
+
+    for root in (legacy / "groups", target / "groups"):
+        with capacity.reserve_cache_write(root, key="same-source", maximum_growth_bytes=MIB,
+                family="panel") as observed:
+            assert observed["contract"] == capacity.CONTRACT
+        assert capacity.cache_capacity_status(root, family="panel")["root"] == str(target / "groups")
+    assert len(admitted) == 2  # Neither spelling bypasses the physical check.
+    assert all(root == target for root, _ in admitted)
+    controls = capacity.CONTROL_ROOT / f"stockagent-capacity-{__import__('os').geteuid()}"
+    assert len(list(controls.glob("cache-*"))) == 1
+
+    def unavailable(*_):
+        raise CapacityDeferred("physical_backing_headroom_unconfirmed")
+    monkeypatch.setattr(capacity, "_admit_backing_volume", unavailable)
+    with pytest.raises(CapacityDeferred, match="physical_backing_headroom_unconfirmed"):
+        with capacity.reserve_cache_write(target / "groups", key="same-source",
+                maximum_growth_bytes=MIB, family="panel"):
+            pytest.fail("canonical spelling bypassed admission")
+
+    (target / "redirected").symlink_to(tmp_path)
+    with pytest.raises(CapacityDeferred, match="redirected_cache_namespace"):
+        with capacity.reserve_cache_write(legacy / "redirected/groups", key="bad",
+                maximum_growth_bytes=MIB, family="panel"):
+            pytest.fail("descendant redirect admitted")
+    legacy.unlink()
+    legacy.symlink_to(tmp_path)
+    with pytest.raises(CapacityDeferred, match="redirected_cache_namespace"):
+        with capacity.reserve_cache_write(legacy / "groups", key="bad",
+                maximum_growth_bytes=MIB, family="panel"):
+            pytest.fail("unregistered compatibility target admitted")
 
 
 def test_authority_budget_does_not_silently_limit_remote_training_nodes(tmp_path, monkeypatch):

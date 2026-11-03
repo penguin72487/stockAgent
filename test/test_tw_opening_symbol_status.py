@@ -20,7 +20,7 @@ def test_symbol_cli_keeps_unknowns_on_closed_day_and_skips_unneeded_refresh(tmp_
     cfg = market_config.LiveMarketConfig(market="A", label="A", config_path="unused",
         day_trade_simulation_enabled=True, holidays=(receipt["session_date"],))
     monkeypatch.setattr(market_config, "load_market_configs", lambda _: {"A": cfg})
-    monkeypatch.setattr(audit, "load_current_universe", lambda _: official)
+    monkeypatch.setattr(audit, "load_recorded_universe", lambda _, **kwargs: official)
     def unexpected_provider(*args, **kwargs):
         raise AssertionError("a verified closure must not trigger a full quote refresh")
     monkeypatch.setattr(audit.quotes, "fetch_tw_mis_last_prices", unexpected_provider)
@@ -83,6 +83,35 @@ def test_journal_partial_failed_scope_is_not_guessed_per_symbol(tmp_path):
     assert result["failure_jobs"][0]["reasons"] == ["permission_or_subscription"]
     assert not result["failure_jobs"][0]["full_scope_verified"]
     assert all(not row["deadlines"]["11000"]["full_scope_failed_providers"] for row in result["symbols"])
+
+
+def test_provider_job_forensics_keeps_shapes_stale_rows_and_missing_completion(tmp_path):
+    receipt, official = fixtures()
+    path = tmp_path / "acquisition.jsonl"
+    base = {"session_date": receipt["session_date"], "provider": "mis", "owner_pid": 1,
+            "job_id": "one"}
+    rows = [
+        {**base, "event": "started", "observed_at_taipei": "2026-10-22T09:00:01+08:00"},
+        {**base, "event": "finished", "observed_at_taipei": "2026-10-22T09:00:05+08:00",
+         "state": "failed", "requested_count": 5,
+         "observation_quality": {"states": {"stale_or_preopen_time": 5}},
+         "transport_timing": {"mis_failed_request_count": 4,
+             "private_token": "must not copy this",
+             "mis_requests": [{"channel_count": 80, "error_type": "ReadTimeout"}] * 4}},
+        {**base, "event": "observations_delta", "observed_at_taipei": "2026-10-22T09:00:06+08:00",
+         "observations": [{"symbol": "OPEN", "state": "valid_open"}]},
+    ]
+    path.write_text("".join(json.dumps(row) + "\n" for row in reversed(rows)))
+    result = audit.journal_symbol_timeline(path, receipt, official)
+    stats = result["provider_jobs"]["mis"]
+    assert stats["first_dispatch_after_open_ms"] == 1000
+    assert stats["completed_jobs"] == 1 and stats["job_states"] == {"failed": 1}
+    assert stats["request_shapes"] == {"80:ReadTimeout": 4}
+    assert stats["unique_valid_open_count"] == 1
+    assert stats["valid_open_coverage_ms"]["10"] == 6000
+    assert stats["valid_open_coverage_ms"]["100"] is None
+    assert stats["first_jobs"][0]["observation_states"] == {"stale_or_preopen_time": 5}
+    assert "private_token" not in json.dumps(result) and "must not copy" not in json.dumps(result)
 
 
 @pytest.mark.parametrize("bulk", [False, True])
@@ -370,6 +399,46 @@ def test_whole_second_capture_accepts_fractional_rows_but_not_next_second():
         receipt_snapshot(receipt)
 
 
+def test_invalid_snapshot_reports_clock_violation_without_zero_missing_or_admitting_prices():
+    receipt, official = fixtures()
+    capture_ms = int(datetime.fromisoformat(receipt["captured_at_taipei"]).timestamp() * 1000)
+    receipt["rows"]["OPEN"]["open_timestamp_ms"] = capture_ms + 1000
+    original = deepcopy(receipt)
+    report = audit.classify_retained_symbols(receipt, official)
+    assert report["state"] == "invalid_snapshot_clock"
+    assert report["unknown_count"] is None and report["source_quality"] is None
+    assert report["snapshot_error"]["invalid_observations"] == [{"symbol": "OPEN",
+        "field": "open_timestamp_ms", "timestamp_ms": capture_ms + 1000,
+        "capture_interval_end_exclusive_ms": capture_ms + 1000}]
+    assert receipt == original
+    with pytest.raises(ValueError, match="after its capture clock"):
+        receipt_snapshot(receipt)
+    official["fingerprint"] = "different-generation"
+    with pytest.raises(ValueError, match="generation differs"):
+        audit.classify_retained_symbols(receipt, official)
+
+
+def test_invalid_snapshot_does_not_block_journal_diagnostics_or_start_refresh(tmp_path, monkeypatch):
+    receipt, official = fixtures()
+    receipt["rows"]["ZERO"]["no_open_print_observed_ms"] += 2000
+    source, output, journal = tmp_path / "source.json", tmp_path / "diagnostic.json", tmp_path / "journal.jsonl"
+    source.write_text(json.dumps(receipt))
+    monkeypatch.setattr(audit, "load_recorded_universe", lambda *args, **kwargs: official)
+    monkeypatch.setattr(audit, "journal_symbol_timeline", lambda *args, **kwargs: {
+        "state": "observed", "requested_count": len(receipt["requested_symbols"]), "symbols": ["OPEN", "ZERO"]})
+    def no_request(*args, **kwargs):
+        pytest.fail("invalid snapshot must not initiate refresh")
+    monkeypatch.setattr(audit.quotes, "fetch_tw_mis_last_prices", no_request)
+    monkeypatch.setattr(audit.sys, "argv", ["audit", "--receipt", str(source), "--output", str(output),
+        "--journal", str(journal), "--refresh-unknown-mis"])
+    assert audit.main() == 0
+    report = json.loads(output.read_text())
+    assert report["state"] == "invalid_snapshot_clock"
+    assert report["journal_timeline"]["state"] == "observed"
+    assert report["fresh_mis"]["state"] == "skipped_invalid_snapshot"
+    assert not report["provider_requests_enabled"]
+
+
 def test_later_stale_broker_row_cannot_renew_old_no_first_print_evidence():
     receipt, official = fixtures()
     later = deepcopy(receipt)
@@ -403,7 +472,7 @@ def test_source_bytes_are_read_once_and_the_hash_binds_that_exact_revision(tmp_p
             self.write_text(json.dumps({"later_revision": True}))
         return value
     monkeypatch.setattr(type(path), "read_bytes", read_once)
-    monkeypatch.setattr(audit, "load_current_universe", lambda day: official)
+    monkeypatch.setattr(audit, "load_recorded_universe", lambda day, **kwargs: official)
     monkeypatch.setattr(audit.sys, "argv", ["audit", "--receipt", str(path), "--output", str(output)])
     assert audit.main() == 0
     report = json.loads(output.read_text())

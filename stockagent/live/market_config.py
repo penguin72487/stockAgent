@@ -25,7 +25,8 @@ def live_panel_disk_cache_root(*, repo_root: Path | None = None) -> Path:
         path = Path(configured).expanduser()
         return path if path.is_absolute() else Path.cwd() / path
     root = repo_root if repo_root is not None else Path(__file__).resolve().parents[2]
-    return root / "artifacts" / "cache" / "live_signal_panels"
+    from stockagent.service_layout import service_path
+    return service_path("live_signal_panels", area="cache", root=root)
 
 
 @dataclass(slots=True)

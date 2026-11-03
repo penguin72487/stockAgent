@@ -55,6 +55,38 @@ def test_local_partitions_preserve_both_real_source_query_gaps(queue, monkeypatc
     assert json.loads((root/'scheduler_status.json').read_text())['completed_tasks'] == 2
 
 
+@pytest.mark.parametrize('local_state', ['finite_admission_rejected_before_query', 'selector_scope_repartitioned'])
+def test_batch_owner_continues_after_local_isolation_without_a_provider_query_gap(
+        queue, tmp_path, monkeypatch, capsys, local_state):
+    from downloader import download_tej_history as cli
+    root, config = queue
+    config_path, session_path = tmp_path/'config.json', tmp_path/'session.json'
+    config_path.write_text(json.dumps(config))
+    session_path.write_text('{}')
+    calls, sleeps, finished = [], [], []
+    states = iter([local_state, 'completed_task', 'idle'])
+    monkeypatch.setattr(cli, 'refresh_axis_profiles', lambda *_: None)
+    monkeypatch.setattr(cli, 'configure_runtime_policy', lambda *_: None)
+    monkeypatch.setattr(cli, 'DesktopBridge', lambda *_: object())
+    monkeypatch.setattr(cli, 'mark_worker_wait', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(cli, 'mark_batch_finished', lambda *_args, **kwargs: finished.append(kwargs))
+    monkeypatch.setattr(cli.time, 'sleep', sleeps.append)
+
+    def run_one(*_args, **_kwargs):
+        state = next(states)
+        if state == 'completed_task':
+            calls.append('source_request')
+        return state
+
+    monkeypatch.setattr(cli, 'run_one', run_one)
+    assert cli.main(['run', '--root', str(root), '--config', str(config_path),
+                     '--session', str(session_path), '--download-only', '--max-tasks', '3']) == 0
+    states_seen = [json.loads(line)['state'] for line in capsys.readouterr().out.splitlines()]
+    assert states_seen == [local_state, 'completed_task', 'idle']
+    assert calls == ['source_request'] and sleeps == [2]
+    assert finished[-1]['reason'] == 'no_ready_tasks_in_selected_mode'
+
+
 @pytest.mark.parametrize('field,value',[('query_interval_contract','unreviewed'),
     ('minimum_export_interval_seconds',True),('minimum_export_interval_seconds',float('nan')),
     ('minimum_export_interval_seconds',-2)])

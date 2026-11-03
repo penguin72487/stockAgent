@@ -270,8 +270,10 @@ def test_continuous_metadata_only_backlog_does_not_wait_for_next_service_cycle(c
         http.close()
 
 
-def test_metadata_only_continuation_flushes_completed_body_before_backlog_finishes(config, queue, tmp_path, monkeypatch):
+@pytest.mark.parametrize('slow_local_commits', [False, True])
+def test_metadata_only_continuation_flushes_completed_body_before_backlog_finishes(config, queue, tmp_path, monkeypatch, slow_local_commits):
     from downloader.news_fulltext import run_cycle
+    from downloader import news_fulltext_urls
     routes = {'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
               'https://publisher.test/a': FakeResponse(article_html())}
     http, _ = http_fixture(config, tmp_path, routes)
@@ -284,14 +286,30 @@ def test_metadata_only_continuation_flushes_completed_body_before_backlog_finish
         remaining_at_flush.append(original_url_progress(queue)['remaining_urls'])
         return accept(records)
     monkeypatch.setattr(queue, 'accept', observed_accept)
+    if slow_local_commits:
+        original_backfill = news_fulltext_urls.backfill_original_urls
+        def delayed_backfill(*args, **kwargs):
+            time.sleep(.4)  # Six bounded slices exceed the old two-second assumption.
+            return original_backfill(*args, **kwargs)
+        monkeypatch.setattr(news_fulltext_urls, 'backfill_original_urls', delayed_backfill)
+    # This checks eventual local continuation, not a storage throughput SLA.
+    # A loaded filesystem can legitimately take over two seconds to commit six
+    # slices; retain a watchdog for a genuinely stuck loop instead.
+    watchdog = threading.Timer(30, http.stop.set)
+    watchdog.daemon = True
     try:
         with queue.db:
             queue.add_articles([{'url': 'https://publisher.test/a'},
                                 *[alias(f'https://unreviewed.test/{i}') for i in range(6)]])
+        watchdog.start()
         result = run_cycle(queue, http, config, max_articles=1, max_discovery_requests=0,
-                           continuous_budgets=True, max_run_seconds=2)
+                           continuous_budgets=True)
+        assert not http.stop.is_set(), 'local continuation did not finish before the watchdog'
         assert result['cycle']['durably_accepted_versions'] == 1
         assert remaining_at_flush and remaining_at_flush[0] > 0
         assert result['original_url_resolution']['examined_urls'] == 6
+        if slow_local_commits:
+            assert result['cycle']['wall_seconds'] > 2
     finally:
+        watchdog.cancel()
         http.close()

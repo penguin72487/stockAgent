@@ -960,6 +960,51 @@ def test_dashboard_reports_measured_input_to_ledger_latency(tmp_path: Path, veri
     assert latest_receipt["stages"]["opening_signal_batch_wait_ms"] == 40.0
 
 
+@pytest.mark.parametrize("offset_ms,result,expected", [
+    (800, "registered", True),
+    (1001, "registered", False),
+    (800, "already_processed", False),
+])
+def test_registration_latency_slo_is_one_second_not_full_target(
+    tmp_path: Path, offset_ms: int, result: str, expected: bool,
+) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    gate = _now(9, 0)
+    engine.record_latency_sample(
+        market="mode", signal_id="signal", result=result,
+        summary={"signal_started_at": gate.isoformat(), "signal_ready_at": gate.isoformat(),
+                 "artifact_published_at": gate.isoformat(), "live_latency": {
+                     "pre_quote_prepare_ms": 0.0, "quote_fetch_ms": 0.0,
+                     "model_inference_ms": 10.0, "compute_before_publish_ms": 10.0,
+                     "artifact_publish_ms": 0.0}},
+        consumer_detected_at=gate, ledger_persisted_at=gate + timedelta(milliseconds=offset_ms),
+        executor_quote_fetch_ms=0.0, eligibility_load_ms=0.0, ledger_compute_persist_ms=0.0,
+    )
+    row = json.loads(engine.latency_path.read_text().splitlines()[-1])
+    assert row["opening_commit_slo_ms"] == 1000.0
+    assert row["opening_commit_slo_contract"] == "one_mode_signal_registration_only_not_full_target_v1"
+    assert row["opening_commit_slo_met"] is expected
+    assert row["stages"]["signal_pre_quote_prepare_ms"] == 0.0
+    assert row["stages"]["signal_quote_fetch_ms"] == 0.0
+    assert row["stages"]["artifact_publish_ms"] == 0.0
+    assert row["stages"]["signal_other_compute_ms"] is None
+
+
+def test_registration_latency_does_not_treat_missing_quote_as_zero(tmp_path: Path) -> None:
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    gate = _now(9, 0)
+    engine.record_latency_sample(
+        market="mode", signal_id="signal", result="registered",
+        summary={"signal_started_at": gate.isoformat(), "signal_ready_at": gate.isoformat(),
+                 "live_latency": {"model_inference_ms": 3.0, "compute_before_publish_ms": 10.0}},
+        consumer_detected_at=gate, ledger_persisted_at=gate,
+        executor_quote_fetch_ms=0.0, eligibility_load_ms=0.0, ledger_compute_persist_ms=0.0,
+    )
+    row = json.loads(engine.latency_path.read_text().splitlines()[-1])
+    assert row["stages"]["signal_quote_fetch_ms"] is None
+    assert row["stages"]["signal_other_compute_ms"] is None
+
+
 def test_opening_latency_compares_only_the_same_mode_set() -> None:
     def row(day: str, market: str, ready_second: int) -> dict[str, object]:
         return {
@@ -6776,7 +6821,9 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "function matchesSymbol(" not in javascript
     assert "Dashboard.scheduleRefresh(updateClock, {intervalMs: 1000});" in javascript
     assert re.search(r'src="presentation\.js\?v=[1-9][0-9]*"', html)
-    assert re.search(r'src="detail-components\.js\?v=[1-9][0-9]*"', html)
+    assert re.search(r'src="detail-components\.js\?v=[0-9a-f]{12}"', html)
+    detail_fingerprint = hashlib.sha256((root / "detail-components.js").read_bytes()).hexdigest()[:12]
+    assert f'detail-components.js?v={detail_fingerprint}' in html
     # Details default to the latest session; YTD remains an explicit action.
     assert "let followLatestSession = true;" in javascript
     assert "let followPerformanceRange = false;" in javascript
@@ -7777,7 +7824,9 @@ def test_identical_cold_signal_queries_coalesce_without_skipping_source_validati
         "symbol": "2330", "target_weight": 0.1, "status": "ready",
     }) + "\n")
     source_started, release_source, second_lookup = (threading.Event() for _ in range(3))
-    original_reader = dashboard_module._latest_contiguous_session_rows
+    # The canonical signal-page path now reads complete session projections,
+    # not the legacy recent-row reader. Block the actual cold source operation.
+    original_reader = dashboard_module._narrow_signal_page_projection
     original_locker = dashboard_module._detail_query_lock
     reads = 0
     lookups = 0
@@ -7797,7 +7846,7 @@ def test_identical_cold_signal_queries_coalesce_without_skipping_source_validati
             second_lookup.set()
         return lock
 
-    monkeypatch.setattr(dashboard_module, "_latest_contiguous_session_rows", reader)
+    monkeypatch.setattr(dashboard_module, "_narrow_signal_page_projection", reader)
     monkeypatch.setattr(dashboard_module, "_detail_query_lock", locker)
     request = dict(state_dir=tmp_path, session_date=day, limit=10)
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -8256,6 +8305,7 @@ def test_narrow_signal_page_matches_complete_history_and_falls_back_safely(
         {"symbol": "台積", "limit": 3},
         {"status": "blocked", "limit": 3},
         {"mode": "mode_b", "offset": 1, "limit": 1},
+        {"mode": "unknown", "limit": 1},
     ):
         dashboard_module._SIGNAL_PAGE_CACHE.clear()
         dashboard_module._SIGNAL_RANGE_SUMMARY_CACHE.clear()

@@ -28,6 +28,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import time
 from typing import BinaryIO, Final, TextIO
 import zipfile
 from zoneinfo import ZoneInfo
@@ -61,6 +62,9 @@ FUTURES_LISTING_URL: Final[str] = (
 OPTIONS_LISTING_URL: Final[str] = (
     "https://www.taifex.com.tw/cht/3/optPrevious30DaysSalesData"
 )
+CUSTOMIZED_FUTURES_LISTING_URL: Final[str] = (
+    "https://www.taifex.com.tw/cht/3/futPrevious30DaysSalesDataFlx"
+)
 USER_AGENT: Final[str] = "stockAgent/taifex-index-derivatives-ticks"
 PARSER_CONTRACT_VERSION: Final[int] = 2
 TAIPEI: Final[ZoneInfo] = ZoneInfo("Asia/Taipei")
@@ -72,6 +76,10 @@ FUTURES_URL_RE: Final[re.Pattern[str]] = re.compile(
 OPTIONS_URL_RE: Final[re.Pattern[str]] = re.compile(
     r"https://www\.taifex\.com\.tw/file/taifex/Dailydownload/"
     r"OptionsDailydownloadCSV/OptionsDaily_(\d{4}_\d{2}_\d{2})\.zip"
+)
+CUSTOMIZED_FUTURES_URL_RE: Final[re.Pattern[str]] = re.compile(
+    r"https://www\.taifex\.com\.tw/file/taifex/Dailydownload/"
+    r"DailydownloadCSVFlx/Daily_(\d{4}_\d{2}_\d{2})\.zip"
 )
 
 OPTION_COLUMNS: Final[list[str]] = [
@@ -126,6 +134,39 @@ def _atomic_write_bytes(path: Path, payload: bytes) -> None:
 
 def _atomic_write_text(path: Path, text: str) -> None:
     atomic_write_text(path, text, durable=True)
+
+
+def _archive_manifest_bytes(root: Path, payload: bytes) -> Path:
+    """Retain a content-addressed source receipt before changing its head."""
+    digest = _sha256_bytes(payload)
+    archive = root / "manifest_versions" / f"{digest}.json"
+    if archive.is_symlink():
+        raise ValueError("TAIFEX manifest archive cannot be a symlink")
+    if archive.exists():
+        if not archive.is_file() or _sha256_path(archive) != digest:
+            raise ValueError("TAIFEX manifest archive identity collision")
+    else:
+        _atomic_write_bytes(archive, payload)
+        if _sha256_path(archive) != digest:
+            raise ValueError("TAIFEX manifest archive failed readback")
+    return archive
+
+
+def _write_manifest_preserving_versions(root: Path, payload: dict) -> None:
+    """Publish only after both the previous and new receipt bytes are saved.
+
+    The collector's existing dataset lock serializes this operation. The
+    content-addressed copies retain exact native bytes, including raw source
+    identities; they do not certify history outside that receipt's window.
+    """
+    head = root / "manifest.json"
+    if head.is_symlink():
+        raise ValueError("TAIFEX manifest head cannot be a symlink")
+    if head.exists():
+        _archive_manifest_bytes(root, head.read_bytes())
+    encoded = (json.dumps(payload, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
+    _archive_manifest_bytes(root, encoded)
+    _atomic_write_bytes(head, encoded)
 
 
 def _atomic_write_parquet(frame: pl.DataFrame, path: Path) -> None:
@@ -306,7 +347,8 @@ def _reuse_previous_complete_window(
     return True, "verified_previous_30_day_window", _sha256_bytes(manifest_bytes)
 
 
-def _validate_zip_payload(payload: bytes, *, expected_member: str) -> None:
+def _validate_zip_payload(payload: bytes, *, expected_member: str,
+                          minimum_csv_bytes: int = 101) -> None:
     try:
         with zipfile.ZipFile(io.BytesIO(payload)) as archive:
             members = [
@@ -317,7 +359,7 @@ def _validate_zip_payload(payload: bytes, *, expected_member: str) -> None:
                     f"ZIP CSV members {members!r} do not equal expected {expected_member!r}"
                 )
             info = archive.getinfo(expected_member)
-            if info.file_size <= 100:
+            if info.file_size < minimum_csv_bytes:
                 raise ValueError(
                     f"CSV member is implausibly small: {info.file_size} bytes"
                 )
@@ -337,13 +379,14 @@ def _download_zip(
     attempts: int,
     timeout: float,
     transport: ResilientHttpTransport | None = None,
+    minimum_csv_bytes: int = 101,
 ) -> dict[str, object]:
     headers: dict[str, str] = {}
     reused = False
     if target.is_file() and target.stat().st_size > 0:
         payload = target.read_bytes()
         try:
-            _validate_zip_payload(payload, expected_member=expected_member)
+            _validate_zip_payload(payload, expected_member=expected_member, minimum_csv_bytes=minimum_csv_bytes)
             reused = True
         except ValueError:
             payload, headers = _fetch_bytes(
@@ -352,7 +395,7 @@ def _download_zip(
                 timeout=timeout,
                 transport=transport,
             )
-            _validate_zip_payload(payload, expected_member=expected_member)
+            _validate_zip_payload(payload, expected_member=expected_member, minimum_csv_bytes=minimum_csv_bytes)
             _atomic_write_bytes(target, payload)
     else:
         payload, headers = _fetch_bytes(
@@ -361,7 +404,7 @@ def _download_zip(
             timeout=timeout,
             transport=transport,
         )
-        _validate_zip_payload(payload, expected_member=expected_member)
+        _validate_zip_payload(payload, expected_member=expected_member, minimum_csv_bytes=minimum_csv_bytes)
         _atomic_write_bytes(target, payload)
     return {
         "path": str(target),
@@ -900,6 +943,88 @@ def _acquire_lock(path: Path) -> BinaryIO:
     return handle
 
 
+def _customized_tick_source_readback(payload: bytes, *, day: date, member: str) -> dict:
+    """Inspect the FLEX source archive without treating its rows as fills."""
+    _validate_zip_payload(payload, expected_member=member, minimum_csv_bytes=40)
+    expected_header = ["成交日期", "商品代號", "到期日", "成交時間", "成交價格",
+                       "成交數量(B+S)", "近月價格", "遠月價格"]
+    with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+        if archive.getinfo(member).file_size > 128 * 1024 * 1024:
+            raise ValueError("customized tick archive exceeds source safety bound")
+        with archive.open(member) as binary, io.TextIOWrapper(binary, encoding="cp950", newline="") as text:
+            rows = csv.reader(text)
+            if next(rows, None) != expected_header:
+                raise ValueError("unsupported customized tick source header")
+            products = set()
+            count = 0
+            for line, row in enumerate(rows, start=2):
+                if len(row) != len(expected_header):
+                    raise ValueError(f"invalid customized tick field count at line {line}")
+                event_day, product, expiry, event_time = (value.strip() for value in row[:4])
+                if (event_day != day.strftime("%Y%m%d")
+                        or not re.fullmatch(r"[A-Z0-9]{2,12}", product)
+                        or not re.fullmatch(r"\d{8}", expiry)
+                        or not re.fullmatch(r"\d{6}", event_time)):
+                    raise ValueError(f"invalid customized tick identity at line {line}")
+                datetime.strptime(expiry, "%Y%m%d")
+                _parse_time(event_time, row_number=line)
+                products.add(product)
+                count += 1
+    return {"rows": count, "products": sorted(products),
+            "status": "rows_observed" if count else "header_only_observed"}
+
+
+def _collect_customized_recent(root: Path, *, days: int, attempts: int,
+                               timeout: float, transport: ResilientHttpTransport) -> Path:
+    """Use the canonical TAIFEX transport and lock for the separate FLEX page."""
+    page, headers = _fetch_bytes(CUSTOMIZED_FUTURES_LISTING_URL, attempts=attempts,
+                                 timeout=timeout, transport=transport)
+    urls = _extract_downloads(page, pattern=CUSTOMIZED_FUTURES_URL_RE)
+    observed_at = datetime.now(TAIPEI)
+    cutoff = _latest_completed_listing_date(observed_at)
+    selected = sorted(day for day in urls if day <= cutoff)[-days:]
+    if len(selected) < days:
+        raise ValueError(f"only {len(selected)} completed customized source archives listed; need {days}")
+    page_receipt = {"url": CUSTOMIZED_FUTURES_LISTING_URL,
+                    "last_modified": headers.get("last-modified"),
+                    **_save_listing_page(root, "customized_futures", page)}
+    downloads = []
+    for day in selected:
+        compact = day.strftime("%Y_%m_%d")
+        target = root / "raw" / "customized_futures" / f"Daily_{compact}.zip"
+        receipt_path = target.with_suffix(".receipt.json")
+        member = f"Flx_Daily_{compact}.csv"
+        if target.exists() and not receipt_path.is_file():
+            quarantine = root / "raw" / "quarantined"
+            quarantine.mkdir(parents=True, exist_ok=True)
+            os.replace(target, quarantine / f"{target.stem}.{_sha256_path(target)}.{time.time_ns()}.raw")
+        if target.exists():
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            if (receipt.get("contract") != "taifex_customized_futures_recent_tick_source_v1"
+                    or receipt.get("date") != day.isoformat() or receipt.get("url") != urls[day]
+                    or receipt.get("sha256") != _sha256_path(target)):
+                raise ValueError("customized tick source receipt mismatch")
+        download = _download_zip(urls[day], target, expected_member=member, attempts=attempts,
+                                 timeout=timeout, transport=transport, minimum_csv_bytes=40)
+        readback = _customized_tick_source_readback(target.read_bytes(), day=day, member=member)
+        receipt = {"contract": "taifex_customized_futures_recent_tick_source_v1",
+                   "date": day.isoformat(), **download, **readback}
+        if not receipt_path.exists():
+            _atomic_write_text(receipt_path, json.dumps(receipt, ensure_ascii=False, indent=2) + "\n")
+        downloads.append({**receipt, "receipt_path": str(receipt_path)})
+        print(json.dumps({"state": "source_readback", "date": day.isoformat(), **readback},
+                         ensure_ascii=False), flush=True)
+    manifest = root / "manifest.json"
+    _write_manifest_preserving_versions(root, {
+        "contract": "taifex_customized_futures_recent_tick_source_v1",
+        "observed_at": observed_at.isoformat(), "listing_page": page_receipt,
+        "completed_cutoff": cutoff.isoformat(), "raw_downloads": downloads,
+        "total_rows": sum(item["rows"] for item in downloads),
+        "scope": "source observations only; not trading, executable prices or training admission",
+    })
+    return manifest
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Download matched recent TAIFEX TX and TXO trade files."
@@ -913,6 +1038,8 @@ def main() -> int:
     parser.add_argument("--attempts", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=120.0)
     parser.add_argument("--request-interval", type=float, default=0.25)
+    parser.add_argument("--customized-only", action="store_true",
+                        help="Collect the separate FLEX tick ZIPs without changing standard datasets.")
     args = parser.parse_args()
     if args.days < 1 or args.days > 30:
         parser.error("--days must be between 1 and the TAIFEX rolling limit of 30")
@@ -924,6 +1051,8 @@ def main() -> int:
         parser.error("--request-interval must be non-negative")
 
     root = Path(args.output_dir).expanduser().resolve()
+    if args.customized_only:
+        root = root / "customized"
     request_interval = resolve_request_interval("taifex_public", args.request_interval)
     transport = ResilientHttpTransport(
         HttpRequestPolicy(
@@ -936,6 +1065,11 @@ def main() -> int:
     )
     lock = _acquire_lock(root / "state" / "download.lock")
     try:
+        if args.customized_only:
+            manifest = _collect_customized_recent(root, days=args.days, attempts=args.attempts,
+                                                   timeout=args.timeout, transport=transport)
+            print(f"customized futures tick source manifest: {manifest}")
+            return 0
         futures_page, futures_headers = _fetch_bytes(
             FUTURES_LISTING_URL,
             attempts=args.attempts,
@@ -1198,10 +1332,7 @@ def main() -> int:
                 ),
             },
         }
-        _atomic_write_text(
-            root / "manifest.json",
-            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        )
+        _write_manifest_preserving_versions(root, manifest)
         listing_status.update(
             {
                 "status": "complete",

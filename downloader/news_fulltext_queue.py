@@ -8,12 +8,14 @@ whole FinMind/FinLab dataset. Body batches are private, compressed and immutable
 from __future__ import annotations
 
 from collections import Counter
-from contextlib import closing
+from contextlib import ExitStack, closing
 from copy import deepcopy
 import codecs
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+import errno
 import fcntl
+from functools import lru_cache
 import hashlib
 import io
 from itertools import islice
@@ -56,13 +58,49 @@ from downloader.news_fulltext_status import (
     cnyes_metadata_resource_waits, cnyes_metadata_index_progress, cnyes_metadata_large_replay,
 )
 from downloader.news_fulltext_metadata_ingest import METADATA_INGEST_CONTRACT_VERSION
+from downloader.news_fulltext_metadata_current import current_origins_cte, unresolved_alias_count
 
 
 ARTICLE_DISPATCH_CONTRACT_VERSION = 6
+ARTICLE_REVALIDATION_LEASE_CONTRACT_VERSION = 2
+ARTICLE_CLAIM_WITNESS_CONTRACT_VERSION = 1
+ARTICLE_CAPTURE_COMMIT_CONTRACT_VERSION = 7
+ARTICLE_CLAIM_HEAD_FIELDS = (
+    'provider', 'url', 'parquet_path', 'body_sha256', 'body_bytes', 'captured_at_utc',
+    'last_checked_at_utc', 'etag', 'last_modified', 'validator_url',
+    'authorization_fingerprint', 'due', 'error_code', 'attempts',
+)
+UNLEASED_ARTICLE_HEAD_WITNESS_VERSION = 2
+_UNLEASED_LEGACY_HEAD_WITNESS_VERSION = 1
+_UNSPECIFIED_REQUEST_CLOCK = object()
+UNLEASED_ARTICLE_HEAD_FIELDS = (*ARTICLE_CLAIM_HEAD_FIELDS, 'state', 'lease_owner', 'lease_until',
+                                'lease_token', 'recovery_lease_token')
 ARTICLE_READY_PROBE_SQL = (
     "SELECT 1 FROM articles INDEXED BY dispatch WHERE provider=? "
     "AND state IN ('pending','retry','retry_cooldown') AND due<=? LIMIT 1"
 )
+_ARTICLE_WAKE_BATCH_SIZE = 128
+ACCEPTANCE_RECEIPT_IO_CONTRACT_VERSION = 2
+_TRANSIENT_RECEIPT_READ_ERRNOS = frozenset((
+    errno.EAGAIN, errno.EINTR, errno.EIO, errno.ESTALE, errno.ETIMEDOUT,
+    errno.ECONNRESET, errno.EBUSY,
+))
+
+
+@lru_cache(maxsize=32)
+def _article_wake_batch_sql(provider_count: int, after: bool) -> str:
+    """Keep three indexed seeks per source, but use one SQLite round trip."""
+    if not 1 <= provider_count <= _ARTICLE_WAKE_BATCH_SIZE:
+        raise ValueError('bounded_article_wake_batch_required')
+    due_filter = ' AND due>?' if after else ''
+    columns = ','.join(
+        "(SELECT due FROM articles INDEXED BY dispatch WHERE provider=e.provider "
+        f"AND state='{state}'{due_filter} ORDER BY due LIMIT 1)"
+        for state in ('pending', 'retry', 'retry_cooldown'))
+    return ('WITH eligible(provider) AS (VALUES ' + ','.join('(?)' for _ in range(provider_count))
+            + ') SELECT e.provider,' + columns + ' FROM eligible AS e')
+
+
 CNYES_WINDOW_DISPATCH_CONTRACT_VERSION = 3
 STORED_BODY_RETRY_FAIRNESS_CONTRACT_VERSION = 1
 FAILURE_OBSERVATION_CONTRACT_VERSION = 2
@@ -96,9 +134,142 @@ ACCEPTANCE_RECEIPT_DECODE_VERSION = 2
 ACCEPTANCE_RECEIPT_INPUT_VERSION = 2
 PARSER_REPAIR_IDENTITY_CONTRACT_VERSION = 1
 ABANDONED_WORK_RECOVERY_SQL = (
-    "UPDATE articles SET state='retry',due=0,lease_owner=NULL,lease_until=NULL,"
+    "UPDATE articles SET state='retry',due=0,recovery_lease_token=lease_token,"
+    "lease_owner=NULL,lease_until=NULL,lease_token=NULL,"
     "error_code='owner_restart' WHERE state='inflight'"
 )
+
+
+def article_claim_witness(row):
+    """Persist the exact claimed head with a live article response, if claimed."""
+    token = row.get('_article_claim_token')
+    if not token:
+        return None
+    owner = row.get('_article_claim_owner')
+    if not isinstance(token, str) or not isinstance(owner, str):
+        raise ValueError('invalid_article_claim_witness')
+    return json.dumps({'contract_version': ARTICLE_CLAIM_WITNESS_CONTRACT_VERSION,
+                       'lease_owner': owner, 'lease_token': token,
+                       'head': {key: row[key] for key in ARTICLE_CLAIM_HEAD_FIELDS}},
+                      ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def parse_article_claim_witness(record):
+    raw = record.get('article_claim_witness_json')
+    if raw is None:
+        return None
+    if not isinstance(raw, str) or len(raw) > 16384:
+        raise ValueError('invalid_article_claim_witness')
+    witness = json.loads(raw)
+    if (not isinstance(witness, dict)
+            or set(witness) != {'contract_version', 'lease_owner', 'lease_token', 'head'}
+            or type(witness['contract_version']) is not int
+            or witness['contract_version'] != ARTICLE_CLAIM_WITNESS_CONTRACT_VERSION
+            or not isinstance(witness['head'], dict)
+            or set(witness['head']) != set(ARTICLE_CLAIM_HEAD_FIELDS)
+            or any(not isinstance(witness[key], str) or not re.fullmatch('[0-9a-f]{32}', witness[key])
+                   for key in ('lease_owner', 'lease_token'))):
+        raise ValueError('invalid_article_claim_witness')
+    head = witness['head']
+    text_fields = set(ARTICLE_CLAIM_HEAD_FIELDS) - {'body_bytes', 'due', 'attempts'}
+    if (any(value is not None and not isinstance(value, str)
+            for key, value in head.items() if key in text_fields)
+            or type(head['attempts']) is not int or head['attempts'] < 0
+            or head['body_bytes'] is not None and type(head['body_bytes']) is not int
+            or type(head['due']) not in (int, float) or not math.isfinite(head['due'])
+            or not head['url'] or head['url'] != record.get('requested_url')
+            or head['provider'] != record.get('provider')
+            or hashlib.sha256(head['url'].encode()).hexdigest() != record.get('article_id')):
+        raise ValueError('invalid_article_claim_head')
+    return witness
+
+
+def parse_article_capture_witness(record):
+    """Bind a lease witness to a retained-head witness when both exist."""
+    witness = parse_article_claim_witness(record)
+    if witness is None:
+        return None
+    retained = [key for key in ('reviewed_native_head_json', 'retained_failure_head_json',
+                                'retained_supplement_head_json', 'retained_metadata_head_json')
+                if record.get(key) is not None]
+    if len(retained) > 1 or retained == ['retained_metadata_head_json']:
+        raise ValueError('incompatible_article_capture_witnesses')
+    if retained:
+        raw = record[retained[0]]
+        if not isinstance(raw, str) or len(raw) > 16384:
+            raise ValueError('invalid_retained_article_head')
+        observed = json.loads(raw)
+        prior = witness['head']
+        shared = ('url', 'provider', 'due', 'error_code', 'body_sha256', 'parquet_path',
+                  'captured_at_utc', 'last_checked_at_utc', 'authorization_fingerprint')
+        if (not isinstance(observed, dict) or observed.get('state') != 'inflight'
+                or observed.get('lease_owner') != witness['lease_owner']
+                or observed.get('attempts') != prior['attempts'] + 1
+                or any(key not in observed or observed[key] != prior[key] for key in shared)):
+            raise ValueError('incompatible_article_capture_witnesses')
+    return witness
+
+
+def unleased_article_head_witness(row, *, request_started_at_utc=_UNSPECIFIED_REQUEST_CLOCK):
+    """Bind a bulk body to the exact unleased head observed by the owner."""
+    head = {key: row[key] for key in UNLEASED_ARTICLE_HEAD_FIELDS}
+    if (head['state'] == 'inflight' or head['lease_owner'] is not None
+            or head['lease_until'] is not None or head['lease_token'] is not None):
+        raise ValueError('bulk_article_head_is_leased')
+    witness = {'contract_version': _UNLEASED_LEGACY_HEAD_WITNESS_VERSION, 'head': head}
+    if request_started_at_utc is not _UNSPECIFIED_REQUEST_CLOCK:
+        try:
+            started = datetime.fromisoformat(request_started_at_utc.replace('Z', '+00:00'))
+            if started.tzinfo is None or started.utcoffset() is None:
+                raise ValueError('naive request clock')
+        except (ValueError, TypeError, AttributeError, OverflowError):
+            request_started_at_utc = None
+        witness.update(contract_version=UNLEASED_ARTICLE_HEAD_WITNESS_VERSION,
+                       request_started_at_utc=request_started_at_utc)
+    return json.dumps(witness,
+                      ensure_ascii=False, sort_keys=True, separators=(',', ':'))
+
+
+def parse_unleased_article_head_witness(record):
+    raw = record.get('unleased_article_head_witness_json')
+    if raw is None:
+        return None
+    if (not isinstance(raw, str) or len(raw) > 16384
+            or any(record.get(key) is not None for key in ('article_claim_witness_json',
+                   'reviewed_native_head_json', 'retained_failure_head_json',
+                   'retained_supplement_head_json', 'retained_metadata_head_json'))):
+        raise ValueError('invalid_unleased_article_head_witness')
+    witness = json.loads(raw)
+    if (not isinstance(witness, dict) or type(witness.get('contract_version')) is not int
+            or witness['contract_version'] not in {_UNLEASED_LEGACY_HEAD_WITNESS_VERSION, UNLEASED_ARTICLE_HEAD_WITNESS_VERSION}
+            or set(witness) != ({'contract_version', 'head'} if witness['contract_version'] == _UNLEASED_LEGACY_HEAD_WITNESS_VERSION
+                                else {'contract_version', 'head', 'request_started_at_utc'})
+            or not isinstance(witness['head'], dict)
+            or set(witness['head']) != set(UNLEASED_ARTICLE_HEAD_FIELDS)):
+        raise ValueError('invalid_unleased_article_head_witness')
+    if witness['contract_version'] == UNLEASED_ARTICLE_HEAD_WITNESS_VERSION:
+        started = witness['request_started_at_utc']
+        if started is not None:
+            try:
+                parsed = datetime.fromisoformat(started.replace('Z', '+00:00'))
+                if parsed.tzinfo is None or parsed.utcoffset() is None:
+                    raise ValueError('naive request clock')
+            except (ValueError, TypeError, AttributeError, OverflowError):
+                raise ValueError('invalid_unleased_request_clock') from None
+    head = witness['head']
+    text_fields = set(UNLEASED_ARTICLE_HEAD_FIELDS) - {'body_bytes', 'due', 'attempts', 'lease_until'}
+    if (any(value is not None and not isinstance(value, str)
+            for key, value in head.items() if key in text_fields)
+            or type(head['attempts']) is not int or head['attempts'] < 0
+            or head['body_bytes'] is not None and type(head['body_bytes']) is not int
+            or type(head['due']) not in (int, float) or not math.isfinite(head['due'])
+            or not isinstance(head['state'], str) or not head['state'] or head['state'] == 'inflight'
+            or head['lease_owner'] is not None or head['lease_until'] is not None or head['lease_token'] is not None
+            or not head['url'] or head['url'] != record.get('requested_url')
+            or head['provider'] != record.get('provider')
+            or hashlib.sha256(head['url'].encode()).hexdigest() != record.get('article_id')):
+        raise ValueError('invalid_unleased_article_head')
+    return witness
 
 
 def parser_repair_identity(source):
@@ -530,7 +701,7 @@ def discovery_selection_sql(statement, readiness_rows):
     return statement
 
 
-def sorted_acceptance_receipt_paths(root: Path):
+def sorted_acceptance_receipt_paths(root: Path, *, strict_root=False):
     """Same direct-child *.json set/order, with bounded Path materialization.
 
     On this POSIX single-owner queue, sibling Path order equals filename
@@ -543,6 +714,8 @@ def sorted_acceptance_receipt_paths(root: Path):
         with os.scandir(directory) as children:
             names = sorted(child.name for child in children if child.name.endswith('.json'))
     except (FileNotFoundError, NotADirectoryError):
+        if strict_root:
+            raise
         return iter(())  # Same empty frontier as Path.glob, not a valid receipt.
     return (directory / name for name in names)
 
@@ -608,9 +781,29 @@ def accepted_publication_sort_day(value) -> str:
         return ''
 
 
+def _resolved_source_paths(root: Path, relative: str) -> tuple[Path, Path]:
+    try:
+        candidate = (root / relative).resolve()
+        resolved_root = root.resolve()
+    except RuntimeError as error:
+        # pathlib on Python 3.12 raises RuntimeError for ELOOP rather than an
+        # OSError; treat the malformed path like any other unsafe artifact.
+        raise ValueError('invalid source artifact path') from error
+    except OSError as error:
+        # Python versions may propagate ELOOP directly. Other local I/O errors
+        # retain their original type so bounded replay can defer and retry.
+        if error.errno == errno.ELOOP:
+            raise ValueError('invalid source artifact path') from error
+        raise
+    return candidate, resolved_root
+
+
 def source_path(root: Path, relative: str) -> Path:
-    candidate = (root / relative).resolve()
-    if not candidate.is_relative_to(root.resolve()) or not candidate.is_file():
+    try:
+        candidate, resolved_root = _resolved_source_paths(root, relative)
+    except ValueError as error:
+        raise ValueError('invalid or missing source artifact') from error
+    if not candidate.is_relative_to(resolved_root) or not candidate.is_file():
         raise ValueError("invalid or missing source artifact")
     return candidate
 
@@ -622,8 +815,8 @@ def replay_source_path(root: Path, relative: str) -> Path:
     ``source_path`` error contract. Containment and regular-file checks remain
     mandatory; a missing or inaccessible file raises its original OSError.
     """
-    candidate = (root / relative).resolve()
-    if not candidate.is_relative_to(root.resolve()):
+    candidate, resolved_root = _resolved_source_paths(root, relative)
+    if not candidate.is_relative_to(resolved_root):
         raise ValueError('invalid source artifact path')
     if not stat.S_ISREG(candidate.stat().st_mode):
         raise ValueError('invalid source artifact file')
@@ -647,9 +840,77 @@ def summarize_bulk_coverage(db, registry):
     return endpoints
 
 
+def _accepted_batch_frontier(db, scan_key, accepted):
+    """Estimate the remaining registered paths in this local scan frontier.
+
+    The checkpoint counts attempted paths, including failures. New registrations
+    can change this estimate; it is neither a body nor a history completion rate.
+    A concurrent checkpoint change invalidates the estimate for this heartbeat.
+    """
+    unknown = {'remaining_frontier_batches': None, 'estimated_frontier_batches': None}
+    if not isinstance(accepted, dict) or accepted.get('scan_state') not in (
+            'not_started', 'scanning', 'complete', 'local_retry_wait'):
+        return unknown
+    scanned, indexed = accepted.get('scanned_batches'), accepted.get('indexed_candidates')
+    max_count = 2**53 - 1  # Public JSON must remain exact in the browser.
+    if any(type(n) is not int or not 0 <= n <= max_count for n in (scanned, indexed)):
+        return unknown
+    try:
+        before_row = db.execute('SELECT value FROM queue_settings WHERE key=?', (scan_key,)).fetchone()
+        before = before_row[0] if before_row else None
+        if before is None:
+            if accepted['scan_state'] != 'not_started' or scanned or indexed:
+                return unknown
+            remaining = db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0]
+        else:
+            state = json.loads(before)
+            if (type(state) is not dict or type(state.get('version')) is not int or state['version'] != 1
+                    or state.get('state') not in ('scanning', 'complete')
+                    or type(state.get('path')) is not str or type(state.get('end_path')) is not str
+                    or state['path'] > state['end_path']
+                    or any(type(state.get(k)) is not int or state[k] < 0
+                           for k in ('checked', 'indexed', 'attempts'))
+                    or type(state.get('retry_after')) not in (int, float)
+                    or not math.isfinite(state['retry_after']) or state['retry_after'] < 0
+                    or state['checked'] != scanned or state['indexed'] != indexed):
+                return unknown
+            remaining = db.execute('SELECT count(*) FROM accepted_batches WHERE path>? AND path<=?',
+                                   (state['path'], state['end_path'])).fetchone()[0]
+        after_row = db.execute('SELECT value FROM queue_settings WHERE key=?', (scan_key,)).fetchone()
+        after = after_row[0] if after_row else None
+        if before != after or type(remaining) is not int or remaining < 0 or scanned + remaining > max_count:
+            return unknown
+        return {'remaining_frontier_batches': remaining, 'estimated_frontier_batches': scanned + remaining}
+    except (sqlite3.Error, TypeError, ValueError, KeyError, OverflowError):
+        return unknown
+
+
+def _is_transient_sqlite_lock(error):
+    code = getattr(error, 'sqlite_errorcode', None)
+    if type(code) is int:
+        return (code & 255) in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}
+    return str(error).lower() in {'database is locked', 'database table is locked', 'database is busy'}
+
+
 class NewsQueue:
     def __init__(self, root: Path, registry: PolicyRegistry, *, metrics: NewsMetrics | None = None,
                  defer_initial_finite_freeze: bool = False, lifecycle=None):
+        try:
+            self._initialize(root, registry, metrics=metrics,
+                             defer_initial_finite_freeze=defer_initial_finite_freeze, lifecycle=lifecycle)
+        except BaseException as startup_error:
+            # Any phase after opening the owner lock can fail, including a
+            # database open or schema migration. Tracebacks can retain self;
+            # release resources now instead of relying on garbage collection.
+            if getattr(self, 'owner_lock', None) is not None:
+                try:
+                    self.close(failed=True, error=startup_error)
+                except BaseException as cleanup_error:
+                    startup_error.add_note(f'news queue startup cleanup failed: {type(cleanup_error).__name__}')
+            raise
+
+    def _initialize(self, root: Path, registry: PolicyRegistry, *, metrics: NewsMetrics | None = None,
+                    defer_initial_finite_freeze: bool = False, lifecycle=None):
         if type(defer_initial_finite_freeze) is not bool:
             raise ValueError('finite_cohort_freeze_switch_must_be_boolean')
         root.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -684,7 +945,8 @@ class NewsQueue:
                 title TEXT, metadata_date_raw TEXT, metadata_order_day TEXT, first_seen_utc TEXT NOT NULL,
                 last_seen_utc TEXT NOT NULL, error_code TEXT, captured_at_utc TEXT, last_checked_at_utc TEXT,
                 body_bytes INTEGER DEFAULT 0, body_sha256 TEXT, parquet_path TEXT,
-                etag TEXT, last_modified TEXT, authorization_fingerprint TEXT, validator_url TEXT
+                etag TEXT, last_modified TEXT, authorization_fingerprint TEXT, validator_url TEXT,
+                lease_token TEXT, recovery_lease_token TEXT
             );
             CREATE INDEX IF NOT EXISTS dispatch ON articles(provider,state,due,metadata_date_raw DESC);
             CREATE INDEX IF NOT EXISTS host_state ON articles(host,state);
@@ -709,6 +971,34 @@ class NewsQueue:
             CREATE TABLE IF NOT EXISTS receipt_heads(
                 path TEXT PRIMARY KEY, mtime_ns INTEGER NOT NULL, bytes INTEGER NOT NULL
             );
+            CREATE TABLE IF NOT EXISTS metadata_current_origins(
+                receipt_path TEXT PRIMARY KEY, origin_id INTEGER NOT NULL, selected_at_utc TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS metadata_receipt_alias_heads(
+                provider TEXT NOT NULL, logical_path TEXT NOT NULL, target_path TEXT NOT NULL,
+                observed_at_utc TEXT NOT NULL, PRIMARY KEY(provider,logical_path)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS metadata_receipt_alias_pending(
+                provider TEXT NOT NULL, logical_path TEXT NOT NULL, old_target TEXT NOT NULL,
+                new_target TEXT NOT NULL, observed_at_utc TEXT NOT NULL,
+                PRIMARY KEY(provider,logical_path)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS metadata_receipt_alias_provisional(
+                receipt_path TEXT PRIMARY KEY
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS metadata_retired_receipt_targets(
+                receipt_path TEXT PRIMARY KEY, retired_at_utc TEXT NOT NULL, evidence_sha256 TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS metadata_receipt_alias_events(
+                id INTEGER PRIMARY KEY, provider TEXT NOT NULL, logical_path TEXT NOT NULL,
+                old_target TEXT, new_target TEXT NOT NULL, observed_at_utc TEXT NOT NULL,
+                census_sha256 TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS metadata_receipt_alias_census_proofs(
+                census_sha256 TEXT PRIMARY KEY, version INTEGER NOT NULL, raw_bytes INTEGER NOT NULL,
+                payload_zlib BLOB NOT NULL, recorded_at_utc TEXT NOT NULL
+            ) WITHOUT ROWID;
+            CREATE INDEX IF NOT EXISTS origins_by_receipt_id ON origins(receipt_path,id);
             CREATE TABLE IF NOT EXISTS metadata_ingest_progress(
                 origin_id INTEGER PRIMARY KEY, expected_rows INTEGER NOT NULL,
                 processed_rows INTEGER NOT NULL, link_column TEXT NOT NULL,
@@ -727,6 +1017,12 @@ class NewsQueue:
                 response_bytes INTEGER NOT NULL,checked_at_utc TEXT NOT NULL,
                 first_publication_aware TEXT,last_publication_aware TEXT,
                 PRIMARY KEY(provider,feed_url)
+            ) WITHOUT ROWID;
+            CREATE TABLE IF NOT EXISTS metadata_feed_observations(
+                provider TEXT NOT NULL,feed_url TEXT NOT NULL,parser_fingerprint TEXT NOT NULL,
+                response_sha256 TEXT NOT NULL,receipt_path TEXT NOT NULL,rows INTEGER NOT NULL,
+                processed_at_utc TEXT NOT NULL,
+                PRIMARY KEY(provider,feed_url,parser_fingerprint,response_sha256)
             ) WITHOUT ROWID;
             CREATE TABLE IF NOT EXISTS bulk_api_coverage(
                 base_url TEXT PRIMARY KEY,provider TEXT NOT NULL,total_articles INTEGER NOT NULL,
@@ -788,7 +1084,6 @@ class NewsQueue:
         """)
         contract = self.db.execute("SELECT version FROM contract").fetchone()
         if contract and contract[0] != CONTRACT_VERSION:
-            self.close()
             raise ValueError("incompatible news fulltext queue; use a versioned root")
         if self.registry.sources.get('cnyes') and self.registry.sources['cnyes'].allowed:
             initialize_metadata_index(self.db)
@@ -809,6 +1104,12 @@ class NewsQueue:
             # Additive cache metadata, not a source/body ABI change. Legacy
             # heads are bound lazily from sealed evidence when actually due.
             self.db.execute("ALTER TABLE articles ADD COLUMN validator_url TEXT")
+        if "lease_token" not in {row[1] for row in self.db.execute("PRAGMA table_info(articles)")}:
+            # Additive queue-only generation, never a source/body field.
+            # Existing inflight leases are requeued by the owner recovery.
+            self.db.execute("ALTER TABLE articles ADD COLUMN lease_token TEXT")
+        if "recovery_lease_token" not in {row[1] for row in self.db.execute("PRAGMA table_info(articles)")}:
+            self.db.execute("ALTER TABLE articles ADD COLUMN recovery_lease_token TEXT")
         if "priority" not in {row[1] for row in self.db.execute("PRAGMA table_info(discovery)")}:
             self.db.execute("ALTER TABLE discovery ADD COLUMN priority INTEGER NOT NULL DEFAULT 100")
         discovery_columns = {row[1] for row in self.db.execute("PRAGMA table_info(discovery)")}
@@ -847,6 +1148,10 @@ class NewsQueue:
             self.db.execute("CREATE INDEX IF NOT EXISTS abandoned_work ON articles(id) WHERE state='inflight'")
         self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_dispatch_contract_version',?)",
                         (str(ARTICLE_DISPATCH_CONTRACT_VERSION),))
+        self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_revalidation_lease_contract_version',?)",
+                        (str(ARTICLE_REVALIDATION_LEASE_CONTRACT_VERSION),))
+        self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_capture_commit_contract_version',?)",
+                        (str(ARTICLE_CAPTURE_COMMIT_CONTRACT_VERSION),))
         self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('article_request_deferral_contract_version',?)",
                         (str(REQUEST_DEFERRAL_CONTRACT_VERSION),))
         self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('discovery_request_deferral_contract_version',?)",
@@ -906,6 +1211,12 @@ class NewsQueue:
         # migration. Its raw-reference index must exist in that transaction.
         from downloader.news_fulltext_cnyes_history import initialize_accepted_batch_candidates
         initialize_accepted_batch_candidates(self)
+        from downloader.news_fulltext_cnyes_checkpoint import initialize as initialize_cnyes_checkpoints
+        initialize_cnyes_checkpoints(self)
+        from downloader.news_fulltext_metadata_checkpoint import initialize as initialize_metadata_checkpoints
+        initialize_metadata_checkpoints(self)
+        from downloader.news_fulltext_bulk_checkpoint import initialize as initialize_bulk_checkpoints
+        initialize_bulk_checkpoints(self)
         if self.lifecycle is not None:
             self.lifecycle.phase('acceptance_recovery', receipts_decoded=0)
         self.recover_acceptance()
@@ -922,11 +1233,7 @@ class NewsQueue:
         # first, so a corrupt counter cannot block its existing repair owner.
         from downloader.news_fulltext_urls import initialize_original_urls
         initialize_original_urls(self)
-        try:
-            self.sync_finite_cohorts(freeze_new=not defer_initial_finite_freeze)
-        except Exception:
-            self.close()
-            raise
+        self.sync_finite_cohorts(freeze_new=not defer_initial_finite_freeze)
         self.migrate_cnyes_endpoint_circuits()
         from downloader.news_fulltext_references import initialize as initialize_publisher_references
         with self.metrics.measure('publisher_reference_recovery'):
@@ -936,19 +1243,39 @@ class NewsQueue:
         if self.lifecycle is not None:
             self.lifecycle.phase('awaiting_first_snapshot')
 
-    def close(self):
-        large_job = getattr(self, '_large_metadata_job', None)
-        if large_job is not None:
-            large_job['job'].close()
-            self._large_metadata_job = None
-        from downloader.news_fulltext_metadata_ingest import close_readers
-        close_readers(self)
-        entries = getattr(self, '_cached_cnyes_inventory_entries', None)
-        if entries is not None:
-            entries.close()
-            self._cached_cnyes_inventory_entries = None
-        self.db.close()
-        self.owner_lock.close()
+    def close(self, *, failed=False, error=None):
+        # Close every registered resource even if an earlier cleanup fails;
+        # finalize this owner's observation before releasing the flock, so a
+        # delayed old-owner callback cannot overwrite its successor.
+        with ExitStack() as cleanup:
+            owner_lock = getattr(self, 'owner_lock', None)
+            if owner_lock is not None:
+                cleanup.callback(owner_lock.close)
+            lifecycle = getattr(self, 'lifecycle', None)
+            if callable(getattr(lifecycle, 'finish', None)):
+                def finish_lifecycle(exc_type, exc_value, _traceback):
+                    lifecycle.finish(failed=failed or exc_type is not None,
+                        error=error if error is not None else exc_value)
+                cleanup.push(finish_lifecycle)
+            db = getattr(self, 'db', None)
+            if db is not None:
+                cleanup.callback(db.close)
+            entries = getattr(self, '_cached_cnyes_inventory_entries', None)
+            if entries is not None:
+                cleanup.callback(entries.close)
+                self._cached_cnyes_inventory_entries = None
+            from downloader.news_fulltext_metadata_ingest import close_readers
+            cleanup.callback(close_readers, self)
+            large_job = getattr(self, '_large_metadata_job', None)
+            if large_job is not None:
+                cleanup.callback(large_job['job'].close)
+                self._large_metadata_job = None
+            from downloader.news_fulltext_metadata_legacy import close_scanner as close_metadata_legacy_scanner
+            cleanup.callback(close_metadata_legacy_scanner, self)
+            row_verifier = getattr(self, '_finlab_hint_row_verifier', None)
+            if row_verifier is not None:
+                cleanup.callback(row_verifier.close)
+                self._finlab_hint_row_verifier = None
 
     def initialize_stored_body_metrics(self):
         """One transactional migration, then exact O(providers) head counts.
@@ -1621,7 +1948,12 @@ class NewsQueue:
                         == source.parser_repair_prior_capture_fingerprint
                     and not parser_changed
                     and prior_allowed.get('source_capture_allowed:cnyes') == str(int(source.allowed)))
-                if provider == target and chart_only_upgrade:
+                cmnews_clock_basis_only_upgrade = bool(source and source.provider == 'cmnews'
+                    and source.embedded_article_layout == 'cmnews_visible_article_v1'
+                    and prior_sources.get('source_capture_fingerprint:cmnews') in source.parser_repair_capture_history
+                    and not parser_changed
+                    and prior_allowed.get('source_capture_allowed:cmnews') == str(int(source.allowed)))
+                if provider == target and (chart_only_upgrade or cmnews_clock_basis_only_upgrade):
                     continue
                 if (provider == target and source and not capture_changed
                         and prior_allowed.get("source_capture_allowed:" + source.provider) == str(int(source.allowed))):
@@ -1813,6 +2145,16 @@ class NewsQueue:
                 else:
                     self.db.execute("UPDATE articles SET state='awaiting_authorization' "
                                     "WHERE host=? AND state IN ('pending','retry','retry_cooldown','inflight')", (host,))
+            cnyes_source = self.registry.sources.get('cnyes')
+            if (cnyes_source and cnyes_source.allowed
+                    and (prior_sources.get('source_capture_fingerprint:cnyes') != cnyes_source.data_fingerprint
+                         or prior_allowed.get('source_capture_allowed:cnyes') != '1')):
+                # A formerly excluded candidate can become eligible when the
+                # source contract changes without changing its article head.
+                # Revisit only the bounded AMP scan; authorization is checked
+                # afresh by its existing admission function.
+                from downloader.news_fulltext_cnyes_work import AMP_CURSOR
+                self.db.execute('DELETE FROM queue_settings WHERE key=?', (AMP_CURSOR,))
             self.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('policy_fingerprint',?)", (fingerprint,))
             self.db.executemany("INSERT OR REPLACE INTO queue_settings VALUES (?,?)",
                                 (("source_capture_fingerprint:" + p, s.data_fingerprint) for p, s in self.registry.sources.items()))
@@ -4076,7 +4418,11 @@ class NewsQueue:
         from downloader.news_fulltext_host_circuit import host_filtered_query
         def lookup(statement, parameters):
             statement, parameters = host_filtered_query(statement, parameters, excluded_hosts, excluded_origins=excluded_origins)
-            return self.db.execute(statement, parameters).fetchone()
+            row = self.db.execute(statement, parameters).fetchone()
+            if row is not None and provider == 'cnyes':
+                from downloader.news_fulltext_cnyes_work import fresh_dispatch_row
+                return fresh_dispatch_row(self, row)
+            return row
         with self.metrics.measure("article_dispatch"), self.db:
             # A conservative existence check uses the already-maintained
             # covering index. Empty/future-only providers need none of the
@@ -4146,8 +4492,9 @@ class NewsQueue:
                 failed = lookup(self.stored_retry_dispatch_statement(), (provider, now))
                 if failed is not None:
                     row, oldest_stored_retry = failed, True
-            self.db.execute("UPDATE articles SET state='inflight',attempts=attempts+1,lease_owner=?,lease_until=? WHERE id=?",
-                            (self.owner, now + lease_seconds, row["id"]))
+            claim_token = uuid.uuid4().hex
+            self.db.execute("UPDATE articles SET state='inflight',attempts=attempts+1,lease_owner=?,lease_until=?,lease_token=?,recovery_lease_token=NULL WHERE id=?",
+                            (self.owner, now + lease_seconds, claim_token, row["id"]))
         bursts[provider] = min(missing_body_burst, bursts.get(provider, 0) + 1) if row['body_sha256'] is None else 0
         self._missing_body_dispatch_bursts = bursts
         if row['body_sha256'] is None:
@@ -4179,7 +4526,10 @@ class NewsQueue:
         self.metrics.count(provider, "frontier_missing_body_dispatches" if row['body_sha256'] is None else "frontier_stored_recheck_dispatches")
         if row['body_sha256'] is None and not row['metadata_order_day']:
             self.metrics.count(provider, "frontier_undated_missing_body_dispatches")
-        return self._bind_saved_validators(dict(row))
+        claimed = dict(row)
+        claimed['_article_claim_token'] = claim_token
+        claimed['_article_claim_owner'] = self.owner
+        return self._bind_saved_validators(claimed)
 
     @staticmethod
     def discovery_dispatch_filter(source, bulk_allowed=True, *, include_circuits=True, now=None):
@@ -4190,7 +4540,11 @@ class NewsQueue:
         """
         if not source.allowed:
             feeds = source.metadata_feeds
-            return ("kind='metadata_feed' AND url IN (" + ','.join('?' for _ in feeds) + ")", list(feeds)) if feeds else ("0", [])
+            if not feeds:
+                return "0", []
+            return ("kind='metadata_feed' AND url IN (" + ','.join('?' for _ in feeds) + ") "
+                    "AND NOT EXISTS (SELECT 1 FROM metadata_feed_interrupted_checkpoints AS checkpoint "
+                    "WHERE checkpoint.request_url=discovery.url AND checkpoint.state='pending')", list(feeds))
         if source.acquisition_mode == "finite" or source.known_url_only:
             return "0", []  # Retain old discovery receipts, never poll them.
         clauses = ["kind NOT IN ('wordpress_posts','cnyes_news','rss_fulltext','metadata_feed')"]
@@ -4205,7 +4559,21 @@ class NewsQueue:
                     clauses.append("(kind=? AND substr(url,1,instr(url||'?','?')-1) IN (" + ','.join('?' for _ in bases) + "))")
                     parameters.extend((kind, *bases))
         result = '(' + ' OR '.join(clauses) + ')'
+        if source.metadata_feeds:
+            result += (" AND (kind!='metadata_feed' OR NOT EXISTS "
+                       "(SELECT 1 FROM metadata_feed_interrupted_checkpoints AS checkpoint "
+                       "WHERE checkpoint.request_url=discovery.url AND checkpoint.state='pending'))")
+        if source.fulltext_feeds or source.wordpress_apis:
+            result += (" AND (kind NOT IN ('rss_fulltext','wordpress_posts') OR NOT EXISTS "
+                       "(SELECT 1 FROM bulk_interrupted_page_checkpoints AS checkpoint "
+                       "WHERE checkpoint.request_url=discovery.url AND checkpoint.state='pending'))")
         if source.provider == 'cnyes':
+            # A durable source body can outlive a crash before its list-page
+            # checkpoint. Give that exact URL's bounded local recovery first
+            # opportunity, without pausing other pages or publishers.
+            result += (" AND (kind NOT IN ('cnyes_news','index') OR NOT EXISTS "
+                       "(SELECT 1 FROM cnyes_interrupted_page_checkpoints AS checkpoint "
+                       "WHERE checkpoint.request_url=discovery.url AND checkpoint.state='pending'))")
             from downloader.news_fulltext_cnyes_index import ENDPOINT, request_failure_scope_guard
             if getattr(source,'cnyes_index_api',''):
                 from downloader.news_fulltext_cnyes_index import compatible_fingerprints
@@ -4344,53 +4712,103 @@ class NewsQueue:
                     deadlines.append(deadline)
         return min(deadlines) if deadlines else None
 
-    def next_wake_delay(self, provider_cooldowns: dict, maximum: float = 60, *, request_scope_cooldowns=None) -> float:
-        """Index lookups, not a full pending/frontier scan or busy polling."""
-        now, deadlines = time.time(), []
+    def _unscoped_article_wake_deadlines(self, providers, dispatch_after):
+        """Read indexed article deadlines for unscoped sources in bounded batches."""
+        deadlines = {}
+        for start in range(0, len(providers), _ARTICLE_WAKE_BATCH_SIZE):
+            chunk = providers[start:start + _ARTICLE_WAKE_BATCH_SIZE]
+            bindings = (*chunk, *((dispatch_after,) * 3 if dispatch_after is not None else ()))
+            statement = _article_wake_batch_sql(len(chunk), dispatch_after is not None)
+            for provider, pending, retry, retry_cooldown in self.db.execute(statement, bindings):
+                due = min((item for item in (pending, retry, retry_cooldown) if item is not None), default=None)
+                if due is not None:
+                    deadlines[provider] = due
+        return deadlines
+
+    def next_wake_delay(self, provider_cooldowns: dict, maximum: float = 60, *, request_scope_cooldowns=None,
+                        provider_ids=None, include_articles=True, include_discovery=True, include_local=True,
+                        dispatch_after=None) -> float:
+        """Use indexed deadlines; optional filters describe a dispatch opportunity.
+
+        ``dispatch_after`` excludes work already offered to this dispatcher.
+        A deadline crossing during that offer is still included, even if it has
+        passed by the time this method reads it. Such a row may cause one more
+        dispatch round, but an unclaimable old row cannot cause a hot loop.
+        """
+        now, deadlines, eligible = time.time(), [], []
         for provider, source in self.registry.sources.items():
-            if not source.request_enabled:
+            if not source.request_enabled or provider_ids is not None and provider not in provider_ids:
                 continue
             scopes = (request_scope_cooldowns or {}).get(provider, {})
             hosts = {host: until for host, until in scopes.get('hosts', {}).items() if until > now}
             origins = {origin: until for origin, until in scopes.get('origins', {}).items() if until > now}
+            eligible.append((provider, source, hosts, origins))
+        unscoped = [provider for provider, source, hosts, origins in eligible
+                    if include_articles and source.allowed and not hosts and not origins]
+        article_deadlines = self._unscoped_article_wake_deadlines(unscoped, dispatch_after)
+        for provider, source, hosts, origins in eligible:
             # Expiration permits an actual policy/request probe, not success.
             # Paused rows with due=0 must not create repeated empty cycles.
             earliest = list(hosts.values()) + list(origins.values())
             from downloader.news_fulltext_host_circuit import host_filtered_query
-            for state in ("pending", "retry", "retry_cooldown") if source.allowed else ():
-                statement, binds = host_filtered_query(
-                    'SELECT due FROM articles INDEXED BY dispatch WHERE provider=? AND state=? ORDER BY due LIMIT 1',
-                    (provider, state), tuple(hosts), excluded_origins=tuple(origins))
-                row = self.db.execute(statement, binds).fetchone()
-                if row:
-                    earliest.append(row[0])
-            bulk_allowed = self.bulk_allowed(source, now)
-            # An unusable bulk adapter must not hold HTML/RSS behind its timer.
-            cache = getattr(self, '_cnyes_revision_empty_selection', None)
-            cache_deadline = (cache.wake_deadline(source, bulk_allowed, tuple(origins), tuple(hosts))
-                              if cache is not None else None)
-            if cache_deadline is not None:
-                earliest.append(cache_deadline)
-            else:
-                dispatch_filter, parameters = self.discovery_dispatch_filter(source, bulk_allowed, now=now)
-                statement, binds = host_filtered_query(
-                    'SELECT min(due) FROM discovery WHERE provider=? AND superseded_by_windows_json IS NULL',
-                    (provider,), tuple(hosts), excluded_origins=tuple(origins), discovery_url=True)
-                row = self.db.execute(statement + ' AND ' + dispatch_filter, (*binds, *parameters)).fetchone()
-                if row and row[0] is not None:
-                    earliest.append(row[0])
-                cooldown_deadline = self.discovery_cooldown_deadline(source, bulk_allowed, now, tuple(origins), tuple(hosts))
-                if cooldown_deadline is not None:
-                    earliest.append(cooldown_deadline)
+            if include_articles and source.allowed:
+                if not hosts and not origins:
+                    due = article_deadlines.get(provider)
+                    if due is not None:
+                        earliest.append(due)
+                else:
+                    for state in ("pending", "retry", "retry_cooldown"):
+                        after_sql = ' AND due>?' if dispatch_after is not None else ''
+                        parameters = (provider, state, dispatch_after) if dispatch_after is not None else (provider, state)
+                        statement, binds = host_filtered_query(
+                            'SELECT due FROM articles INDEXED BY dispatch WHERE provider=? AND state=?' + after_sql
+                            + ' ORDER BY due LIMIT 1', parameters, tuple(hosts), excluded_origins=tuple(origins))
+                        row = self.db.execute(statement, binds).fetchone()
+                        if row:
+                            earliest.append(row[0])
+            if include_discovery:
+                bulk_allowed = self.bulk_allowed(source, now)
+                # An unusable bulk adapter must not hold HTML/RSS behind its timer.
+                cache = getattr(self, '_cnyes_revision_empty_selection', None)
+                cache_deadline = (cache.wake_deadline(source, bulk_allowed, tuple(origins), tuple(hosts))
+                                  if cache is not None else None)
+                if cache_deadline is not None:
+                    if dispatch_after is None or cache_deadline > dispatch_after:
+                        earliest.append(cache_deadline)
+                else:
+                    dispatch_filter, parameters = self.discovery_dispatch_filter(source, bulk_allowed, now=now)
+                    after_sql = ' AND due>?' if dispatch_after is not None else ''
+                    wake_parameters = (provider, dispatch_after) if dispatch_after is not None else (provider,)
+                    statement, binds = host_filtered_query(
+                        'SELECT min(due) FROM discovery WHERE provider=? AND superseded_by_windows_json IS NULL' + after_sql,
+                        wake_parameters, tuple(hosts), excluded_origins=tuple(origins), discovery_url=True)
+                    row = self.db.execute(statement + ' AND ' + dispatch_filter, (*binds, *parameters)).fetchone()
+                    if row and row[0] is not None:
+                        earliest.append(row[0])
+                    cooldown_deadline = self.discovery_cooldown_deadline(source, bulk_allowed, now, tuple(origins), tuple(hosts))
+                    if cooldown_deadline is not None:
+                        earliest.append(cooldown_deadline)
             if earliest:
                 deadlines.append(max(min(earliest), provider_cooldowns.get(provider, 0)))
+        source = self.registry.sources.get('cnyes')
+        if include_local and source and source.request_enabled:
+            # This is disk-only work and must not inherit a publisher cooldown.
+            local = self.db.execute("SELECT min(not_before) FROM cnyes_interrupted_page_checkpoints "
+                                    "WHERE state='pending'").fetchone()[0]
+            if local is not None:
+                deadlines.append(local)
         return min(maximum, max(0.0, min(deadlines) - now)) if deadlines else maximum
 
     def claim_url(self, url: str, lease_seconds: int, *, refresh: bool = False,
-                  expected_missing_head: dict | None = None, reviewed_native_record: dict | None = None):
+                  expected_missing_head: dict | None = None, reviewed_native_record: dict | None = None,
+                  retained_failure_replay: bool = False):
         """Respect retry deadlines and an optional exact retained-original fence."""
         url = normalize_url(url)
         source = self.registry.require(url)
+        if (type(retained_failure_replay) is not bool
+                or retained_failure_replay and (expected_missing_head is None or reviewed_native_record is not None
+                                                or source.provider != 'cnyes' or source.acquisition_mode == 'finite')):
+            raise ValueError('invalid retained failure claim')
         reviewed_title = False
         if reviewed_native_record is not None:
             from downloader.news_fulltext_retained_native import reviewed_native_missing_head_allowed
@@ -4402,7 +4820,9 @@ class NewsQueue:
             if (not isinstance(expected_missing_head, dict)
                     or set(expected_missing_head) != set(RETAINED_SUPPLEMENT_HEAD_FIELDS)
                     or expected_missing_head['url'] != url or expected_missing_head['provider'] != source.provider
-                    or (expected_missing_head['state'] not in {'pending', 'retry', 'retry_cooldown'} and not reviewed_title)
+                    or (expected_missing_head['state'] not in {'pending', 'retry', 'retry_cooldown'}
+                        and not reviewed_title
+                        and not (retained_failure_replay and expected_missing_head['state'] == 'body_not_found'))
                     or expected_missing_head['body_sha256'] is not None or refresh):
                 raise ValueError('invalid exact missing-head claim fence')
         if source.acquisition_mode == "finite":
@@ -4426,12 +4846,16 @@ class NewsQueue:
                 # earlier SELECT. Never consume an attempt over a new refusal.
                 conditions = ''.join(' AND '+field+' IS ?' for field in RETAINED_SUPPLEMENT_HEAD_FIELDS)
                 expected_values = tuple(expected_missing_head[field] for field in RETAINED_SUPPLEMENT_HEAD_FIELDS)
-            changed = self.db.execute("UPDATE articles SET state='inflight',attempts=attempts+1,lease_owner=?,lease_until=? WHERE id=?"+conditions,
-                            (self.owner, now + lease_seconds, row["id"], *expected_values)).rowcount
+            claim_token = uuid.uuid4().hex
+            changed = self.db.execute("UPDATE articles SET state='inflight',attempts=attempts+1,lease_owner=?,lease_until=?,lease_token=?,recovery_lease_token=NULL WHERE id=?"+conditions,
+                            (self.owner, now + lease_seconds, claim_token, row["id"], *expected_values)).rowcount
             if changed != 1:
                 return None
         self.metrics.count(row["provider"], "frontier_attempts_started")
-        return self._bind_saved_validators(dict(row))
+        claimed = dict(row)
+        claimed['_article_claim_token'] = claim_token
+        claimed['_article_claim_owner'] = self.owner
+        return self._bind_saved_validators(claimed)
 
     def schedule_recent_rechecks(self, seconds: int, days: int):
         now = datetime.now(timezone.utc)
@@ -4444,7 +4868,13 @@ class NewsQueue:
                                     "WHERE provider=? AND state='complete' AND metadata_order_day>=? "
                                     "AND coalesce(last_checked_at_utc,captured_at_utc)<?", (source.provider, start_day, cutoff))
 
-    def failed(self, row: dict, error: NewsError, max_attempts: int):
+    def failed(self, row: dict, error: NewsError, max_attempts: int, *, _fence=None,
+               _clear_validators=False):
+        implicit_fence = _fence is None and bool(row.get('_article_claim_token'))
+        if implicit_fence:
+            _fence = self._revalidation_fence(row)
+        fence_sql, fence_values = _fence if _fence is not None else ('', ())
+        clear_validators = ',etag=NULL,last_modified=NULL,validator_url=NULL' if _clear_validators else ''
         deferred = (getattr(error, 'request_deferred', False) is True and error.retry is True
                     and error.code in REQUEST_DEFERRAL_CODES)
         if deferred:
@@ -4455,9 +4885,15 @@ class NewsQueue:
             # Earlier redirect or robots requests remain in HTTP telemetry.
             state = row['state'] if row['state'] in {'pending', 'retry', 'retry_cooldown'} else 'retry'
             with self.db:
-                self.db.execute('UPDATE articles SET state=?,due=max(due,?),attempts=?,'
-                                'lease_owner=NULL,lease_until=NULL WHERE id=?',
-                                (state, time.time() + max(0, error.delay), row['attempts'], row['id']))
+                changed = self.db.execute('UPDATE articles SET state=?,due=max(due,?),attempts=?,'
+                                'lease_owner=NULL,lease_until=NULL,lease_token=NULL,recovery_lease_token=NULL' + clear_validators + ' WHERE id=?' + fence_sql,
+                                (state, time.time() + max(0, error.delay), row['attempts'], row['id'], *fence_values)).rowcount
+                if changed != 1:
+                    if implicit_fence:
+                        self.counter('article_attempts_finished', 1)
+                        self.counter('article_failure_superseded', 1)
+                        self.metrics.count(row['provider'], 'frontier_failure_superseded')
+                    return False
                 # Preserve the existing dispatch-outcome counters for readers
                 # of old snapshots; this additional counter identifies gates
                 # observed under this version, not all historical deferrals.
@@ -4468,7 +4904,7 @@ class NewsQueue:
             self.metrics.count(row['provider'], 'frontier_error_' + error.code)
             self.metrics.count(row['provider'], 'frontier_source_gate_deferrals')
             self.metrics.count(row['provider'], 'frontier_deferred_' + error.code)
-            return
+            return True
         attempts = row["attempts"] + 1
         unknown_body = (error.code == 'body_not_found' and self.unknown_cnyes_body_recheck_allowed(
             self.registry.sources.get(row['provider']), row))
@@ -4486,11 +4922,17 @@ class NewsQueue:
         delay = max(error.delay, CNYES_UNKNOWN_BODY_RECHECK_SECONDS if unknown_body or unknown_identity or retained_validation else 0,
                     3600 if cooldown else min(900, 15 * 2 ** min(attempts, 6)))
         with self.db:
-            self.db.execute("UPDATE articles SET state=?,error_code=?,due=?,last_checked_at_utc=?,"
+            changed = self.db.execute("UPDATE articles SET state=?,error_code=?,due=?,last_checked_at_utc=?,"
                             "attempts=CASE WHEN ? THEN 0 ELSE attempts END,"
-                            "lease_owner=NULL,lease_until=NULL WHERE id=?",
+                            "lease_owner=NULL,lease_until=NULL,lease_token=NULL,recovery_lease_token=NULL" + clear_validators + " WHERE id=?" + fence_sql,
                             (state, error.code, time.time() + delay if recoverable else 0, utc_now(),
-                             cooldown, row["id"]))
+                             cooldown, row["id"], *fence_values)).rowcount
+            if changed != 1:
+                if implicit_fence:
+                    self.counter('article_attempts_finished', 1)
+                    self.counter('article_failure_superseded', 1)
+                    self.metrics.count(row['provider'], 'frontier_failure_superseded')
+                return False
             self.counter("article_attempts_finished", 1)
             self.counter("article_failures", 1)
             if row['provider'] == 'cmnews' and error.code == 'article_identity_not_verified':
@@ -4523,6 +4965,32 @@ class NewsQueue:
         if getattr(error, 'failure_response', None) is not None:
             from downloader.news_fulltext_diagnostics import retain_failure_response
             retain_failure_response(self, row, error)
+        return True
+
+    def _revalidation_fence(self, row):
+        """Match the observed head and, for a claimed request, its unique lease."""
+        fields = ('provider', 'url', 'parquet_path', 'body_sha256', 'body_bytes',
+                  'captured_at_utc', 'last_checked_at_utc', 'etag', 'last_modified',
+                  'validator_url', 'authorization_fingerprint', 'due', 'error_code')
+        sql = ''.join(' AND ' + key + ' IS ?' for key in fields)
+        values = tuple(row.get(key) for key in fields)
+        token = row.get('_article_claim_token')
+        if token:
+            return (sql + " AND state='inflight' AND lease_owner IS ? AND lease_token IS ? AND attempts IS ?",
+                    (*values, self.owner, token, row['attempts'] + 1))
+        # Discovery's same-body reuse is based on an unleased current head;
+        # it cannot finish another request simply by presenting its snapshot.
+        if row.get('state') == 'inflight':
+            return ' AND 0', ()
+        other = ('state', 'lease_owner', 'lease_until', 'lease_token', 'recovery_lease_token', 'attempts')
+        return (sql + ''.join(' AND ' + key + ' IS ?' for key in other),
+                (*values, *(row.get(key) for key in other)))
+
+    def _note_superseded_revalidation(self, row):
+        with self.db:
+            self.counter('article_attempts_finished', 1)
+            self.counter('article_revalidation_superseded', 1)
+        self.metrics.count(row['provider'], 'frontier_revalidation_superseded')
 
     def _saved_body_record(self, row, *, validators=False):
         """Verify the sealed batch and select this head using metadata only.
@@ -4530,18 +4998,30 @@ class NewsQueue:
         A valid batch for another article is not evidence for this head. Body
         and raw-response columns are not decoded for conditional revalidation.
         """
-        target = source_path(self.root, row['parquet_path'])
         accepted = self.db.execute('SELECT receipt_path FROM accepted_batches WHERE path=?',
                                    (row['parquet_path'],)).fetchone()
-        receipt = json.loads(source_path(self.root, accepted[0]).read_text()) if accepted else None
-        if receipt is None or sha256_file(target) != receipt['sha256']:
-            raise ValueError('saved_body_digest_mismatch')
-        columns = ('article_id', 'body_sha256', 'source_request_url', 'etag', 'last_modified',
-                   'authorization_fingerprint')
+        if accepted is None:
+            raise ValueError('saved_body_batch_not_committed')
+        receipt = json.loads(source_path(self.root, accepted[0]).read_text())
+        target = verify_immutable_body_receipt(self.root, receipt,
+                                               expected_parquet_path=row['parquet_path'])
+        if (not isinstance(row.get('url'), str)
+                or hashlib.sha256(row['url'].encode()).digest() != row['id']):
+            raise ValueError('saved_body_head_identity_mismatch')
+        columns = ('article_id', 'requested_url', 'contract_version', 'body_sha256', 'body_bytes',
+                   'source_request_url', 'etag', 'last_modified', 'authorization_fingerprint')
         batch = pq.ParquetFile(target)
+        if batch.metadata.num_rows != receipt['rows']:
+            raise ValueError('parquet_row_count_mismatch')
+        required = {'article_id', 'requested_url', 'contract_version', 'body_sha256', 'body_bytes'}
+        if not required.issubset(batch.schema_arrow.names):
+            raise ValueError('saved_body_identity_metadata_missing')
         records = batch.read(columns=[key for key in columns if key in batch.schema_arrow.names]).to_pylist()
         matches = [record for record in records if record.get('article_id') == row['id'].hex()
+                   and record.get('requested_url') == row['url']
+                   and record.get('contract_version') == receipt['contract_version']
                    and record.get('body_sha256') == row['body_sha256']
+                   and record.get('body_bytes') == row['body_bytes']
                    and (not validators or all(record.get(key) == row.get(key)
                         for key in ('etag', 'last_modified', 'authorization_fingerprint')))]
         if not matches or validators and len({r.get('source_request_url') for r in matches}) != 1:
@@ -4559,35 +5039,186 @@ class NewsQueue:
         except (OSError, ValueError, TypeError, KeyError, NewsError, pa.ArrowException):
             self.metrics.count(row['provider'], 'saved_validator_binding_unavailable')
             return row  # No guessing from article URL, canonical tag or API item ID.
+        fence_sql, fence_values = self._revalidation_fence(row)
         with self.db:
-            self.db.execute('UPDATE articles SET validator_url=? WHERE id=? AND body_sha256=? '
-                            'AND parquet_path=? AND validator_url IS NULL',
-                            (bound_url, row['id'], row['body_sha256'], row['parquet_path']))
+            changed = self.db.execute(
+                'UPDATE articles SET validator_url=? WHERE id=? AND validator_url IS NULL' + fence_sql,
+                (bound_url, row['id'], *fence_values)).rowcount
+        if changed != 1:
+            self.metrics.count(row['provider'], 'saved_validator_binding_head_changed')
+            return row  # Do not send an old conditional header after a lost compare-and-set.
         row['validator_url'] = bound_url
         self.metrics.count(row['provider'], 'saved_validator_binding_recovered')
         return row
 
-    def unchanged(self, row: dict, max_attempts: int = 6):
+    def unchanged(self, row: dict, max_attempts: int = 6, *, observed_at_utc: str | None = None,
+                  request_started_at_utc=_UNSPECIFIED_REQUEST_CLOCK):
+        if request_started_at_utc is not _UNSPECIFIED_REQUEST_CLOCK and observed_at_utc is None:
+            with self.db:
+                self.counter('bulk_revalidation_unverified_clock', 1)
+            self.metrics.count(row['provider'], 'bulk_revalidation_unverified_clock')
+            return
+        if observed_at_utc is not None:
+            try:
+                observed = datetime.fromisoformat(observed_at_utc.replace('Z', '+00:00'))
+                if observed.tzinfo is None or observed.utcoffset() is None:
+                    raise ValueError('unverified_bulk_revalidation_clock')
+                ordering_clock = observed
+                if request_started_at_utc is not _UNSPECIFIED_REQUEST_CLOCK:
+                    ordering_clock = datetime.fromisoformat(request_started_at_utc.replace('Z', '+00:00'))
+                    if (ordering_clock.tzinfo is None or ordering_clock.utcoffset() is None
+                            or ordering_clock > observed):
+                        raise ValueError('unverified_bulk_request_clock')
+                if row.get('body_sha256') and not row.get('captured_at_utc'):
+                    raise ValueError('unverified_bulk_revalidation_body_clock')
+                for last_checked in (row.get('last_checked_at_utc'), row.get('captured_at_utc')):
+                    if last_checked is not None:
+                        checked = datetime.fromisoformat(last_checked.replace('Z', '+00:00'))
+                        if checked.tzinfo is None or checked.utcoffset() is None:
+                            raise ValueError('unverified_bulk_revalidation_clock')
+                        if checked >= ordering_clock:
+                            with self.db:
+                                self.counter('bulk_revalidation_older_source', 1)
+                            self.metrics.count(row['provider'], 'bulk_revalidation_older_source')
+                            return
+            except (ValueError, AttributeError, TypeError, OverflowError):
+                with self.db:
+                    self.counter('bulk_revalidation_unverified_clock', 1)
+                self.metrics.count(row['provider'], 'bulk_revalidation_unverified_clock')
+                return
+        fence = self._revalidation_fence(row)
         if not row.get("parquet_path") or not row.get("body_sha256"):
-            self.failed(row, NewsError("unverifiable_not_modified"), 1)
+            if not self.failed(row, NewsError("unverifiable_not_modified"), 1, _fence=fence):
+                self._note_superseded_revalidation(row)
             return
         try:
             self._saved_body_record(row)
         except (OSError, ValueError, TypeError, KeyError, pa.ArrowException):
-            with self.db:
-                self.db.execute("UPDATE articles SET etag=NULL,last_modified=NULL,validator_url=NULL WHERE id=?", (row["id"],))
-            self.failed(row, NewsError("saved_body_unavailable", retry=True, delay=1), max_attempts)
+            if not self.failed(row, NewsError("saved_body_unavailable", retry=True, delay=1), max_attempts,
+                               _fence=fence, _clear_validators=True):
+                self._note_superseded_revalidation(row)
             return
+        fence_sql, fence_values = fence
         with self.db:
-            self.db.execute("UPDATE articles SET state='complete',last_checked_at_utc=?,lease_owner=NULL,lease_until=NULL,"
-                            "error_code=NULL WHERE id=?", (utc_now(), row["id"]))
-            self.counter("article_attempts_finished", 1)
-            self.counter("not_modified", 1)
-        self.metrics.count(row["provider"], "frontier_not_modified")
+            changed = self.db.execute("UPDATE articles SET state='complete',last_checked_at_utc=?,lease_owner=NULL,lease_until=NULL,"
+                            "lease_token=NULL,recovery_lease_token=NULL,error_code=NULL WHERE id=?" + fence_sql,
+                            (observed_at_utc or utc_now(), row["id"], *fence_values)).rowcount
+            if changed:
+                self.counter("article_attempts_finished", 1)
+                self.counter("not_modified", 1)
+        if changed:
+            self.metrics.count(row["provider"], "frontier_not_modified")
+        else:
+            self._note_superseded_revalidation(row)
 
-    def accept(self, records: list[dict]):
+    def accept_live_article_batch(self, records: list[dict], *, stop, should_stop):
+        """Keep a live article receipt while retrying a transient SQLite lock."""
+        if getattr(self, '_live_acceptance_retry', None) is not None:
+            raise RuntimeError('nested_live_acceptance_retry')
+        if any(row.get('retained_metadata_head_json') is not None for row in records):
+            raise ValueError('live_article_retry_cannot_accept_metadata_replay')
+        self._live_acceptance_retry = (stop, should_stop)
+        try:
+            # Keep the canonical accept entrypoint observable by callers and
+            # tests; the retry applies only to this owner's direct captures.
+            return self.accept(records)
+        finally:
+            del self._live_acceptance_retry
+            lifecycle = self.lifecycle
+            if (lifecycle is not None and lifecycle.record is not None
+                    and lifecycle.record.get('phase') == 'waiting_local_sqlite'):
+                # This is a retry boundary, not a new data snapshot. The next
+                # successful status publication will acknowledge that snapshot.
+                lifecycle.phase('local_sqlite_retry_finished')
+
+    def _commit_acceptance(self, records, relative, receipt_relative, receipt):
+        retry = getattr(self, '_live_acceptance_retry', None)
+        if retry is None:
+            return self._accept_records(records, relative, receipt_relative)
+        stop, should_stop = retry
+        delay = .05
+        providers = None
+        initial_evidence_checked = False
+        next_wait_heartbeat = 0.
+
+        def verify_original_evidence():
+            expected = (json.dumps(receipt, ensure_ascii=False, indent=2) + '\n').encode('utf-8')
+            if source_path(self.root, receipt_relative).read_bytes() != expected:
+                raise ValueError('live_acceptance_receipt_changed')
+            verify_immutable_body_receipt(self.root, receipt, expected_parquet_path=relative)
+
+        while True:
+            try:
+                return self._accept_records(records, relative, receipt_relative)
+            except sqlite3.OperationalError as error:
+                if not _is_transient_sqlite_lock(error) or self.db.in_transaction:
+                    raise
+                if providers is None:
+                    providers = {record['provider'] for record in records}
+                for provider in providers:
+                    self.metrics.count(provider, 'local_sqlite_busy_commit_events')
+                while True:
+                    if should_stop():
+                        raise error
+                    if self.lifecycle is not None and time.monotonic() >= next_wait_heartbeat:
+                        from stockagent.data.news_worker_lifecycle import LOCAL_SQLITE_WAIT_HEARTBEAT_SECONDS
+                        # The lifecycle contains no source, body or URL data.
+                        # Telemetry errors remain nonfatal to the durable batch.
+                        self.lifecycle.phase('waiting_local_sqlite')
+                        next_wait_heartbeat = time.monotonic() + LOCAL_SQLITE_WAIT_HEARTBEAT_SECONDS
+                    stop.wait(delay)
+                    if should_stop():
+                        raise error
+                    try:
+                        # Catch already-changed evidence immediately, even if
+                        # another writer keeps the database locked indefinitely.
+                        checked_now = False
+                        if not initial_evidence_checked:
+                            verify_original_evidence()
+                            initial_evidence_checked = checked_now = True
+                        committed = self.db.execute('SELECT receipt_path FROM accepted_batches WHERE path=?',
+                                                    (relative,)).fetchone()
+                        if committed is None:
+                            # WAL permits reads while another connection owns
+                            # the writer lock. Check that a write can start
+                            # before rehashing the immutable batch; release
+                            # the probe transaction immediately and retain the
+                            # normal acceptance transaction and lease fences.
+                            # A new writer can still race after this probe: the
+                            # actual commit remains authoritative and retries.
+                            self.db.execute('BEGIN IMMEDIATE')
+                            self.db.rollback()
+                        # A prior check may precede a long lock wait. Verify
+                        # again immediately before accepting the original
+                        # batch or recognizing its already committed identity.
+                        if not checked_now:
+                            verify_original_evidence()
+                        if committed is not None:
+                            if committed[0] != receipt_relative:
+                                raise ValueError('live_acceptance_receipt_identity_conflict')
+                            # The commit may have succeeded even if its caller
+                            # observed an error. The unique path is the exact
+                            # original batch, so do not write or commit it twice.
+                            record_ids = {bytes.fromhex(row['article_id']) for row in records}
+                            adopted = set()
+                            keys = list(record_ids)
+                            for offset in range(0, len(keys), 500):
+                                chunk = keys[offset:offset + 500]
+                                adopted.update(row[0] for row in self.db.execute(
+                                    'SELECT id FROM articles WHERE parquet_path=? AND id IN ('
+                                    + ','.join('?' for _ in chunk) + ')', (relative, *chunk)))
+                            return 0, adopted
+                        break
+                    except sqlite3.OperationalError as probe_error:
+                        if not _is_transient_sqlite_lock(probe_error) or self.db.in_transaction:
+                            raise
+                        error = probe_error
+                        delay = min(delay * 2, 2.)
+                delay = min(delay * 2, 2.)
+
+    def accept(self, records: list[dict], *, return_adopted=False, return_batch=False):
         if not records:
-            return
+            return None if return_batch else (0, set()) if return_adopted else None
         for record in records:
             if record.get('reviewed_native_head_json') is not None:
                 from downloader.news_fulltext_retained_native import reviewed_native_head_matches
@@ -4608,13 +5239,14 @@ class NewsQueue:
             atomic_write_parquet(target, table, compression="zstd", compression_level=9, durable=True)
         receipt_relative = "receipts/" + stamp + ".json"
         with self.metrics.measure("receipt_hash_fsync"):
-            atomic_write_json(self.root / receipt_relative, {
+            receipt = {
                 "contract_version": CONTRACT_VERSION, "parquet_path": relative, "sha256": sha256_file(target),
                 "rows": len(records), "text_bytes": sum(r["body_bytes"] for r in records),
                 "raw_response_bytes": sum(len(r.get("raw_response_body") or b"") + len(r.get("url_resolution_response_body") or b"") for r in records),
                 "canonical_resolution_response_bytes": sum(len(r.get("url_resolution_response_body") or b"") for r in records),
                 "accepted_at_utc": utc_now(), "publish": False, "historical_point_in_time": False,
-            })
+            }
+            atomic_write_json(self.root / receipt_relative, receipt)
         with self.metrics.measure("acceptance_sqlite_commit"):
             # Count new URL heads separately from revisions/rechecks, using a
             # single indexed lookup per bounded chunk, not a full lake scan.
@@ -4623,14 +5255,41 @@ class NewsQueue:
             workloads = {bytes.fromhex(row["article_id"]): record_workload(row) for row in records}
             new_heads = Counter()
             new_workload_heads = Counter()
+            previously_missing = set()
             keys = list(ids)
             for offset in range(0, len(keys), 500):
                 chunk = keys[offset:offset + 500]
                 for row in self.db.execute("SELECT id FROM articles WHERE body_sha256 IS NULL AND id IN ("
                                            + ",".join("?" for _ in chunk) + ")", chunk):
-                    new_heads[ids[row[0]]] += 1
-                    new_workload_heads[(ids[row[0]], workloads[row[0]])] += 1
-            metadata_heads = self._accept_records(records, relative, receipt_relative)
+                    previously_missing.add(row[0])
+            try:
+                metadata_heads, adopted_ids = self._commit_acceptance(records, relative, receipt_relative, receipt)
+            except (OSError, sqlite3.Error):
+                if return_batch:
+                    # The original and receipt are already durable, but their
+                    # SQLite transaction did not finish. Keep a bounded
+                    # source-page intent so the owner can validate and adopt
+                    # this exact orphan receipt without rescanning all files.
+                    from downloader.news_fulltext_cnyes_checkpoint import register as register_cnyes_checkpoint
+                    from downloader.news_fulltext_bulk_checkpoint import register as register_bulk_checkpoint
+                    try:
+                        with self.db:
+                            register_cnyes_checkpoint(self, records, relative, receipt_relative)
+                            register_bulk_checkpoint(self, records, relative, receipt_relative)
+                            self.db.execute("UPDATE cnyes_interrupted_page_checkpoints "
+                                            "SET outcome='acceptance_receipt_pending' "
+                                            "WHERE parquet_path=? AND state='pending'", (relative,))
+                            self.db.execute("UPDATE bulk_interrupted_page_checkpoints "
+                                            "SET outcome='acceptance_receipt_pending' "
+                                            "WHERE parquet_path=? AND state='pending'", (relative,))
+                    except (OSError, sqlite3.Error):
+                        # The durable receipt still belongs to normal startup
+                        # recovery if this same database is unavailable.
+                        pass
+                raise
+            for key in previously_missing & adopted_ids:
+                new_heads[ids[key]] += 1
+                new_workload_heads[(ids[key], workloads[key])] += 1
         for provider, count in Counter(row["provider"] for row in records).items():
             self.metrics.count(provider, "durably_accepted_versions", count)
         for provider, count in Counter(row['provider'] for row in records
@@ -4642,11 +5301,15 @@ class NewsQueue:
             self.metrics.count(provider, "durable_workload_" + workload + "_new_heads", count)
             if workload == 'cached_source_reparse':
                 self.metrics.count(provider, 'durably_accepted_cached_new_url_heads', count)
-        return metadata_heads
+        if return_batch:
+            return {'metadata_heads': metadata_heads, 'adopted_ids': adopted_ids,
+                    'parquet_path': relative, 'receipt_path': receipt_relative}
+        return (metadata_heads, adopted_ids) if return_adopted else metadata_heads
 
     def _metadata_head_matches(self, record):
         from downloader.news_fulltext_metadata_replay import HEAD_FIELDS, METADATA_REPLAY_VERSION
-        if (record.get('metadata_replay_contract_version') not in {1, METADATA_REPLAY_VERSION}
+        version = record.get('metadata_replay_contract_version')
+        if (type(version) is not int or version not in {1, 2, METADATA_REPLAY_VERSION}
                 or record.get('acquisition_transport') != 'retained_raw_reparse'
                 or record.get('replay_preserves_last_http_check') is not True):
             raise ValueError('invalid retained metadata acceptance contract')
@@ -4724,11 +5387,84 @@ class NewsQueue:
                 and head['lease_owner'] is None and head['lease_until'] is None
                 and all(head[key] == expected[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS if key not in restart_fields))
 
-    def _accept_records(self, records: list[dict], relative: str, receipt_relative: str):
+    def _legacy_article_recovery_fence(self, record):
+        """Replay old unfenced receipts only when their observation is newer.
+
+        This does not reconstruct a missing lease; newer checks, active leases,
+        unresolved clocks and future cooldowns leave the current head intact.
+        The immutable receipt is still registered as a historical version.
+        """
+        def clock(value):
+            if not isinstance(value, str):
+                raise ValueError('invalid_legacy_capture_clock')
+            parsed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+            if parsed.tzinfo is None:
+                raise ValueError('invalid_legacy_capture_clock')
+            return parsed.astimezone(timezone.utc)
+
+        try:
+            captured = clock(record['captured_at_utc'])
+            requested = record['requested_url']
+            if (not isinstance(requested, str) or hashlib.sha256(requested.encode()).hexdigest() != record['article_id']):
+                return ' AND 0', ()
+            current = self.db.execute('SELECT * FROM articles WHERE id=?',
+                                      (bytes.fromhex(record['article_id']),)).fetchone()
+            if current is None:
+                return ' AND 0', ()
+            head = dict(current)
+            if (head['url'] != requested or head['provider'] != record['provider']
+                    or head['state'] not in {'pending', 'retry', 'retry_cooldown', 'complete'}
+                    or head['lease_owner'] is not None or head['lease_until'] is not None
+                    or head['lease_token'] is not None or head['recovery_lease_token'] is not None
+                    or head['state'] in {'retry', 'retry_cooldown'} and head['due'] > time.time()):
+                return ' AND 0', ()
+            for key in ('captured_at_utc', 'last_checked_at_utc'):
+                if head[key] is not None and clock(head[key]) >= captured:
+                    return ' AND 0', ()
+            fields = (*ARTICLE_CLAIM_HEAD_FIELDS, 'state', 'lease_owner', 'lease_until', 'lease_token', 'recovery_lease_token')
+            return ''.join(' AND ' + key + ' IS ?' for key in fields), tuple(head[key] for key in fields)
+        except (ValueError, TypeError, KeyError, OverflowError):
+            return ' AND 0', ()
+
+    def _article_capture_commit_fence(self, record, *, recovering, unleased=None):
+        if unleased is not None:
+            head = unleased['head']
+            return (''.join(' AND ' + key + ' IS ?' for key in UNLEASED_ARTICLE_HEAD_FIELDS),
+                    tuple(head[key] for key in UNLEASED_ARTICLE_HEAD_FIELDS))
+        witness = parse_article_capture_witness(record)
+        if witness is None:
+            return self._legacy_article_recovery_fence(record) if recovering else None
+        head = witness['head']
+        fields = tuple(key for key in ARTICLE_CLAIM_HEAD_FIELDS
+                       if key != 'attempts' and (not recovering or key not in {'due', 'error_code'}))
+        sql = ''.join(' AND ' + key + ' IS ?' for key in fields)
+        values = tuple(head[key] for key in fields)
+        if recovering:
+            # Startup converted only abandoned inflight work to this exact
+            # state before replaying the durable, pre-commit receipt.
+            sql += (" AND state='retry' AND error_code='owner_restart' AND due=0 "
+                    "AND lease_owner IS NULL AND lease_until IS NULL AND lease_token IS NULL "
+                    "AND recovery_lease_token IS ? AND attempts IS ?")
+            return sql, (*values, witness['lease_token'], head['attempts'] + 1)
+        sql += " AND state='inflight' AND lease_owner IS ? AND lease_token IS ? AND attempts IS ?"
+        return sql, (*values, witness['lease_owner'], witness['lease_token'], head['attempts'] + 1)
+
+    def _accept_records(self, records: list[dict], relative: str, receipt_relative: str, *, recovering=False):
         from downloader.news_fulltext_retained_native import FAILURE_NATIVE_REPLAY_VERSION
-        metadata_heads, http_attempts = 0, 0
+        metadata_heads, http_attempts, adopted_ids = 0, 0, set()
         with self.db:
             for record in records:
+                try:
+                    unleased = parse_unleased_article_head_witness(record)
+                except (ValueError, TypeError, KeyError):
+                    self.counter('article_capture_witness_invalid', 1)
+                    http_attempts += 1
+                    continue
+                if (record.get('article_claim_witness_json') is not None
+                        and record.get('retained_metadata_head_json') is not None):
+                    self.counter('article_capture_witness_invalid', 1)
+                    http_attempts += 1
+                    continue
                 if record.get('reviewed_native_head_json') is not None:
                     from downloader.news_fulltext_retained_native import reviewed_native_head_matches
                     if not reviewed_native_head_matches(self, record):
@@ -4750,12 +5486,89 @@ class NewsQueue:
                     self.db.execute('UPDATE articles SET body_bytes=?,body_sha256=?,parquet_path=? WHERE id=?',
                                     (record['body_bytes'], record['body_sha256'], relative,
                                      bytes.fromhex(record['article_id'])))
+                    adopted_ids.add(bytes.fromhex(record['article_id']))
                     metadata_heads += 1
                     continue
-                updated = self.db.execute("""UPDATE articles SET state='complete',error_code=NULL,captured_at_utc=?,last_checked_at_utc=?,body_bytes=?,
+                try:
+                    retained_head = any(record.get(key) is not None for key in (
+                        'reviewed_native_head_json', 'retained_failure_head_json',
+                        'retained_supplement_head_json'))
+                    # Retained-source evidence needs both its own source/head
+                    # checks and the unique claim. Pre-token receipts may only
+                    # recover a head that has no modern active/recovery token.
+                    if retained_head and record.get('article_claim_witness_json') is None:
+                        fence = (' AND lease_token IS NULL AND recovery_lease_token IS NULL', ())
+                    else:
+                        fence = self._article_capture_commit_fence(record, recovering=recovering, unleased=unleased)
+                    preserve_newer_check = False
+                    if unleased is not None:
+                        head = unleased['head']
+                        legacy_recovery_without_request_clock = (
+                            recovering and unleased['contract_version'] == _UNLEASED_LEGACY_HEAD_WITNESS_VERSION)
+                        if ((unleased['contract_version'] == UNLEASED_ARTICLE_HEAD_WITNESS_VERSION
+                             or legacy_recovery_without_request_clock)
+                                and head['last_checked_at_utc'] is None
+                                and (head['error_code'] is not None or head['state'] not in {'pending', 'complete'})):
+                            # A non-pristine status without a check clock is
+                            # not proof that a bulk response may clear it.
+                            preserve_newer_check = True
+                        ordering_clock = None
+                        if head['last_checked_at_utc'] is not None or head['body_sha256'] is not None:
+                            if not isinstance(record.get('captured_at_utc'), str):
+                                raise ValueError('unverified_bulk_capture_clock')
+                            captured = datetime.fromisoformat(record['captured_at_utc'].replace('Z', '+00:00'))
+                            if captured.tzinfo is None or captured.utcoffset() is None:
+                                raise ValueError('unverified_bulk_capture_clock')
+                            if (unleased['contract_version'] == _UNLEASED_LEGACY_HEAD_WITNESS_VERSION
+                                    and not legacy_recovery_without_request_clock):
+                                ordering_clock = captured
+                            elif (unleased['contract_version'] == UNLEASED_ARTICLE_HEAD_WITNESS_VERSION
+                                  and unleased['request_started_at_utc'] is not None):
+                                started = datetime.fromisoformat(unleased['request_started_at_utc'].replace('Z', '+00:00'))
+                                if started <= captured:
+                                    ordering_clock = started
+                            if ordering_clock is None:
+                                # Keep recent failure state; an exact body
+                                # version can still be retained as evidence.
+                                preserve_newer_check = preserve_newer_check or bool(head['last_checked_at_utc'] or head['error_code'])
+                                if head['body_sha256'] is not None:
+                                    fence = (' AND 0', ())
+                            elif head['last_checked_at_utc'] is not None:
+                                checked = datetime.fromisoformat(head['last_checked_at_utc'].replace('Z', '+00:00'))
+                                if checked.tzinfo is None or checked.utcoffset() is None:
+                                    raise ValueError('unverified_bulk_check_clock')
+                                # A late live response, just like a retained
+                                # replay, cannot erase a newer HTTP outcome.
+                                preserve_newer_check = preserve_newer_check or checked >= ordering_clock
+                            if ordering_clock is not None and head['body_sha256'] is not None:
+                                body_clock = head['captured_at_utc']
+                                if body_clock is None:
+                                    fence = (' AND 0', ())  # No ordering proof for the current body.
+                                else:
+                                    current_body = datetime.fromisoformat(body_clock.replace('Z', '+00:00'))
+                                    if current_body.tzinfo is None or current_body.utcoffset() is None:
+                                        raise ValueError('unverified_bulk_body_clock')
+                                    if current_body >= ordering_clock:
+                                        fence = (' AND 0', ())  # Keep the newer head; retain this immutable version.
+                except (ValueError, TypeError, KeyError, OverflowError):
+                    self.counter('article_capture_witness_invalid', 1)
+                    http_attempts += 1
+                    continue
+                fence_sql, fence_values = fence if fence is not None else ('', ())
+                if preserve_newer_check:
+                    # An older source observation proves a body, not a new
+                    # publisher check or clearance of a later failure.
+                    updated = self.db.execute("""UPDATE articles SET captured_at_utc=?,body_bytes=?,body_sha256=?,parquet_path=?,
+                        metadata_order_day=CASE WHEN coalesce(metadata_order_day,'')='' THEN ? ELSE metadata_order_day END
+                        WHERE id=?""" + fence_sql,
+                        (record['captured_at_utc'], record['body_bytes'], record['body_sha256'], relative,
+                         accepted_publication_sort_day(record.get('published_at_raw')),
+                         bytes.fromhex(record['article_id']), *fence_values))
+                else:
+                    updated = self.db.execute("""UPDATE articles SET state='complete',error_code=NULL,captured_at_utc=?,last_checked_at_utc=?,body_bytes=?,
                     body_sha256=?,parquet_path=?,etag=?,last_modified=?,authorization_fingerprint=?,validator_url=?,
                     metadata_order_day=CASE WHEN coalesce(metadata_order_day,'')='' THEN ? ELSE metadata_order_day END,
-                    lease_owner=NULL,lease_until=NULL WHERE id=?""",
+                    lease_owner=NULL,lease_until=NULL,lease_token=NULL,recovery_lease_token=NULL WHERE id=?""" + fence_sql,
                     (record["captured_at_utc"], (json.loads(record['retained_failure_head_json'])['last_checked_at_utc']
                         if record.get('retained_failure_head_json') is not None else
                         json.loads(record['reviewed_native_head_json'])['last_checked_at_utc']
@@ -4763,7 +5576,11 @@ class NewsQueue:
                      record.get("etag"), record.get("last_modified"), record["authorization_fingerprint"],
                      record.get('source_request_url') if record.get('etag') or record.get('last_modified') else None,
                      accepted_publication_sort_day(record.get('published_at_raw')),
-                     bytes.fromhex(record["article_id"])))
+                     bytes.fromhex(record["article_id"]), *fence_values))
+                if not updated.rowcount and fence is not None:
+                    self.counter('article_capture_superseded_at_commit', 1)
+                if updated.rowcount:
+                    adopted_ids.add(bytes.fromhex(record['article_id']))
                 if updated.rowcount and record.get('provider') == 'cnyes':
                     # The checkpoint and accepted source head commit together.
                     # This never sends a request or changes the source clock.
@@ -4773,11 +5590,15 @@ class NewsQueue:
             self.db.execute("INSERT INTO accepted_batches VALUES (?,?)", (relative, receipt_relative))
             from downloader.news_fulltext_cnyes_history import register_accepted_body_batch
             register_accepted_body_batch(self, records, relative, receipt_relative)
+            from downloader.news_fulltext_cnyes_checkpoint import register as register_cnyes_checkpoint
+            register_cnyes_checkpoint(self, records, relative, receipt_relative)
+            from downloader.news_fulltext_bulk_checkpoint import register as register_bulk_checkpoint
+            register_bulk_checkpoint(self, records, relative, receipt_relative)
             self.counter("article_attempts_finished", http_attempts)
             self.counter("accepted_versions", len(records))
             if metadata_heads:
                 self.counter('retained_metadata_versions', metadata_heads)
-        return metadata_heads
+        return metadata_heads, adopted_ids
 
     def recover_acceptance(self, *, receipt_paths=None, read_ahead_workers=None):
         # Only small commit receipts, not a recursive raw-data scan. Replay files
@@ -4786,16 +5607,16 @@ class NewsQueue:
         # covering indexed seek in bounded chunks replaces one SQL round trip
         # per historical receipt. Never skip orphan digest/row validation or
         # use filename/mtime as proof. Explicit paths serve read-only benchmarks.
-        paths = (sorted_acceptance_receipt_paths(self.root) if receipt_paths is None
-                 else iter(sorted(receipt_paths)))
         receipt_directory = self.root / 'receipts'
         if read_ahead_workers is not None and (type(read_ahead_workers) is not int or not 0 <= read_ahead_workers <= 2):
             raise ValueError('bounded_batched_receipt_readers_required')
-        observation = {'contract_version': 1, 'mode': 'adaptive' if read_ahead_workers is None else 'explicit',
+        observation = {'contract_version': ACCEPTANCE_RECEIPT_IO_CONTRACT_VERSION,
+            'mode': 'adaptive' if read_ahead_workers is None else 'explicit',
             'adaptive_strategy_version': ADAPTIVE_RECEIPT_STRATEGY_VERSION,
             'prefix_io_contract_version': RECEIPT_PREFIX_IO_VERSION,
             'chosen_readers': read_ahead_workers or 0, 'probes_checked': 0, 'last_probe': None,
             'receipts_decoded': 0, 'prefetched_inputs': 0, 'synchronous_inputs': 0, 'completed': False,
+            'transient_read_retries': 0, 'transient_read_retry_successes': 0,
             'started_readers_after_receipts': 0 if read_ahead_workers else None,
             'reader_mode_switches': 0, 'prefetch_slices': 0,
             'adaptive_prefetch_slice_receipts': RECEIPT_CHUNK * RECEIPT_PREFETCH_MAX_CHUNKS,
@@ -4842,6 +5663,23 @@ class NewsQueue:
                         chunk_number = 0
 
         try:
+            if receipt_paths is None:
+                try:
+                    paths = sorted_acceptance_receipt_paths(self.root, strict_root=True)
+                    observation['receipt_directory_state'] = 'scanned'
+                except FileNotFoundError:
+                    observation['receipt_directory_state'] = 'absent'
+                    # A brand-new or idle legacy queue may have no directory
+                    # until the first body is accepted. Once a committed batch
+                    # exists, an absent root is a local storage failure, not an
+                    # empty frontier. This does not prove individual receipts
+                    # are present; the independent verifier still checks them.
+                    if self.db.execute('SELECT 1 FROM accepted_batches LIMIT 1').fetchone():
+                        raise
+                    paths = iter(())
+            else:
+                paths = iter(sorted(receipt_paths))
+                observation['receipt_directory_state'] = 'explicit_paths'
             with self.metrics.measure('acceptance_recovery'), closing(inputs()) as input_batches:
                 for input_chunk in input_batches:
                     self._recover_acceptance_chunk(input_chunk, receipt_directory, observation)
@@ -4869,8 +5707,15 @@ class NewsQueue:
             + ','.join('?' for _ in chunk) + ')', relative_receipts)}
         for (receipt_path, raw, error), receipt_relative in zip(input_chunk, relative_receipts):
             if error is not None:
-                raise error
-            if raw is None:
+                # A worker has not decoded or committed this input. Retry a
+                # transient read once on the owner, at this exact position;
+                # never repeat the already-replayed prefix of the history.
+                if not isinstance(error, OSError) or error.errno not in _TRANSIENT_RECEIPT_READ_ERRNOS:
+                    raise error
+                observation['synchronous_inputs'] += 1
+                self._recover_acceptance_receipt(receipt_path, receipt_relative, committed,
+                    receipt_text=self._retry_acceptance_receipt_read(receipt_path))
+            elif raw is None:
                 observation['synchronous_inputs'] += 1
                 self._recover_acceptance_receipt(receipt_path, receipt_relative, committed)
             else:
@@ -4878,6 +5723,13 @@ class NewsQueue:
                 self._recover_acceptance_receipt(receipt_path, receipt_relative, committed,
                     receipt_text=acceptance_receipt_input_from_bytes(raw))
             observation['receipts_decoded'] += 1
+
+    def _retry_acceptance_receipt_read(self, receipt_path):
+        """One bounded reread, with all acceptance still performed by the owner."""
+        self.acceptance_receipt_io['transient_read_retries'] += 1
+        receipt_text = read_acceptance_receipt_input(receipt_path)
+        self.acceptance_receipt_io['transient_read_retry_successes'] += 1
+        return receipt_text
 
     def _recover_acceptance_receipt(self, receipt_path, receipt_relative, committed, *, receipt_text=None):
         # I/O may supply a complete bounded original input. JSON decoding,
@@ -4888,11 +5740,15 @@ class NewsQueue:
         # digest/row/contract verification are unchanged.
         if receipt_text is None:
             probe = getattr(self, '_acceptance_read_probe', None)
-            if probe is None:
-                receipt_text = read_acceptance_receipt_input(receipt_path)
-            else:
+            if probe is not None:
                 cpu, wall = time.process_time(), time.perf_counter()
+            try:
                 receipt_text = read_acceptance_receipt_input(receipt_path)
+            except OSError as error:
+                if error.errno not in _TRANSIENT_RECEIPT_READ_ERRNOS:
+                    raise
+                receipt_text = self._retry_acceptance_receipt_read(receipt_path)
+            if probe is not None:
                 probe['wall_seconds'] += time.perf_counter() - wall
                 probe['cpu_seconds'] += time.process_time() - cpu
                 probe['receipts'] += 1
@@ -4907,7 +5763,7 @@ class NewsQueue:
         table = pq.read_table(target)
         if table.num_rows != receipt["rows"]:
             raise ValueError("news_acceptance_recovery_rows_mismatch")
-        self._accept_records(table.to_pylist(), relative, receipt_relative)
+        self._accept_records(table.to_pylist(), relative, receipt_relative, recovering=True)
 
     def advance_discovery_error_rollup(self):
         """Do one low-priority local slice; a dashboard failure cannot stop capture."""
@@ -4942,6 +5798,7 @@ class NewsQueue:
                cycle: dict | None = None) -> dict:
         from downloader.news_fulltext_urls import original_source_inventory, original_url_progress
         from downloader.news_fulltext_url_metadata import inbox_progress as url_metadata_inbox_progress
+        from downloader.news_fulltext_finlab_priority import priority_progress as finlab_cnyes_priority_progress
         from downloader.news_fulltext_candidate_diagnostics import candidate_progress
         from downloader.news_fulltext_cohorts import NONBODY_SCOPE_PROGRESS_QUERY_VERSION
         from downloader.news_fulltext_cnyes_work import CONTRACT_VERSION as work_version, LOOKUP_DISCOVERY_VERSION
@@ -5022,11 +5879,24 @@ class NewsQueue:
         eligible_missing = sum(item['body_state_counts']['missing'].get(state, 0) for item in providers.values()
                                for state in ('pending', 'retry', 'retry_cooldown', 'inflight'))
         rate = accepted_this_run / run_seconds if run_seconds > 0 and accepted_this_run >= 3 else None
-        origins = self.db.execute("SELECT count(*),coalesce(sum(rows),0),coalesce(sum(invalid_urls),0) FROM origins "
-                                  "WHERE id IN (SELECT max(id) FROM origins WHERE id NOT IN "
-                                  "(SELECT origin_id FROM metadata_ingest_progress) GROUP BY receipt_path)").fetchone()
+        aliases_pending = unresolved_alias_count(self.db)
+        origins = self.db.execute(current_origins_cte(self.db) +
+                                  "SELECT count(*),coalesce(sum(rows),0),coalesce(sum(invalid_urls),0) "
+                                  "FROM current_metadata").fetchone()
         metadata_pending = self.db.execute("SELECT count(*),coalesce(sum(processed_rows),0),coalesce(sum(expected_rows),0) "
                                            "FROM metadata_ingest_progress WHERE state='pending'").fetchone()
+        metadata_errors = self.db.execute(
+            "SELECT count(*),coalesce(sum(CASE WHEN substr(error_code,1,18)='finmind_source_db:' "
+            "THEN 1 ELSE 0 END),0),coalesce(sum(CASE WHEN substr(error_code,1,22)='finlab_source_catalog:' "
+            "THEN 1 ELSE 0 END),0) FROM origin_errors e WHERE NOT EXISTS "
+            "(SELECT 1 FROM metadata_retired_receipt_targets r WHERE r.receipt_path=e.receipt_path) OR EXISTS "
+            "(SELECT 1 FROM metadata_receipt_alias_pending p WHERE p.old_target=e.receipt_path "
+            "OR p.new_target=e.receipt_path)").fetchone()
+        # The current-origin CTE above has already checked every explicit
+        # pointer; count its active selections without building it twice.
+        explicit_selections = self.db.execute(
+            "SELECT count(*) FROM metadata_current_origins h WHERE NOT EXISTS "
+            "(SELECT 1 FROM metadata_retired_receipt_targets r WHERE r.receipt_path=h.receipt_path)").fetchone()[0]
         origin_versions = self.db.execute("SELECT count(*) FROM origins").fetchone()[0]
         counters = dict(self.db.execute("SELECT key,value FROM counters"))
         with self.metrics.measure('status_cnyes_local_replay_retries'):
@@ -5043,10 +5913,25 @@ class NewsQueue:
             performance = self.metrics.snapshot()
         elapsed = performance["owner_elapsed_seconds"]
         if 'cnyes' in providers:
-            from downloader.news_fulltext_cnyes_work import progress as cnyes_work_progress
+            from downloader.news_fulltext_cnyes_work import (
+                lookup_recheck_progress, progress as cnyes_work_progress,
+            )
             providers['cnyes']['body_work_progress'] = cnyes_work_progress(self.db)
-            from downloader.news_fulltext_cnyes_history import progress as cnyes_history_progress
-            providers['cnyes']['history_list_progress'] = cnyes_history_progress(self.db, self.registry.sources.get('cnyes'))
+            with self.metrics.measure('status_cnyes_lookup_recheck_progress'):
+                providers['cnyes']['native_lookup_recheck_progress'] = lookup_recheck_progress(self.db)
+            from downloader.news_fulltext_cnyes_history import (
+                accepted_batch_scan_key, progress as cnyes_history_progress,
+            )
+            source = self.registry.sources.get('cnyes')
+            history = cnyes_history_progress(self.db, source)
+            history['original_priority_admission'] = getattr(self, '_cnyes_original_priority_view', None)
+            from downloader.news_fulltext_cnyes_priority import progress as original_priority_progress
+            history['original_priority_audit'] = original_priority_progress(self)
+            if source is not None:
+                with self.metrics.measure('status_cnyes_accepted_frontier_projection'):
+                    history['accepted_body_batch_scan'].update(_accepted_batch_frontier(
+                        self.db, accepted_batch_scan_key(source), history['accepted_body_batch_scan']))
+            providers['cnyes']['history_list_progress'] = history
             from downloader.news_fulltext_cnyes_index import PublicIndexRowsCache, progress as cnyes_index_progress
             index_rows_cache = getattr(self, '_cnyes_public_index_rows_cache', None)
             if index_rows_cache is None:
@@ -5168,20 +6053,29 @@ class NewsQueue:
             "unique_articles": sum(totals.values()), "states": dict(totals), "providers": providers,
             "accepted_text_bytes": sum(p["text_bytes"] for p in providers.values()),
             "articles_with_stored_body": sum(stored_heads.values()),
-            "metadata_partitions": origins[0], "metadata_association_rows": origins[1], "invalid_metadata_urls": origins[2],
+            "metadata_partitions": origins[0] if not aliases_pending else None,
+            "metadata_association_rows": origins[1] if not aliases_pending else None,
+            "invalid_metadata_urls": origins[2] if not aliases_pending else None,
             "metadata_inventory": {"contract_version": METADATA_INGEST_CONTRACT_VERSION, "partial_partitions": metadata_pending[0],
                                    "partial_rows_imported": metadata_pending[1], "partial_rows_expected": metadata_pending[2],
-                                   "complete_receipts_only_in_metadata_totals": True},
+                                   "finmind_catalog_errors": metadata_errors[1],
+                                   "finlab_catalog_errors": metadata_errors[2],
+                                   "receipt_alias_retargets_pending": aliases_pending,
+                                   "complete_receipts_only_in_metadata_totals": True,
+                                   "explicit_current_origins": explicit_selections if not aliases_pending else None,
+                                   "legacy_inferred_origins": origins[0] - explicit_selections if not aliases_pending else None},
             "metadata_partition_versions_retained": origin_versions,
-            "metadata_association_basis": "latest accepted version per source receipt; original stock associations retained",
+            "metadata_association_basis": "current completed version per receipt; verified alias census excludes unreferenced targets; legacy entries inferred from latest completed origin id",
             "url_metadata_inbox": url_metadata_inbox_progress(self),
+            "finlab_cnyes_priority": finlab_cnyes_priority_progress(self),
+            "retained_link_handoff": getattr(self, '_retained_link_handoff_status', None),
             "candidate_diagnostic_progress": candidate_progress(self),
             "cnyes_local_replay_retries": local_replay_retries,
             "cnyes_metadata_resource_waits": metadata_resource_waits,
             "cnyes_metadata_large_replay": metadata_large_replay,
             "cnyes_metadata_index_progress": metadata_index_progress,
             "original_url_resolution": original_url_progress(self),
-            "metadata_partition_errors": self.db.execute("SELECT count(*) FROM origin_errors").fetchone()[0],
+            "metadata_partition_errors": metadata_errors[0],
             "discovery_pending": discovery_pending,
             "discovery_errors": discovery_errors,
             "discovery_error_rollup": discovery_error_rollup,
@@ -5265,65 +6159,183 @@ def verify_bodies(root: Path) -> dict:
             db.close()
 
 
-def _verify_bodies_snapshot(root: Path, db, snapshot_at: str) -> dict:
+def _verification_receipt_inputs(root: Path, db):
+    """Match exact committed receipt identities in bounded indexed chunks.
+
+    A duplicate or a receipt written after the pinned snapshot is still read
+    and checked, but cannot provide evidence for a committed queue head. Old
+    snapshots without the owner-created index use one legacy set rather than
+    repeatedly scanning the entire acceptance table for each chunk.
+    """
+    paths = iter(sorted_acceptance_receipt_paths(root))
+    indexed = db is not None and db.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='index' AND name='accepted_batches_receipt_path'"
+    ).fetchone() is not None
+    legacy = None if db is None or indexed else {
+        tuple(row) for row in db.execute('SELECT receipt_path,path FROM accepted_batches')}
+    directory = root / 'receipts'
+    while chunk := list(islice(paths, RECEIPT_CHUNK)):
+        relatives = [('receipts/' + path.name if receipt_parent_matches(path, directory)
+                      else str(path.relative_to(root))) for path in chunk]
+        committed = ({tuple(row) for row in db.execute('SELECT receipt_path,path FROM accepted_batches '
+            'INDEXED BY accepted_batches_receipt_path WHERE receipt_path IN ('
+            + ','.join('?' for _ in chunk) + ')', relatives)} if indexed else legacy)
+        for path, relative in zip(chunk, relatives):
+            yield path, relative, committed
+
+
+BODY_BATCH_VERIFICATION_CONTRACT_VERSION = 5
+
+
+def verify_immutable_body_receipt(root: Path, receipt: dict, *, expected_parquet_path=None) -> Path:
+    """Verify the common immutable receipt envelope without decoding body columns."""
+    relative = receipt['parquet_path']
+    if expected_parquet_path is not None and relative != expected_parquet_path:
+        raise ValueError('receipt_parquet_path_mismatch')
+    target = source_path(root, relative)
+    if receipt['contract_version'] != CONTRACT_VERSION or sha256_file(target) != receipt['sha256']:
+        raise ValueError('parquet_digest_or_contract_mismatch')
+    return target
+
+
+def verify_immutable_body_batch(root: Path, receipt: dict, *, expected_parquet_path=None,
+                                include_references=True) -> dict:
+    """Validate one whole receipt and every immutable body/raw envelope.
+
+    The caller establishes whether the receipt is the committed identity in
+    its pinned queue snapshot. Identical raw bytes from distinct response IDs
+    remain distinct source observations; a shared response ID is hashed once.
+    """
     from downloader.news_fulltext_public_originals import verify_resolution_response
+    relative = receipt['parquet_path']
+    target = verify_immutable_body_receipt(root, receipt, expected_parquet_path=expected_parquet_path)
+    try:
+        table = pq.read_table(target)
+    except pa.ArrowException as error:
+        raise ValueError('parquet_decode_error:' + type(error).__name__ + ':' + str(error)[:120]) from error
+    if table.num_rows != receipt['rows']:
+        raise ValueError('parquet_row_count_mismatch')
+    records = table.to_pylist()
+    raw_envelopes = {r['article_id']: r['raw_response_body'] for r in records if r['raw_response_body'] is not None}
+    source_bytes, text_bytes = sum(map(len, raw_envelopes.values())), 0
+    raw_digests, references = {}, {}
+    for record in records:
+        if record.get('contract_version') != receipt['contract_version']:
+            raise ValueError('record_contract_version_mismatch')
+        requested_url = record.get('requested_url')
+        if (not isinstance(requested_url, str) or not requested_url
+                or hashlib.sha256(requested_url.encode()).hexdigest() != record.get('article_id')):
+            raise ValueError('record_requested_url_identity_mismatch')
+        parse_article_capture_witness(record)
+        parse_unleased_article_head_witness(record)
+        source_bytes += verify_resolution_response(record)
+        response_id = record.get('source_response_article_id') or record['article_id']
+        raw = raw_envelopes.get(response_id)
+        if raw is None:
+            raise ValueError('missing_shared_raw_response')
+        body = record['body'].encode()
+        if hashlib.sha256(body).hexdigest() != record['body_sha256']:
+            raise ValueError('body_digest_mismatch')
+        if response_id not in raw_digests:
+            raw_digests[response_id] = hashlib.sha256(raw).hexdigest()
+        if raw_digests[response_id] != record['response_sha256']:
+            raise ValueError('raw_response_digest_mismatch')
+        if len(body) != record['body_bytes'] or len(raw) != record['http_response_bytes']:
+            raise ValueError('byte_count_mismatch')
+        if record['historical_point_in_time'] or record['publish'] or record['remote_training_export']:
+            raise ValueError('unapproved_publication_or_pit_claim')
+        if record.get('capture_policy_version', 1) >= 2:
+            if record.get('collection_purpose') != 'personal_research' or record.get('fair_use_legally_determined') is not False:
+                raise ValueError('unsupported_capture_purpose_or_rights_claim')
+            if record.get('commercial_use_enabled') is not False or record.get('training_injection_enabled') is not False:
+                raise ValueError('unapproved_downstream_use')
+            if record.get('collection_basis') == 'personal_research' and record.get('rights_status') != 'not_cleared_for_reuse':
+                raise ValueError('personal_research_is_not_a_license')
+        if include_references:
+            references[(relative, record['article_id'])] = record['body_sha256']
+        text_bytes += record['body_bytes']
+    if receipt['raw_response_bytes'] != source_bytes or receipt['text_bytes'] != text_bytes:
+        raise ValueError('receipt_byte_count_mismatch')
+    return {'records': records, 'references': references, 'raw_response_bytes': source_bytes,
+            'text_bytes': text_bytes, 'distinct_source_responses_hashed': len(raw_digests)}
+
+
+def _verify_bodies_snapshot(root: Path, db, snapshot_at: str) -> dict:
     source_bytes, text_bytes, versions, errors, referenced = 0, 0, 0, [], {}
-    for receipt_path in sorted((root / "receipts").glob("*.json")):
+    committed_total = db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] if db is not None else None
+    committed_verified = committed_versions = uncommitted_versions = 0
+    uncommitted_observed = 0
+    for receipt_path, receipt_relative, committed in _verification_receipt_inputs(root, db):
         try:
             receipt = json.loads(receipt_path.read_text())
-            target = source_path(root, receipt["parquet_path"])
-            if receipt["contract_version"] != CONTRACT_VERSION or sha256_file(target) != receipt["sha256"]:
-                raise ValueError("parquet_digest_or_contract_mismatch")
-            table = pq.read_table(target)
-            if table.num_rows != receipt["rows"]:
-                raise ValueError("parquet_row_count_mismatch")
-            records = table.to_pylist()
-            raw_envelopes = {r["article_id"]: r["raw_response_body"] for r in records if r["raw_response_body"] is not None}
-            batch_source_bytes, batch_text_bytes = sum(map(len, raw_envelopes.values())), 0
-            for record in records:
-                batch_source_bytes += verify_resolution_response(record)
-                response_id = record.get("source_response_article_id") or record["article_id"]
-                raw = raw_envelopes.get(response_id)
-                if raw is None:
-                    raise ValueError("missing_shared_raw_response")
-                if hashlib.sha256(record["body"].encode()).hexdigest() != record["body_sha256"]:
-                    raise ValueError("body_digest_mismatch")
-                if hashlib.sha256(raw).hexdigest() != record["response_sha256"]:
-                    raise ValueError("raw_response_digest_mismatch")
-                if len(record["body"].encode()) != record["body_bytes"] or len(raw) != record["http_response_bytes"]:
-                    raise ValueError("byte_count_mismatch")
-                if record["historical_point_in_time"] or record["publish"] or record["remote_training_export"]:
-                    raise ValueError("unapproved_publication_or_pit_claim")
-                if record.get("capture_policy_version", 1) >= 2:
-                    if record.get("collection_purpose") != "personal_research" or record.get("fair_use_legally_determined") is not False:
-                        raise ValueError("unsupported_capture_purpose_or_rights_claim")
-                    if record.get("commercial_use_enabled") is not False or record.get("training_injection_enabled") is not False:
-                        raise ValueError("unapproved_downstream_use")
-                    if record.get("collection_basis") == "personal_research" and record.get("rights_status") != "not_cleared_for_reuse":
-                        raise ValueError("personal_research_is_not_a_license")
-                referenced[(receipt["parquet_path"], record["article_id"])] = record["body_sha256"]
-                versions += 1
-                batch_text_bytes += record["body_bytes"]
-                text_bytes += record["body_bytes"]
-            if receipt["raw_response_bytes"] != batch_source_bytes or receipt["text_bytes"] != batch_text_bytes:
-                raise ValueError("receipt_byte_count_mismatch")
-            source_bytes += batch_source_bytes
+            is_committed = db is None or (receipt_relative, receipt["parquet_path"]) in committed
+            if not is_committed:
+                uncommitted_observed += 1
+            batch = verify_immutable_body_batch(root, receipt)
+            records = batch['records']
+            if is_committed:
+                referenced.update(batch['references'])
+                if db is not None:
+                    committed_verified += 1
+                    committed_versions += len(records)
+            elif db is not None:
+                uncommitted_versions += len(records)
+            versions += len(records)
+            text_bytes += batch['text_bytes']
+            source_bytes += batch['raw_response_bytes']
         except (OSError, ValueError, KeyError, TypeError, pa.ArrowException) as error:
             errors.append({"receipt": str(receipt_path.relative_to(root)), "error": type(error).__name__ + ":" + str(error)[:160]})
-    complete_heads = 0
+    complete_heads = complete_heads_checked = 0
+    stored_heads = verified_stored_heads = noncomplete_stored_heads = verified_noncomplete_stored_heads = 0
+    stored_counter_verified = None
     if db is not None:
-        for key, path, digest in db.execute("SELECT id,parquet_path,body_sha256 FROM articles WHERE state='complete'"):
-            complete_heads += 1
-            if referenced.get((path, key.hex())) != digest:
+        if committed_verified != committed_total:
+            errors.append({"error": "committed_receipt_missing_or_invalid",
+                           "count": committed_total - committed_verified})
+        for key, path, digest, state in db.execute("SELECT id,parquet_path,body_sha256,state FROM articles "
+                "WHERE state='complete' OR body_sha256 IS NOT NULL OR parquet_path IS NOT NULL"):
+            stored = path is not None or digest is not None
+            valid = bool(path and digest and referenced.get((path, key.hex())) == digest)
+            complete_heads_checked += state == 'complete'
+            complete_heads += state == 'complete' and valid
+            stored_heads += stored
+            verified_stored_heads += stored and valid
+            noncomplete_stored_heads += state != 'complete' and stored
+            verified_noncomplete_stored_heads += state != 'complete' and stored and valid
+            if not valid:
                 errors.append({"article_id": key.hex(), "error": "queue_head_missing_verified_body"})
-        actual = dict(((p, s), (n, b)) for p, s, n, b in db.execute(
-            "SELECT provider,state,count(*),coalesce(sum(body_bytes),0) FROM articles GROUP BY provider,state"))
-        metrics = dict(((p, s), (n, b)) for p, s, n, b in db.execute(
-            "SELECT provider,state,articles,body_bytes FROM state_metrics WHERE articles>0"))
+        has_stored_counter = any(row[1] == 'stored_body_urls' for row in db.execute('PRAGMA table_info(state_metrics)'))
+        if has_stored_counter:
+            actual = dict(((p, s), (n, b, stored)) for p, s, n, b, stored in db.execute(
+                "SELECT provider,state,count(*),coalesce(sum(body_bytes),0),sum(body_sha256 IS NOT NULL) "
+                "FROM articles GROUP BY provider,state"))
+            metrics = dict(((p, s), (n, b, stored)) for p, s, n, b, stored in db.execute(
+                "SELECT provider,state,articles,body_bytes,stored_body_urls FROM state_metrics WHERE articles>0"))
+            stored_counter_verified = ({key: value[2] for key, value in actual.items()}
+                                       == {key: value[2] for key, value in metrics.items()})
+        else:
+            actual = dict(((p, s), (n, b)) for p, s, n, b in db.execute(
+                "SELECT provider,state,count(*),coalesce(sum(body_bytes),0) FROM articles GROUP BY provider,state"))
+            metrics = dict(((p, s), (n, b)) for p, s, n, b in db.execute(
+                "SELECT provider,state,articles,body_bytes FROM state_metrics WHERE articles>0"))
         if actual != metrics:
             errors.append({"error": "incremental_progress_metrics_mismatch"})
-    return {"contract_version": CONTRACT_VERSION, "verified_at_utc": utc_now(), "accepted": not errors,
+    return {"contract_version": CONTRACT_VERSION, "verification_contract_version": 6,
+            "body_batch_verification_contract_version": BODY_BATCH_VERIFICATION_CONTRACT_VERSION,
+            "verified_at_utc": utc_now(), "accepted": not errors,
             "body_versions_verified": versions, "complete_queue_heads_verified": complete_heads,
+            "committed_body_versions_verified": committed_versions if db is not None else None,
+            "uncommitted_body_versions_verified": uncommitted_versions if db is not None else None,
+            "body_versions_and_bytes_basis": "valid receipt rows including duplicate or uncommitted receipts; committed versions are separately counted",
+            "complete_queue_heads_checked": complete_heads_checked,
+            "stored_body_queue_heads_checked": stored_heads,
+            "stored_body_queue_heads_verified": verified_stored_heads,
+            "noncomplete_stored_body_queue_heads_checked": noncomplete_stored_heads,
+            "noncomplete_stored_body_queue_heads_verified": verified_noncomplete_stored_heads,
+            "stored_body_counter_verified": stored_counter_verified,
+            "committed_batches_in_snapshot": committed_total,
+            "committed_batches_verified": committed_verified if db is not None else None,
+            "uncommitted_receipts_observed": uncommitted_observed if db is not None else None,
             "raw_response_bytes": source_bytes, "text_bytes": text_bytes, "errors": errors,
             "historical_completeness_verified": False, "publish": False,
-            "database_snapshot_at_utc": snapshot_at, "verification_scope": "immutable receipts and consistent read-only queue snapshot; not future writes or all source history"}
+            "database_snapshot_at_utc": snapshot_at, "verification_scope": "immutable receipts and all stored or complete heads in a consistent read-only queue snapshot; not future writes or all source history"}

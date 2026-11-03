@@ -1,5 +1,6 @@
 from dataclasses import replace
 import json
+import hashlib
 import os
 from pathlib import Path
 import time
@@ -201,6 +202,149 @@ def fixture(tmp_path, monkeypatch, *, benchmark_d=False, offline_d=False):
     return spec, packed, options
 
 
+def reviewed_legacy_fixture(tmp_path, monkeypatch):
+    spec, packed, options = fixture(tmp_path, monkeypatch)
+    # Remove the C scratch exemption: this test must admit only the new exact
+    # dataset/release/retirement binding, while keeping real full recovery.
+    monkeypatch.setattr(module, 'C_TEMP_STAGE_ROOT', tmp_path / 'other-c-scratch')
+    monkeypatch.setattr(module, 'LEGACY_D_STAGE_ROOT', spec.stage_root)
+    selected = resolve_latest_packed(packed, spec.dataset)
+    retired = options['state_root'] / 'retirements' / (spec.dataset + '.json')
+    binding = {'relative_root': spec.relative_root, 'snapshot_id': selected.manifest['snapshot_id'],
+               'manifest_sha256': selected.manifest_sha256,
+               'retirement_receipt_sha256': hashlib.sha256(retired.read_bytes()).hexdigest()}
+    policy = tmp_path / 'reviewed-stage.json'
+    policy.write_text(json.dumps({'schema_version': 1, 'contract': 'reviewed_retired_legacy_d_encoding_v1',
+        'authority_node_id': 'penguin', 'stage_root': str(spec.stage_root), 'datasets': {spec.dataset: binding}}))
+    monkeypatch.setattr(module, 'REVIEWED_STAGE_POLICY', policy)
+    return spec, packed, options, policy, binding
+
+
+def test_reviewed_old_d_encoding_reuses_complete_recovery_and_preserves_cold(tmp_path, monkeypatch):
+    spec, packed, options, _policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    before = {path.relative_to(packed).as_posix(): path.read_bytes()
+              for path in packed.rglob('*') if path.is_file()}
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    assert module._d_stage_file_workers(spec, spec.stage_root / spec.dataset / 'archive') == 4
+    result = apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                      owned_verified_plan=plan, **options)
+    assert result['pruned'] and result['reclaimed_allocated_file_bytes'] > 0
+    assert {path.relative_to(packed).as_posix(): path.read_bytes()
+            for path in packed.rglob('*') if path.is_file()} == before
+    assert verify_cold_archive(spec, packed)['decoded_originals_verified']
+
+
+def test_reviewed_stage_fuses_exact_commitments_and_reuses_decode_only_for_same_generation(tmp_path, monkeypatch):
+    spec, packed, options, _policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    decode, reconstruct = module.verify_archive_directory, module.verify_packed_snapshot
+    calls, cold_calls = [], []
+    def decoded(*args, **kwargs):
+        calls.append(args[0])
+        return decode(*args, **kwargs)
+    def recovered(*args, **kwargs):
+        cold_calls.append(kwargs)
+        return reconstruct(*args, **kwargs)
+    monkeypatch.setattr(module, 'verify_archive_directory', decoded)
+    monkeypatch.setattr(module, 'verify_packed_snapshot', recovered)
+    plan = plan_archive_stage_prune(spec, packed, **options)
+    proof_time = plan['full_verification']['verified_at_epoch']
+    result = apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                      owned_verified_plan=plan, **options)
+    assert len(calls) == 1 and len(cold_calls) == 1
+    assert cold_calls[0]['reconstruct_all'] is True and 'materialized_path' not in cold_calls[0]
+    assert result['pruned'] and result['full_verification']['verified_at_epoch'] == proof_time
+    assert result['encoding_decode_reuse']['verification_time_extended'] is False
+    assert verify_cold_archive(spec, packed)['decoded_originals_verified']
+
+
+@pytest.mark.parametrize('mutation', ['cold-commitment', 'portable-tree', 'decode-generation', 'cold-counts', 'expired'])
+def test_reviewed_fused_proof_never_replaces_complete_binding_or_fresh_generation(tmp_path, monkeypatch, mutation):
+    spec, packed, options, _policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    if mutation == 'cold-commitment':
+        load = module._load_inventory
+        def wrong(*args):
+            rows = [dict(row) for row in load(*args)]
+            for row in rows:
+                if row['kind'] == 'file':
+                    row['sha256'] = '0'*64
+                    break
+            return rows
+        monkeypatch.setattr(module, '_load_inventory', wrong)
+    elif mutation == 'portable-tree':
+        monkeypatch.setattr(module, 'scan_tree', lambda *a, **kw: {'portable_fingerprint_sha256': '0'*64})
+    if mutation in {'cold-commitment', 'portable-tree'}:
+        with pytest.raises(SnapshotError, match='commitments|portable metadata'):
+            plan_archive_stage_prune(spec, packed, **options)
+    else:
+        plan = plan_archive_stage_prune(spec, packed, **options)
+        if mutation == 'decode-generation':
+            plan['full_verification']['encoding_stage_fingerprint'] = '0'*64
+        elif mutation == 'cold-counts':
+            plan['full_verification']['complete_cold_reconstruction']['independently_reconstructed_files'] = 0
+        else:
+            plan['full_verification']['verified_at_epoch'] = time.time()-1501
+        with pytest.raises(SnapshotError):
+            apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                      owned_verified_plan=plan, **options)
+    assert (spec.stage_root / spec.dataset).is_dir()
+
+
+def test_reviewed_stage_uses_enrolled_vast_policy_only_with_native_d_authority(tmp_path, monkeypatch):
+    from stockagent.data_sync import packed_verification
+    spec, packed, options, _policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    calls = []
+    monkeypatch.setattr(module, '_native_read_options', lambda root: {'d_primary_native_blob_reads': True})
+    monkeypatch.setattr(packed_verification, 'configuration', lambda dataset: calls.append(dataset) or {'enabled': True})
+    recovery = module._reviewed_stage_recovery_options(spec, packed, options['state_root'])
+    assert calls == [spec.dataset] and recovery['d_primary_native_original_hashes'] is True
+    assert recovery['pack_verification']['evidence_directory'].startswith(str(options['state_root']/'stage-pruning'/spec.dataset))
+    monkeypatch.setattr(module, '_native_read_options', lambda root: {})
+    assert module._reviewed_stage_recovery_options(spec, packed, options['state_root']) == {}
+    assert calls == [spec.dataset]
+
+
+def test_reviewed_native_encoding_path_cannot_admit_unlisted_or_other_owners(tmp_path, monkeypatch):
+    spec, _packed, _options, _policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    monkeypatch.setattr(module, 'load_legacy_specs', lambda _path: {spec.dataset: spec})
+    source = spec.stage_root / spec.dataset / 'archive/payload/test.gz'
+    assert module.reviewed_retired_stage_path(source)
+    assert module.reviewed_retired_stage_path(spec.stage_root/f'.{spec.dataset}.pruning-{os.getpid()}'/'archive/payload/test.gz')
+    for other in (spec.stage_root/'other/archive/payload/test.gz',
+                  spec.stage_root/spec.dataset/'receipts/test.gz',
+                  spec.stage_root/f'.{spec.dataset}.pruning-{os.getpid()+1}'/'archive/payload/test.gz'):
+        assert not module.reviewed_retired_stage_path(other)
+
+
+@pytest.mark.parametrize('mutation', ['other-dataset', 'manifest', 'retirement', 'redirect-policy',
+                                      'reappeared-source', 'binding-changed-after-plan'])
+def test_reviewed_old_d_encoding_rejects_unbound_or_changed_inputs(tmp_path, monkeypatch, mutation):
+    spec, packed, options, policy, _binding = reviewed_legacy_fixture(tmp_path, monkeypatch)
+    plan = plan_archive_stage_prune(spec, packed, **options) if mutation == 'binding-changed-after-plan' else None
+    data = json.loads(policy.read_text())
+    if mutation == 'other-dataset':
+        data['datasets']['unregistered'] = data['datasets'].pop(spec.dataset)
+    elif mutation in {'manifest', 'binding-changed-after-plan'}:
+        data['datasets'][spec.dataset]['manifest_sha256'] = '0' * 64
+    elif mutation == 'retirement':
+        retired = options['state_root'] / 'retirements' / (spec.dataset + '.json')
+        retired.write_bytes(retired.read_bytes() + b' ')
+    elif mutation == 'redirect-policy':
+        real = policy.with_suffix('.real')
+        policy.rename(real)
+        policy.symlink_to(real)
+    else:
+        (options['artifact_root'] / spec.relative_root).mkdir(parents=True)
+    if mutation not in {'retirement', 'redirect-policy', 'reappeared-source'}:
+        policy.write_text(json.dumps(data))
+    with pytest.raises(SnapshotError):
+        if plan is not None:
+            apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                      owned_verified_plan=plan, **options)
+        else:
+            plan_archive_stage_prune(spec, packed, **options)
+    assert (spec.stage_root / spec.dataset).is_dir()
+
+
 @pytest.mark.parametrize('after_audit', [False, True])
 def test_stage_prune_keeps_actual_fd_parser_and_fresh_use_gate_in_isolated_proc(
     tmp_path, monkeypatch, after_audit,
@@ -286,6 +430,40 @@ def test_d_stage_parallel_receipt_verification_rejects_corruption(tmp_path, monk
     with pytest.raises(SnapshotError, match='per-file receipt differs'):
         plan_archive_stage_prune(spec, packed, **options)
     assert stage.is_dir()
+
+
+def test_stage_prune_progress_observes_full_work_but_is_not_a_receipt(tmp_path, monkeypatch):
+    spec, packed, options = fixture(tmp_path, monkeypatch, offline_d=True)
+    observations = []
+    plan = plan_archive_stage_prune(spec, packed, progress=observations.append, **options)
+    planned_steps = {row['prune_step'] for row in observations}
+    assert {'plan-initial-stage-fingerprint', 'plan-verify-archive', 'plan-reconstruct-cold',
+            'plan-check-receipts', 'plan-final-stage-fingerprint'} <= planned_steps
+    receipt_counts = [row for row in observations if row['prune_step'] == 'plan-check-receipts']
+    assert receipt_counts[0]['completed_items'] == 0
+    assert receipt_counts[-1]['completed_items'] == receipt_counts[-1]['total_items'] == 2
+    assert all(row['acceptance_proof'] is False for row in observations)
+    assert all(row['total_items'] is None for row in observations
+               if row['stage'] == 'scan-stage-metadata')
+    result = apply_archive_stage_prune(spec, packed, expected_fingerprint=plan['stage_fingerprint'],
+                                      owned_verified_plan=plan, progress=observations.append, **options)
+    assert result['pruned'] is True
+    assert {'apply-before-rename-fingerprint', 'apply-after-rename-fingerprint',
+            'apply-verify-quarantine-archive', 'apply-final-stage-fingerprint',
+            'apply-unlink-quarantine'} <= {row['prune_step'] for row in observations}
+    assert all(row['acceptance_proof'] is False for row in observations)
+    assert verify_cold_archive(spec, packed)['decoded_originals_verified']
+
+
+def test_stage_prune_progress_does_not_turn_corruption_into_a_receipt(tmp_path, monkeypatch):
+    spec, packed, options = fixture(tmp_path, monkeypatch, offline_d=True)
+    stage = spec.stage_root / spec.dataset
+    next((stage / 'receipts').iterdir()).write_text('{}')
+    observations = []
+    with pytest.raises(SnapshotError, match='per-file receipt differs'):
+        plan_archive_stage_prune(spec, packed, progress=observations.append, **options)
+    assert observations and all(row['acceptance_proof'] is False for row in observations)
+    assert stage.is_dir() and not list(stage.parent.glob(f'.{spec.dataset}.pruning-*'))
 
 
 def test_offline_d_scratch_uses_exact_cold_recovery_and_quarantine_before_prune(tmp_path, monkeypatch):
@@ -545,9 +723,36 @@ def test_canonical_finisher_resumes_expired_stage_quarantine_without_recreating_
     accepted = cleanup.finish_retirement(spec, SimpleNamespace(sync_root=packed), target, retired,
         fixed_d_stage_only=True, expected_fixed_manifest_sha256=plan['manifest_sha256'])
     assert accepted['retired'] is True and accepted['cold_objects_deleted'] == 0
+    progress = json.loads((target / 'stage-prune-progress.json').read_text())
+    assert progress['state'] == 'completed' and progress['prune_step'] == 'stage-prune-receipt-written'
+    assert progress['acceptance_proof'] is False and (target / 'stage-pruned.json').is_file()
+    phases = json.loads((target / 'phase-history.json').read_text())['events']
+    assert {'plan-encoding-stage-prune', 'apply-encoding-stage-prune'} <= {row['phase'] for row in phases}
     assert not stage.exists() and not list(spec.stage_root.glob(f'.{spec.dataset}.pruning-*'))
     assert list(target.glob('stage-quarantine-recovery-*.json'))
     assert verify_cold_archive(spec, packed)['decoded_originals_verified']
+
+
+def test_canonical_finisher_reports_prune_failure_without_acceptance(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    spec, packed, options = fixture(tmp_path, monkeypatch, offline_d=True)
+    target = tmp_path / 'retirement-receipts'
+    target.mkdir()
+    release = resolve_latest_packed(packed, spec.dataset)
+    stage = spec.stage_root / spec.dataset
+    next((stage / 'receipts').iterdir()).write_text('{}')
+    monkeypatch.setattr(cleanup, 'source_layout', lambda _: (
+        options['artifact_root'], tmp_path / 'mirror', options['state_root'], tmp_path / 'activations'))
+    retired = {'deleted': True, 'snapshot_id': release.manifest['snapshot_id'],
+               'manifest_sha256': release.manifest_sha256, 'reclaimed_allocated_file_bytes': 1234}
+    with pytest.raises(SnapshotError, match='per-file receipt differs'):
+        cleanup.finish_retirement(spec, SimpleNamespace(sync_root=packed), target, retired,
+            fixed_d_stage_only=True, expected_fixed_manifest_sha256=release.manifest_sha256)
+    progress = json.loads((target / 'stage-prune-progress.json').read_text())
+    assert progress['state'] == 'failed' and progress['acceptance_proof'] is False
+    assert stage.is_dir() and not (target / 'stage-pruned.json').exists()
+    assert not (target / 'acceptance.json').exists()
 
 
 @pytest.mark.parametrize('benchmark_d', [False, True])

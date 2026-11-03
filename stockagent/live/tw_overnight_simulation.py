@@ -13,7 +13,6 @@ assumption because a level-one snapshot cannot prove queue allocation.
 from __future__ import annotations
 
 from datetime import datetime, time
-import json
 import math
 import os
 from pathlib import Path
@@ -29,7 +28,6 @@ from stockagent.live.tw_day_trade_simulation import (
     ModeSpec,
     TAIPEI,
     TwDayTradeSimulationEngine,
-    _atomic_json,
     _finite,
     _now_taipei,
     _parse_timestamp,
@@ -1202,14 +1200,9 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
         if changed_markets:
             self._persist(observed)
 
-    def _persist(self, now: datetime | None = None) -> None:
-        observed = _now_taipei(now)
-        super()._persist(observed)
-        # Reuse the battle-tested atomic state/position publication, then
-        # replace its day-trade schedule description with this product's actual
-        # contract.  This status file is display metadata; the ledgers remain
-        # authoritative and were fsynced before the state revision advanced.
-        status = json.loads(self.status_path.read_text(encoding="utf-8"))
+    def _status_projection(self, status: dict[str, Any]) -> dict[str, Any]:
+        # Status participates in the same financial read fence as positions.
+        # Never rewrite it AFTER the superclass has acknowledged its generation.
         status["product"] = "tw_overnight"
         status["overnight_contract_version"] = OVERNIGHT_CONTRACT_VERSION
         public_modes = status.get("modes") or {}
@@ -1258,7 +1251,7 @@ class TwOvernightSimulationEngine(TwDayTradeSimulationEngine):
                 "mandatory_open_exit_completed_at",
             ):
                 public_mode[key] = state_mode.get(key)
-        _atomic_json(self.status_path, status)
+        return status
 
 
 __all__ = [

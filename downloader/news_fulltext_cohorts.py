@@ -426,12 +426,38 @@ def validate_declared_original(db, registry, url, witness):
         raise ValueError(error) from None
 
 
+class DeclaredOriginalProofConflict(OSError):
+    """An immutable local proof conflicts; it is not a bad source witness."""
+
+
+def _persist_declared_original_proof(root, relative, payload):
+    try:
+        _persist_immutable_proof(root, relative, payload)
+    except ValueError as error:
+        raise DeclaredOriginalProofConflict('declared_original_local_proof_conflict') from error
+
+
 def approve_declared_original(queue, url, witness):
     """Add one immutable acquisition membership inside the owner's transaction.
 
     No independent commit, network request, body replay, failure reset or due
-    reset. The caller's URL/cursor transaction makes interruption idempotent.
+    reset. A savepoint rolls back partial admission even when the caller
+    classifies a ValueError and continues its enclosing transaction.
     """
+    if not queue.db.in_transaction:
+        queue.db.execute('BEGIN')
+    queue.db.execute('SAVEPOINT declared_original_admission')
+    try:
+        result = _approve_declared_original(queue, url, witness)
+    except BaseException:
+        queue.db.execute('ROLLBACK TO declared_original_admission')
+        queue.db.execute('RELEASE declared_original_admission')
+        raise
+    queue.db.execute('RELEASE declared_original_admission')
+    return result
+
+
+def _approve_declared_original(queue, url, witness):
     from downloader.news_fulltext_queue import utc_now
     from downloader.news_fulltext_repairs import _bytes
     source, proof = validate_declared_original(queue.db, queue.registry, url, witness)
@@ -448,7 +474,7 @@ def approve_declared_original(queue, url, witness):
         raise ValueError('declared_original_already_approved')
     proof_sha = hashlib.sha256(proof).hexdigest()
     private = 'capture_cohorts/supplement_sources/' + proof_sha + '.json'
-    _persist_immutable_proof(queue.root, private, proof)
+    _persist_declared_original_proof(queue.root, private, proof)
     digest = hashlib.sha256((url + '\n').encode()).hexdigest()
     receipt = {'contract_version': 2, 'scope_kind': DECLARED_ACQUISITION_KIND, 'provider': source.provider,
         'urls': [url], 'urls_sha256': digest, 'original_cohort_unchanged': True, 'publish': False,
@@ -460,7 +486,7 @@ def approve_declared_original(queue, url, witness):
     payload = _bytes(receipt)
     receipt_sha = hashlib.sha256(payload).hexdigest()
     relative = f'capture_cohorts/supplements/{source.provider}-{digest}-{receipt_sha}.json'
-    _persist_immutable_proof(queue.root, relative, payload)
+    _persist_declared_original_proof(queue.root, relative, payload)
     queue.db.execute('INSERT INTO finite_capture_supplements VALUES (?,?,?,?,?)',
         (source.provider, digest, 1, relative, receipt_sha))
     queue.db.execute('INSERT INTO finite_supplement_members VALUES (?,?,?,?)', (source.provider, row['id'], url, digest))
@@ -692,12 +718,16 @@ def materialize_reviewed_supplements(queue, urls, *, lease_seconds):
             skipped.append(url)
             continue  # Persisted due/lease/refusal rules remain authoritative.
         witness = queue.db.execute("SELECT * FROM articles WHERE url=?", (url,)).fetchone()
+        from downloader.news_fulltext_queue import article_claim_witness
+        record["article_claim_witness_json"] = article_claim_witness(row)
         record["retained_supplement_head_json"] = json.dumps(
             {field: witness[field] for field in RETAINED_SUPPLEMENT_HEAD_FIELDS}, sort_keys=True)
         records.append(record)
-    queue.accept(records)
-    return {"contract_version": RETAINED_SUPPLEMENT_REPLAY_VERSION, "materialized_bodies": len(records),
-        "selected_urls": len(urls), "skipped_urls": skipped, "publisher_requests_this_command": 0,
+    _, adopted = queue.accept(records, return_adopted=True)
+    return {"contract_version": RETAINED_SUPPLEMENT_REPLAY_VERSION, "materialized_bodies": len(adopted),
+        "selected_urls": len(urls), "skipped_urls": skipped,
+        "superseded_urls": [r['requested_url'] for r in records if bytes.fromhex(r['article_id']) not in adopted],
+        "publisher_requests_this_command": 0,
         "retained_original_response_bytes": sum(r["http_response_bytes"] for r in records),
         "metadata_source_publication_day_conflicts": sum(r["metadata_source_publication_day_conflict"] is True for r in records),
         "wall_seconds": time.monotonic() - started, "original_observation_clocks_preserved": True,

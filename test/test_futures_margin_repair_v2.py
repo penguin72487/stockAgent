@@ -215,6 +215,8 @@ def test_benchmark_artifact_checks_return_values_not_only_label(tmp_path):
     output = tmp_path / 'benchmark_audit.npz'
     _save_stock_context_tx_rolling_benchmark_audit(output, dates=dates, benchmark_returns=returns, config=cfg)
     with np.load(output) as receipt:
+        assert receipt['artifact_schema_version'] == 2
+        assert str(receipt['calendar_coverage_contract']) == 'panel_market_dates_match_tx_source_sessions_within_horizon_v1'
         assert receipt['contract_months'].tolist() == ['202601', '202602']
         np.testing.assert_array_equal(receipt['benchmark_log_returns'], returns)
     with pytest.raises(ValueError, match='differs from verified'):

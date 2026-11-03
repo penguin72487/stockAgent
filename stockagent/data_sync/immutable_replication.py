@@ -22,6 +22,7 @@ import time
 
 from downloader.artifact_io import atomic_write_json, atomic_write_text
 from stockagent.runtime_identity import identity_sha256
+from stockagent.data_sync.work_progress import report_work
 
 CONTRACT = "immutable_lake_delivery_v1"
 ACK = "immutable_lake_archive_acceptance_v1"
@@ -105,21 +106,27 @@ def inventory(root: Path) -> dict:
     safe(root, "manifest.json")
     files = {}
     pending = []
+    report_work('enumerate_transport')
     for path in sorted(root.rglob("*")):
         relative = path.relative_to(root).as_posix()
         safe(root, relative)
         if path.is_dir():
             continue
         pending.append((path, relative))
+        report_work('enumerate_transport', done=len(pending))
     from stockagent.data_sync.windows_cold_io import hash_many, windows_path
     native = [p for p, _ in pending if NATIVE_HASH_MIN_BYTES <= p.lstat().st_size <= 8 * 1024**3
               and windows_path(p) is not None]
     hashes = {}
+    report_work('hash_transport_native', total=len(native) if len(native) > 1 else 0)
     if len(native) > 1:
         for offset in range(0, len(native), 16):
             hashes.update(hash_many(native[offset:offset + 16]))
+            report_work('hash_transport_native', done=len(hashes), total=len(native))
+    report_work('hash_transport', total=len(pending))
     for path, relative in pending:
         files[relative] = {"sha256": hashes[path] if path in hashes else digest(path), "bytes": path.stat().st_size}
+        report_work('hash_transport', done=len(files), total=len(pending))
     return files
 
 

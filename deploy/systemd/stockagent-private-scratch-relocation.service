@@ -1,0 +1,16 @@
+[Unit]
+Description=Resume one fixed private SQLite staging handoff from C to E
+Requires=stockagent-e-workspace-mount.service
+After=stockagent-e-workspace-mount.service
+ConditionPathExists=!/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/c1fe0af6f2b34891429bc194/complete.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/relocate_private_sqlite_scratch.py --operation /var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a --dataset local-openbb --source-relative _state/openbb_archive.sqlite3 --snapshot-sha256 286ef35f7d122969103112df83d4fbf23e9f444e86731570a31dba94477879f2'
+SuccessExitStatus=75
+TimeoutStartSec=infinity
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

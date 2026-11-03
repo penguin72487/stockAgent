@@ -176,10 +176,16 @@ def queued_candidate(con, now: str, *, provider: str, where: str, args=()):
     if not has_intents(con):
         return None
     identity = "id" if provider == "tej_api" else "task_id"
+    # A request may contain many Wizard tasks. A retryable first task must not
+    # monopolize that request merely because its ID sorts first. The native
+    # owner records attempted_at only when it commits a claim, so this ordering
+    # is read-only and rotates eligible work without weakening due, isolation,
+    # or older-request precedence. The TEJ API has a different queue schema.
+    attempt_order = "tasks.attempted_at_utc IS NOT NULL,tasks.attempted_at_utc," if provider == "tej" else ""
     return con.execute(
         f"SELECT tasks.* FROM provider_query_intents p JOIN tasks ON tasks.{identity}=p.task_key "
         "WHERE p.created_at_utc<=? AND p.expires_at_utc>? AND " + where
-        + f" ORDER BY p.created_at_utc,tasks.{identity} LIMIT 1", (now, now, *args)).fetchone()
+        + f" ORDER BY p.created_at_utc,{attempt_order}tasks.{identity} LIMIT 1", (now, now, *args)).fetchone()
 
 
 def _items(plan: dict) -> list:

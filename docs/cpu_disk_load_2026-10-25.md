@@ -1988,6 +1988,253 @@ wall 少 **16.31%**；讀回、初始化、I/O 與當下競爭仍有波動。小
 preflight 查明資料／fold 範圍，避免對已知不可用日曆重複做昂貴準備，不能以
 跳過該 market 或偽造完整資料來當作效能改善。
 
+## 2026-10-29 第十五輪：依實際輸入重用價格快取，正式後續工作已採用
+
+本輪接續原 CPU／I/O 任務，未設定資源佔用上限、調低優先權或中止資料工作。
+第一性原理是減少「相同輸入再次計算與發布」的次數，而非把可運算時間變成等待。
+以下是階段成果；完整歷史推論、整輪備份及桌面互動延遲仍未驗收。
+
+### 當下佔用者與可知的進度
+
+- **00:15:50–00:16:05**，16 邏輯 CPU 忙碌 **66.33%**、iowait **3.88%**。
+  單核心 100% 尺度下，開盤訊號基準測試 PID 1073090 **97.37%**、儲存監控
+  `find` PID 1066573 **70.96%**、Syncthing PID 983432 **43.71%**、私有備份
+  PID 1023194 **27.19%**、FinMind PID 1056075 **19.38%**。基準測試、find
+  及這個 FinMind 程序後來已退出，不再把它們列為持續佔用者。
+- **00:33:23–00:33:39**，忙碌 **65.85%**、iowait **1.08%**；此時已換成
+  V8 正式歷史推論 PID 1155696 **246.39%**、新聞私有備份 PID 1150037
+  **178.62%**、監控快照 PID 1157744 **78.62%**、Syncthing **24.97%**。
+  多執行緒程序可超過 100%；不同時間、父子 cgroup、Windows 的 WSL 聚合值
+  都不能相加。診斷與 Codex 自身的負載亦保留在原始窗口。
+- Windows 原生 GetSystemTimes 在 **00:16:22** 的約 4 秒窗口忙碌 **100%**、
+  核心態 **72.35%**；**00:33:22** 仍為 **100%／68.07%**。第二次附帶程序
+  counter 為 vmmemWSL **606%**、wsl **123%**、System **102%**、WmiPrvSE
+  **93%**。原生累計窗口在 CIM 查詢之前取得；counter 與累計窗口不完全重合。
+  尚不能證明是哪一個驅動／跨主機 I/O 呼叫造成全部核心態成本，更不能宣稱卡頓已消除。
+- 00:30 的唯讀 Syncthing API 顯示 NAS backup ingress 自 **23:51:13** 起仍在
+  `scanning`。`needBytes=0` 不能證明掃描完成；沒有完整掃描進度，ETA **未知**。
+  私有備份 00:26:45 收據為複製與獨立驗證當前 **328 檔／535,643,371 bytes**；
+  這不是所有歷史的完成分母。公開 backup status 仍是 22:46 的舊收據，未用來估算 ETA。
+- V8 上次 23:31:36 因 3,600 秒 liveness timeout 失敗，保留 attempt 3 及
+  **00:31:36** 的最早重試時間。原 owner 於 **00:32:37** 開始新一輪，00:33:01
+  正在建立 **2,767 個 Parquet** 的 panel，00:33:40 記錄範圍裁切；尚無可推算
+  整輪完成時間的分母，不能把舊輪的 1,200 session 當作新輪進度。沒有清除 backoff、
+  強行解鎖、擴大來源配額或修改此 timeout。
+
+### 實作：將價格失效範圍與完整來源分開
+
+原 `_load_or_build_price_limit_cache` 以整份 physical source digest 為 key。
+分鐘 manifest 的 audit 欄位、開盤價、成交量或帳戶政策即使不被 `_price_limits`
+讀取，也會重新解析來源、計算完整上下限並重寫三個陣列。
+
+新增 `_price_limit_input_digest`，只包含實際消費的 **完整 TPEx／公司行動參考
+檔 SHA、順序化日期與標的、收盤價的 dtype／shape／原始 bytes，以及價格規則 ABI**。
+重用 `_source_identity` 已計算的完整來源 SHA，沒有再掃一次那兩個來源檔。
+價格衍生快取升為 `tw_day_trade_physical_price_limits_v2_consumed_inputs`，
+manifest／READY 對照 `input_digest`；舊 v1 保留且不冒認為 v2。
+完整來源 digest、金融數值、交易時鐘、全量三檔 SHA、manifest／READY proof、鎖與
+原子寫入均保留。實際 TPEx、公司行動參考、收盤價、日期或標的順序變動仍會重算。
+此處尚以整份兩個來源檔為證明；未建立逐列或逐日期價格增量，也未消除首次建置。
+
+### 完整流程測速與負向結果
+
+使用正式相容 base 與精確凍結 candidate 做 **A/B/B/A**。每個新程序均經 namespace
+驗證，順序執行冷建置、相同來源命中、metadata 變更，包含 import、來源 SHA、計算、
+落盤與新程序的全部陣列／快取讀回。下表為兩次同版本的平均；CPU 為 worker 與讀回
+程序合計，未加 controller CPU；wall 不含 namespace 啟動，該呼叫時間另存。
+
+| 實測範圍 | 舊版 CPU 秒 | 新版 CPU 秒 | 舊版 wall 秒 | 新版 wall 秒 |
+| --- | ---: | ---: | ---: | ---: |
+| 真實輸入日期切片 2020-03-02、2026-09-10，2,767 標的的完整價格快取流程 | 18.6243 | 12.5420 | 11.9728 | 9.1977 |
+| 兩日三標的的完整 physical source 與下游張量讀回 | 7.1267 | 6.6838 | 7.9442 | 7.0670 |
+
+第一列 CPU **減少 32.66%**，是此兩日輸入切片之快取流程，不能外推為完整
+3,124 日推論或策略回測的加速。第二列 CPU **減少 6.22%**，也不能當作正式
+全市場歷史已完成。每次流程中的價格實際建置次數均由 **2 次降為 1 次**。
+全部下游輸出、各來源快取與價格陣列皆由獨立程序驗證 dtype／shape／完整 bytes；
+candidate 少一組重複價格快取，不能以不同檔案數冒充少驗證數值。
+
+負向結果一併保留：真實切片冷建置 **5.6165→5.7441 CPU 秒**，未變來源命中
+**0.1856→0.2244 秒**；小型完整來源的 metadata 階段 **0.0927→0.1092 秒**。
+真實切片 metadata 階段則為 **4.8447→0.2554 CPU 秒**。整個流程包含 import
+與驗證成本，不把這一小段的倍數當作整輪改善。
+另將實際完整 **3,124×2,767** 收盤矩陣單獨量測新增 key 成本，69,152,864 bytes
+的四次 hash 平均 **0.05535 CPU 秒**；這只是額外識別成本，未發布大型測試資料，
+也不是完整歷史測速。首次新 ABI 建置仍須付出正常計算／發布成本。
+
+讀回工具曾把 `cache/physical-price-limits-*` 誤判為根目錄下的價格快取，造成一次
+collector 失敗。保留原始 run、錯誤與既成輸出，修正前綴判斷後繼續驗證已完成的
+worker，再完成其餘對照；未重做成功計算或刪除失敗紀錄。
+
+### 正式採用與後續瓶頸
+
+以當時正式 `20261028T161337Z-057fba711311` 為 base，經 reviewed source 副本
+建立 `20261028T162333Z-8c14fd74926a`。完整 **1,624 檔只有一個 carry source
+模組不同，其餘 1,623 檔相同**，未回滾同時進行的服務修改或帶入其他工作區價格規則。
+工作區相關測試 **88 passed**；精確凍結 namespace **57 passed**，兩組有重疊。
+測試包含無關來源變動重用、五類真正輸入變動重算、同大小 payload 損壞拒絕，
+以及跨世代中斷恢復時禁止價格重算。
+
+**00:29:31** 正式 qualified reload 接受 `accepted_code_admission_only`；
+獨立讀回 Gateway Python PID **1143151** 的完整 namespace 與實際 source SHA
+`2c01d1748241dd5f6f6c582442b8c2bed57248780c20f31ff22d23b46c193298`。
+四個受保護服務 PID／start ticks 連續、三個帳本共 **869,064,380 bytes** 的
+原始前綴 SHA 一致，engine 未重啟；broker orders／operator ledger writes 均為零。
+有效服務與祖先 **43 個 cgroup** 未見有限 CPU／I/O／記憶體／swap／task／CPU-set
+上限；本輪未修改資源政策。00:33:14 獨立讀回亦確認新 V8 worker PID **1155696**
+的實際 source SHA 相同，並非只準備了未採用的工作區程式。
+
+儲存監控 00:09 那輪 **469.217 秒**、清冊含 **5,997,148 檔**；既有 epoch 已
+避開 **1,926,353 次**期貨歷史 stat，仍有即時期權 **2,819,213 檔**等範圍
+需要遍歷。後續須由原 capture owner 對已關閉分區建立可失效的增量證明；僅改
+掃描間隔、漏算活躍檔案或把掃描藏到另一個程序，不能算消除工作。
+此外仍有完整 panel／來源 SQL、未涵蓋的 header／唯一 stats、新 stats 編碼、
+完整公開 JSON、日期 audit 與 Windows 核心態競爭。本輪未證明桌面卡頓或
+整輪歷史／備份完成時間改善，原兩項任務維持 active。
+
+私有原始窗口、全部負向數字、逐位元讀回、版本凍結／採用及完整 key 成本均保留於
+[第十五輪證據](../artifacts/operations/incremental_round15_20261029/)；原始 Linux
+窗口保留於 [負載收據](../artifacts/operations/cpu_disk_load_20261025/)。
+
+## 第十六輪：減少寬表聚合與非有限值清理的實際工作（2026-10-29）
+
+本輪為**階段性改善，整體任務仍 active**。正式採用兩項 panel 修改；另一項分鐘
+稀疏編碼實驗因完整流程 CPU 未改善而撤回。沒有新增或收緊資源上限，也沒有跳過
+資料、規則、快取驗證或下游輸出。所有來源與失敗收據均保留。
+
+### 實際使用者、進度與估時
+
+**00:55:41** 起的 15 秒 Linux 窗口：16 邏輯 CPU 的 busy **54.75%**、iowait
+**1.67%**。V8 正式歷史 Python **1155696** 使用 **89.80% 單核 CPU**，是當時
+最大持續計算者；另有 lakehouse、其他維運測試、Codex 與 Syncthing。**00:56:06**
+先於 CIM 查詢採樣的 Windows 原生計數器為 busy **100%**、核心態 **64.66%**。
+不能將 Windows 的全部負載歸給一個 Python，也不能把稍後自己的大型測速當作原始負載。
+
+同一正式 job 的冷 panel 完整日誌為：symbols **38.175 秒**、external **480.660 秒**、
+assemble/rules **348.666 秒**、cache save **124.406 秒**、總計 **992.056 秒**。
+之後另有實體分鐘來源建置與歷史推論，不把 panel 結束當作整個工作結束。
+01:17 的 15 秒非阻塞抽樣共 **700 samples／2 errors**，220 個葉節點樣本在
+`numpy.full`；這只是該窗口的線索，不是整輪 CPU 分攤比例。
+
+**01:32:40**，attempt 4 觸發原有 **3,600 秒**正式歷史逾時並退出；最後已輸出的
+分鐘進度為 **1,500／1,621**。這是失敗，不是完成，也不是本輪中止或新設的上限。
+原收據的 `next_retry_at` 為 **03:32:40**，是最早重試時間，不能當作完成時間。
+已存在的逐 session checkpoint／來源驗證路徑可供後續 owner 驗證及重用；本輪未
+清除退避、改寫完成狀態或為它另起第二個 writer。整體完成 ETA 仍未知。
+
+大型測速結束後，**01:38:47** 起的 Linux 窗口為 busy **45.81%**、iowait **2.05%**，
+swap 讀取約 **266 bytes/s**、寫入為零。該窗口主要單核 CPU 為狀態快照
+`snapshot_data_refresh_services.py` **98.50%**、FinMind complement **89.48%**、
+本輪接手中的 Gateway **83.76%**、Syncthing **26.17%**、lakehouse **21.95%**。
+Gateway 的讀取含接手啟動成本，不能當成日常固定成本。**01:38:54** 的 Windows
+原生 busy 仍 **100%**、核心態 **67.85%**，另有 vmmemWSL、WSL、Defender、桌面
+與索引等程序。前後是不同工作集合，不能以 Linux busy 降低宣稱本輪解決桌面卡頓。
+
+最後 **01:45:37** 起、所有本輪大型測速已結束的窗口：Linux busy **31.15%**、
+iowait **3.12%**、swap 讀寫均為零；主要是 FinMind scoped-due owner Python
+**1404927／76.94% 單核 CPU**、FinMind free Python **1416765／50.29%**、
+另一個 FinMind conflict waiter **20.10%**、lakehouse **15.52%**、Syncthing
+**12.18%**。第一個 owner 的 logical read 約 **272 MB/s**，實體 block read 只有
+約 **55 kB/s**，不能把這些邏輯讀取說成硬碟實際吞吐；其重複讀取值得由原 owner
+繼續查核。未取得可推算全部待辦的穩定分母與完成速率，不給虛構 ETA。
+**01:45:42** 的 Windows 原生 busy **99.59%**、核心態 **70.09%**，主機端競爭
+仍在；這亦不是任何單一程序的占用百分比。
+
+01:36 的私人備份收據仍為複製與獨立驗證波次，當波 **200 檔／535,558,693 bytes**；
+候選清冊共 **48,276 檔／817,226,447,345 bytes**，不代表全部尚待傳輸。公開備份
+狀態收據停在前日 22:46，仍有待 NAS 回執的項目；未用過時收據推算當前速度或 ETA。
+
+### 採用的演算法與完整範圍比較
+
+第一性原理是先消除不影響結果的運算與記憶體搬移。實際來源有 **9,652,279 列**、
+**162 欄**，以原有日期／代碼正規化後，兩個鍵的重複列數為 **0**。原程式卻仍對
+每一列、每一個值欄建立 last-non-null 聚合狀態。現在先檢查正規化後的兩鍵，僅
+聚合真正重複的組，其餘列直接保留，最後維持相同排序；有重複時仍逐欄保留最後
+非 null 值，NaN 不當成 null。原有欄位投影、日期條件、Float32／Float64 精度及
+歷史規則事件路徑不變。
+
+完整真實來源固定 SHA 為
+`c783f3e913921ce67ce64b1e5671c8a9071da09a1e0067e4b3053629fc55d871`。
+經實體 C backing 容量 admission 後，使用唯讀副本做 **A/B/B/A**；保留當前設定
+選出的 **83 個 feature／17 個 rule**，所有日期及 **2,767 個個股＋市場列**均有計入。
+兩版都沿用正式流程既有的 Polars/Rayon 設定，沒有把調低執行緒當作改善。
+
+每輪含 namespace 內來源程式驗證、完整來源 SHA、Arrow 讀取、正規化、重複處理、
+排序、NumPy 轉換、symbol 分組、全部回傳陣列 SHA，再由新程序比較收據並重讀來源 SHA。
+四輪各核對 **11,072 個陣列／4,671,703,036 bytes** 的 dtype、shape 與完整位元指紋。
+陣列值未另寫成磁碟快取，因此這是完整 external reader 比較，**不是持久化陣列讀回、
+整份 panel 組裝／cache save，也不是完整歷史推論比較**；controller CPU 未計入。
+
+| 固定範圍；每版兩次平均 | 原版 CPU 秒 | 新版 CPU 秒 | 原版耗時秒 | 新版耗時秒 |
+| --- | ---: | ---: | ---: | ---: |
+| 真實完整 external reader＋全輸出指紋比較 | 629.7742 | 474.3699 | 465.9588 | 202.8549 |
+| 實際 panel 形狀的合成值配置／清理／完整 SHA | 175.1757 | 83.8934 | 189.2068 | 94.0203 |
+
+第一列 CPU **減少 24.68%**、耗時 **減少 56.47%**；reader 本體耗時平均
+**426.4030→171.6923 秒**。程序峰值 RSS 平均 **31.81→30.20 GiB**，仍然很大，
+不能稱為已消除寬表物化。
+來源大量重複時仍會付出新增鍵檢查的成本；本輪沒有證明所有重複分布都加速。
+
+第二項修改只改既有特徵的 NaN／正負無限值清理：三種分類遮罩與多次替換改成一個
+`isfinite` 遮罩，原地反轉再 `copyto` 零。所有有限值、負零與既有排列維持原位元。
+以正式 **3,124×2,767×98 Float32** 形狀、**3,388,490,336 bytes** 合成值做
+A/B/B/A，全輸出 SHA 均為
+`5d931106146dee4b5930b6c7384f06731b96bbee3ea4d94ee4a207271fd498f3`。
+整個合成測試 CPU **減少 52.11%**；清理核心 **115.5677→18.9436 CPU 秒**，
+峰值 RSS 平均 **7.26→4.10 GiB**。這不是歷史財務資料或完整金融工作流加速。
+背景競爭造成單次時間波動，兩次平均不是長期效能保證，兩列也不能相加當作整輪改善。
+
+### 撤回的實驗與保留的失敗
+
+另試由既有 minute／proxy／carried 分類直接產生相同排序的稀疏 payload，省去
+完整五通道 NaN path 及其 flatten copies。核心與完整持久化輸出均可一致，但
+**完整流程未證明 CPU 改善**，因此本輪撤回兩個 maintained 檔的這項修改，保留
+精確凍結候選、測試、原始輸出與負向數字，不帶入正式 release：
+
+| 完整流程 A/B/B/A | 原版 CPU 秒 | 實驗 CPU 秒 | CPU 變化 | 原版／實驗耗時秒 |
+| --- | ---: | ---: | ---: | ---: |
+| 兩個固定真實分鐘日、全 2,767 symbols、寫入及獨立完整讀回 | 23.5369 | 27.9518 | **增加 18.76%** | 31.3555／34.7976 |
+| 兩日三代碼完整來源、冷建置／命中／metadata 更新及下游讀回 | 7.5645 | 7.7912 | **增加 3.00%** | 11.5135／11.8910 |
+
+第一列沿用 R13 的真實 volume／limit admission，不包含完整 corporate／gap gate；
+第二列用明確的合成 receipt fixture，套用既有 `frozen_target_until_1320`，不是正式
+市場歷史。每輪分別核對 **26／153 個持久化陣列**的完整 bytes。編碼核心變快不能
+抵消上述負向結果，仍需改善或更充分的完整流程證據才能重新評估。
+
+相關 panel 測試於工作區 **154 passed**、正式候選精確 namespace **154 passed**，
+兩者有重疊。稀疏實驗擴大凍結回歸為 **317 passed／1 個缺少測試 helper 的失敗**；
+補入 helper 後僅重跑該項，**1 passed**。另一次工作區擴大回歸為 **161 passed／
+3 failed**，出現 Triton cubin 缺失／`Unknown key: 'cubin'`；後續精確凍結回歸未重現，
+沒有將其原因推定為 GC 或本輪 panel 修改。測速與測試 harness 的錯誤路徑、隔離測試
+漏帶 helper、匯入舊 harness 的 argparse 失敗及全部既成輸出亦保留，沒有刪錯誤重做為成功。
+
+### 正式接手與仍未消除的工作
+
+以 R15 正式 release 為 base，採用
+`20261028T171108Z-df8d66d1445c`：**1,624 檔僅 `stockagent/data/panel.py` 一檔不同**，
+其 SHA 為 `1c142ecb89ab9646bbba966d0de2cdec7afe1dcd0f31b722998eab74f7753ebe`。
+其餘 **1,623 檔**相同；未帶入其他工作區修改或被撤回的稀疏實驗。
+
+**01:39:10** 正式 qualified reload 回傳 `accepted_code_admission_only`；
+**01:41:06** 獨立讀回 Gateway Python PID **1386052** 的完整唯讀 namespace 與
+實際 panel SHA 均一致。原 carry source SHA 仍為 R15 的 `2c01d174...193298`。
+四個受保護交易／行情服務 PID／start ticks 連續，engine 未重啟，三個帳本共
+**869,064,380 bytes** 的原始前綴 SHA 不變，broker orders／operator ledger writes
+均為零。新 Gateway 的程式已採用，**失敗的 V8 舊 attempt 沒有被回溯改版，也沒有
+證明下一輪完整歷史已完成或 GPU warmup 已就緒**。
+
+接手後核對 **42 個服務／祖先 cgroup**，沒有有限 CPU、I/O、記憶體、swap、tasks
+或 CPU-set 上限；本輪資源政策修改為零。所有公開／私人來源、帳本、收據均保留。
+仍有完整 reader 的寬表讀取、正規化與排序，panel 組裝與 cache save，分鐘來源
+初始化，來源 SQL／檔案遍歷、header／唯一 stats、新 stats 編碼、公開 JSON、日期
+audit，以及 Windows 核心態競爭。下一步仍應讓原 owner 提供可隨實際變動失效的
+分區證明，不能以資源占用上限、漏驗證或降低完整性取代減少工作。本輪尚未證明
+桌面卡頓已解決，也未達到計算極限。
+
+私有腳本、固定來源身分、逐位元／完整讀回、負向結果、凍結與接手證據在
+[第十六輪收據](../artifacts/operations/incremental_round16_20261029/)；Linux 原始
+觀測在[負載收據](../artifacts/operations/cpu_disk_load_20261025/)。
+
 ## 未完成的邊界
 
 - 本機 StockAgent CPU／I/O／記憶體／swap／task 硬性上限已撤回。完成速度依同輸入、完整輸出與正式 owner 收據驗證，
@@ -2010,3 +2257,228 @@ preflight 查明資料／fold 範圍，避免對已知不可用日曆重複做�
 
 原始觀測與可重跑的輕量腳本保留於
 [本輪收據目錄](../artifacts/operations/cpu_disk_load_20261025/)。
+
+## 10-29 早盤續修：完整特徵建置、寬表搬移與收據依賴（R17）
+
+本輪延續原 CPU／磁碟及工作流測速任務，兩項任務仍為 active。沒有修改 CPU、
+I/O、記憶體、swap、task、affinity 或執行緒政策，也沒有重啟交易／行情服務。
+最終採用完整 A/B/B/A 證明有效的 B，正式特徵收據已經 canonical builder 驗證
+接手；原生 last 候選依完整負向證據撤回。以下保留來源、時序與採用邊界。
+
+### 即時歸因與實際完成時間
+
+08:40 的 15 秒取樣，16 個邏輯 CPU 的 busy 為 **86.48%**、iowait **2.14%**，
+swap-out 約 **12.0 MiB/s**。最大程序為 PID **2416625**、
+`build_tw_public_training_features.py`，約 **609.3% 單核心 CPU**、當時 RSS 約
+**18.45 GiB**；同輪 FinLab 約 53.8%、備份約 33.1%、training recipes 約 32.7%，
+本次 Codex 程序約 29.9%。這些是區間值，不能拿 lifetime `%CPU` 當當下使用率。
+
+該特徵建置由原 owner 自然完成，**9,652,279 列、143 個特徵及 17 個規則欄**，
+requested end 為 2026-10-28；完整表含兩個鍵共 **162 欄**。全量原因是
+`non_dated_or_global_dependency_changed`，共 48 個來源變動。其 wall 分段如下，
+子階段互有包含，不能再加進父階段：
+
+| 階段 | 秒 |
+| --- | ---: |
+| 來源證明 | 38.984 |
+| 股票建置，含合併 | 218.521 |
+| 其中股票合併 | 67.193 |
+| 市場建置 | 7.041 |
+| 輸出組裝與排序 | 91.356 |
+| Parquet 寫入及核對 | 39.317 |
+| 完整 builder，摘要前 | 395.219 |
+
+整個 08:30 acceptance owner 於 **08:55:27** 自然成功結束，耗時 **21 分 11 秒**、
+CPU **4,407.722 秒**、systemd 記錄 memory peak **49.5G**。audit 為
+`model_safe=True`、critical/high 均為零、medium 一項；這不是 broker fill 或所有
+研究／訓練就緒的證明。前次 V8 attempt 5 已於 **05:56:08** 完成，此刻不再是
+主要 CPU owner；其他失敗模式與未知備份 ETA 仍另列，未推定全數完成。
+
+08:47 後續取樣為 Linux busy **59.92%**、iowait **1.81%**、swap-out **0**；
+audit、Discord、資料發布及 monitor 約各用一核。這是工作階段自然切換，不列為
+本輪優化效果。Windows 原生 4 秒取樣仍為 **100% busy／77.60% kernel busy**；
+09:07 的原生記憶體取樣為 **91% 使用中、可用約 11.27 GiB**。Windows／WSL
+競爭尚未排除，不能宣稱桌面卡頓已解除。核對的 **47 個服務及祖先 cgroup**
+沒有有限上限；後來的高負載亦包含本輪全量對照測試，不能漏算本次新增工作。
+
+### 候選機制與驗證邊界
+
+- 大表合併只 join 鍵與列索引，再對每個勝出的欄位 gather 一次，減少反覆搬移
+  已合併的寬表；完整保留鍵聯集、第一來源欄位優先及重複 suffix 的拒絕行為。
+- 大表只聚合真正重複的鍵；所有鍵重複時仍走完整聚合。原生
+  `last(ignore_nulls=True)` 另以相同資料核對 `.drop_nulls().last()`，保留 NULL、
+  NaN payload、正負零及來源內順序。
+- 已合併的來源表及組裝參照提早釋放；股票／市場列數只讀 `symbol`，不再為了
+  `.height` 篩選整張 162 欄表。沒有減少來源、日期、標的、特徵或規則。
+- TAIEX 歷史非交易日判定實際消費 `twse_taiex_ohlc.summary.json`。原特徵依賴
+  只有 Parquet，無法因這份收據遺失／失效而拒絕 unchanged cache。候選共用
+  session verifier 的語意投影，綁定實際驗證欄位，排除收集時間與報告路徑；
+  malformed receipt 仍以原始 bytes 綁定。cached session proof 加入 ctime，
+  改寫後還原 mtime 也不能沿用舊證明。程式 fingerprint 保留新版本邊界。
+
+原候選為 **130 passed**；加入收據與 calendar cache 邊界後，精確 namespace 為
+**175 passed**，兩者有重疊。收據任一驗證欄位變動、mtime 還原、收據遺失與
+invalidated proof 均有語意檢查；cosmetic metadata 不使特徵來源失效。
+
+固定來源含 **957,372,941 bytes Parquet／supplemental**、2767 個原 universe
+名稱，另保留 **1,483 bytes** 的真實 TAIEX 收據。原 A1 漏帶正式 publication-lag
+設定且快照缺少此收據；A3 補設定後仍因缺收據而失敗。兩次失敗完整保留，均不列入
+加速對照，沒有移除日期驗證來跑完。補齊後，完整當沖規則 smoke 為 **5,927,801 列**、
+2014-01-06 至 2026-10-28，23 日由原完整收據證明為非交易日。
+
+首次成功完整基準 A5 為 builder **652.616 秒 wall／2,734.042 秒 CPU**、
+worker peak RSS **53,379,534,848 bytes**，完整 162 欄讀回另為 **125.397 秒**。
+這次基準的輸出 SHA 與當時正式表相同：
+`d3c4fec29573b57d347df11fae652edc18dd76133e35a6b414deea3ce8c4be21`。
+原生 last 合成聚合／排序／寫入／完整讀回的小測 CPU **17.001 → 6.080 秒**，
+這不是完整 builder 的加速倍率。完整對照與正式接手尚須其各自收據，不以小測代替。
+
+### 已完成的同機完整對照
+
+A5／B5／B6／A6 依序完成；每次都建置 **9,652,279 列、162 欄**，再另行讀回
+所有欄位、NULL validity 及有效 Float64 原始 bits。四次實體檔案 SHA 均與上述
+正式表相同；ordered logical SHA 為
+`496786ef9f083d3c973c4b3ca224a3f895b90b0d6fc852e958275c8b114977be`。
+
+| 兩次平均 | 原流程 A | 窄鍵合併／重複鍵聚合 B | 變化 |
+| --- | ---: | ---: | ---: |
+| 完整建置 wall 秒 | 626.053 | 562.546 | -10.14% |
+| 完整建置 CPU 秒 | 3,104.049 | 2,362.162 | -23.90% |
+| 獨立完整讀回 wall 秒 | 106.062 | 119.225 | **+12.41%** |
+| 獨立完整讀回 CPU 秒 | 89.501 | 86.643 | -3.19% |
+| 建置＋完整讀回 wall 秒 | 732.115 | 681.771 | -6.88% |
+| 建置＋完整讀回 CPU 秒 | 3,193.550 | 2,448.805 | -23.32% |
+| worker peak RSS bytes | 52,832,765,952 | 39,062,134,784 | -26.06% |
+
+完整 builder 計時包含來源證明、所有特徵／規則、排序、Parquet 寫入、來源重驗及
+summary；namespace 啟動及 harness 前後的固定 fixture SHA 不在計時內。四輪均
+為 16 個 Polars threads、相同 16 CPU affinity；未設定額外限制。固定種子只有
+既有 exact partition proofs，沒有舊特徵 payload，canonical capture 每輪自行核對
+來源與實作後 reused 16／scanned 1，再重算所有特徵。因此這是 **已有分區證明的
+完整 builder**，不是完全冷啟動、整個 training、桌面延遲或全工作流終點的對照。
+獨立完整讀回 wall 的退步已計入總耗時並保留，未以單一 join 小測取代。
+
+10:04 的 A6 主堆疊仍在 `output.filter(...).height` 計算列數，這條路徑會搬動寬表；
+候選僅對 `symbol` Series 計數。單次堆疊不是 CPU 時間占比；改善幅度以上述完整
+流程實測為準。
+
+### 外部重啟與後續驗證範圍
+
+WSL 於 **10:16:33** 重啟，boot ID 從 `a73fedd8-f23c-4378-9668-b1ba0518e73f`
+改為 `e5b1b865-be3f-4791-9204-282f7a59951a`。R17 沒有執行 shutdown／restart；
+重啟發起者未知。舊 native follow-up 登記仍為 running，但其 PID／boot 身分已失效；
+已由 canonical `run-reconcile` 證明 owner 與 unit 結束，保留中斷收據。四輪已完成
+的原始結果、完整輸出與 fixture 均保留，native 全量試跑當時尚未開始。
+
+10:30 的新 boot 取樣為 Linux busy **40.36%**、iowait **5.16%**。公開儀表板 PID
+2359 約 **125.6% 單核**、更新快照 PID 27612 約 **96.0%**、儲存監控 `du` PID
+1160 約 **38.9%**；重啟與工作切換不能列為優化成果。公開儀表板取樣落在 JSONL
+tail 與 ledger session index；快照程序在取堆疊前已結束，未據此推斷其內部熱點。
+32 個當時有效 Linux cgroup／祖先仍無有限上限，四個行情／模擬服務均為 active。
+
+原生聚合 C 的後續完整試跑使用同一個固定來源及唯讀程式 snapshot，重新通過
+實體 backing capacity：free **109,009,186,816 bytes**、required **32,212,254,720
+bytes**。這兩輪位於重啟之後，不能稱作同 boot 的 C 對照或把跨重啟 wall 比值當
+受控加速倍率；後續結果與正式接手另以收據核對。
+
+10:36 的 Windows `GetSystemTimes` 補測為 busy **99.81%**、kernel busy **75.12%**，
+原生記憶體為 **87%**、available **16,975,077,376 bytes**。一般 process API 有
+196 個程序讀取失敗，不能把可讀程序最高的 Code 當成整機主要 owner。
+後續以 [Microsoft PDH 原生計數器](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhaddenglishcounterw)
+補測，10:41 的 vmmemWSL 為 **884.48% 單核**，即 16 核主機的約 **55.28%**；
+其中包含本輪完整試跑。DPC 為整機 **1.04%**、interrupt **1.55%**，System 約
+26.43% 單核、MsMpEng 約 33.03% 單核。Wazuh-Security instance 為 invalid data，
+不是零負載。這些窗口尚不能把 kernel 成本細分到驅動、VM 或每個工作；沒有桌面
+延遲 SLO／ETW 堆疊證據，仍不能宣稱卡頓解決。PDH 的 process 值保留多核超過
+100% 的[原生格式](https://learn.microsoft.com/en-us/windows/win32/api/pdh/nf-pdh-pdhgetformattedcountervalue)，
+沒有改變任何程序佔用政策。
+
+### 完整原生聚合後續：保留負向結果、撤回兩個 expression
+
+重啟後 C1／C2 的完整 builder wall 為 **298.091／275.653 秒**，CPU 為
+**1,451.411／1,472.449 秒**；各自再獨立讀回全表 **53.937／41.355 秒**。
+兩輪平均建置＋讀回為 **334.518 秒 wall／1,507.580 秒 CPU**，worker peak RSS
+平均 **41,435,684,864 bytes**。完整 162 欄 validity／有效數值 bits 與實體 SHA
+都和 A5／B5／B6／A6 相同。這份精確 namespace 的 175 項測試亦通過。
+
+同 boot 後置 B7 參照也完成所有欄位讀回，原始值與實體 SHA 完全相同：
+
+| 同 boot 完整流程 | B7，一次後置參照 | 原生 C1／C2 平均 |
+| --- | ---: | ---: |
+| builder wall 秒 | 296.145 | 286.872 |
+| builder CPU 秒 | 1,468.975 | 1,461.930 |
+| 完整讀回 wall 秒 | 65.886 | 47.646 |
+| 完整讀回 CPU 秒 | 57.092 | 45.650 |
+| 建置＋完整讀回 wall 秒 | 362.031 | 334.518 |
+| 建置＋完整讀回 CPU 秒 | 1,526.067 | 1,507.580 |
+| worker peak RSS bytes | 40,166,354,944 | 41,435,684,864 |
+
+這是 C／C／B 後置參照，並非 randomized／interleaved A/B/B/A。原生 builder
+CPU 只少 **0.48%**，包含讀回後少 **1.21%**，而 peak RSS 多 **3.16%**；wall
+差異也包含讀回波動。這份完整流程沒有支持把合成小測的約 2.8 倍 CPU 優勢套到
+實際工作。最終撤回兩個 `last(ignore_nulls=True)`，保留配對已證明的窄鍵合併、
+只聚合重複鍵、提早釋放及窄欄計數。C 曾短暫通過 metadata 接手，原收據及其
+完整 audit 均保留；完成同 boot 參照後，正式 source／summary 都回到 B。
+
+### 最終正式接手與驗證
+
+最終兩個 source SHA 與 B 的精確唯讀 snapshot 完全相同；其他四個語意依賴
+逐一相符。該版本為 **175 passed in 59.48s**，完整 A/B/B/A 及 B7 輸出已全部
+獨立讀回，沒有用局部測試推定資料完整。
+
+正式資料接手前，重新核對當前原始來源 receipts、2767 個 universe 名稱、
+producer 的完整 summary／code fingerprint／逐欄讀回，並驗證既有正式 Parquet
+與完整 B7 產物 **所有 bytes 相同**。在 canonical source shared guard 與既有
+feature writer exclusive lock 內，將已完整重算的結果搬回實際 storage aliases，
+再由正常 builder 的 `unchanged_verified` 路徑核對。此操作禁止呼叫所有 feature
+`_build_*`，意外需要重算會直接失敗；通過後才用既有 `_write_summary` 發布正式
+收據，保留原收據完整備份及 SHA，沒有另開 collector 或變更時鐘／行情／ledger。
+
+最終接手耗時 **8.874 秒**，正式 Parquet 的 device／inode／size／mtime／ctime
+保持不變，`reused_rows=9,652,279`，只有 summary 更新。正式 summary SHA 為
+`7fd229f51d6d87b2463fe8a05168b713440743b942d69e6666165cca7007d96a`，
+新 implementation SHA 為
+`aadbebf6c0b118487a9964e4761226cf59f3ae3bedf2467b94430bc56abe9130`。
+另一新程序的 current-source／current-output audit 為 **valid=True、findings=[]**，
+schema、rules、availability、source bytes、universe、output bytes 六項均通過，
+並確認新 calendar proof 已綁定。這是正式特徵產物／收據接手證明；active Gateway
+的 immutable release 未 rollout，也沒有 broker fill、策略績效或完整 training
+完成的新增主張。
+
+### 測試結束後的負載、ETA 與剩餘工作
+
+全部七次成功全表建置及獨立完整讀回都已結束。10:59:27 起的 15.16 秒取樣，
+Linux busy **57.48%**、iowait **1.85%**、swap-out **0**，此窗口已沒有 R17
+全量 builder。這是當時的新工作組合，不是同工作量下的整機 A/B 成效。
+
+| 區間主要 owner | PID | 單核 CPU | 可用的完成邊界 |
+| --- | ---: | ---: | --- |
+| `manage_backup_stream.py` | 3064 | 126.32% | 當輪仍執行，沒有可靠剩餘工作分母／ETA |
+| FinLab intraday priority worker | 125973 | 100.53% | 仍執行，不把 service 活躍當查詢完成 |
+| `retire_local_offline_artifacts.py` | 49842 | 50.00% | 其他 owner 的既有工作，本輪未介入 |
+| 日內模擬 | 401 | 49.27% | 常駐金融服務，沒有整個程序的完工倒數 |
+| FinMind option reference history | 125107 | 43.01% | 取樣當時執行，未量到完整剩餘查詢量 |
+| Discord | 2101 | 38.98% | 常駐服務，個別 recipe 與程序存活分開 |
+
+同時的 Windows PDH 為整機 busy **96.73%**、privileged **73.72%**，vmmemWSL
+**676.54% 單核**（整機約 **42.28%**）；DPC **2.21%**、interrupt **3.06%**。
+這仍不構成 kernel 成本根因或桌面卡頓解決證明。前述 WSL bridge 逾時、已成功的
+canonical verified bridge，以及 unavailable counter 均有獨立收據；失敗讀取
+沒有被當成零或已完成。最終 33 個當時有效 Linux cgroup／祖先沒有有限上限；
+與 source 接手前相比，四個行情／模擬及 Discord service 的 MainPID／start ticks
+一致，沒有本輪 service restart。
+
+最終 B7 的 wall 分段為 source proof **1.348 秒**、股票建置 **255.263 秒**（含
+合併 **104.216 秒**）、市場 **3.650 秒**、組裝 **21.201 秒**、寫入及重驗
+**11.588 秒**；summary 前 **293.050 秒**，含 summary 的 builder **296.145 秒**。
+父子階段不相加。下一步應對準仍占主要時間的股票來源轉換／窄鍵聯接與必要
+gather，再量 CPU／memory traffic，而不是繼續放大 last 小測。
+
+仍未完成的範圍包括：變動來源缺少更細的模型依賴證明時仍需全量建置；儀表板
+JSONL tail／session index、儲存 census／manifest、備份整輪與 Windows kernel
+仍有成本；Monitor 新唯一 stats／null 編碼、其他公開投影與完整日期 audit 並未
+在本輪取得各自完整增量證明及對照，不能列為已消除。這輪只對上述精確工作量
+成立，尚未達演算法、儲存、純計算或整機的計算極限。
+
+原始觀測、失敗、完整來源、namespace、逐欄 bits 與後續結果保留於
+[第十七輪收據](../artifacts/operations/incremental_round17_20261029/)。

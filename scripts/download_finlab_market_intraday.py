@@ -46,7 +46,7 @@ from scripts.download_finlab_intraday import (  # noqa: E402
 )
 from scripts.derive_finlab_minute import derive_partition  # noqa: E402
 from scripts.check_finlab_refresh_due import intraday_source_identity  # noqa: E402
-from scripts.check_acquisition_capacity import check_dispatch  # noqa: E402
+from scripts.check_acquisition_capacity import check_dispatch, check_futures_workspace_dispatch  # noqa: E402
 from stockagent.data_sync.cache_capacity import acquisition_dispatch_status  # noqa: E402
 from stockagent.data_sync.completed_forward_capacity import CapacityDeferred  # noqa: E402
 from stockagent.data.finlab_acquisition_contract import (  # noqa: E402
@@ -933,7 +933,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 download_threads: int | None = None, queue_depth: int | None = None,
                 authorization_slots: int | None = None,
                 finite_priority_only: bool = False,
-                capacity_deferred_priority: bool = False) -> dict:
+                capacity_deferred_priority: bool = False,
+                futures_workspace_only: bool = False) -> dict:
     if kind not in KINDS:
         raise ValueError("unsupported FinLab intraday family")
     if type(finite_priority_only) is not bool or (finite_priority_only and not 1 <= limit <= 64):
@@ -943,6 +944,9 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             or workers != 1 or range_calendar_days != 1
             or any(value not in (None, 1) for value in (download_threads, queue_depth, authorization_slots)))):
         raise ValueError("capacity-deferred priority requires at most four serial minute partitions or one stock Tick partition")
+    if (type(futures_workspace_only) is not bool or futures_workspace_only and
+            (not finite_priority_only or not capacity_deferred_priority or kind != "tw_minute")):
+        raise ValueError("futures workspace requires a finite capacity-deferred minute pass")
     if (type(workers) is not int or not 1 <= workers <= 32
             or type(range_calendar_days) is not int or not 1 <= range_calendar_days <= 31):
         raise ValueError("invalid bounded FinLab pipeline")
@@ -1228,11 +1232,12 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             if pending_daytrade_priority(root, now=boundary):
                 state = "priority_handoff"
                 return False
-            if time.monotonic() - priority_capacity_checked_at >= 60:
+            if futures_workspace_only or time.monotonic() - priority_capacity_checked_at >= 60:
                 priority_capacity_checked_at = time.monotonic()
-                if check_dispatch(root, report_admitted=False, priority=True,
-                                  additional_priority_headroom_bytes=(
-                                      CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES if capacity_deferred_priority else 0)):
+                if (check_futures_workspace_dispatch(root) if futures_workspace_only else
+                        check_dispatch(root, report_admitted=False, priority=True,
+                                       additional_priority_headroom_bytes=(
+                                           CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES if capacity_deferred_priority else 0))):
                     state = "capacity_deferred"
                     return False
         if source_backoff_until:
@@ -1292,8 +1297,9 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         if not allowed and capacity_exception:
             # General work remains due, not completed. Before every finite
             # request independently recheck the existing priority reserve.
-            if check_dispatch(root, report_admitted=False, priority=True,
-                              additional_priority_headroom_bytes=CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES):
+            if (check_futures_workspace_dispatch(root) if futures_workspace_only else
+                    check_dispatch(root, report_admitted=False, priority=True,
+                                   additional_priority_headroom_bytes=CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES)):
                 state = "capacity_deferred"
                 return False
             allowed = True
@@ -1427,7 +1433,10 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                     _checked_this_cycle(attempt_path, 'attempted_at_utc', datetime.now(UTC))):
                 futures_priority_seen.add(identity)
                 continue
-            native_sdk = _supports_futures_partition(key)
+            # The isolated, pinned SDK has an in-memory cache. Native SDK
+            # versions may use a C-backed FileStorage, so this mode requires
+            # the verified bridge even if the native version supports futures.
+            native_sdk = not futures_workspace_only and _supports_futures_partition(key)
             if not native_sdk:
                 if not futures_priority_overlay_checked:
                     futures_priority_overlay = validated_overlay(root)
@@ -1456,7 +1465,9 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             symbol = key.split(':', 1)[1]
             try:
                 receipt = (fetch(root, key, day, now=datetime.now(UTC), force_download=False)
-                           if native_sdk else fetch_with_owner_session(root, key, day, overlay=futures_priority_overlay))
+                           if native_sdk else fetch_with_owner_session(root, key, day,
+                               overlay=futures_priority_overlay,
+                               **({'futures_workspace': True} if futures_workspace_only else {})))
                 _record_source(index, root, 'tw_futures_minute', symbol, day, receipt)
                 successes += 1
                 futures_priority_successes += 1
@@ -1468,7 +1479,17 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 print(f"[finlab-market] priority {key} {day}: {receipt['status']}", flush=True)
             except Exception as exc:
                 failure = exc.category if isinstance(exc, PartitionFailure) else record_failed_partition(root, key, day, exc)
-                _record(index, 'tw_futures_minute', symbol, day, failure)
+                if failure == 'workspace_unavailable_before_source':
+                    # The child has not called the provider; do not turn an
+                    # unavailable mount into a source attempt or empty result.
+                    attempts -= 1
+                    futures_priority_attempts -= 1
+                    sdk_calls -= 1
+                    phase['attempts'] -= 1
+                    phase['newly_checked'] -= int(not attempt_path.exists())
+                    state = 'capacity_deferred'
+                else:
+                    _record(index, 'tw_futures_minute', symbol, day, failure)
                 print(f"[finlab-market] priority {key} {day}: {failure}", flush=True)
                 if failure in {'quota_exhausted', 'authentication_failed', 'source_rate_limited'}:
                     state = failure
@@ -1488,7 +1509,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
     def drain_stock_priorities():
         """Run verified stock/day intents inside their existing account owner."""
         nonlocal stock_priority_next_check, stock_priority_attempts, stock_priority_successes
-        if time.monotonic() < stock_priority_next_check:
+        if futures_workspace_only or time.monotonic() < stock_priority_next_check:
             return
         stock_priority_next_check = time.monotonic() + 5
         from downloader.provider_priority import finlab_stock_candidates
@@ -1741,7 +1762,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             from downloader.provider_priority import finlab_futures_candidates, finlab_stock_candidates
             from stockagent.data.finlab_gap_priority import pending_daytrade_priority
             boundary = datetime.now(UTC)
-            candidates = finlab_stock_candidates(index, boundary, source_kind)
+            candidates = [] if futures_workspace_only else finlab_stock_candidates(index, boundary, source_kind)
             if source_kind == "tw_minute":
                 candidates += finlab_futures_candidates(index, boundary)
             due = False
@@ -1759,10 +1780,11 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                     state = "opening_window_yield"
                 elif source_backoff_until and boundary < datetime.fromisoformat(source_backoff_until):
                     state = "source_rate_limited"
-                elif time.monotonic() - priority_capacity_checked_at >= 60 and check_dispatch(
-                        root, report_admitted=False, priority=True,
-                        additional_priority_headroom_bytes=(
-                            CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES if capacity_deferred_priority else 0)):
+                elif (futures_workspace_only or time.monotonic() - priority_capacity_checked_at >= 60) and (
+                        check_futures_workspace_dispatch(root) if futures_workspace_only else check_dispatch(
+                            root, report_admitted=False, priority=True,
+                            additional_priority_headroom_bytes=(
+                                CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES if capacity_deferred_priority else 0))):
                     state = "capacity_deferred"
                 else:
                     priority_capacity_checked_at = time.monotonic()
@@ -1800,6 +1822,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 "futures_priority_sdk_unsupported": futures_priority_sdk_unsupported,
                 "stock_priority_attempts": stock_priority_attempts,
                 "stock_priority_successes": stock_priority_successes,
+                "futures_workspace_only": futures_workspace_only,
                 "catalog_refresh": priority_catalog_refresh,
                 "general_acquisition_admission": general_admission, "quota_policy": policy_state,
                 "full_history_completion_claim": False,
@@ -2173,10 +2196,14 @@ def main() -> int:
                         help="run only registered finite partition requests under priority capacity admission")
     parser.add_argument("--capacity-deferred-priority", action="store_true",
                         help="allow four registered minute partitions or one stock Tick partition while ordinary dispatch is measurably capacity-blocked")
+    parser.add_argument("--futures-workspace-only", action="store_true",
+                        help="select only finite futures minutes and write validated objects to the enrolled E workspace")
     args = parser.parse_args()
     settings = load_policy()
     if args.capacity_deferred_priority and (not args.priority_only or args.limit > (4 if args.kind == "tw_minute" else 1)):
         parser.error("capacity-deferred-priority requires --priority-only and at most four minutes or one Tick")
+    if args.futures_workspace_only and (not args.capacity_deferred_priority or args.kind != "tw_minute"):
+        parser.error("futures-workspace-only requires capacity-deferred finite minute priority")
     if args.priority_only:
         if (args.status_only or args.derive_existing or args.limit > 64 or
                 any(value not in (None, 1) for value in (args.workers, args.range_calendar_days,
@@ -2211,7 +2238,8 @@ def main() -> int:
         capacity_kwargs = {"report_admitted": False, "priority": args.priority_only}
         if args.capacity_deferred_priority:
             capacity_kwargs["additional_priority_headroom_bytes"] = CAPACITY_DEFERRED_PRIORITY_HEADROOM_BYTES
-        capacity_exit = check_dispatch(args.output_root, **capacity_kwargs)
+        capacity_exit = (check_futures_workspace_dispatch(args.output_root) if args.futures_workspace_only
+                         else check_dispatch(args.output_root, **capacity_kwargs))
         if capacity_exit:
             return capacity_exit
         def terminate(signum, frame):
@@ -2230,6 +2258,7 @@ def main() -> int:
                                       authorization_slots=args.authorization_slots,
                                       finite_priority_only=args.priority_only,
                                       capacity_deferred_priority=args.capacity_deferred_priority,
+                                      futures_workspace_only=args.futures_workspace_only,
                                       quota_policy=settings)
         except BlockingIOError:
             print(json.dumps({"state": "account_sync_active", "attempted_this_run": 0}))

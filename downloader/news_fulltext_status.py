@@ -27,7 +27,7 @@ _NOT_COPIED = object()
 
 
 def cnyes_local_replay_retries(db, source, focus):
-    """Owner snapshot of persisted local-I/O retry records, not article progress.
+    """Owner snapshot of persisted local retry records, not article progress.
 
     These three tables have different grains. A record can remain after its
     head or authorization changes, so its deadline is only a local lower bound,

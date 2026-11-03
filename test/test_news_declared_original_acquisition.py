@@ -215,8 +215,8 @@ def test_interruption_rolls_back_membership_with_cursor_and_resumes_without_http
         raise OSError('interruption after membership, before cursor commit')
     with monkeypatch.context() as patch:
         patch.setattr(cohorts, 'approve_declared_original', interrupted)
-        with pytest.raises(OSError, match='interruption'):
-            consume(queue)
+        result = consume(queue)
+        assert result['outcomes'] == {'original_declaration_storage_deferred': 1}
     assert head(queue) is None and not cohorts.validate_supplements(queue.root, queue.db)
     root, registry = queue.root, queue.registry
     queue.close()

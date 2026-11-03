@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from datetime import datetime
 import json
+import math
 import threading
 import time
 from typing import Any, Mapping
@@ -16,6 +17,34 @@ from stockagent.live.market_config import SIGNAL_UPDATE_PROGRESSIVE
 
 
 _phase_thread_identity = threading.current_thread
+
+
+def nonnegative_duration_ms(value: Any) -> float | None:
+    """A measured zero is valid; an absent, invalid or negative span is unknown."""
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    return number if math.isfinite(number) and number >= 0.0 else None
+
+
+def residual_duration_ms(total: Any, *parts: Any) -> float | None:
+    """Subtract only complete, non-overlapping measured spans.
+
+    Callers own the clock/overlap contract. Values are published with
+    millisecond precision, so allow tiny negative rounding error, not a
+    materially inconsistent set of clocks.
+    """
+    whole = nonnegative_duration_ms(total)
+    measured = [nonnegative_duration_ms(part) for part in parts]
+    if whole is None or not measured or any(part is None for part in measured):
+        return None
+    remainder = whole - sum(measured)
+    if remainder < -0.01:
+        return None
+    return round(max(0.0, remainder), 3)
 
 
 class OpeningPhaseTimer:

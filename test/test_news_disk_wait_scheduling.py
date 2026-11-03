@@ -15,6 +15,7 @@ def service(monkeypatch, *, duration=62, stop_at_metadata=None, inventory_comple
     queue = SimpleNamespace(metrics=SimpleNamespace(measure=lambda *args: nullcontext()),
                             metadata_inventory_pending=metadata_pending)
     http = SimpleNamespace(stop=stop, capacity_snapshot=lambda: {}, cooldown_snapshot=lambda: {},
+                           scheduling_cooldown_snapshot=lambda: {},
                            request_scope_cooldown_snapshot=lambda: {}, requests_by_provider={}, response_bytes=0,
                            traffic_snapshot=lambda: ({}, 0))
 
@@ -148,6 +149,7 @@ def test_idle_heartbeats_refresh_capacity_and_return_to_disk_wait(monkeypatch, b
                             metadata_inventory_pending=False, reviewed_repair_pending=False,
                             next_wake_delay=lambda *args, **kwargs: 60)
     http = SimpleNamespace(stop=stop, capacity_snapshot=lambda: {}, cooldown_snapshot=lambda: {},
+                           scheduling_cooldown_snapshot=lambda: {},
                            request_scope_cooldown_snapshot=lambda: {}, requests_by_provider={}, response_bytes=0,
                            traffic_snapshot=lambda: ({}, 0))
     queue.status = lambda **kwargs: statuses.append((clock[0], kwargs['activity'])) or {'activity': kwargs['activity']}

@@ -86,10 +86,11 @@ def test_admission_uses_observed_effective_headroom(monkeypatch, available, allo
     assert packed._native_pack_buffer_allowed(Path('/fixed/pack'), 8 * 1024**2) is allowed
 
 
-@pytest.mark.parametrize('count', [134_390_589, 198_594_344])
-def test_original_financial_packs_above_128_mib_still_need_exact_headroom(monkeypatch, count):
-    # The real 3,541-member pack and the largest declared financial source
-    # pack previously fell back to portable seeks despite sufficient RAM.
+@pytest.mark.parametrize('count', [134_390_589, 198_594_344, 772_989_351, 912_340_798,
+                                 1_912_555_133, 1_959_876_479])
+def test_financial_packs_need_exact_observed_headroom(monkeypatch, count):
+    # Real source packs, including FinMind and derivative-tick packs, still
+    # require the same conservative admission; no test allocates their bytes.
     required = 4 * count + 512 * 1024**2
     monkeypatch.setattr(remote_build, 'observe_node',
                         lambda *_: {'limits': {'memory_headroom_bytes': required - 1}})

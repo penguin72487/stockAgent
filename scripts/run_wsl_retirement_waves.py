@@ -47,7 +47,10 @@ def _own_agent_run_id() -> str | None:
 
 
 def _inspect(pairs: list[tuple[Path, Path]], parallelism: int, *, fixed_d_stage_only: bool = False,
-             d_stage_recovery_only: bool = False) -> dict:
+             d_stage_recovery_only: bool = False, use_backup_reserve: bool = False) -> dict:
+    if type(use_backup_reserve) is not bool or (use_backup_reserve and not (
+            fixed_d_stage_only or d_stage_recovery_only)):
+        raise ValueError('backup reserve use requires a guarded-D recovery mode')
     active = planner.observe_active_supervisors()
     own = _own_agent_run_id()
     if active is not None and own is not None:
@@ -56,11 +59,15 @@ def _inspect(pairs: list[tuple[Path, Path]], parallelism: int, *, fixed_d_stage_
     if d_stage_recovery_only:
         options['d_stage_recovery_only'] = True
     cohorts = [planner.inspect_cohort(inventory, receipt, active, **options) for inventory, receipt in pairs]
-    return planner.build_plan(cohorts, parallelism, planner.capacity_observation())
+    if use_backup_reserve:
+        for cohort in cohorts:
+            cohort['canonical_argv'].append('--use-backup-reserve')
+    return planner.build_plan(cohorts, parallelism, planner.capacity_observation(),
+                              **({'use_backup_reserve': True} if use_backup_reserve else {}))
 
 
 @contextmanager
-def _scheduler_lock():
+def _scheduler_lock(*, shared: bool = False):
     # This only serializes cooperating wave schedulers. The original owner
     # retains every publication, recovery, consumer and deletion lock.
     fd = os.open(SCHEDULER_LOCK, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC | os.O_NOFOLLOW, 0o600)
@@ -69,7 +76,7 @@ def _scheduler_lock():
         if not stat.S_ISREG(st.st_mode) or st.st_uid != os.geteuid():
             raise ValueError('wave scheduler lock is not a local owned regular file')
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(fd, (fcntl.LOCK_SH if shared else fcntl.LOCK_EX) | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise SchedulerBusy('another wave owns the scheduler') from error
         yield
@@ -77,8 +84,16 @@ def _scheduler_lock():
         os.close(fd)
 
 
-def _accepted(cohort: dict) -> dict:
+def _scheduler_read_lock():
+    """Share only an already-accepted, read-only proof check with a census."""
+    return _scheduler_lock(shared=True)
+
+
+def _accepted(cohort: dict, *, expected_manifest_sha256: str | None = None) -> dict:
     """Check the original owner's durable completion, not just child exit 0."""
+    if expected_manifest_sha256 is not None and (not isinstance(expected_manifest_sha256, str)
+            or not re.fullmatch(r'[0-9a-f]{64}', expected_manifest_sha256)):
+        raise ValueError('invalid enrolled cold manifest')
     inventory = Path(cohort['inventory'])
     if hashlib.sha256(inventory.read_bytes()).hexdigest() != cohort['inventory_sha256']:
         raise ValueError('frozen inventory changed while the owner was running')
@@ -109,6 +124,8 @@ def _accepted(cohort: dict) -> dict:
                 or type(item.get('reclaimed_allocated_bytes')) is not int
                 or item['reclaimed_allocated_bytes'] < 0):
             raise ValueError('owner item lacks an exact accepted cold retirement')
+        if expected_manifest_sha256 is not None and item['manifest_sha256'] != expected_manifest_sha256:
+            raise ValueError('owner accepted another enrolled cold manifest')
         acceptance = receipt / dataset / 'acceptance.json'
         if acceptance.parent.is_symlink() or acceptance.is_symlink():
             raise ValueError('owner acceptance is redirected')
@@ -123,8 +140,11 @@ def _accepted(cohort: dict) -> dict:
         reclaimed += item['reclaimed_allocated_bytes']
     if seen != set(sources) or progress.get('reclaimed_allocated_bytes') != reclaimed:
         raise ValueError('owner reclaimed-byte or source coverage does not reconcile')
-    return {'inventory_sha256': cohort['inventory_sha256'], 'items': len(items),
-            'reclaimed_allocated_bytes': reclaimed, 'receipt_directory': str(receipt)}
+    proof = {'inventory_sha256': cohort['inventory_sha256'], 'items': len(items),
+             'reclaimed_allocated_bytes': reclaimed, 'receipt_directory': str(receipt)}
+    if expected_manifest_sha256 is not None:
+        proof['manifest_sha256'] = expected_manifest_sha256
+    return proof
 
 
 def _run_one(cohort: dict) -> dict:
@@ -157,7 +177,7 @@ def _initial_admission_blocked(plan: dict, continue_independent_waves: bool) -> 
 def wait_for_capacity(pairs: list[tuple[Path, Path]], parallelism: int, *, poll_seconds: int = 60,
                       fixed_d_stage_only: bool = False, handoff_identity: list | None = None,
                       expected_identity: list | None = None, d_stage_recovery_only: bool = False,
-                      continue_independent_waves: bool = False) -> int:
+                      continue_independent_waves: bool = False, use_backup_reserve: bool = False) -> int:
     """Wait without holding the scheduler or any retirement owner lock.
 
     Capacity is re-observed, not reserved. The actual executor must still
@@ -173,6 +193,8 @@ def wait_for_capacity(pairs: list[tuple[Path, Path]], parallelism: int, *, poll_
         options = {'fixed_d_stage_only': True} if fixed_d_stage_only else {}
         if d_stage_recovery_only:
             options['d_stage_recovery_only'] = True
+        if use_backup_reserve:
+            options['use_backup_reserve'] = True
         current = _inspect(pairs, parallelism, **options)
         digests = [cohort['inventory_sha256'] for cohort in current['cohorts']]
         publications = [cohort.get('fixed_d_publication') for cohort in current['cohorts']]
@@ -274,13 +296,15 @@ def wait_for_predecessor(pair: tuple[Path, Path], run_id: str, *, poll_seconds: 
 
 def execute(pairs: list[tuple[Path, Path]], parallelism: int, *, fixed_d_stage_only: bool = False,
             expected_handoff_identity: list | None = None, d_stage_recovery_only: bool = False,
-            continue_independent_waves: bool = False) -> int:
+            continue_independent_waves: bool = False, use_backup_reserve: bool = False) -> int:
     if os.readlink('/proc/self/ns/mnt') != os.readlink('/proc/1/ns/mnt'):
         raise ValueError('wave scheduler must observe the authority mount namespace')
     with _scheduler_lock():
         options = {'fixed_d_stage_only': True} if fixed_d_stage_only else {}
         if d_stage_recovery_only:
             options['d_stage_recovery_only'] = True
+        if use_backup_reserve:
+            options['use_backup_reserve'] = True
         initial = _inspect(pairs, parallelism, **options)
         _emit('initial_plan', plan=initial)
         if _initial_admission_blocked(initial, continue_independent_waves):
@@ -349,7 +373,7 @@ def wait_and_execute(pairs: list[tuple[Path, Path]], parallelism: int, *,
                      fixed_d_stage_only: bool = False, expected_identity: list | None = None,
                      wait_for_scheduler: bool = False, poll_seconds: int = 60,
                      d_stage_recovery_only: bool = False,
-                     continue_independent_waves: bool = False) -> int:
+                     continue_independent_waves: bool = False, use_backup_reserve: bool = False) -> int:
     """Queue behind the scheduler without holding a lock or trusting stale capacity.
 
     Only scheduler contention is retried. Unknown owner, source, publication,
@@ -360,8 +384,27 @@ def wait_and_execute(pairs: list[tuple[Path, Path]], parallelism: int, *,
     options = {'fixed_d_stage_only': True} if fixed_d_stage_only else {}
     if d_stage_recovery_only:
         options['d_stage_recovery_only'] = True
+    if use_backup_reserve:
+        options['use_backup_reserve'] = True
     pinned = expected_identity
     while True:
+        if wait_for_scheduler:
+            try:
+                # Observe only; never hold this lock while waiting for capacity
+                # or another owner. A final execution still acquires it again.
+                with _scheduler_lock():
+                    pass
+            except SchedulerBusy:
+                if pinned is None:
+                    queued = _inspect(pairs, parallelism, **options)
+                    pinned = [(c['inventory_sha256'], c.get('fixed_d_publication'))
+                              for c in queued['cohorts']]
+                    if fixed_d_stage_only and any(publication is None for _, publication in pinned):
+                        _emit('deferred', reason='queued_fixed_publication_unavailable')
+                        return 75
+                _emit('waiting_for_scheduler', poll_seconds=poll_seconds)
+                time.sleep(poll_seconds)
+                continue
         handoff: list = []
         waiting_options = dict(options)
         if continue_independent_waves:
@@ -385,8 +428,10 @@ def wait_and_execute(pairs: list[tuple[Path, Path]], parallelism: int, *,
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--cohort', action='append', nargs=2, required=True,
+    parser.add_argument('--cohort', action='append', nargs=2,
                         metavar=('INVENTORY', 'RECEIPT'))
+    parser.add_argument('--queue-config', type=Path,
+                        help='Resume the explicitly enrolled persistent queue (no candidate discovery)')
     parser.add_argument('--parallelism', type=int, default=1, choices=range(1, 9))
     parser.add_argument('--apply', action='store_true', help='Invoke existing owner after fresh safety gates')
     parser.add_argument('--wait-for-capacity', action='store_true',
@@ -397,13 +442,28 @@ def main() -> int:
                         help='Use only an existing pinned D stage; defer instead of recreating source-sized workspaces')
     parser.add_argument('--d-stage-recovery-only', action='store_true',
                         help='Prepare on guarded D and require its encoding throughout recovery and retirement')
+    parser.add_argument('--use-backup-reserve', action='store_true',
+                        help='Use the pool earmarked for this guarded-D backup/recovery wave')
     parser.add_argument('--wait-for-prior-run',
                         help='After this exact supervised owner exits, accept it or retry one known audit failure')
     parser.add_argument('--continue-independent-waves', action='store_true',
                         help='Continue disjoint waves after a deferral; retain failures and exit incomplete')
     args = parser.parse_args()
+    if args.queue_config:
+        if (args.cohort or args.wait_for_capacity or args.wait_for_scheduler or args.wait_for_prior_run
+                or args.fixed_d_stage_only or args.d_stage_recovery_only or args.continue_independent_waves
+                or args.parallelism != 1 or args.use_backup_reserve):
+            parser.error('--queue-config uses only its enrolled policy and --apply')
+        from stockagent.data_sync.retirement_queue import cycle
+        result = cycle(args.queue_config.absolute(), root=ROOT, runner=sys.modules[__name__], apply=args.apply)
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if not args.cohort:
+        parser.error('provide --cohort or --queue-config')
     if args.fixed_d_stage_only and args.d_stage_recovery_only:
         parser.error('choose exactly one D resource mode')
+    if args.use_backup_reserve and not (args.fixed_d_stage_only or args.d_stage_recovery_only):
+        parser.error('--use-backup-reserve requires a guarded-D recovery mode')
     pairs = [(Path(inventory).absolute(), Path(receipt).absolute()) for inventory, receipt in args.cohort]
     if not args.apply:
         if (args.wait_for_capacity or args.wait_for_prior_run or args.wait_for_scheduler
@@ -412,12 +472,16 @@ def main() -> int:
         options = {'fixed_d_stage_only': True} if args.fixed_d_stage_only else {}
         if args.d_stage_recovery_only:
             options['d_stage_recovery_only'] = True
+        if args.use_backup_reserve:
+            options['use_backup_reserve'] = True
         print(json.dumps(_inspect(pairs, args.parallelism, **options), ensure_ascii=False, indent=2))
         return 0
     try:
         options = {'fixed_d_stage_only': True} if args.fixed_d_stage_only else {}
         if args.d_stage_recovery_only:
             options['d_stage_recovery_only'] = True
+        if args.use_backup_reserve:
+            options['use_backup_reserve'] = True
         if args.continue_independent_waves:
             options['continue_independent_waves'] = True
         predecessor_identity = None

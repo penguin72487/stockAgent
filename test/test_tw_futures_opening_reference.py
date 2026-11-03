@@ -82,6 +82,31 @@ def test_original_opening_trade_can_itself_be_the_last_trade_of_a_prior_session(
     assert row['reference_quote'] == 100. and row['reference_kind'] == 'last_observed_trade'
 
 
+def test_v2_ambiguous_last_trade_fails_closed_but_open_still_wins():
+    source = events().with_columns(pl.lit(False).alias('fallback_ambiguous'))
+    source = source.with_columns(pl.when(pl.col('price') == 103.).then(True)
+                                 .otherwise(pl.col('fallback_ambiguous')).alias('fallback_ambiguous'))
+    with pytest.raises(ValueError, match='contract v2'):
+        resolve_opening_references(decisions(), source, decision_time='08:45')
+    early = resolve_opening_references(decisions(), source, decision_time='08:45', version=2).row(0, named=True)
+    late = resolve_opening_references(decisions(), source, decision_time='09:00', version=2).row(0, named=True)
+    assert early['reference_kind'] == 'unavailable' and early['reference_quote'] is None
+    assert early['reference_trade_ts'] is None and early[OPENING_REFERENCE_FEATURES[1]] == 0.
+    assert late['reference_quote'] == 105. and late['reference_kind'] == 'observed_session_open'
+
+
+def test_v2_requires_explicit_ambiguity_and_never_assumes_legacy_is_clear():
+    with pytest.raises(ValueError, match='requires explicit fallback ambiguity'):
+        resolve_opening_references(decisions(), events(), decision_time='08:45', version=2)
+
+
+def test_v2_ambiguous_prior_denominator_is_never_used():
+    source = events().with_columns((pl.col('price') == 100.).alias('fallback_ambiguous'))
+    early = resolve_opening_references(decisions(), source, decision_time='08:45', version=2).row(0, named=True)
+    assert early['reference_quote'] == 103. and early['prior_trade_quote'] is None
+    assert early[OPENING_REFERENCE_FEATURES[0]] == 0.
+
+
 def test_repeated_opening_flags_cannot_silently_turn_first_open_into_latest_trade():
     invalid = events().with_columns((pl.col('is_session_open') | (pl.col('price') == 106.)).alias('is_session_open'))
     with pytest.raises(ValueError, match='multiple session-opening'):
@@ -142,24 +167,42 @@ def test_opening_reference_feature_and_source_change_reject_incompatible_resume(
     from test_tw_stock_context_futures_portfolio import _stock_panel
     c = load_config('configs/markets/tw_futures_v8_margin_components_causal_account_capital100m_v5.yaml')
     entry = tmp_path/'entries.parquet'; entry.write_bytes(b'entry fixture')
-    from stockagent.data.tw_futures_decision_clock import CLOCK_DATASET, decision_clock_contract
+    from stockagent.data.tw_futures_decision_clock import (
+        CLOCK_DATASET, OPENING_REFERENCE_DATASET, decision_clock_contract, opening_reference_contract,
+    )
     entry.with_name('manifest.json').write_text(json.dumps(dict(
         dataset=CLOCK_DATASET, clock=decision_clock_contract('09:00'), status='complete',
-        entries_sha256=sha256_file(entry),
+        entries_sha256=sha256_file(entry), pair_identity='paired', source_daily_sha256='a' * 64,
     )))
     c.trading.tw_futures_portfolio_entry_clock_path = str(entry)
     c.trading.tw_futures_portfolio_decision_time = '09:00'
     old = build_checkpoint_manifest(_stock_panel(),c,include_data_content=False)
     ref = tmp_path/'opening_reference.parquet'; ref.write_bytes(b'reference fixture')
-    ref.with_name('opening_reference_manifest.json').write_text('{}')
+    reference_manifest = dict(dataset=OPENING_REFERENCE_DATASET, status='complete',
+        contract=opening_reference_contract('09:00'), pair_identity='paired',
+        source_daily_sha256='a' * 64, data_sha256=sha256_file(ref))
+    manifest_path = ref.with_name('opening_reference_manifest.json')
+    manifest_path.write_text(json.dumps(reference_manifest))
     c.trading.tw_futures_portfolio_opening_reference_path = str(ref)
     new = build_checkpoint_manifest(_stock_panel(),c,include_data_content=False)
     assert new['fingerprints']['trading'] != old['fingerprints']['trading']
     with pytest.raises(RuntimeError,match='semantic fingerprint mismatch'):
         _validate_checkpoint_manifest({'experiment_manifest':old},new,checkpoint_path=tmp_path/'old.pt',scope='resume')
     ref.write_bytes(b'changed reference fixture')
+    with pytest.raises(ValueError, match='paired source'):
+        build_checkpoint_manifest(_stock_panel(),c,include_data_content=False)
+    reference_manifest['data_sha256'] = sha256_file(ref)
+    manifest_path.write_text(json.dumps(reference_manifest))
     changed = build_checkpoint_manifest(_stock_panel(),c,include_data_content=False)
     assert new['fingerprints']['trading'] != changed['fingerprints']['trading']
+    reference_manifest['contract'] = opening_reference_contract('09:00', version=3)
+    manifest_path.write_text(json.dumps(reference_manifest))
+    gap_aware = build_checkpoint_manifest(_stock_panel(),c,include_data_content=False)
+    assert changed['fingerprints']['trading'] != gap_aware['fingerprints']['trading']
+    with pytest.raises(RuntimeError, match='semantic fingerprint mismatch'):
+        _validate_checkpoint_manifest({'experiment_manifest':changed},gap_aware,checkpoint_path=tmp_path/'old.pt',scope='resume')
+    from stockagent.training.trainer import _mode_artifact_contract_for_config
+    assert _mode_artifact_contract_for_config(c)['mode_details']['opening_reference']['version'] == 3
 
 
 def test_opening_reference_encoder_receives_gradients_through_the_actual_integer_account():

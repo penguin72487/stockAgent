@@ -26,13 +26,16 @@ from stockagent.data.tw_index_futures import (
 )
 
 
-ALL_PRODUCT_DAILY_SOURCE_CONTRACT = 'taifex_all_option_product_daily_source_v1'
+ALL_PRODUCT_DAILY_SOURCE_CONTRACT = 'taifex_all_option_product_daily_source_v2'
 _SOURCE_COLUMNS = {
     '交易日期': 'date_raw', '契約': 'product_raw', '到期月份(週別)': 'series_raw',
     '履約價': 'strike_raw', '買賣權': 'right_raw', '開盤價': 'open_raw',
     '最高價': 'high_raw', '最低價': 'low_raw', '收盤價': 'close_raw',
     '結算價': 'settlement_raw', '成交量': 'volume_raw', '交易時段': 'session_raw',
     '最後最佳買價': 'last_bid_raw', '最後最佳賣價': 'last_ask_raw',
+    # The exchange added this column to its newer daily report. Keep the raw
+    # source text; older archives lack it and must remain null, not inferred.
+    '契約到期日': 'contract_expiry_raw',
 }
 _REQUIRED = frozenset({'交易日期', '契約', '到期月份(週別)', '履約價', '買賣權',
                        '開盤價', '收盤價', '結算價', '成交量'})

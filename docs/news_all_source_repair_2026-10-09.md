@@ -1,5 +1,6591 @@
 # 全來源新聞：下載器、CPU、故障範圍與完整性清冊
 
+## 10/30 維護期間：逐列核對鉅亨來源提示
+
+檔案身分和 SHA-256 可以確認目前比對的是哪個 FinLab 版本，但不能單憑
+這些資訊證明私人交接中的網址、日期和列索引互相對應。故障注入時，
+舊版接收端會採用與原列不符的日期；這是測試重現的缺陷，不表示下方
+182 筆真實樣本發現錯誤。
+
+現在既有背景比對器按選中的 Parquet row group 一次讀取網址及日期，
+逐列產生核對結果，再與有封存 request ID 的交接內容比對。owner 接收
+交易前後也核對已登記的來源與檔案版本；來源列不符、檔案不可讀、
+版本變動或舊格式無法核對時，仍可依來源政策登記網址，但不採用
+來源日期。檔案在交易中改變會回滾該次切片，稍後退回無日期處理。
+這些日期仍只是排序提示，並非新聞發布時鐘；完整匯入繼續負責原始
+來源關聯。既有 head、重試狀態及正文不因提示改寫。
+
+正常流程沿用背景比對已取得的核對結果，避免收件匣等待二次讀檔；
+若寫入交接後中斷而記憶體結果遺失，owner 會另以單一背景讀者核對，
+不佔住其他收件匣工作。背景讀取卡住兩秒、啟動失敗或讀取失敗時，
+退回無日期登記；完整來源匯入後仍可帶入原始日期。較新的已核對
+交接也不會等候較舊的卡住工作。頁面將無法核對原始列的狀況與其他
+交接結果分開顯示。
+
+[真實收據隔離重播](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_row_check_readback_20261030.json)
+獨立核對兩版本之間的 **182 個新增鉅亨來源列**；正常與模擬寫入後
+中斷的流程，均在隔離佇列新增 181 個網址、保留 1 個既有 head，
+後者也觀察到背景重查及進度標記恢復。這些不是新下載正文或正式佇列
+變更，完整來源關聯仍未由此證明。
+
+[本機交錯量測](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_single_read_abba_20261030.json)
+以同一組 443,139／443,321 列來源，將合併讀取與模擬多一次日期讀取
+各測三次，網址、日期、索引及核對結果一致。模擬重複讀取的 wall／
+程序 CPU 中位數為 **3.182／3.133 秒**，合併讀取為 **2.042／1.958 秒**；
+樣本少且時間波動重疊，僅能描述這次熱快取的本機比對，不能推算正式
+owner、網路吞吐或完工時間。此輪沒有請求新聞網站或寫入正式佇列。
+
+[最終程式的隔離共用回歸](../artifacts/operations/agent-workflow/runs/cnyes-row-single-read-shared-202-20261030T065438-f3bf8bbe/run.log)
+**977 項通過**，涵蓋來源列錯誤、讀取時換版、背景讀者逾時或失敗、
+中斷恢復、其他工作公平性、鉅亨排程以及桌面／手機面板；這不是整個
+專案的測試或正式服務驗收。
+
+新聞 service／timer 仍依維護指示停止，正式 owner 與網頁尚未就這次
+變更完成端到端驗收；TEJ 可依使用者指示繼續運作。
+
+## 10/30 維護期間：社群與影音候選網址
+
+[停機佇列的唯讀清點](../artifacts/data_quality/news_offline_inventory_20261029/social_candidate_census_20261030.json)
+找到 Facebook 的 **948 個網址 head**，其中 659 個外形像貼文連結、10 個
+像影片連結、279 個為其他形狀；YouTube 的 **153 個網址 head** 中有
+148 個觀看網址帶有影片 ID，另有 5 個其他形狀。這些均沒有正文指標，
+目前的嘗試計數為 0。網址形狀只是候選分類，不代表實際是新聞、可以
+取得文字或具有相同來源；影片也不能直接當成新聞文章或字幕。
+
+[獨立唯讀 SQL](../artifacts/operations/agent-workflow/runs/social-census-readback-20261030-20261030T061949-47b67983/run.log)
+已核對數量和正文指標；分類函式另以十個合成網址檢查。
+佇列與來源檔未寫入，也沒有對平台發請求。兩個來源均已記錄三項
+待辦，包含恢復後確認可用的官方／授權取得路徑、原始報導身分與文字，
+以及可取得的歷史和發布時間。來源審查仍屬未完成，並未授權下載。
+[更新後規劃](../artifacts/data_quality/news_offline_inventory_20261029/work_order_review_scope_v7_20261030.json)
+沿用 10/29 的佇列快照；[清冊及面板測試](../artifacts/operations/agent-workflow/runs/social-review-contract-20261030-20261030T061819-8ae4e539/run.log)
+**188 項通過**。本機 owner 面板可讀到兩個來源的待查狀態，但其下載
+快照仍是維護前資料，不能作為目前下載進度。
+
+## 10/30 維護期間：快點 TV 歷史網址的未完成清點
+
+[停機佇列的唯讀清點](../artifacts/data_quality/news_offline_inventory_20261029/gotv_candidate_census_20261030.json)
+找到 `gotv.ctitv.com.tw` 的 **52 個網址 head**：49 個 HTTPS、3 個 HTTP，
+皆等待來源確認、目前的嘗試計數為 0，且沒有正文指標。這些 head 有 52 筆
+來源連結、66 筆來源關聯、來自 50 個來源版本；這些數字不能相加或視為
+去重新聞篇數。網址雖含日期形狀，目前沒有可用的來源發布時鐘。
+
+[台灣媒體觀察教育基金會委託的 2018 年報告](https://www.mediawatch.org.tw/sites/default/files/files/%E3%80%8A%E7%B6%B2%E8%B7%AF%E6%96%B0%E8%81%9E%E5%B0%88%E6%A5%AD%E8%A1%A8%E7%8F%BE%E8%A9%95%E9%91%91%EF%BC%9A%E6%AF%8F%E6%97%A5%E6%96%B0%E8%81%9E%E5%AA%92%E9%AB%94%E8%87%89%E6%9B%B8%E7%B2%89%E7%B5%B2%E5%B0%88%E9%A0%81%E8%A9%95%E6%AF%94%E4%B9%8B%E5%88%9D%E6%8E%A2%E3%80%8B%E7%B5%90%E6%A1%88%E5%A0%B1%E5%91%8A.pdf#page=143)
+當時將快點 TV 粉絲頁列為中天，並列出該網站；這不能證明目前站方、
+52 篇的作者、網頁仍存在或可自動抓取。已在[來源查核清冊](../configs/news/source_reviews_20261009.json)
+記錄四項未完成工作：[更新後的規劃](../artifacts/data_quality/news_offline_inventory_20261029/work_order_review_scope_v6_20261030.json)
+將其標為部分查核，未授予抓取權限。此次沒有請求該新聞網站或寫入
+正式佇列。[來源清冊、規劃及面板投影回歸](../artifacts/operations/agent-workflow/runs/gotv-review-contract-20261030-20261030T061233-0e2c5fe6/run.log)
+**186 項通過**。
+
+## 10/30 維護期間：鉅亨來源列與中斷後的進度恢復
+
+延續下方 FinLab 新網址交接，現在私人請求保留原始收據的 SHA-256、
+來源列索引、檔案身分與比對基準。單一 owner 在採用來源日期前核對
+已登記的來源及本機檔案版本；檔案在寫入期間改變時會回滾該批並重試。
+檔案不存在、版本不符，或使用沒有來源綁定的舊格式時，仍保留合格
+網址，但不採用無法核對的日期。既有 head 不被覆寫；面板將這類新增
+網址列為「其他」的子項並說明原因。這些日期只是來源排序提示，不是
+已證實的發布時間；完整來源關聯仍由原匯入器負責。
+
+如果私人請求已寫入、進度標記尚未寫入就中斷，owner 會先核對來源及
+基準登記，再於接收交易中重建標記。較晚處理的舊請求不會覆蓋較新
+來源的標記。缺少可核對的基準時，不重建差異計數；若舊來源已被換版
+且原檔不可得，也不能保證還原該來源的日期和完整關聯。
+
+[真實收據的隔離斷電重播](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_origin_recovery_readback_20261030.json)
+在 10/30 14:06 台北時間以兩個 FinLab 版本獨立核對 **182 個原始列**，
+再模擬「已寫入收件匣、尚未寫入標記」：隔離 owner 重建標記並檢查
+182 個目標，新增 181 個網址、保留 1 個既有 head。未請求發布者、
+未改動正式佇列，也沒有取得新正文；這不是全歷史下載完成的證明。
+檢查檔案身分與來源紀錄的成本按每次有界交接切片計算，尚未量測正式
+服務的端到端吞吐或完成時間。
+[隔離共用回歸及桌面／手機頁面驗證](../artifacts/operations/agent-workflow/runs/cnyes-origin-recovery-shared-fin-20261030T060616-34cac78f/run.log)
+**968 項通過**；這不是整個專案的測試或正式服務驗收。
+
+新聞 service／timer 依維護指示保持停止，新程式尚未經正式 owner 與
+網頁端到端驗收，需待維護解除後以實際收據和頁面確認。TEJ 可以繼續運作。
+
+## 10/30 維護期間：鉅亨新網址保留來源日期排序
+
+原有 FinLab 鉅亨增量提示會提早登記網址，但只交接網址、不帶來源日期；
+因此原本有日期的新文章會暫時進入無日期的公平輪詢，無法利用既有的
+日期排序。現在背景比對找出新增網址後，只讀取包含候選的 Parquet row
+group，將該網址第一個來源列的原始日期一起交給既有的單一 owner。
+日期過長、含 NUL、缺欄或無法讀取時，仍可退回無日期交接；完整匯入
+繼續負責所有列、標題及來源關聯。這是來源 metadata 和排序依據，不是
+已驗證的新聞發布時間。既有文章狀態、重試期限及正文均不因提示改寫，
+來源政策變動也仍由原 owner 核對。保留對舊版網址收件匣格式的相容。
+
+[真實來源的隔離讀回](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_source_date_readback_20261030_v2.json)
+以 10/30 13:46 台北時間的兩版 FinLab 收據驗證 182 個來源日期；當時
+181 個網址尚不在正式佇列，其中 84 個來源日期為 10/28、97 個為
+10/29；另一個既有項目原狀保留。在隔離佇列，原匯入游標只到第 4,096
+列時，181 個新增 head 已帶入日期；一次隔離排程選到 10/29 的新增
+網址。這不保證正式工作一定依相同順序執行，也不是已下載正文的證明。
+讀回未寫入正式佇列、未請求新聞網站；來源關聯仍需完整匯入完成。
+[同一收據的隔離排程對照](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_source_date_dispatch_ab_20261030.json)
+使用兩個獨立測試 owner：僅交接網址時，第一次選到既有的 2016/04/22
+日期項；交接來源日期時，第一次選到新增的 2026/10/29 日期項。兩組
+都在完整來源匯入尚未走到表尾時比較，未發出文章請求或證明下載加速。
+
+[日期讀取成本的 ABBA 對照](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_date_compare_abba_20261030.json)
+對同一組 443,139／443,321 列來源各跑兩次：原網址比對的 wall／程序
+CPU 中位數為 **1.751／1.738 秒**，加上日期為 **2.157／2.126 秒**。
+樣本只有各兩次，量測包含原檔雜湊及本機比對，兩組執行時間有波動；
+它不是正式 owner、新聞網路吞吐或完成時間的實測。新增日期會增加本機
+讀取與處理成本，是否縮短正式抓取時間仍待維護結束後驗證。
+
+[隔離共用回歸](../artifacts/operations/agent-workflow/runs/cnyes-source-date-shared-regress-20261030T054409-741bb838/run.log)
+**933 項通過**，涵蓋收件匣相容、來源政策、斷點恢復、鉅亨排程及面板；
+不是整個專案測試。新聞 service／timer 依維護指示保持停止，正式 owner
+尚未載入此變更；TEJ 依使用者指示可繼續運作。
+
+## 10/30 維護期間：鉅亨優先交接的 owner 收據與面板
+
+下方 FinLab 新網址優先路徑原本只寫入每個來源版本的私人標記；網頁
+只能看見全部來源共用收件匣的合計，無法知道鉅亨這一次是否已由
+owner 檢查。現在提交後以同一資料庫交易保留最新指標及原版本標記；
+狀態讀取必須兩者相符，再用 request ID 查既有 URL metadata 的游標及
+逐項結果。沒有 owner 收據時顯示「尚無處理紀錄」；游標、完成狀態或
+結果計數矛盾時顯示「未知」，不把提交視為已登記。即使中斷發生在
+檔案送出後、標記寫入前，既有 request ID 與 owner 收據仍可安全續接。
+
+[新聞面板](../services/news_dashboard/index.html)現在分別顯示最近一次
+原始網址差異、已檢查候選、交接目標及 owner 已處理數；新增網址、
+保留既有網址和來源政策變動分開列示，並提供這次本機交接的觀測時間。
+該時鐘不是新聞發布時間。這些數字不是正文下載數、完整來源
+匯入進度或全部歷史分母。公開 API 只投影有界彙總，不傳網址、請求 ID、
+檔案路徑或私人標記；舊、無效或未載入的快照顯示未知。
+
+[真實 FinLab 收據的最終程式隔離狀態讀回](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_priority_status_readback_20261030_v3.json)
+以 10/30 13:33 台北時間的 443,139／443,321 列版本，測得 182 個合格
+目標；隔離 owner 的狀態由「尚無處理紀錄」轉成「已檢查 182 個」，
+其中新增 181、保留 1 個既有 head，公開投影與 owner 結果相符。
+正式佇列、原始來源與來源正文未改動，發布者請求為零。
+桌面及兩種手機寬度的[三項隔離瀏覽器測試](../artifacts/operations/agent-workflow/runs/finlab-cnyes-timestamp-browser-20261030T053326-a90c7927/run.log)
+通過，包含停機時標示上次快照；這些不是正式網站發布驗收。
+後續加嚴異常結果分類的判斷，避免未知分類被忽略後顯示錯誤數字；
+[13 項投影測試](../artifacts/operations/agent-workflow/runs/finlab-cnyes-status-validation-f-20261030T053118-5f44d827/run.log)
+已通過；加入觀測時間後另重做回歸。此前[初版讀回](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_priority_status_readback_20261030.json)
+和[加嚴分類後的讀回](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_priority_status_readback_20261030_v2.json)
+保留，但不能當成目前程式身分的證據。
+
+[最終程式的隔離共用回歸](../artifacts/operations/agent-workflow/runs/finlab-cnyes-status-final-regres-20261030T053411-7acda535/run.log)
+**840 項通過**，涵蓋斷點、重複交接、收據、來源政策、時間與面板；
+不是整個專案的測試。[狀態查詢量測](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_priority_status_cost_20261030.json)
+在記憶體 SQLite 的 512 個目標項及 6,400 個無關項目下執行 200 次，
+單次 wall 中位數 **0.187 毫秒**、p95 **0.384 毫秒**，查詢計畫使用
+request ID 主鍵；這只量測該狀態函式，不是完整快照、實體磁碟或下載
+速度。先前[837 項共用回歸](../artifacts/operations/agent-workflow/runs/finlab-cnyes-status-shared-regre-20261030T052943-f59f2e86/run.log)
+在新增觀測時鐘前開始，保留但不作目前完整程式版本驗收。
+
+新聞 service／timer 繼續停止，正在執行的網站 gateway 尚未載入新的
+Python 投影。10/30 維護期間對本機 owner 頁面作唯讀檢查時，HTML 已有新
+欄位，但 API 回報 `stopped`、觀測時間仍為 10/28 07:44 台北時間，
+並且沒有新交接欄位；因此不能宣稱目前的正式頁面已有新進度。
+維護解除後仍須核對實際 owner 收據、頁面與來源
+正文；不能由這個交接推算網站抓取速度或全歷史完成時間。
+
+## 10/30 維護期間：鉅亨新網址提早交給既有佇列
+
+FinLab 的鉅亨新聞收據一換版，原匯入器仍須從頭依序讀完大型表格；
+因此新增網址即使位於表尾，也要等到原游標走到該處才能登記。
+為不阻斷完整匯入，[優先比對器](../downloader/news_fulltext_finlab_priority.py)
+在背景比較前一個已完成版本和目前版本的 URL 欄，先把新增且符合現行
+鉅亨來源政策的網址交給原有 URL metadata 收件匣。完整來源關聯與計數
+仍由[原匯入器](../downloader/news_fulltext_metadata_ingest.py)負責。
+這只是網址線索，不是已下載或已驗證正文；既有文章狀態與重試期限不變，
+實際抓取先後仍由原排程及來源政策決定。
+
+比對前核對舊檔雜湊，並檢查收據與兩份檔案在比對期間有無變更。
+提交使用固定 request ID，寫入後中斷可重送而不重複建立請求；來源
+換版時最多一個背景比對，避免重複掃描。一次最多交接 512 個不同合格
+網址，其他網址由原完整匯入處理。舊檔不存在、背景工作失敗或收件匣
+暫時不可用時，不中斷原匯入流程；此優先路徑不保證每次都能提早完成。
+
+[真實停機快照的隔離讀回](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_priority_actual_readback_20261030.json)
+於 10/30 13:20 台北時間核對 443,139 筆舊版與 443,321 筆新版，
+有 182 個新增鉅亨網址，其中 181 個當時不在正式佇列、1 個已存在。
+在隔離佇列重播時，181 個被登記、1 個原狀態保留；此時原匯入游標在
+第 4,096 筆。沒有寫入正式佇列或發出發布者請求，也沒有取得新正文。
+9.33 秒包含雜湊、獨立比對與隔離重播，不是正式下載時間。
+
+[隔離常駐流程 ABBA 對照](../artifacts/data_quality/news_offline_inventory_20261029/finlab_cnyes_priority_service_abba_20261030.json)
+使用 32,769 筆合成列、1 個位於表尾的新網址與假 HTTP：網址進入佇列
+的中位數從 2.86 秒降至 2.27 秒，整個匯入中位數由 2.88 秒變為
+2.69 秒，程序 CPU 時間則由 2.36 秒增至 2.68 秒。四次量測受本機負載
+影響，僅代表該小型測例，不證明正式網站下載更快；此方法確實增加了
+背景比較的 CPU 與記憶體成本。測試結束的指定 head 欄位及完整來源
+關聯相同；first/last seen 觀測時鐘未列入一致性雜湊。
+
+[該次優先交接程式的隔離共用回歸](../artifacts/operations/agent-workflow/runs/finlab-cnyes-priority-shared-fin-20261030T052210-bfc8f1d7/run.log)
+**417 項通過**，涵蓋背景比對、收據換版、重啟重送、既有文章狀態、
+完整來源關聯、原佇列及鉅亨排程；正式來源目錄唯讀且沒有外部網路。
+未執行整個專案測試。
+
+新聞服務及計時器依維護指示保持停止；程式尚未由正式新聞 owner 載入。
+恢復後仍需核對真實收件匣、來源回應與面板，才知道實際提早多少、
+有多少文章取得正文以及何時可抓完。TEJ 獲准繼續運作。
+
+## 10/30 維護期間：CMNews 已核對網址交接與自動恢復
+
+下方已完成離線核對但尚未交給正式排程的 772 個 CMNews 網址，現以
+[私人交接憑證](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_links_handoff_v1_20261030.json)
+綁定原有獨立讀回、兩批網址、401 個來源文章 head 與 254 個來源批次。
+憑證只證明既存來源頁出現過這些連結，**不代表目標存在、可抓或已有正文**。
+
+[既有新聞 owner 的交接程式](../downloader/news_fulltext_retained_handoff.py)
+在服務獲准恢復後，會先逐一核對目前來源政策、指定 head、來源批次及
+收據身分，再透過既有 URL metadata 收件匣處理；不另開下載器，也不改變
+鉅亨優先順序。已有的網址狀態與正文予以保留。收件匣滿載或本機暫時
+無法讀寫時會自動重試；程序中斷後以既有 request ID 和 owner 的逐筆
+收據續接。來源、授權或原件變動時該批次暫緩，其餘 provider 仍可運作。
+整庫 SQLite 快照即使因無關工作變動，只要這 401 個 head 及 254 個
+原批次／收據仍與憑證一致，無須重掃整庫；任何關聯證據變動仍必須重核。
+憑證或其私人證據遺失時，狀態明示暫緩，不推測可用。
+
+[固定目前程式身分的唯讀驗證](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_handoff_final_code_readback_v2_20261030.json)
+核對全部 772 筆，該次本機驗證約 **0.239 秒**；這不是網站抓取速度。
+[完整 772 筆的隔離 owner 重播](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_handoff_772_isolated_recovery_v2_20261030.json)
+以真實候選及唯讀原批次、254 份雜湊相同的收據副本測試：第一批送出
+後模擬中斷、重啟 owner，最終新增 771 個 metadata head、保留事先存在的
+1 個 head，兩份測試收據均完成；全程約 3.06 秒，**只屬隔離測試**。
+原佇列、正式收件匣與來源檔未改變，沒有發布者請求，也沒有取得新正文。
+
+[549 項隔離回歸](../artifacts/operations/agent-workflow/runs/cmnews-handoff-final-reg-20261030T050023-eeeb4fa8/run.log)
+通過；桌面頁面、手機頁面與舊版面板的[三項瀏覽器重測](../artifacts/operations/agent-workflow/runs/cmnews-handoff-browser-v2-20261030T050420-fc1973dd/run.log)
+亦通過。先前一次瀏覽器啟動逾時已保留[失敗紀錄](../artifacts/operations/agent-workflow/runs/cmnews-handoff-dashboard-20261030T045557-eb237669/run.log)，
+重測不把逾時當成發布者錯誤。
+
+網頁程式與唯讀投影已更新，明確分開私人候選、收件匣、owner 檢查與
+正文；目前只完成隔離與唯讀投影驗證，執行中的共用網站 gateway 尚未
+載入新 Python 程式，不能視為公開頁面已更新。新聞 service／timer 繼續
+按維護指示停止，TEJ 可以運作。解除維護後仍需核對正式 owner 的兩份
+收據、實際來源回應與面板，才可確認正式交接和下載結果；目前沒有可
+驗證的全站完成時間。
+
+## 10/30 維護期間：CMNews 保留原頁的精確發布宣告
+
+沿用下方已完成的 619 個舊時間見證，新增相容舊資料集的建置處理。
+舊的 `published_at_raw` 原樣保留；只有已固定的 head、正文、收據、
+回應雜湊與網址一致，現行來源解析器並核對了同一篇標題、作者、
+可見發布／更新分鐘、來源精確宣告及原頁未呈現已知登入遮罩時，才在新欄位
+`retained_published_declaration_raw` 及 `retained_modified_declaration_raw`
+分別保存原頁帶時區的發布及更新宣告，並由發布宣告換算
+`published_at_utc`。擷取與 `available_at_utc` 不提前，
+宣告不等於已證明歷史當時取得的文章版本；有缺漏或矛盾不推測時區。
+原始頁面只在便宜欄位初篩後逐筆解碼，避免同時載入整批原頁；不因此
+重抓網站，也不將登入預覽補成全文。
+
+[實際原批次的唯讀建置路徑核對](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_clock_dataset_readback_v4_20261030.json)
+對 235 批、619 個 head 比對來源收據、正文及舊的逐筆原頁見證：
+**450 筆各自恢復精確發布及更新宣告，169 筆維持原樣，差異 0**；
+約 32.5 秒的量測僅涵蓋
+這批本機讀取、解析和比對，不是整條下載或全庫語料建置速度。
+全部保留原文及其實際觀測時間；不等於所有來源時間或權利已驗證。
+新聞來源目錄以唯讀掛載，發布者請求、正式 queue 寫入和正式語料
+寫入都是 0。
+
+第二版讀回進行時，單篇原頁大小處理曾改動；該版雖保留紀錄，不能
+作為最終程式身分的驗收。第三版增加執行前後 builder 與讀回程式
+雜湊一致檢查，第三版完成後又修正語料欄位說明表的排版，最後以
+固定程式重做上述建置路徑核對。
+
+此處理與新欄位採新的建置 scope；既有 manifest 的舊 schema 仍可
+讀取與驗證，不會以新 scope 在舊根目錄直接刷新。已用模擬舊版實體
+執行驗證，並唯讀核對現有正式語料的一個舊版文章分區 schema；這
+不是對全部現有正式分區重新驗證。將修正實際用於語料，仍需容量
+確認、相容新快照／根目錄及完整獨立驗收；目前**尚未建置或發布
+正式新版語料**。新聞服務與計時器按維護指示繼續停止；TEJ 可運作，
+鉅亨仍是維護解除後的優先工作。
+
+[最終隔離回歸](../artifacts/operations/agent-workflow/runs/news-cmnews-two-clocks-final-reg-20261030T044603-385f70c0/run.log)
+共 **361 項通過**，包含原頁身分及遮罩、精確發布／更新時間、未知
+時區、來源收據、新舊 schema、資料集建置、快照與品質覆核。此為
+工程驗證，不代表維護停機中的服務已載入程式或已下載新的新聞。
+
+## 10/30 維護期間：舊 Global Voices 來源時間依據可供新語料使用
+
+沿用下方已驗證的舊原件見證，修正資料集讀取器：對整個來源批次原本
+沒有 `published_time_basis` 欄位的 Global Voices HTML，在核對目前 head、
+批次收據及雜湊後，只有來源網址、請求與最終網址、回應雜湊、原始
+時間及唯一的 `article:published_time` 都符合，才補記這個**來源宣告
+的依據**。有既有依據或證據缺漏、不同、重複時維持原值或未知，不把
+RSS、網址日期、擷取時間或其他來源當成發布時間。原文、作者、來源
+時計、授權、擷取時間及 `available_at_utc` 均不回填或提前。
+
+[讀取程式](../stockagent/data/news_dataset.py)先投影較小的欄位，只有
+符合上述初步條件的舊 HTML 才逐列解碼原回應；RSS、衝突和已有欄位的
+批次不為此解碼原始 HTML。這是避免不必要工作的結構驗證，不是全部
+下載或整個語料建立速度的量測。
+
+[正式停機快照的隔離讀回](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_legacy_basis_materialization_v2_20261030.json)
+以目前讀取器核對 **1,033 個既有 head、425 個原始批次**：推導的依據、
+原始時間、正文雜湊、來源收據及實際擷取時間均符合先前固定範圍；
+約 24 秒僅涵蓋這批唯讀投影，不包括完整語料建置或線上下載。這些
+是原已保存的文章，不是新增下載，也不證明發布當下已取得內容、
+使用權利或全站歷史完整。
+
+此輸出語意採新 scope，新的訓練語料必須使用相容的新輸入快照和獨立
+根目錄；舊 manifest 仍可讀。**本次沒有重建或覆寫正式語料**，所以
+現有語料中的空欄位不會自行變更。[跨模組回歸](../artifacts/operations/agent-workflow/runs/news-globalvoices-legacy-basis-f-20261030T043315-06c685c7/run.log)
+有 **220 項通過**，涵蓋真實批次格式的隔離測試、正反例、來源收據、
+新語料、來源快照和舊資料集邊界；[舊版讀取補充檢查](../artifacts/operations/agent-workflow/runs/news-globalvoices-legacy-reader--20261030T043416-878f154d/run.log)
+另有 1 項通過，與前者重疊。初版多餘解碼的三項[失敗重現](../artifacts/operations/agent-workflow/runs/news-globalvoices-basis-projecti-20261030T043234-e956a585/run.log)保留。
+
+新聞服務及計時器依使用者維護指示保持停止，沒有發布者請求或正式
+queue 寫入。TEJ 可繼續運作；鉅亨實際缺文回補、其他來源及正式
+語料建置仍待各自的後續驗收，不能以離線測試表示全新聞已抓完。
+
+## 10/30 維護期間：HTTP 連線清理與 owner 鎖
+
+正式設定有啟用 HTTP 獨占鎖。[隔離重現](../artifacts/operations/agent-workflow/runs/news-http-lock-red-20261030-20261030T041520-4d54f724/run.log)
+顯示三種可阻礙同程序接手的情況：其中一個 session 關閉失敗時，
+後續 session 和鎖未清理；明確解鎖失敗時沒有繼續關閉檔案；HTTP
+初始化失敗而 traceback 仍持有物件時，鎖仍被持有。這些是隔離注入，
+不是正式事故的證明；若舊程序已終止，作業系統會關閉其檔案描述符。
+
+[共用 HTTP owner](../downloader/news_fulltext_http.py)現在在初始化失敗時
+主動釋放已取得的鎖；結束時逐一嘗試關閉 session 和鎖，保留第一個
+失敗，其他失敗只在附註放階段及類別。即使明確解鎖失敗仍嘗試關閉
+描述符。無法保證拋錯的外部 session 本身已完整關閉，也不能據此
+宣稱卡住不返回的函式已被修復。既有來源配額、排程與授權條件不變。
+
+[聚焦驗證](../artifacts/operations/agent-workflow/runs/news-http-lock-focus-20261030-20261030T041812-6a8cf03c/run.log)
+**15 項通過**，包含多個 session／解鎖同時失敗與新 owner 接手；
+[實際 CLI 串接測試](../artifacts/operations/agent-workflow/runs/news-http-cli-chain-20261030-20261030T041836-9549ea42/run.log)
+另以保留 traceback 的 HTTP 初始化失敗，驗證佇列鎖及 HTTP 鎖皆可由
+新 owner 取得。測試沒有連線發布者；正式新聞服務和排程仍維持停止，
+修改尚未由正式 owner 載入。
+
+[最終跨模組隔離回歸](../artifacts/operations/agent-workflow/runs/news-http-owner-final-regression-20261030T041853-cbe66d48/run.log)
+**2,423 項通過**，涵蓋鉅亨與既有新聞恢復、佇列、HTTP 連線、
+限流、robots、排程及面板；正式新聞目錄唯讀，隔離網路只啟用
+loopback。[獨占鎖補充測試](../artifacts/operations/agent-workflow/runs/news-http-owner-uniqueness-20261-20261030T042015-2c43f15c/run.log)
+亦確認兩次拒絕另一個 owner 都不會釋放原 owner 的鎖。這些測試
+不代表來源網站已恢復或歷史文章已下載。
+
+## 10/30 維護期間：保留下載器第一個故障
+
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-primary-failure-red-2026103-20261030T041156-ec6c85f8/run.log)
+顯示工作本身已失敗後，若中斷狀態寫入、HTTP 關閉或佇列清理也失敗，
+後續例外會取代原始例外；四種重現失敗，一種只有清理失敗的情境原本
+通過。這是注入本機故障的測試，不代表正式服務曾發生相同組合。
+
+[共用執行入口](../scripts/download_news_fulltext.py)現在保留第一個
+工作例外；狀態回報及清理的次要錯誤以階段與例外類別附在主例外，
+不把例外內容放入附註，並繼續關閉 HTTP、佇列及其 owner 鎖。若工作
+本身成功但清理失敗，仍將第一個清理例外作為失敗回報；生命週期
+觀測可正常寫入時會標記失敗，後續清理錯誤不應蓋過它。[聚焦測試](../artifacts/operations/agent-workflow/runs/news-cleanup-failure-focus-20261-20261030T041245-a34963ff/run.log)
+**10 項通過**，另確認訊號處理器還原失敗時仍會執行其餘清理及釋鎖。
+現場新聞服務及排程維持停止，修改尚未由正式 owner 執行。
+
+在後續 HTTP 鎖修正之前，[跨模組回歸](../artifacts/operations/agent-workflow/runs/news-cleanup-final-regression-20-20261030T041300-1ee1598b/run.log)
+**1,845 項通過**，網路隔離且正式新聞目錄唯讀。
+
+## 10/30 維護期間：新聞 owner 狀態交接與上次失敗
+
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-owner-handoff-red-20261030-20261030T035955-27fe51ef/run.log)
+發現舊 owner 原本先釋放鎖、再記錄終止狀態；新 owner 若在間隙取得
+鎖並寫入狀態，舊 owner 的遲到寫入可能覆蓋它。另一個測試顯示收據
+恢復在建構中失敗後，狀態可能仍停留在初始化。這兩項是隔離重現，
+不是聲稱正式服務曾發生相同競爭。
+
+現在[共同佇列](../downloader/news_fulltext_queue.py)在仍持有 owner 鎖時
+完成資源清理和生命週期終止紀錄，再釋放鎖；取得鎖後失敗的初始化也走
+這個順序。舊生命週期物件終止後的延遲寫入會被忽略。[執行入口](../scripts/download_news_fulltext.py)
+將初始化、執行及清理階段的例外交給同一個結束路徑；若初始化
+量測在佇列建構完成後失敗，也會先關閉佇列、釋放鎖再回報原錯誤。
+這些修改不改新聞工作、來源權限、重試期限或已接受正文。
+
+[生命週期觀測](../stockagent/data/news_worker_lifecycle.py)會在新 owner
+取得鎖後，從前一次**有效且有界**的紀錄保留最近一次失敗的階段、
+固定原因類別、時間及最後記錄的收據數；例外原文、私人路徑、PID
+與帳號不送到公開面板。新的[面板](../services/news_dashboard/app.js)
+將它明確標為「上次失敗」，只有確實屬目前停止的 owner 才標為
+「本次失敗」；不相干的舊 owner 不會套用到較新的快照。公開生命週期
+投影為 v3，失敗欄位有獨立 v1；舊觀測缺少此欄位時保持未知。
+保留的是最近一筆可驗證觀測，不是完整錯誤日誌；強制終止可能沒有
+留下結束紀錄，取得鎖之前的失敗或本機觀測檔無法寫入也不能保證留存。程式恢復運行
+不代表先前缺文或來源權限問題已修復。
+
+[真實入口的隔離交接測試](../artifacts/operations/agent-workflow/runs/news-owner-restart-chain-2026103-20261030T040535-412e7ed9/run.log)
+包含收據恢復失敗、下一 owner 發布快照、清理與鎖釋放，以及 320／1280
+寬度的測試頁面；沒有呼叫發布者或寫入正式新聞資料。[空佇列啟動到
+關閉的 ABBA](../artifacts/operations/agent-workflow/runs/news-owner-handoff-abba-v2-20261-20261030T040655-5a6991dd/run.log)
+以 tmpfs 各測六次：跳過前次觀測讀取的參考為 11.702–15.902 ms，實作
+為 11.647–18.017 ms。兩邊執行的驗證不同，且樣本受當時負載影響；
+這不是正式完整歷史啟動或下載吞吐的比較。第一次基準因測試模組匯入
+路徑錯誤而失敗，原紀錄保留，後以正確匯入重新量測。
+
+[現有唯讀閘道的瀏覽器讀回](../artifacts/operations/agent-workflow/runs/news-live-v2-backward-ui-2026103-20261030T040814-4359c141/run.log)
+在 320／1440 寬度均正常呈現、無水平溢出與頁面錯誤，未向發布者發出
+請求。閘道直接提供磁碟上的新版前端，但其既有 Python 程序仍是 v2
+投影，因此新的上次失敗欄位要待後端依正常維護流程重新載入後才會出現；
+新版前端已驗證能相容舊後端。新聞下載服務和排程維持停止，TEJ 服務
+與排程不受這次修改影響。
+
+[該階段跨模組隔離回歸](../artifacts/operations/agent-workflow/runs/news-owner-handoff-final-regress-20261030T040559-dfd19f56/run.log)
+在後續例外清理修改之前 **1,839 項通過**，涵蓋新聞收據、鉅亨與遺留工作恢復、共用下載器、
+owner 生命週期及面板；正式新聞資料唯讀，隔離網路僅有 loopback。
+先前一輪有一個測試替身的方法簽章錯誤，修正測試替身後重新通過；
+未把它描述為正式服務故障，也保留了原始失敗紀錄。
+
+## 10/30 維護期間：正文收據的暫時性讀取錯誤
+
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-receipt-transient-red-20261-20261030T035006-efcdec49/run.log)
+顯示啟動恢復接近完成時，若某份收據出現一次本機 I/O 錯誤，舊流程
+會中斷；服務重新啟動時必須再讀取先前所有收據。這是模擬錯誤，
+不是正式服務確曾發生此故障的證據。
+
+[共用佇列](../downloader/news_fulltext_queue.py)現在只對指定的暫時性
+本機讀取錯誤，在原順序位置重新讀取同一份收據一次；背景預讀遇到
+此類錯誤時，重試及後續解碼仍由原 owner 執行。重試成功後仍須完整
+解碼，孤兒正文仍須核對合約、雜湊和筆數。重複失敗、權限錯誤、
+檔案不存在、損壞 JSON 或正文驗證失敗會明確傳出，不能跳過或標記
+為完成；沒有無限等待，下一次啟動仍可取得釋放的 owner 鎖。收據 I/O
+觀察合約為 v2，私人狀態記錄重試次數及讀取成功次數；讀取成功
+不是正文驗收成功，也不是新下載。舊狀態快照保持原 v1。
+
+[合成 ABBA](../artifacts/operations/agent-workflow/runs/news-receipt-retry-abba-20261030-20261030T035240-5287b04b/run.log)
+在暫存 tmpfs 使用 8,192 份已提交的合成收據，於倒數第八份注入一次
+EIO，完整比較重掃和原位重試：前者讀取 16,377 次、約 0.807／1.048 秒；
+後者讀取 8,193 次、約 0.441／0.520 秒。兩邊完成相同的恢復並核對
+資料庫未變；這是同進程模擬重掃，不包含 systemd 重啟等待、磁碟冷快取、
+孤兒正文的讀取或網路。無故障樣本波動較大，不能據此宣稱正常啟動
+或發布者下載變快。
+
+[既有收據唯讀抽樣](../artifacts/operations/agent-workflow/runs/news-real-receipt-retry-abba-202-20261030T035526-4f22d735/run.log)
+另取已提交路徑排序前 2,048 份真實收據，在隔離記憶體資料庫中注入
+相同單次錯誤；重掃與原位重試分別讀取 4,089 和 2,049 次，讀取前後
+逐份雜湊不變。這是已提交收據的有限樣本，不含孤兒正文、不代表
+所有來源或全部收據；沒有寫正式資料庫或請求發布者。
+
+[收據、下載器、生命週期與面板的隔離回歸](../artifacts/operations/agent-workflow/runs/news-receipt-contract-final-2026-20261030T035344-6faab202/run.log)
+1,583 項通過，包含同步／預讀兩種路徑、正常與損壞的孤兒收據、
+永久錯誤、持續失敗後鎖釋放及本機測試網頁；不等於全部專案測試
+或正式 owner 的線上驗收。新聞服務與計時器仍依維護要求停止，
+正式 owner 尚未載入修改；TEJ 可繼續運作。
+
+## 10/30 維護期間：來源引用清點的可重建見證
+
+上一版來源收據改指的清點事件只有摘要；來源清單後來變更時，不能
+還原當時哪些邏輯路徑引用哪個實體目標。共用匯入器現在在新事件中
+保存壓縮的兩來源清單成員、解析後的引用、待改指項目與不再引用的
+目標，並以內容雜湊連結原事件；見證、停用舊目標、游標與事件在同一
+筆 SQLite 交易中提交。[獨立讀取函式](../downloader/news_fulltext_metadata_ingest.py)
+可檢查壓縮資料、雜湊、成員對照及停用集合的一致性。舊的摘要沒有
+保存完整清單，無法事後補成當時的證據。完整見證保存在私人新聞
+queue，現行訓練輸入快照不含這份見證；它不是發布者簽章，也不
+保證跨來源檔案系統與資料庫的原子快照或全部歷史完整。
+
+正常流程只在已知改指時產生見證；序列化和壓縮在資料庫寫入交易前
+完成，提交前複核暫存目標與改指來源，並比對寫入的壓縮位元組。
+遇到相同雜湊但不同位元組時才執行完整讀回，不覆蓋有衝突的證據；
+新見證的完整語義讀回可在之後獨立執行，並非每次提交同步重做。
+正常情況的來源選取條件沒有改動；證據衝突時保留待核對狀態，
+原始資料及既有 origin 保留。
+
+[隔離測試](../artifacts/operations/agent-workflow/runs/news-alias-proof-optimized-20261-20261030T034304-47869582/run.log)
+21 項通過，涵蓋 FinLab／FinMind、共享舊目標、重啟、損壞、衝突及
+中斷回滾；[修改前測試](../artifacts/operations/agent-workflow/runs/news-alias-proof-red-20261030-20261030T033805-da960b07/run.log)
+顯示原先無見證能力。[跨模組回歸](../artifacts/operations/agent-workflow/runs/news-alias-proof-final-regressio-20261030T034338-c0b68d6d/run.log)
+727 項通過，涵蓋匯入器、資料集、共用下載器、狀態及面板，與前述
+測試重疊，不是整個專案的全測試。5,685 條**合成**引用的[本機 ABBA 比較](../artifacts/operations/agent-workflow/runs/news-alias-proof-abba-20261030-20261030T034329-c41a052a/run.log)
+中，1,080,478 bytes 的見證壓縮為 49,691 bytes；提交時完整解碼核對
+的中位數為 138.136 ms，改成先比對位元組為 14.716 ms。兩者做的
+同步驗證工作不同：後者把完整語義讀回留到需要時，這不是同等驗證
+量的直接加速比較。量測受當時主機負載影響，沒有檔案系統清點、磁碟 SQLite、網路或正式
+owner 迴圈，不能推算實際下載吞吐或完成時間。
+
+新聞 service 和 timer 依維護要求維持停止，正式 owner 尚未載入此
+修改；TEJ 可運作。鉅亨及其他來源的實際回補、逐筆正文與收據、
+線上派工和網頁驗收仍須在維護結束後由既有 owner 完成。
+
+## 10/30 維護期間：來源收據改指目標的選取與復原
+
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-alias-selection-red-20261030T031047-642002b2/run.log)
+發現已驗證的邏輯收據連結若由 A 改指 B，舊版以實體路徑分別選取
+A、B，可能把舊來源與新來源都算成目前資料；同時另一個邏輯路徑仍
+引用 A 時，A 又必須保留。這是合成故障，不表示正式來源曾發生改指。
+
+共用匯入器現在先耐久記錄已驗證的邏輯路徑，偵測到改指便先留下
+待核對紀錄。舊目標只在 FinLab 與 FinMind 來源目錄的路徑成員穩定、兩次分段
+清點均一致，而且沒有其他路徑引用時，才從目前來源選取中排除；
+原始檔、既有 origin 和網址關聯保留。若目錄失聯、收據未驗證、
+清點中途變動或 owner 重啟，待辦會保留並重試；清點期間面板的目前
+來源筆數顯示未知，訓練快照也不會發布。其他來源仍可繼續派工。
+僅在已知連結改指時才執行完整清點，一般例行匯入不重掃全部路徑。
+來源清單中與成員無關的更新時間，或其他收據的 mtime 改變，不會
+讓引用清點重來；新增／移除成員、路徑改指或正在核對的目標版本
+變動仍會重查。其他收據的內容與版本由原匯入流程繼續檢查，不由
+這次引用清點代替。
+中途被取代且不再有引用的未完成游標改標 `superseded`，保留游標
+以供日後重新引用時續傳，並釋放已開啟的讀取器；不再把它算成目前
+進度。舊目標的錯誤紀錄也保留，但不在沒有引用時算作目前錯誤；
+一旦新引用指向該目標，先回到待核對，錯誤會重新列出，驗證成功
+後才恢復來源選取。
+
+此前沒有保存邏輯路徑的舊收據，無法由既有實體路徑精確推回過去
+曾有哪個連結；這些舊項目仍按原規則標為推測選取。檔案系統與來源
+SQLite 也沒有共用原子交易，兩次清點與提交前檢查不能排除提交後
+立刻發生的外部變更，後續清點仍須偵測。新選取範圍為
+`explicit_current_origin_or_legacy_inference_alias_census_v2`，建立新
+語料須用新來源快照及獨立輸出根目錄；舊 manifest 保持可讀，正式
+語料沒有重建。網址 head 和已保存的正文也不因排除舊來源而刪除。
+舊清點事件保存的是引用對照摘要，沒有保存完整當時的路徑清單；
+來源後續變更後，不能僅靠舊摘要重建該次清單。新事件的見證與
+使用範圍見上節。
+
+[跨模組回歸](../artifacts/operations/agent-workflow/runs/news-alias-recovery-regression-2-20261030T032019-d2cb7477/run.log)
+在後續游標與錯誤分類修正前 **926 項通過**，包含資料集選取、版本相容、匯入、派工、服務生命週期
+與面板；不是專案全測試。[額外模擬](../artifacts/operations/agent-workflow/runs/news-alias-liveowner-fixture-202-20261030T032237-7149c756/run.log)
+確認共享實體收據保留，以及清冊暫時失敗時其他模擬正文仍可落盤並
+讀回；[分段續跑](../artifacts/operations/agent-workflow/runs/news-alias-yield-fixture-2026103-20261030T032331-8aff6b84/run.log)
+和[320／1440 畫面](../artifacts/operations/agent-workflow/runs/news-alias-browser-20261030-20261030T032124-e733c32c/run.log)
+另行通過。測試均與發布者網路隔離、正式新聞目錄唯讀。
+續查保留了[未完成游標與讀取器問題的重現](../artifacts/operations/agent-workflow/runs/news-alias-partial-red-20261030-20261030T032510-d79531c6/run.log)
+及[舊錯誤分類問題的重現](../artifacts/operations/agent-workflow/runs/news-alias-error-red-20261030-20261030T032616-c12c9913/run.log)；
+[修正後的 16 項重點測試](../artifacts/operations/agent-workflow/runs/news-alias-error-green-20261030-20261030T032648-3e534d50/run.log)
+涵蓋未完成游標恢復、記憶體釋放及舊錯誤重新引用後再次可見。
+[無關更新使清點反覆重來的重現](../artifacts/operations/agent-workflow/runs/news-alias-starvation-red-202610-20261030T032808-f860f6e6/run.log)
+以及[後續 44 項重點測試](../artifacts/operations/agent-workflow/runs/news-alias-census-efficient-2026-20261030T033036-f441aff1/run.log)
+確認可繼續完成引用清點，同時仍會偵測真正的目錄成員變化。
+[最後跨模組回歸](../artifacts/operations/agent-workflow/runs/news-alias-efficient-regression--20261030T033100-f07f78a9/run.log)
+**722 項通過**，涵蓋本次修改的匯入器、資料集、正文派工、狀態發布
+與網頁；它與前述 926 項重疊，不能相加。兩者皆不是全專案測試。
+
+約 11:21 的實際來源清冊唯讀量測有 FinLab 1 項、FinMind 5,684 項；
+兩次路徑檢查分別約 1.899 和 1.794 秒，當時 5,685 個項目均可解析。
+這是本機路徑檢查，不是收據內容雜湊、正文或來源歷史完整性驗收，
+也不能當成常態抓取速度。另以[唯讀 A／B／B／A 對照](../artifacts/operations/agent-workflow/runs/news-alias-census-abba-20261030-20261030T033118-76d545b4/run.log)
+測同一批 5,685 個路徑的單次引用掃描：舊方式 1.289、1.353 秒，
+新方式 1.336、1.265 秒；引用結果雜湊一致，但時間差不足以證明
+實際加速。這只比較同一進程中的路徑解析與身分檢查，不包含整次
+清單讀取、交易或正文下載。其收益是避免無關更新造成清點飢餓，
+不是已證明的吞吐提升。
+新聞 service／timer 仍依維護指示停止，
+原 owner 尚未運作，公開 gateway 的 Python 程序啟動早於本次修改；
+尚未驗收現場畫面。TEJ 不在停機範圍。所有
+發布者下載、實際進度及完工時間仍需維護解除後驗收。
+
+## 10/30 維護期間：單筆收據錯誤、增量更新與清點恢復
+
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-invalid-path-red-20261030T025604-b4bec7d2/run.log)
+發現 FinMind 任務已標記完成，但收據路徑是空值、空字串或非文字時，
+舊清點可能忽略該任務，或由單筆異常中斷整輪；單筆路徑的 I/O 錯誤
+也可能直接中斷。這些是合成故障，並非宣稱正式 FinMind 已發生故障。
+
+[新聞共用匯入器](../downloader/news_fulltext_metadata_ingest.py)現在將
+無效任務保留為可見的清單錯誤與待辦，繼續匯入其他有效收據，並在
+來源清單修復後由原 owner 續跑；FinLab 仍可優先追新。已完成的有效
+收據不因一個壞項目每秒重做。若來源任務的 `last_attempt_at_utc`
+改變，只重查有變化或仍失敗的路徑，並保留既有收據順序；即使來源
+未更新任務時間，也會定期重查收據。清單仍有無效項目時，固定不變
+且驗證失敗的資料檔只檢查檔案身分，重新雜湊採短暫遞增間隔，最長 30 秒；身分一變就
+可以提前重試。實際重試時間仍取決於 owner 工作量和磁碟。
+
+個別路徑解析遇到 I/O 錯誤時會記錄而不阻斷其他項目；已修好的符號
+連結必須先指向已驗證的收據，才清除舊的路徑錯誤。一般個別收據
+錯誤仍由例行清點重試，不能把「清單已走訪」解讀成全部收據均已
+驗證。不同來源在故障恢復時的匯入順序可能改變共用網址的中繼
+標題最後值；來源收據及關聯仍保留，該標題不代表正文或發布時間。
+本次符號連結測試涵蓋「先解析失敗、修復後才驗證」；先前已完成的
+邏輯路徑改指其他目標時，舊來源選取是否應保留仍需按完整目錄成員
+關係驗證；後續改指測試與其侷限見上節。
+
+[符號連結復原的舊失敗](../artifacts/operations/agent-workflow/runs/news-symlink-recovery-red-20261030T025741-3a4510a2/run.log)
+及[變更偵測的舊失敗](../artifacts/operations/agent-workflow/runs/news-pending-freshness-red-20261030T030148-ba41ee22/run.log)
+保留為重現紀錄；[隔離整鏈測試](../artifacts/operations/agent-workflow/runs/news-invalid-owner-chain-20261030T030300-e9b30fbd/run.log)
+確認壞清單存在時，模擬發布者正文仍可由原 owner 落盤並通過獨立
+收據讀回，來源修復後關聯不重複。以上不代表正式發布者目前可存取。
+[跨模組回歸](../artifacts/operations/agent-workflow/runs/news-path-resilience-regression-20261030T030307-6bb48234/run.log)
+**903 項通過**，範圍涵蓋新聞匯入、資料集、鉅亨優先派工、服務
+生命週期及面板瀏覽器測試；不是整個專案的全部測試。
+
+[唯讀快照](../artifacts/operations/agent-workflow/runs/news-receipt-snapshot-20261030T030041-c2acaa8b/run.log)
+於台北時間 11:00 讀到 FinMind 5,684 筆完成任務：5,681 筆收據宣告
+雜湊與新聞佇列已選版本相同、1 筆不同、2 筆尚未選入。這只是收據
+版本比較，並非缺少文章或已下載全文的數量；沒有重新雜湊 Parquet，
+兩個資料庫也不是跨庫原子快照。FinLab 當時可發現 1 份收據，佇列
+已選的 1 份路徑存在。新聞 service／timer 仍依維護指示停止，正式
+owner 尚未載入本次修正，也沒有新抓正文或可驗證的全部完成時間。
+
+[鉅亨佇列計數快照](../artifacts/operations/agent-workflow/runs/news-cnyes-heads-20261030T030751-e095dd55/run.log)
+於 11:07 顯示 3,693,925 個已知網址 head，其中 3,686,903 個登記有
+正文、7,022 個沒有；後者有 187 個處於重試或冷卻分類，其餘屬其他
+狀態。這些是佇列的交易式計數，不是鉅亨全部歷史的篇數，也不是
+逐檔正文讀回；重試分類不代表每筆當下都已到期或可下載。
+
+## 10/30 維護期間：FinLab 收據目錄失聯與來源獨立恢復
+
+前一版只處理 FinMind 清單失敗；[隔離重現](../artifacts/operations/agent-workflow/runs/news-finlab-catalog-red-20261030T024304-d746116c/run.log)
+進一步顯示，FinLab 已匯入過收據後，若整個來源目錄消失，舊目錄掃描
+可能回報空結果並把本次清點標為完成。這是合成重現，不是聲稱正式
+FinLab 已失聯，也不能由此推算遺漏的鉅亨篇數。
+
+[本機清點器](../downloader/news_fulltext_metadata_ingest.py)現在明確
+辨識目錄讀取失敗、已使用過的來源消失與從未建立的可選來源；沿用
+原有的檔名範圍與順序。FinLab 失聯時繼續處理 FinMind；FinMind 也
+失聯時，各自保留待辦與錯誤。FinLab 來源恢復後，在 FinMind 收據
+之間重試並優先續跑，不重新匯入已完成收據；同一錯誤重試不重複
+寫入。此機制處理的是目錄和清單是否可讀，並不保證清單中每份檔案
+或來源的整段歷史完整。重試排程仍受實際處理與磁碟狀態影響。
+
+狀態契約 v6 另列 FinLab 清單錯誤，保留 v5 的 FinMind 讀取相容性；
+兩種來源錯誤的數目若和總錯誤數不一致，面板顯示未知。停止中的
+服務只顯示上次快照。 [隔離測試](../artifacts/operations/agent-workflow/runs/news-both-catalogs-fixtures-20261030T024559-9410c38b/run.log)
+**28 項通過**，涵蓋兩來源同時異常、單獨恢復、目錄讀取失敗、
+跨 owner 重啟、FinLab 優先與手機／桌面畫面。測試使用合成收據與
+本地瀏覽器，沒有發布者請求或正式新聞佇列寫入。
+另以[隔離整鏈測試](../artifacts/operations/agent-workflow/runs/news-catalog-dual-failure-work-20261030T024725-56202eed/run.log)
+確認兩個清單同時失聯時，已入列的模擬發布者正文仍可落盤並通過
+獨立收據讀回；這不代表實際發布者目前可存取。
+[最終跨模組回歸](../artifacts/operations/agent-workflow/runs/news-source-catalogs-final-20261030T024627-2dc88b63/run.log)
+**891 項通過**，涵蓋新聞匯入、鉅亨派工、資料集、服務生命週期及
+面板；上述兩清單失聯的額外整鏈測試另行通過。這不是整個專案測試。
+
+新聞 service／timer 依維護指示維持停止。本次核對到公開面板
+gateway 仍在運行，但其程序啟動早於本次 Python
+面板投影修改，因此不能宣稱新的錯誤分類已由目前程序載入；本次
+沒有重啟 gateway，待維護解除後再以實際狀態與頁面讀回驗收。
+
+## 10/30 維護期間：FinMind 新聞清單故障隔離與面板
+
+程式檢查發現，新聞 owner 在處理 FinLab 前就以最長十秒的 SQLite 等待
+讀取 FinMind 工作清單；該資料庫鎖住、損壞或結構不符時，例外會
+直接中斷整個本機清點。另有路徑含 `#` 或 `?` 時，舊 SQLite URI
+可能開到錯誤位置。[隔離重現](../artifacts/operations/agent-workflow/runs/news-finmind-catalog-red-20261030T022945-677dc36d/run.log)
+是在合成目錄執行，不能據此推論正式資料庫曾損壞或服務曾因此停止。
+
+原[共用匯入器](../downloader/news_fulltext_metadata_ingest.py)現先處理
+FinLab，再以正確編碼的唯讀 URI 讀取 FinMind 清單；來源暫時不可讀
+時記錄錯誤並保持待辦，讓新聞派工和其他來源繼續。資料庫忙碌時立即
+交還控制權，無進展時沿用既有有界切片等待；讀取恢復後由同一 owner
+續跑，清除該來源的清單錯誤，不重複匯入已完成收據。若來源根目錄
+或以前匯入過的來源突然消失，不會把失聯當成空清單完成；從未建立
+的可選來源仍可為空。相同錯誤的重試不會反覆覆寫錯誤紀錄。這不能
+自動修復受損的來源資料庫，也不保證故障期間所有網址已知。
+
+狀態契約 v5 將清單錯誤與其他 metadata 錯誤分開計數；
+[唯讀面板投影](../stockagent/live/news_dashboard.py)對舊版、無效或
+總數不一致的快照維持未知，[新聞頁](../services/news_dashboard/app.js)
+顯示 FinMind 清單讀取異常，停止時標示為上次快照，不顯示本機路徑
+或資料庫錯誤原文。[隔離測試](../artifacts/operations/agent-workflow/runs/news-finmind-catalog-ui-20261030T023312-34f0f5f1/run.log)
+涵蓋來源損壞、重啟、鎖定時處理其他模擬正文、恢復後關聯數與正文
+收據讀回，以及 320／1440 像素的頁面顯示；這些是模擬測試，不是
+正式來源的新下載。
+
+[首次跨模組回歸](../artifacts/operations/agent-workflow/runs/news-finmind-final-regression-20261030T023454-b6fbf86f/run.log)
+有 **869 項通過、9 項失敗**；失敗發生在新增的模組共用瀏覽器 fixture
+與原有同步 Playwright 測試之間的事件迴圈衝突。改為每個新增測試自行
+啟閉瀏覽器後，[同檔重跑](../artifacts/operations/agent-workflow/runs/news-finmind-browser-regression-20261030T023815-ca5de1f4/run.log)
+**22 項通過**。此紀錄保留原始失敗，不把單檔重跑稱為完整跨模組通過。
+[修正後完整重跑](../artifacts/operations/agent-workflow/runs/news-finmind-final-verified-20261030T023915-d1a30c25/run.log)
+為 **878 項通過**；範圍是上述新聞來源、資料集、服務及面板測試，
+不是整個專案的所有測試。
+
+[唯讀清單檢查](../artifacts/operations/agent-workflow/runs/news-finmind-catalog-readonly-20261030T023704-a93227eb/run.log)
+於台北時間 10:37 讀到 FinMind 資料庫內 **5,684 筆**已完成新聞
+收據路徑；這只確認當次查詢可讀，不驗證每份收據、來源歷史或新聞
+正文完整性。本次沒有發布者請求、正式新聞佇列寫入或新增正文；
+新聞 service／timer 仍依維護指示停止，正式 owner 尚未載入修正。
+
+## 10/30 維護期間：鉅亨新增網址與大表匯入等待
+
+新聞 service 與 timer 依維護指示停止，TEJ 可繼續運作。本次沒有向
+新聞發布者發送請求，也沒有把候選網址寫入正式新聞佇列或信箱。
+
+[只讀來源核驗](../artifacts/operations/agent-workflow/runs/news-unaccepted-input-sha-202610-20261030T015708-5961272c/run.log)
+重新核對 FinLab、FinMind 各一份尚未匯入的新收據，以及各自前一份
+已完成版本：四份 Parquet 的 SHA、宣告列數與檢查前後檔案身分均一致。
+在 10/30 09:58 台北時間的[網址差異與佇列快照](../artifacts/operations/agent-workflow/runs/news-two-receipt-delta-readonly--20261030T015838-088c91e8/run.log)
+中，兩份新收據合計有 383 個新增且正規化去重後的網址，316 個尚未
+出現在該佇列快照，其中 86 個依現有網域規則判為鉅亨。這些是來源
+中繼資料的候選網址，不代表頁面可存取、已接納、已下載正文或完整
+歷史；正式 owner 恢復時仍要按當時的收據及政策核驗。
+
+其中 FinLab 的 84 個未入列鉅亨網址，首次出現在 443,224 列檔案的
+第 422,154 至 423,094 列，均位於原始 4,096 列的第 104 批；FinMind
+另外兩個鉅亨候選位於第一批。這是[實體行順序掃描](../artifacts/operations/agent-workflow/runs/news-priority-positions-fixed-20261030T020126-cafd5943/run.log)，
+不是實際下載速度或完成時間，也不能以收據列數差額代替新增文章數。
+
+[既有匯入器](../downloader/news_fulltext_metadata_ingest.py)現在只在原始
+批次的資料庫交易成功提交後發出本程序內的進展提示；失敗、回滾或
+沒有前進的批次不會觸發快速重試。[原新聞 owner](../downloader/news_fulltext.py)
+在已檢查派工且沒有完成的回應或待交接正文時，直接續跑下一批，也可在
+來源請求等待時處理本機批次；回應完成或正文待落盤時先處理交接，交接
+後再立即續跑。有錯誤或未進展仍走既有有界等待；磁碟未准入時也沿用
+原本的保護。每次不可中斷的本機交易仍可能超過軟時間預算。
+原始批次順序、來源關聯筆數、斷點、來源請求限制和政策均沿用原契約。
+
+[最終 ABBA 對照](../artifacts/operations/agent-workflow/runs/news-metadata-scheduler-abba-fin-20261030T022140-0da00def/run.log)
+在 tmpfs 以 16,385 筆合成中繼資料、每切片一個原始批次、模擬磁碟
+已准入且沒有外部 HTTP 的條件，最後一筆新網址可見時間的兩次中位數
+由 5.236 秒降至 2.586 秒；四次的文章及來源關聯雜湊一致。樣本少且
+條件受控，不可推算正式來源吞吐或剩餘完成時間。[先前對照](../artifacts/operations/agent-workflow/runs/news-metadata-scheduler-abba-fix-20261030T021426-2a38ecca/run.log)
+因測試環境實體磁碟未准入而沒有觀察到明確差異；[剖析](../artifacts/operations/agent-workflow/runs/news-metadata-scheduler-profile-20261030T021536-001e6354/run.log)
+保留了該等待證據，不能把它當成正常准入後的效能結果。
+
+[最終隔離回歸](../artifacts/operations/agent-workflow/runs/news-metadata-handoff-final-regr-20261030T022229-e5bcb805/run.log)
+**482 項通過**，涵蓋收據與斷點、資料集、鉅亨優先、跨來源派工、磁碟等待、服務
+生命週期及已完成正文交接；正式新聞目錄唯讀，網路只開放隔離的
+loopback。正式新聞 owner 尚未載入修改，線上抓取速度及所有來源
+的實際缺口仍待維護解除後驗收。
+
+## 10/30 維護期間：來源收據回到已完成版本
+
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-metadata-reversion-red-2026-20261030T014148-d422eb36/run.log)
+顯示，同一收據先完成 A、再出現 B、最後回到 A 時，原本以最大 origin ID
+選版本，可能仍把 B 計入面板與資料集；B 若尚未完成，也可能仍顯示
+處理中。這是合成案例，不能直接推論正式資料曾發生相同問題。
+
+新聞 owner 新增的耐久版本指標與[共用選擇](../downloader/news_fulltext_metadata_current.py)
+讓狀態及訓練資料快照選同一個已完成來源版本。完成新版本或重新確認
+舊版本時，在同一資料庫交易更新指標和收據頭；檢查期間收據變動就
+回滾。被取代的未完成版本與游標保留，重新出現時可續跑；已完成版本
+不需重抓或重新匯入。版本指標記錄最後改選時的本機觀察時間，不是
+來源發布時間，也不代表來源檔案在兩次盤點之間不會改變。這是來源
+分區選擇；新聞佇列仍保留先前發現的網址，沒有據此刪除文章或正文。
+
+舊資料庫沒有指標的項目以最大已完成 ID 推測，面板與快照分別列出
+明確及推測的數量；指標指向不存在的 origin、其他收據或未完成版本時會拒絕快照。
+新語料使用 `explicit_current_origin_or_legacy_inference_v1` 範圍和
+新的 builder 指紋：由舊範圍轉入時必須使用新輸出根目錄及相容的
+輸入快照，既有 manifest 仍可讀，尚未重建正式語料。
+
+[唯讀核對](../artifacts/operations/agent-workflow/runs/news-metadata-readonly-reversion-20261030T014945-935ddc53/run.log)
+在 10/30 09:49 台北時間看見 5,683 個有已完成版本的收據路徑，其中
+22 個有多個已完成版本；20 個現有收據對應最新完成版本，另 2 個
+不對應任何已完成版本，沒有觀察到已完成版本回退。這只檢查多版本
+收據，沒有驗證所有單版本收據或 Parquet 雜湊。
+[後續只讀分類](../artifacts/operations/agent-workflow/runs/news-metadata-unaccepted-readonl-20261030T015016-c09f3d92/run.log)
+發現這兩個新收據也沒有對應現有 origin：FinLab 收據宣告 443,224 列，
+前一已完成版本 443,139 列；FinMind 收據宣告 2,097 列，前一版本
+1,691 列。收據列數可能包含修訂或刪除，差額不等於新增文章；兩筆
+仍需在維護解除後由原 owner 匯入並檢查實際收據，不能判為已完成。
+
+[最終隔離回歸](../artifacts/operations/agent-workflow/runs/news-metadata-lifecycle-final2-2-20261030T014755-d0f41613/run.log)
+**305 項通過**，涵蓋來源回退與再次前進、重啟續跑、交易回滾、損壞
+指標、舊游標、資料集增量重建與舊快照範圍。網路隔離，正式新聞
+目錄唯讀，沒有發布者請求或正式佇列寫入。
+[合成查詢量測](../artifacts/operations/agent-workflow/runs/news-metadata-selection-bench-fi-20261030T015041-add7b56c/run.log)
+在記憶體 SQLite、10,000 份已完成收據及 30 次交錯取樣中，原查詢與
+新選擇加指標核對中位數約 **9.1／18.9 毫秒**；有額外核對成本，
+此結果不代表真實磁碟或完整下載吞吐。本輪新聞 service／timer 仍
+停止，正式 owner 尚未載入修正；TEJ Smart Wizard service 與 API timer
+可運作，啟動狀態本身不證明其下載結果。
+
+## 10/30 維護期間：FinLab／FinMind 新聞收據換代及續跑
+
+新聞 service／timer 依維護指示停止，TEJ 允許運作。檢查既有匯入器時
+發現，只用收據的檔案大小和修改時間判斷是否已處理，無法辨識保留這兩個
+值的檔案替換。[隔離重現](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_identity_red_20261030.log)
+分別顯示：已完成收據的新網址可能被跳過；分段匯入期間換成無效收據，
+舊程式可能繼續並標為完成。這是合成測試證據，不代表正式收據已發生
+同樣問題，也沒有據此推算漏抓筆數。另有[格式錯誤重現](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_malformed_red_20261030.log)：
+五種損壞收據中四種令匯入函式拋出 `TypeError`，一種已被原校驗攔下。
+
+[共用匯入器](../downloader/news_fulltext_metadata_ingest.py)的狀態契約升為
+v3：在大小與修改時間之外核對裝置、inode 及變更時間，並記錄來源根目錄
+與欄位範圍。已核對身分只緩存在本程序，最多 32,768 項；重啟或淘汰後
+會重新讀收據並對照既有來源版本，不因舊 `receipt_heads` 相同就直接跳過。
+已完成版本在身分一致時沿用原關聯，不重新匯入或重抓；若所指向的
+Parquet 路徑變了，另驗該檔案 SHA。這不新增資料庫表，也不在每輪對
+全部已完成 Parquet 重算雜湊。
+
+進行中的原件在雜湊核對後及每個原有短交易提交前再次檢查身分；偵測到
+變動時回滾當批、丟棄已移動的 Arrow iterator，沿用耐久游標稍後重試。
+已提交的先前批次保留。收據型別、列數及 SHA 格式錯誤會記錄在既有
+`origin_errors`，修復後可再匯入；已完成舊版本恢復有效時亦會清除相應
+錯誤。這些檔案身分檢查依賴檔案系統回報，不能取代不可變檔案系統或
+對每次已完成檔案重新雜湊。
+
+[最終離線回歸](../artifacts/operations/agent-workflow/runs/news-metadata-identity-final-reg-20261030T013506-866b9a96/run.log)
+**322 項通過**，涵蓋兩來源、相同大小與時間的替換及原位修改、跨批
+回滾續跑、舊收據重啟、格式錯誤恢復、鉅亨派工與共用 queue。網路
+隔離，正式新聞資料目錄唯讀；未執行整個專案測試。
+
+[合成效能量測](../artifacts/operations/agent-workflow/runs/news-metadata-receipt-identity-b-20261030T013608-9236ec81/run.log)
+在 tmpfs 以 1,000 份小收據比較：舊檢查、重啟後第一次核對、已核對後
+重複檢查的 wall 中位數約 **0.084／0.391／0.086 秒**。使用相同合成
+來源與資料庫，核對前後程式雜湊及零資料庫變更；樣本少，沒有測量真實
+磁碟、完整 owner 啟動或來源下載吞吐。另保留[第一次替代實作量測](../artifacts/operations/agent-workflow/runs/news-metadata-receipt-identity-b-20261030T013351-3c56ca5d/run.log)，
+其中重複檢查較慢；後續減少根目錄重複路徑解析才得到上述結果。
+
+本輪沒有新聞發布者請求、正式新聞佇列寫入或新增正文；正式新聞 owner
+尚未載入修改。鉅亨優先與其他來源待辦繼續保留，維護解除後仍需以
+實際收據及來源回應驗收，不能宣稱全來源完成或估算總完成時間。
+
+## 10/30 維護期間：排序日期歷史稽核連接新聞面板
+
+已將下節的全來源排序日期掃描接到[新聞面板](https://penguin72487.ddnsgeek.com/news/)
+的獨立「排序日期歷史稽核」區塊。它顯示稽核時間、來源鍵、已知
+網址、有排序提示的筆數及需核對的來源；與下載進度及訓練資料集
+品質分開。原始掃描紀錄是 10/30 09:00 台北時間的歷史快照，不是
+目前佇列或已驗證發布時間。764 個有 head 的來源鍵共 6,352,201 個
+已知網址，4,240,974 個有排序日期；格式無效及晚於核對日 UTC 均為
+零，三個早於 1900 年的標記來自 `fed_board`。早期或未來標記本身
+不證明日期錯誤，沒有排序日期也不代表正文不可用。
+
+[投影程式](../stockagent/live/news_corpus_quality.py)核對證據雜湊、
+來源鍵去重、各來源與總計、時間及各類數量邊界；檔案缺失、變動
+或內容不一致時顯示未知。唯讀面板只讀小型稽核結果，刷新不掃描
+正式新聞佇列。[來源清冊](../scripts/audit_news_providers.py)提供
+`--sort-day-summary`，可在日後原本的全來源 `--sort-day-quality`
+清冊執行時一併輸出小型摘要，保留完整清冊 SHA，不另跑一次掃描；
+[發布程式](../scripts/publish_news_sort_day_status.py)只更新本機
+證據參照，拒絕以較舊稽核覆蓋較新參照。這是按需產生，不是已
+新增自動定期全量掃描。來源清冊規劃器也檢查現代觀測日的互斥
+標記加總，避免不一致的數字流入報表。
+
+[隔離回歸](../artifacts/operations/agent-workflow/runs/news-sort-day-dashboard-loopback-20261030T011629-d5ca40b6/run.log)
+**717 項通過**；正式新聞資料目錄唯讀，測試網路只有隔離的本機
+loopback。首輪測試有兩項斷言用詞錯誤，修正後重跑；另一次擴大
+執行未啟用隔離 loopback，出現連續失敗後中止，保留其紀錄；後續
+啟用隔離 loopback 的完整回歸通過。
+[本機 owner 唯讀網站讀回](../artifacts/operations/agent-workflow/runs/news-sort-day-owner-readback-202-20261030T012202-9cc33dd1/run.log)
+檢查 320、390、768、1440 像素版面及證據數量；
+[使用者 HTTPS 網站讀回](../artifacts/operations/agent-workflow/runs/news-sort-day-public-readback-20-20261030T012249-52205702/run.log)
+另檢查 390、1440 像素。第一次誤用本機匿名公開 listener 收到 403，
+改用既有 owner 唯讀 listener 驗證；沒有更動存取規則。
+唯讀面板重新載入前後，TEJ Smart Wizard、當沖及 Discord 程序的
+PID 與重啟次數不變；新聞服務及計時器仍依維護指示停止。本輪沒有
+向新聞發布者發送請求，也沒有寫入正式新聞佇列或新聞資料集。
+尚未在恢復後驗收實際抓取速度、剩餘歷史或完成時間。
+
+## 10/30 維護期間：排序日期的全來源核對
+
+新聞服務及計時器維持停止，TEJ 可繼續運作。按既有 owner 排他鎖、
+空 WAL／journal、唯讀資料目錄及隔離網路，對停機佇列的
+[完整排序日期索引](../artifacts/data_quality/news_offline_inventory_20261029/all_source_sort_day_quality_index_20261030.json)
+掃描一次並與先前獨立計數核對：**764 個有文章 head 的來源鍵、
+6,352,201 個 URL heads、4,240,974 個有排序日期**。其中 0 個日曆格式
+無效，0 個晚於本次 UTC 核對日期；3 個早於 1900 年，均屬先前記錄的
+聯準會案例。其餘來源鍵可能只有設定或 metadata，不能因未出現在
+此索引而當成不存在。掃描使用既有 covering index，這次約 9 秒；
+不是來源吞吐量或抓取完成時間。
+
+Global Voices 的[10,000 筆索引順序樣本](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_raw_vs_sort_sample_20261030.json)
+中，5,207 筆原始 metadata 可解析的日期與排序日期不同。這不是隨機
+樣本，也不是全來源錯誤率：兩欄可由不同來源觀測累積，排序日期
+不是發布時間；目前不能逐筆證實差異來源，因此不合併、回填或覆寫
+任何一欄。重複網址在同一個 4,096 筆匯入批次保留首筆 metadata
+是既有斷點續跑契約，也沒有在這次稽核中改變。
+
+[來源清冊](../scripts/audit_news_providers.py)新增按需的
+`--sort-day-quality`，在原本的清冊掃描中統計非空、日曆格式無效、
+早於 1900 年、晚於核對當日 UTC 的排序提示；平常未選此項時不額外
+執行日曆解析。[規劃器](../scripts/plan_news_sources.py)保留各來源
+數量，舊清冊或沒有選擇檢查時輸出未知，不當成零。早期或未來日期
+只是待核對的篩選標記，不能單憑它們判斷發布日期錯誤。規劃報表
+契約分別更新為有工作順序 14／無工作順序 11。
+
+[聯準會選定來源實測](../artifacts/data_quality/news_offline_inventory_20261029/fed_sort_day_quality_20261030.json)
+與[規劃結果](../artifacts/data_quality/news_offline_inventory_20261029/fed_sort_day_quality_plan_20261030.json)
+記錄 13,871 個 head，56 個有排序日期、其中 3 個早於 1900 年、
+0 個日曆格式無效。[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/fed_sort_day_quality_readback_20261030.json)
+以 Python 日曆解析核對每筆和 JSON／CSV／規劃結果；沒有將已存頁面
+的事件日期升格為確切發布時間。此檢查只更新離線清冊工具與新報表，
+既有網站和舊報表沒有因此即時更新。沒有新聞網站請求、正式佇列
+寫入或新增正文；線上恢復與剩餘歷史完成時間仍須另行驗證。
+
+第一次[較廣回歸](../artifacts/operations/agent-workflow/runs/news-sort-quality-regression-202-20261030T010109-34186d3f/run.log)
+為 327 通過、1 失敗：測試要求六個清冊切片在兩秒內完成，該次正文
+已提交，但受本機磁碟日誌同步等待影響，只處理了三個切片。保留此
+失敗紀錄；三次 tmpfs 重跑原測試均通過，不能由此推斷正式服務曾經
+停滯。[測試](../test/test_news_original_queue.py)改為觀察正文先落盤及
+全部切片自然完成，並用看門狗限制真正的停滯；另加入刻意延遲、
+整輪超過兩秒的案例。正式排程的執行期限邏輯沒有改動。
+[後續相同範圍回歸](../artifacts/operations/agent-workflow/runs/news-sort-quality-regression-tmp-20261030T010638-7db6987a/run.log)
+**329 項通過**，使用網路隔離、正式資料唯讀及合成 tmpfs；不代表
+線上來源或全部歷史已驗收。
+
+## 10/30 維護期間：缺正文工作量與聯準會已存範圍
+
+新聞服務及計時器依使用者要求維持停止；TEJ 允許運作。使用
+10/29 22:36（台北時間）的[完整來源快照](../artifacts/data_quality/news_offline_inventory_20261029/inventory_current_locked_20261029.json)，
+清冊有 952 個來源鍵、6,352,201 個已知 URL head，其中 3,917,924
+有已存正文指標。這是 URL head 粒度，包含非文章及不同網站鍵，
+不是去重文章數，也不證明全站歷史已找齊。原始離線快照本身沒有
+宣稱取得排他鎖；同一版本隨後有[獨立鎖定讀回](../artifacts/data_quality/news_offline_inventory_20261029/inventory_current_locked_readback_20261029.json)，
+核對空 WAL、檔案身分及各來源數量。
+
+[來源規劃器](../scripts/plan_news_sources.py)原先把每個缺正文
+head 計成一次「最少 HTML 請求」，但這些 head 可能是空模板、PDF、
+入口頁、重複或可從既存原件修復，不能推出 HTTP 次數。規劃報表
+現在把 2,434,277 個缺正文 head 分成 237,553 個在快照中處於
+pending／retry／retry_cooldown／inflight 的項目與其餘 2,196,724
+個；前者仍包含冷卻中或停用的項目，**不代表可立即派工**，也不是
+HTTP 請求數。未知的最少請求數及完成時間保留為未知；舊報表語義
+升級為有工作順序的 contract 13／無工作順序的 contract 10。
+[JSON](../artifacts/data_quality/news_offline_inventory_20261029/work_order_review_scope_v5_20261030.json)
+與 [CSV 工作清冊](../artifacts/data_quality/news_offline_inventory_20261029/work_order_review_scope_v5_20261030.csv)
+及[獨立對帳](../artifacts/data_quality/news_offline_inventory_20261029/news_source_plan_v5_readback_20261030.json)
+逐來源核對兩種輸出、輸入檔雜湊及既有優先順序，沒有向發布者
+發送請求或改動正式佇列。鉅亨快照為 3,693,925 個已知 head、
+3,686,903 個有正文指標、7,022 個缺正文；其中 187 個在上述工作
+狀態，其餘 6,835 個有其他狀態。這不是即時吞吐或完成率保證。
+
+聯準會快照有 13,871 個已知 head，其中 13,864 個有正文指標。
+[已存範圍核驗](../artifacts/operations/agent-workflow/runs/news-fed-board-storage-20261030-20261030T004106-848099a2/run.log)
+涵蓋 555 個批次、批次失敗為零；20 個沿用先前有效批次證據，
+535 個重新核驗。[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/fed_board_provider_storage_readback_20261030.json)
+核對 head 成員、檔案狀態及彙總，沒有對所有正文再次重新雜湊，
+也沒有重跑目前 parser。成功批次中的 14,315 個正文版本包含其他
+來源及舊版本，不能算成聯準會文章數。其餘七個 head 是四份無可用
+文字的 PDF 與三個文件入口，均沒有在快照的待處理或在途狀態；
+舊 OCR 是候選結果，尚未驗證成正文。
+
+在 13,864 個已存 head 的現有紀錄中，1,729 個 `published_at_raw`
+非空；本次稽核沒有將任何值解析為帶時區的 ISO 或郵件格式。
+這不表示原站一定沒有時間，也不證明其他格式無時區。
+[三筆異常索引核對](../artifacts/data_quality/news_offline_inventory_20261029/fed_board_metadata_clock_anomaly_20261030.json)
+另外找到排序中繼資料是 1899-12-30、已存頁首日期卻是 2024 年的
+三篇證詞。頁首日期的發布／事件角色及當日時間仍未證實，因此沒有
+把它回填成精確發布時間，也沒有覆寫正式佇列或原始收據；原排序
+日期只能作為有缺陷的中繼資料，不能用作最早發布日期。
+
+[來源審查](../configs/news/source_reviews_20261009.json)保留上述
+範圍與未解的時鐘、OCR 及歷史問題，沒有擴大來源權限；
+[本機唯讀 API 讀回](../artifacts/operations/agent-workflow/runs/news-fed-gateway-readback-202610-20261030T004755-dd2f9878/run.log)
+讀到聯準會待追蹤狀態及相同的正文／缺正文數，這不等於瀏覽器
+呈現或重新下載。[排程與頁面回歸](../artifacts/operations/agent-workflow/runs/news-fed-review-regression-20261-20261030T004418-df54a135/run.log)
+608 項通過；另有[相關規劃回歸](../artifacts/operations/agent-workflow/runs/news-request-count-regression-20-20261030T004302-8af87211/run.log)
+374 項通過，兩組測試部分重疊。全部歷史仍未完成，維護期間沒有
+可依真實線上吞吐計算的完成時間。
+
+## 10/30 維護期間：東森已保存正文的完整範圍核驗
+
+新聞維持停機，使用 10/29 22:36（台北時間）的既有唯讀清冊，東森
+有 **24,310 個已知 URL heads**：17,549 個有已存正文指標、6,761 個
+沒有。URL head 不是去重文章數，也不是網站全部歷史文章。先前
+Global Voices 已驗證的批次中包含部分東森正文；此次重用有效收據，
+不把相同批次當作新的下載。
+
+[本次儲存核驗](../artifacts/operations/agent-workflow/runs/news-ettoday-storage-full-202610-20261030T003047-6a45fe7a/run.log)
+涵蓋 17,549 個東森已存正文指標、435 個批次，批次失敗數為零：其中
+342 個批次重用先前核驗結果並核對參考及檔案狀態，另外 93 個批次
+重新核驗原件、正文、Parquet 與收據。[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/ettoday_provider_storage_readback_20261030.json)
+核對來源快照、head 成員、批次與彙總，**沒有**再次對所有正文計算
+雜湊，也沒有重跑目前的文章 parser。成功批次合計 20,322 個正文
+版本還包含其他來源及歷史版本，不能稱為東森文章數。所核驗 head
+保留的來源宣告時間涵蓋 2012-05-23 至 2026-10-27；這不是全站
+最早文章、發布時間精確性或訓練使用權已驗證的證明。
+
+停機快照中沒有正文指標的 6,761 個 head，分別是署名待確認 4,881、
+文章身分待確認 62、權利或範圍排除 1,366、不支援路徑 433、來源
+找不到 18、轉址非文章 1。另有一個署名待確認的 head 保留了先前
+正文，因此署名待確認狀態總數是 4,882，而不是全部都缺正文。這些
+是當時既有狀態，並非此次新連線得到的結果，也不能推論全部可修復。
+另將 433 個不支援路徑以目前 literal 身分檢查器離線分類；
+[結果](../artifacts/operations/agent-workflow/runs/news-ettoday-route-inventory-202-20261030T003620-a532a703/run.log)
+全部未符合目前檢查器。其中 136 個是既有 `www`／`finance`／`house`
+文章路徑帶 query（分別 103／23／10）；其餘 297 個屬其他路徑或
+主機。相似路徑只是候選，不能直接去除參數、視為同篇或重新排隊；
+仍需來源對該版本與參數的證據。
+
+[來源清冊](../configs/news/source_reviews_20261009.json)已記錄這個
+範圍與未完成問題，保留既有來源政策及已完成診斷；標註不擴大下載
+權限。[清冊獨立對帳](../artifacts/operations/agent-workflow/runs/news-ettoday-routes-regression-2-20261030T003708-fa02aac7/run.log)
+核對原快照、本次讀回及路徑分類的數量；
+[既有 owner 本機唯讀 API](../artifacts/operations/agent-workflow/runs/news-ettoday-gateway-readback-20-20261030T003529-aaa38d22/run.log)
+已讀回東森 `source_review_followup=open`，正文與缺正文數與上述
+快照一致；這是 API 讀回，不是瀏覽器畫面或正式抓取驗收。
+[隔離回歸](../artifacts/operations/agent-workflow/runs/news-ettoday-routes-regression-2-20261030T003708-fa02aac7/run.log)
+266 項通過。核驗及測試均沒有呼叫新聞網站或寫入正式新聞資料；
+服務與計時器仍依維護要求停止，沒有新的下載或可用的完成時間。
+
+## 10/30 維護期間：多來源文章到期查詢
+
+前一輪在途喚醒會多次查詢文章到期時間。對停機中的正式佇列進行
+[唯讀索引量測](../artifacts/operations/agent-workflow/runs/news-wake-sql-readonly-widths-20261030T001304-27345020/run.log)：
+57 個可取正文的來源、沒有局部主機暫緩時，原方法各查三種狀態，
+共 171 次 SQLite 呼叫。每組 80 次、ABBA／BAAB 各四個樣本，單次
+文章查詢中位數在未設 `dispatch_after` 時約為 **0.276／0.160 毫秒**，
+有截止點時為 **0.276／0.189 毫秒**。兩種方法取得的來源到期值相同；
+資料庫以 immutable 唯讀開啟，WAL 在前後均為空。這是熱快取的文章
+索引查詢，不包含目錄、網路或收據，不能當作正式服務速度。
+[當次腳本副本](../artifacts/data_quality/news_scheduler_pacing_20261030/wake_sql_readonly_benchmark_20261030.py)
+和執行後仍在 `/var/tmp` 的版本 SHA-256 均為
+`13be6487bcd7b3fa9b2b53cb9381185eb4a2f4375a6c0512e58a892b011c0c5c`；
+執行收據本身沒有封存該腳本指紋，這只能證明執行後兩份副本一致。
+
+[共用佇列](../downloader/news_fulltext_queue.py)現在把沒有局部主機／
+origin 暫緩的來源，每 128 個合併為一個 SQLite 呼叫；每個來源及
+每種狀態仍以既有 dispatch 索引各做一次有界查找。來源仍受主機或
+origin 暫緩時沿用原篩選；只有中繼資料、不在本輪範圍及未啟用的
+來源不會因此取得正文權限。`dispatch_after`、來源冷卻、到期後的
+再派工與本機恢復仍依原規則計算。
+[合成重現](../artifacts/operations/agent-workflow/runs/news-wake-batch-red-20261030T001402-417f1f5d/run.log)
+顯示舊實作在 130 個來源案例需要 384 次文章查詢；更新後的 132 個
+來源案例以逐筆 oracle 驗證截止點、來源範圍、停用、主機／origin
+暫緩及超過單批上限的語意，文章查詢少於十次。
+[正式佇列唯讀讀回](../artifacts/operations/agent-workflow/runs/news-wake-batch-readonly-readbac-20261030T002632-c7032941/run.log)
+直接使用目前批次函式，與個別索引查詢比較 57 個來源在無截止點、
+零及當前時間三種截止點的結果，均一致，且每組批次只執行一個 SQL。
+此讀回只覆蓋未受局部主機暫緩的文章到期值，沒有驗證正文或來源完整性。
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-wake-batch-regression-20261030T001642-d7680462/run.log)
+**740 項通過**，涵蓋鉅亨、來源隔離、冷卻、喚醒、候選及收據；
+未執行整個專案測試。
+
+[完整 owner 合成量測](../artifacts/data_quality/news_scheduler_pacing_20261030/provider_batch_20261030.json)
+使用 58 個來源及自有 loopback，對相同 owner 只替換文章到期查詢，
+每個情境各有四個對照與四個批次樣本，均經正文及收據檢查。兩個
+來源併行、第二個在慢回應期間到期的情境，總時間中位數為
+**0.389／0.381 秒**、CPU 為 **0.094／0.087 秒**；只有一個來源
+連續八篇的情境，總時間為 **0.508／0.491 秒**、CPU 為
+**0.241／0.196 秒**。樣本較少且只有本機合成負載，不能宣稱實際
+來源已加速或達到上限。[獨立讀回](../artifacts/data_quality/news_scheduler_pacing_20261030/provider_batch_readback_20261030.json)
+核對量測摘要、各情境語意雜湊及 103 個程式檔指紋；合成暫存正文
+已刪除，沒有第二次獨立讀回。新聞服務及計時器仍按維護要求停止，
+尚未在線上 owner 載入或驗收這次修改。
+
+## 10/30 維護期間：鉅亨與其他來源的工作位優先順序
+
+使用者指定鉅亨先抓，其他來源利用空檔並行。設定檢查時有 58 個可
+請求來源共用 16 個工作位；原先的輪流順序沒有跨來源優先設定。
+[文章派工重現](../artifacts/operations/agent-workflow/runs/news-provider-priority-red-20261029T234711-3793e98a/run.log)
+和[候選補查重現](../artifacts/operations/agent-workflow/runs/news-candidate-priority-red-20261029T234733-f43b8370/run.log)
+顯示其他來源可能先取走唯一空閒工作位。
+
+[設定](../configs/news_fulltext.json)現在明確記錄鉅亨、CMoney、UDN、
+Global Voices、中時／工商、MoneyLink、CMNews、MoneyDJ、LTN 的順序；
+[共用 owner](../downloader/news_fulltext.py)每次選取空閒工作位時先檢查
+前面的來源。同一來源內原有文章／目錄規則先行；沒有合適的普通工作
+時，已核准的候選補查也能依該來源的優先順序派工。每次優先派工後
+重新取樣來源節流與工作位；優先來源尚未到期、冷卻、無權限或沒有
+工作時，其他來源可使用空檔。已在途請求不會被中斷或重送。
+
+排序只影響派工，不提高來源配額，也不啟用原本停用的來源。此時的
+設定中 UDN、中時／工商、MoneyLink、MoneyDJ 尚未開放網路請求；LTN
+僅有受限的中繼資料能力，這不是全文可用的證明。服務和計時器仍依
+維護指示停止；尚未在線上驗證這次排序或實際抓取速度。
+
+[第一次共用回歸](../artifacts/operations/agent-workflow/runs/news-priority-final-regression-20261029T235345-a8bbb44e/run.log)
+733 項通過、6 項失敗：只保留單一虛構來源的共用測試設定仍沿用
+正式來源的優先清單，因此無法通過新設定驗證。已讓該合成設定移除
+不存在的正式來源清單；正式設定的名稱驗證並未放寬。六項分別重跑
+通過後，[完整隔離回歸](../artifacts/operations/agent-workflow/runs/news-priority-final-regression-v-20261030T000223-9b34a943/run.log)
+**739 項通過**，涵蓋跨來源排序、停用來源、冷卻、候選補查、鉅亨
+歷史、服務交接與收據。這不是全專案測試，也不代表正式來源下載成功。
+
+## 10/30 維護期間：在途回應、到期工作與閒置空轉
+
+隔離測試重現另一種跨來源等待：一個來源的回應仍在途時，另一來源的
+文章在佇列中到期，但空閒工作位可能等到原回應完成或一秒輪詢才派工。
+[修正前重現](../artifacts/operations/agent-workflow/runs/news-future-due-red-20261029T233905-54ac32db/run.log)
+使用自有假來源，不是鉅亨實際速度的量測。
+
+[共用 owner](../downloader/news_fulltext.py)在有空閒工作位及在途回應時，
+會依有剩餘來源工作位的文章、目錄與候選查詢到期時間喚醒；
+[佇列查詢](../downloader/news_fulltext_queue.py)沿用索引，排除未啟用的
+工作類型和已經提供派工機會的舊項目。到期跨過查詢時仍有一次重新
+派工機會，舊的不可派工項目不會持續造成空轉。來源速率、拒絕冷卻、
+robots、主機隔離和原有租約仍由原流程決定。暫時性的本機喚醒查詢
+錯誤會留下計數，已在途請求仍完成，並以有界等待重試。
+
+另外，[修正前重現](../artifacts/operations/agent-workflow/runs/news-disabled-lane-red-20261029T234254-a1dd22c2/run.log)
+顯示只啟用文章或只啟用目錄工作時，另一條停用佇列的到期項目可能讓
+閒置 owner 反覆醒來。現在閒置等待只參考啟用的網路工作類型；
+鉅亨本機恢復等既有工作仍保留自己的喚醒條件。
+[隔離驗證](../artifacts/operations/agent-workflow/runs/news-disabled-lane-green-20261029T234312-293c5080/run.log)
+涵蓋這兩條路徑及候選查詢與另一來源在途回應的並行，並檢查正文收據。
+
+[自有 loopback 量測](../artifacts/data_quality/news_scheduler_pacing_20261030/future_due_with_priority_20261030.json)
+使用私人佇列及隔離網路，對相同程式僅切換在途回應期間的到期查詢，
+以 ABBA／BAAB 比較兩種情境，各組四個樣本。第一種是兩個來源共用
+兩個工作位、第二來源於首個慢回應期間到期；到期後開始請求的中位數
+為對照組 **0.774 秒**、啟用後 **0.007 秒**。第二種是兩個來源啟用
+但只有一個來源連續八篇：總時間中位數 **0.475／0.481 秒**，CPU
+時間中位數 **0.057／0.062 秒**；實際執行的佇列喚醒查詢為每次
+**8／15 次**。因此新增查詢有可見成本，不能據此宣稱所有負載都加速。
+16 次均完成原文／正文收據檢查；[另一程序的讀回](../artifacts/data_quality/news_scheduler_pacing_20261030/future_due_with_priority_readback_20261030.json)
+核對輸出摘要、語意雜湊及 103 個實作檔指紋，但沒有獨立重讀已刪除
+的合成正文。該讀回綁定當時的程式；後續文章到期查詢已修改，
+不能把這份舊指紋當成目前版本的證明，目前版本另見上節量測。
+第一次量測的
+[驗收規則](../artifacts/operations/agent-workflow/runs/news-future-dispatch-benchmark-20261029T234121-4e488e27/run.log)
+錯誤假設對照組不會在慢回應結束前醒來；原本就有一秒輪詢，故已修正
+規則並重新執行，保留那次失敗證據。
+
+這些是隔離的程式行為與成本，不代表正式新聞來源速率、存取成功、
+全歷史完成或剩餘時間；服務停止期間未對發布者發出請求，也未更動
+正式新聞佇列。優先順序修改前的[共用回歸](../artifacts/operations/agent-workflow/runs/news-dispatch-deadline-regressio-20261029T234417-4a006bc2/run.log)
+**649 項通過**，包括冷卻、鉅亨、候選、恢復與收據。
+
+## 10/30 維護期間：來源限速等待與共用工作位
+
+在隔離案例中重現：兩個來源共用一個工作位時，第一個來源尚未到
+下一次允許送出的時間，仍會先被派工並在工作執行緒等待，讓另一個
+已可取得的來源排在後面。[原始重現](../artifacts/operations/agent-workflow/runs/news-short-pacing-red-20261029T231305-0976c01f/run.log)
+是合成資料，不代表已量到鉅亨線上的瓶頸。
+
+[共用 owner](../downloader/news_fulltext.py)現在對多來源把已知的
+短間隔等待放在派工前，並在其他來源的回應仍在途時按最近可派工
+時間喚醒。工作範圍僅啟用單一來源時沿用原工作執行緒等待，避免每篇
+多次查佇列。當有多來源且至少還保留一個空閒工作位時，可最多提早
+10 毫秒準備本機任務；[HTTP 保留槽](../downloader/news_fulltext_http.py)
+仍依原時間、共享配額、來源冷卻與 robots 檢查決定實際送出，不會
+因此提早發請求。這個時間不是來源的速率設定，也沒有取消拒絕退避。
+
+第一次修正另被[批次測試](../artifacts/operations/agent-workflow/runs/news-short-pacing-batch-red-20261029T231416-a6e628e2/run.log)
+指出會將五篇正文拆成五次落盤，因此現在只在佇列有即將可派送的工作時
+保留待提交批次，並保留原有批次逾時、停止及信箱喚醒。中途停止時，
+已接收正文會走原收據提交，未發送文章保留 pending 與原嘗試次數。
+長等待維持狀態心跳並計入 `idle_wait`；若狀態寫入跨過下一次派工
+時間，會重新計算等待。尚未發現的跨程序短配額競爭，以及同一次
+抓取內 robots、重導向所需的後續等待，仍由原請求保留與逾時處理；
+這次沒有證明所有等待都已移出工作執行緒。
+
+[可重複的合成量測程式](../scripts/benchmark_news_scheduler_pacing.py)
+以自有 loopback 來源、私人佇列和相同解析、原文與收據流程做
+ABBA／BAAB；為了隔離網路測試，僅合成 fixture 取代實體磁碟探測，
+正式容量閘門未更動。[結果](../artifacts/data_quality/news_scheduler_pacing_20261030/owned_benchmark_final_three_cases.json)
+共 24 次：在兩來源、第一來源間隔 0.6 秒且只有一個工作位的案例，
+另一來源開始請求的中位數由 **0.609 秒降至 0.030 秒**；兩篇都落盤
+的總時間中位數為 **0.683／0.652 秒**。單一來源連續八篇、間隔
+0.05 秒的總時間中位數為 **0.454／0.438 秒**。兩個來源啟用、兩個
+工作位但只有一個來源有八篇待辦時，總時間中位數為 **0.429／0.433 秒**，
+CPU 時間中位數為 **0.057／0.060 秒**；新排程做了八次喚醒查詢，
+舊排程為零。每組各四個樣本，不能據此宣稱正式 CPU 或整體吞吐改善；
+這些額外查詢也是需要在線上資源允許時繼續量測的成本。每次都在
+同一個批次提交，原文與正文的語意雜湊一致，
+並由收據檢查讀回；另一個程序核對量測摘要和 103 個程式指紋，
+但沒有獨立重讀已刪除的合成正文。
+
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-scheduler-final-regression-20261029T233028-0dacf65e/run.log)
+**476 項通過**，涵蓋跨來源、鉅亨、候選資料、重試、狀態及收據。
+本次未請求新聞發布者，也未寫正式新聞資料或佇列。新聞服務及計時器
+依維護指示保持停止，正式 owner 尚未載入修改；TEJ 保持運作。
+解除維護後仍須以實際來源回應、配額和耐久收據驗證，不能用本次
+合成量測推估正式新聞抓取速度、剩餘進度或完成時間。
+
+## 10/30 維護期間：正文交接延遲的分段量測
+
+先前一次合成量測的正文在 **2.97 秒**才完成提交，但該次沒有記錄
+回應結束、解析完成及落盤開始的分段時間，因此不能回推其原因，
+也不能宣稱已解決。為查明這段鏈路，在既有私人測試中新增各階段
+計時，並以四個新程序分別執行 ABBA、BAAB、ABBA、BAAB，避免固定
+讓同一組承受首次載入成本。每次均使用 772 個合成網址、兩個請求
+檔及 1.2 秒假回應，測試落盤含原有收據；不含正式新聞資料。
+
+四個程序的第一篇，從假回應結束到正文提交的中位數為 **0.331 秒**；
+同程序後續 12 篇的中位數為 **0.044 秒**。前者的解析及工作執行緒
+收尾中位數為 **0.089 秒**，後者為 **0.0013 秒**；首次建立 Arrow
+資料表中位數為 **0.199 秒**，後續為 **0.0005 秒**。16 次中，工作
+執行緒結束到 owner 開始提交最長約 **0.00017 秒**；這只代表本次
+合成樣本，不代表正式環境不會因排程或磁碟等待。
+
+另以獨立的單執行緒合成解析及 owner 提交 profiler 檢查首次成本：
+樣本解析主要時間落在 CSS 選擇器的正規表示式編譯；首次 Arrow
+建表過程載入 pandas。Profiler 本身有額外成本，這些結果不能直接
+當成正式來源延遲。兩者都是程序內可重用的首次成本，單純提前
+載入會移動而非消除計算，因此沒有為此增加預熱工作或改動正文、
+收據與來源判斷。上述現象也不能解釋缺少分段證據的那一次 2.97 秒。
+
+四組量測的 [ABBA 1](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_handoff_sealed_abba1_20261030.json)、
+[BAAB 1](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_handoff_sealed_baab1_20261030.json)、
+[ABBA 2](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_handoff_sealed_abba2_20261030.json)、
+[BAAB 2](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_handoff_sealed_baab2_20261030.json)
+各有同名的獨立讀回檔；每次均核對 772 個 head、兩份請求收據及
+正文雜湊。量測前後核對 106 個選定程式與設定檔的指紋，讀回結果
+綁定量測檔雜湊；這不是所有載入程式位元組均已封存的證明。
+[提交 profiler](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_handoff_sealed_profile_20261030.json)
+和[單執行緒解析 profiler](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_synthetic_parser_profile_20261030.json)
+是另一組定位證據，沒有混入上述中位數；前者的一次執行有 26 個
+切片，合計仍處理 772 筆。這些都不能推估鉅亨線上速度、所有來源完成時間
+或證明實際下載成功。新聞服務和計時器仍按維護指示停用，TEJ 可
+運作；沒有發布者請求或正式新聞目錄寫入。
+
+## 10/30 維護期間：三種工作信箱的發現錯誤與自動恢復
+
+原本網址信箱處理一批後，如果再次尋找待辦時遇到本機 I/O 或索引
+錯誤，可能把「不知道還有沒有」當成「沒有」，使餘下工作等待一般
+輪詢；另一種情況是在核心事件通知已讀取後，網址、候選或修復信箱
+的掃描失敗，通知可能不再喚醒 owner。[網址續跑重現](../artifacts/operations/agent-workflow/runs/news-inbox-discovery-retry-red-20261029T225032-3752b853/run.log)、
+[網址事件重現](../artifacts/operations/agent-workflow/runs/news-mailbox-discovery-red-20261029T225139-9d2f3859/run.log)
+及[其他信箱事件重現](../artifacts/operations/agent-workflow/runs/news-other-mailbox-discovery-red-20261029T225324-e894dde8/run.log)
+是隔離注入的錯誤，不代表正式服務當時已出現同樣故障。
+
+[網址信箱](../downloader/news_fulltext_url_metadata.py)現在可在 owner
+需要判斷續跑時區分空信箱與掃描失敗；[事件喚醒](../downloader/news_fulltext_wake.py)
+遇到無法判定的本機狀態會喚醒既有 owner 並保留重試。候選與修復
+信箱的重試各自獨立，由 0.25 秒起逐步退避至最多 5 秒；成功掃描
+並由 owner 完成信箱掃描及索引準備才清除失敗次數；單純的喚醒檢查不能
+清除它。網址信箱沿用其約 0.25 秒的本機重試。這些時間
+只適用本機讀取故障，不會改動發布者限速、來源資格或正文准入。
+其他來源回應在途時也會處理到期的本機重試；長期錯誤不應妨礙
+其他信箱。停機、低磁碟和既有權限判斷仍由原 owner 執行。
+
+[最終共用回歸](../artifacts/operations/agent-workflow/runs/news-mailbox-final-regression-20261029T225857-cd0eafa5/run.log)
+869 項通過，涵蓋鉅亨、跨來源、事件喚醒、候選、修復、在途回應、
+生命週期與面板；其中包括在途回應與持續故障時的信箱恢復測試。
+沒有執行整個專案測試。
+
+修正後重新進行[私人合成量測](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_continuation_final_retries_abba_20261030.json)：
+772 個網址、兩個請求及 1.2 秒假回應，停用續跑提示的兩次約
+1.88–2.33 秒完成登記，啟用的兩次約 0.62–0.87 秒；
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_continuation_final_retries_readback_20261030.json)
+確認四次的 head、收據與正文雜湊一致。這只測量本機假資料，不能
+推論正式網站吞吐量或完整歷史完成時間；下方記錄的先前正文延遲
+異常仍未查明。
+
+本次沒有發布者請求或正式新聞佇列寫入；新聞服務與計時器仍因
+維護停用，正式 owner 尚未載入這些修改，TEJ 可運作。下方 772 個
+CMNews 真實候選仍是私人待驗證清單，尚未提交正式佇列；維護解除
+後仍須重新核對來源政策與工作狀態，並以實際回應及收據驗收。
+
+## 10/30 維護期間：原文宣告 outbox 的續跑
+
+同一 intake pump 的原文宣告 outbox 也有分批等待問題：
+[修正前的兩個隔離案例](../artifacts/operations/agent-workflow/runs/news-declaration-continuation-re-20261029T224601-e795218e/run.log)
+分別重現已提交宣告仍有三筆等待、以及其他來源的回應在途時六個
+切片只處理一個。這不表示正式佇列當時確有這些積壓。
+
+[原文宣告 owner](../downloader/news_fulltext_original_declarations.py)現在
+在新增有效宣告時給既有 owner 一個本機喚醒提示；
+[intake](../downloader/news_fulltext_url_metadata.py)以原有索引確認有
+未完成宣告後繼續處理有界切片。喚醒提示本身不具權限，也不代表
+正文或來源身分已驗證；若原交易回滾，下一次檢查會清除空提示。
+本機索引暫時不可讀時保留宣告，走同一個短間隔重試，同時保留網址
+信箱和其他來源的派送機會。宣告的身分、來源指紋和正文准入規則未
+因此放寬。
+
+[聚焦回歸](../artifacts/operations/agent-workflow/runs/news-declaration-faults-final-20261029T224700-b89ea1e5/run.log)
+151 項通過；另有[交易回滾測試](../artifacts/operations/agent-workflow/runs/news-declaration-rollback-hint-20261029T224756-fe37efb8/run.log)
+驗證回滾後不會憑空產生目標文章或正文。
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-declaration-shared-regressi-20261029T224724-239bf4cc/run.log)
+772 項通過，涵蓋來源協作、鉅亨、冷卻、生命週期與面板；未跑整個
+專案測試。這些測試沒有新聞發布者請求或正式新聞佇列寫入；正式
+owner 尚未載入修改。
+
+## 10/30 維護期間：網址信箱續跑與本機故障恢復
+
+隔離測試重現了既有 owner 的等待：當另一來源的請求尚未結束時，
+網址信箱只處理一個有界切片，剩餘候選會等下一次五秒輪詢。
+這是本機登記延遲，不代表正式來源已漏抓，也不代表來源回應速度。
+[共用 owner](../downloader/news_fulltext.py)現在在網址信箱有已提交的進度、
+而且仍有待辦時繼續處理下一個有界切片，期間仍讓各來源派送及完成
+回應；已收到的正文會先走原有耐久收據流程。其他修復與候選 pump
+仍維持各自的週期，沒有新增 HTTP owner 或調整來源的請求限速。
+
+[網址信箱](../downloader/news_fulltext_url_metadata.py)遇到本機讀取、
+交易或歸檔故障時保留原輸入與已提交狀態；若無法前進，約 0.25 秒後
+再試，避免服務快速空轉。這是本機故障重試，不是來源冷卻或延後新聞
+發布時間。已完成但歸檔失敗的請求也會重試歸檔，不會重複登記。等待
+期間其他來源和候選信箱仍可運作。若暫時停機、低磁碟或來源限制，
+既有的停止、容量和存取判斷仍生效。
+
+隔離環境下，以 772 個合成網址和兩個請求檔，對「同一實作只停用
+續跑提示」及啟用續跑執行前／後／後／前[量測](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_continuation_final_abba_20261030.json)：
+四次都分 25 個切片並登記 772 筆；完成登記時間對照組約 **1.75–2.19 秒**，
+續跑組約 **0.45–0.53 秒**。另一來源使用 1.2 秒合成回應；
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_continuation_final_readback_20261030.json)
+確認四次的網址、狀態、收據和正文雜湊相同。這是私人佇列與假回應，
+沒有發布者請求；不代表正式網站吞吐量或全歷史完成時間。先前一輪
+[量測](../artifacts/data_quality/news_offline_inventory_20261029/url_owner_continuation_repro_abba_20261030.json)
+有一次續跑組的合成正文直到 2.97 秒才提交，原因未確認；後兩輪加入
+接收與提交計時後沒有重現，不能據此保證正式環境的正文延遲。
+[量測腳本](../scripts/benchmark_news_url_owner_continuation.py)及
+[獨立讀回腳本](../scripts/readback_news_url_owner_continuation.py)保留，
+測試資料僅寫入 `/var/tmp`，輸出需明確指定，且拒絕寫入正式新聞目錄。
+
+[故障與喚醒測試](../artifacts/operations/agent-workflow/runs/news-url-owner-final-faults-20261029T224246-36226ccd/run.log)
+64 項通過；[共用回歸](../artifacts/operations/agent-workflow/runs/news-url-owner-shared-regression-20261029T224105-2300cfb3/run.log)
+766 項通過，涵蓋鉅亨、跨來源派送、冷卻與生命週期。取消本機重試
+間隔的[對照](../artifacts/operations/agent-workflow/runs/news-url-retry-zero-control-20261029T224242-839d4cec/run.log)
+則在約 0.004 秒內再次讀取失敗的信箱。未執行整個專案測試。
+
+上述量測只證明網址信箱的隔離行為；同一 pump 的來源原文宣告 outbox
+已另作上述修正。下方 772 個 CMNews 真實候選仍在私人批次，未送入正式
+佇列；維護解除後仍須重新核對來源、快照及既有信箱。正式新聞服務
+與計時器繼續停用，程式尚未由正式 owner 載入；TEJ 可運作。
+
+## 10/30 維護期間：CMNews 既存原件的文章連結
+
+依使用者指定順序，鉅亨仍是恢復後的優先來源；維護停機期間利用
+CMNews 已保存的原件做離線清點。可中斷續跑的[掃描器](../scripts/audit_news_cmnews_retained_links.py)
+核對原有正文 head、批次與收據，掃描 **1,308 批、65,933 筆**
+既存原件，沒有批次錯誤。這是該停機快照中的已存範圍，並非全站
+歷史文章清冊。只抽取原件中同站、符合既有文章路徑規則的連結：
+其中 **772 個網址尚未登記**，另有 353 個 head 已有正文雜湊：327 個
+目前為完成，26 個目前仍是身分、登入或來源錯誤；另外 100 個 head
+沒有正文雜湊，其中 95 個目前標記登入／付費限制。已有 head 的狀態
+與到期時間均沒有改動。
+另發現的標籤頁網址只是連結，不計入文章或下載進度。
+
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_links_readback_20261030.json)
+使用另一套 HTML 解析器，逐一核對 772 個候選的來源頁連結、原始
+回應雜湊、批次及收據，並核對原佇列分類與待處理信箱；當時沒有
+信箱重複。先前 20 批抽樣的 76 個未登記文章網址及 672 個標籤
+連結均包含在完整掃描中。這些是來源頁上的**待驗證網址**，不代表
+目標頁存在、可存取、具有可用全文，或具有可供訓練的授權。
+
+[私人候選批次](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_links_private_stage_20261030/manifest.json)
+將 772 個網址分成 512／260 兩個既有 URL metadata 格式的請求，
+尚未送進正式 owner。[隔離 owner 讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_private_stage_owner_readback_20261030.json)
+在私人測試佇列實際處理兩批：771 筆新增、事先建立的 1 筆既有狀態
+完整保留，並核對兩份收據；沒有下載正文。[相關測試](../artifacts/operations/agent-workflow/runs/cmnews-retained-link-stage-tests-20261029T223049-990a41b1/run.log)
+56 項通過，包括候選原件重播、防止來源變動及既有 owner 的去重和
+恢復行為。私人批次不是正式排程，維護解除後須重新核對當時的
+來源政策、原佇列與待處理信箱，再經既有 owner 決定能否接納；
+若全庫快照改變，現可依上方交接憑證重新核對受影響的 head 與批次；
+關聯證據變動時仍須重掃或重核，不能直接沿用舊結論。
+
+本次沒有發布者請求或正式新聞佇列寫入。新聞 service／timer 維持
+停止；TEJ 可以運作。各來源線上抓取、全文結果及完成時間尚待
+維護解除後的實際收據驗證，不能由此宣稱全歷史抓完。
+
+## 10/30 維護期間：鉅亨保留原件續跑與跨來源交接
+
+在沒有網路工作及其他本機工作時，[隔離案例](../artifacts/operations/agent-workflow/runs/news-retained-cycle-continuation-20261029T221722-d8f4b53b/run.log)
+建立五份已保留的鉅亨原件；原本一個內層循環只重播四份，剩下一份要
+等常駐服務重開循環，重複初始化及來源探索排程。外層原本仍會續跑，
+因此這不是永久停住或正式服務已漏抓的證據。
+同日較早的停機快照對目前設定的診斷批次沒有找到合格待重播原件
+（見下方「鉅亨診斷原件的有界重播排程」）；這次修正不能證明
+該批次當前有積壓，也不能歸因為正式下載速度慢的原因。
+
+[共用排程](../downloader/news_fulltext.py)現在在下一批保留原件已可
+立即處理時留在同一循環；仍保持原有批量、時間、停止和來源冷卻
+限制。其他來源的正文已收到且沒有在途請求時，先經原有耐久收據
+流程提交，再繼續重播；若本機錯誤的重試時間尚未到，則交回常駐
+服務計算全域喚醒，避免占住其他來源的到期機會。
+[聚焦測試](../artifacts/operations/agent-workflow/runs/news-retained-cycle-fairness-foc-20261029T221910-48f5227e/run.log)
+六項通過，包含同輪續跑、先交接已收到的正文，以及另一來源比本機
+重試先到期的情況，並檢查正文收據與原有來源冷卻。
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-retained-idle-regression-20261029T222111-fe9a5499/run.log)
+721 項通過，涵蓋鉅亨、跨來源協作、冷卻喚醒、生命週期和其他本機
+重播；未執行整個專案測試。
+
+使用九份合成原件、相同初始佇列及真正的常駐服務路徑，在私人
+tmpfs 執行前／後／後／前兩輪的[隔離量測](../artifacts/data_quality/news_offline_inventory_20261029/retained_idle_cycle_abba_20261030.json)：
+舊版每次分成三個循環與三次探索初始化，新版都是一個循環與一次
+初始化；兩者均按 4、4、1 筆處理。舊版／新版牆鐘中位數為
+**0.126／0.113 秒**，程序 CPU 中位數為 **0.115／0.099 秒**，
+單次測量有重疊波動。[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/retained_idle_cycle_independent_readback_20261030.json)
+核對八次共 72 筆正文、原始回應、Parquet 和收據雜湊，以及相同
+語意摘要。量測不含原件準備、讀回或來源 HTTP，實體磁碟准入由私人
+測試替代，不能推估正式下載速度或全歷史完成時間。
+
+新聞服務及計時器仍依維護要求停止；上述程式尚未由正式 owner
+載入，本次沒有新聞發布者請求或正式新聞佇列寫入。TEJ 可運作；
+各來源實際恢復、完整性及完成時間仍須維護解除後驗證。
+
+## 10/30 維護期間：各來源未知工作範圍的估時
+
+隔離狀態重現一個跨來源面板問題：來源有主機／政策暫緩或過期但尚未
+成功重查的來源錯誤，而快照沒有記錄待抓網址與該主機的對應範圍時，
+原先仍可能用其他健康請求的速度估算整批完成時間。[修改前測試](../artifacts/operations/agent-workflow/runs/news-provider-scope-eta-red-20261029T220843-e51bbd47/run.log)
+對鉅亨、Global Voices、CMNews 的 21 個暫緩／待重查／錯誤格式案例
+都重現錯誤倒數，空的暫緩清單案例則保留原估時。這是隔離資料重現，
+不代表正式佇列的每個來源都發生該問題。
+另外，[容量快照及個別來源控制格式錯誤的六個案例](../artifacts/operations/agent-workflow/runs/news-malformed-capacity-eta-red-20261029T221137-f31a9e0c/run.log)
+原本被當成空資料並錯誤顯示倒數；即使另有先前的精確範圍紀錄，
+格式損壞或已溢位的當前控制也不能證明現在仍未受影響：另外六個
+[精確範圍與無效主機控制的衝突案例](../artifacts/operations/agent-workflow/runs/news-precise-scope-gate-red-20261029T221354-26bab633/run.log)
+同樣重現錯誤倒數。精確範圍的檢查只讀既有有界控制資料，不掃描佇列。
+
+[面板投影](../stockagent/live/news_dashboard.py)現在對這類沒有精確
+網址範圍證據的來源顯示「完成時間未知」，彙總估時也不借用其他來源
+的速度；流量快照或個別控制格式損壞時也不顯示倒數。仍顯示各來源
+狀態及已觀察速度，不改變下載排程。若鉅亨有
+既有的精確待抓網址範圍，且已核對未受影響，則保留其估時。缺少上述
+欄位的舊快照維持既有相容行為，因此這項修正不聲稱已辨識所有舊狀態
+中未記錄的來源故障；不確定的主機即使與待辦無關，也可能暫時隱藏
+估時，直到有可用的範圍證據。來源主機名稱不傳到頁面。
+
+[聚焦測試](../artifacts/operations/agent-workflow/runs/news-provider-scope-eta-green-20261029T220908-a7d37acb/run.log)
+27 項通過；另以桌機和手機尺寸的隔離瀏覽器讀回頁面文字，並檢查
+其他健康來源仍有自己的估時。[最終擴大回歸](../artifacts/operations/agent-workflow/runs/news-provider-scope-eta-verified-20261029T221411-811a24f7/run.log)
+807 項通過，涵蓋面板、瀏覽器、工作者生命週期、鉅亨派送及正文
+狀態；未執行整個專案測試。測試及所有清點均沒有向新聞發布者發
+請求或寫入正式新聞目錄。新聞 service／timer 維持維護停機；變更
+尚未由正式面板程序載入，也無法由此宣稱來源已恢復或歷史完整。
+
+## 10/30 維護期間：收據編碼判斷的效能候選
+
+沿用已完成的完整收據讀取和 SQL 批次恢復，不略過已提交收據的
+JSON 解碼或孤兒收據驗證。嘗試讓常見 UTF-8 編碼名稱免除每筆的
+`codecs.lookup`；僅當完整恢復流程有實測收益且語意一致時才採用。
+
+[隔離 ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/receipt_encoding_abba_20261030.json)
+從停機快照的 223,582 筆已登記批次中依排序均勻選取 **8,192** 份
+收據，複製到私有 tmpfs，建立隔離 SQLite 索引，兩輪各執行 ABBA。
+每輪使用既有 `recover_acceptance`、完整 JSON 解碼、相同 SQL 與
+自適應讀取；所選收據全部為已提交批次，沒有測量孤兒正文恢復。
+兩種輸出的全欄位與來源收據雜湊核對一致。既有流程／候選的牆鐘
+中位數為 **0.205／0.243 秒**，CPU 中位數為 **0.205／0.243 秒**；
+單次結果有波動，不能由此推定候選在所有環境都較慢，但**沒有證明
+完整流程加速，因此未套用正式程式**。本機選樣不是隨機樣本，
+不包含資料複製、冷開機、網路或完整 owner 初始化，不能推估新聞
+下載速度及全歷史完成時間。前後資料庫和所選正式收據檔案身分相符，
+但這不是整個檔案系統的凍結快照。
+
+[量測程式](../artifacts/data_quality/news_offline_inventory_20261029/news_receipt_encoding_benchmark_20261030.py)
+的第一次執行在私人暫存檔尚未建立時誤用必須檔案已存在的 `source_path`，
+[保留失敗紀錄](../artifacts/operations/agent-workflow/runs/news-receipt-encoding-abba-20261029T220553-54967de6/run.log)；
+修正暫存路徑檢查後重跑完成。兩次均沒有來源請求、正式新聞佇列寫入
+或服務重啟。新聞 service／timer 按維護要求保持停止，TEJ 可運作。
+
+## 10/30 維護期間：歷史 RSS 有進度時立即續跑
+
+既有歷史 RSS 索引每處理一個本機切片，都額外等 50 毫秒；即使切片
+已掃描目錄或處理原件、仍有就緒工作也是如此。[隔離重現](../artifacts/operations/agent-workflow/runs/news-rss-slice-delay-red-20261029T215941-f02213f1/run.log)
+核對有進度和無進度的三種情境，兩個有進度案例原本都等待約 50 毫秒。
+
+[共用排程](../downloader/news_fulltext.py)現在只在切片確實掃描或處理了
+資料、且仍有就緒工作時立即執行下一輪；沒有進度時仍等待 50 毫秒，
+來源到期時間與拒絕／配額照舊。每輪仍先為其他來源派送可用的 HTTP
+工作；已收到正文且沒有在途請求時，沿用下節的耐久交接規則。
+[聚焦測試](../artifacts/operations/agent-workflow/runs/news-rss-slice-priority-green-20261029T220139-e5eb21a7/run.log)
+17 項通過，包含無進度退避、另一來源在連續索引切片間派送並完成
+正文收據、停止邊界與上一輪的交接及合批測試。這些是隔離案例，
+不是正式來源已恢復的證據。
+[擴大回歸](../artifacts/operations/agent-workflow/runs/news-rss-slice-priority-regressi-20261029T220155-90b8fdcc/run.log)
+735 項通過，涵蓋 RSS、鉅亨、跨來源協作、收據恢復與 owner 生命週期；
+未執行整個專案測試。鉅亨保留原件檢核的 parser 指紋不包含本次修改的
+排程檔，既有相容性判定沒有因這次變更改寫。
+
+對同一 feed 依檔名選取 128 份既存原件及收據，複製至私有 tmpfs，
+使用相同的 owner `run_cycle`、佇列初始化與讀回做
+[ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/ltn_legacy_owner_delay_abba_20261030.json)：
+四輪均核對 128 份原件、128 筆來源觀察與 3,989 個網址 head，語義
+讀回雜湊相同。原固定等待／新排程的牆鐘中位數為 **1.691／0.871 秒**，
+程序 CPU 中位數為 **0.990／0.953 秒**。這是選定樣本的本機流程，
+不是隨機樣本或全量完成時間；不含原件複製及來源 HTTP，私有 tmpfs
+容量取樣由測試替代，沒有驗證正式實體磁碟准入。原正式原件及
+資料庫檔案身分在量測前後相符；不代表檔案系統被凍結。
+[第一次量測](../artifacts/operations/agent-workflow/runs/news-rss-owner-delay-abba-20261029T220045-8ebcb2a2/run.log)
+因私有 tmpfs 的正式 backing 取樣尚未完成而未開始索引，保留該失敗；
+上面的結果使用明示的私有測試取樣器重跑。
+
+新聞 service／timer 依維護要求保持停止，新排程尚未由正式 owner
+載入，也沒有向發布者發請求或寫入正式新聞佇列。全來源完整性、
+線上吞吐與完成時間仍需維護解除後以實際來源和收據確認。
+
+## 10/30 維護期間：歷史 RSS 索引與已接收正文的交接
+
+在隔離排程中，[重現測試](../artifacts/operations/agent-workflow/runs/news-legacy-handoff-red-20261029T215457-43643329/run.log)
+顯示：歷史 RSS 本機索引仍有工作時，如果其他來源的正文已接收且已沒有
+在途 HTTP 工作，原排程可能先執行下一個索引切片，之後才提交正文。
+切片時間是軟上限，單次本機 I/O 可能更久；測試證明的是交接風險，
+不是正式佇列曾經遺失正文的證據。
+
+[共用 owner](../downloader/news_fulltext.py)現在仍先讓各來源取得可用
+HTTP 工作機會；若已無在途請求，則保留索引工作的就緒狀態，先以原有
+耐久批次與收據提交已接收正文，再繼續本機索引。仍有在途請求時保留
+既有合批行為，也不更改來源配額、授權或重試時限。
+[隔離測試](../artifacts/operations/agent-workflow/runs/news-rss-handoff-fixtures-20261029T215606-d05aa57b/run.log)
+**12 項通過**：包括使用三份合成 RSS 原件及收據的本機索引，核對
+另一來源的正文 head、批次、收據與原件雜湊，也測試兩篇正文合批。
+最初重現有三項失敗，其中兩項要求仍在途的請求必須先提交，與原本
+合批語意不符；修正後的測試允許在途請求完成再核對，不將那兩項誤稱
+為已修復的正式缺陷。
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-rss-handoff-regression-20261029T215626-3d76f945/run.log)
+**564 項通過**，涵蓋歷史 RSS、鉅亨候選、跨來源協作、耐久恢復及
+owner 生命週期；沒有執行整個專案測試。
+
+測試沒有連接新聞發布者，正式新聞目錄保持唯讀。新聞服務及計時器
+依使用者維護要求維持停止，修正尚未由正式 owner 載入；TEJ 可運作。
+後續仍須維護結束後核對正式收據與各來源歷史，不能由隔離測試推估
+實際下載速度或完成時間。
+
+## 10/30 維護期間：正文交接與鉅亨原件證明重用
+
+隔離排程[重現](../artifacts/operations/agent-workflow/runs/cnyes-lookup-body-red-20261029T214345-ff26eae4/run.log)：
+另一來源的正文已收取，鉅亨本機候選補查仍有工作時，少量正文可能
+暫留記憶體，直到批次門檻、原有 30 秒期限或循環結束才提交；突然
+中斷可能失去尚未入庫的這次結果。這是測試中可重現的風險，不代表
+正式佇列實際遺失過正文。[共用 owner](../downloader/news_fulltext.py)
+已集中本機工作判斷，沒有 HTTP 工作而要繼續本機補查時，先由原有
+耐久收據路徑提交已收到的正文。到期的補查須等待正文交接時也保留
+喚醒，即使當時沒有 journal；其他仍在執行的 HTTP 工作和原有批次
+門檻照常運作。三種到期／journal 喚醒情況均有[隔離重現與驗證](../artifacts/operations/agent-workflow/runs/cnyes-due-scan-green-20261029T214942-1d629535/run.log)，
+並核對正文 head、已登錄批次和收據。
+
+共用回歸另暴露既存效率問題：CMNews 的時間欄位變更使共用政策檔
+雜湊改變，鉅亨原件稽核因此保守地拒絕重用已驗證的舊證明。經
+[離線比對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_cmnews_policy_bridge_20261030.json)，
+確認兩版政策扣除明確的 CMNews 專屬語法後，其餘完整模組語法樹
+一致；四組鉅亨來源設定的政策與指紋也一致。現在只允許經審查的
+舊 v3／v4 證明與目前這個明確版本相容，舊證明保留原政策雜湊；
+未知版本仍拒絕重用。來源指紋、原檔和收據的檔案身分，以及需要時
+的已提交批次身分仍須匹配，這不是新的來源觀測或完整歷史證明。
+
+[正式原件唯讀讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_cmnews_policy_reuse_readback_20261030.json)
+在 owner 鎖及空 WAL／journal 下，核對一份既有稽核的 **30 個觀測
+配對**符合重用條件；以未知政策雜湊測試時是零。這次讀回只檢查
+既有證明與目前的檔案身分，沒有重新下載或重新計算所有正文雜湊。
+[共用回歸](../artifacts/operations/agent-workflow/runs/cnyes-owner-and-proof-final-20261029T215003-38a4ee21/run.log)
+**1,063 項通過**，涵蓋 owner、鉅亨補查與批次、舊證明重用、來源
+政策、CMNews、生命週期及面板；未執行整個專案測試。第一次擴大
+回歸的[八項失敗](../artifacts/operations/agent-workflow/runs/cnyes-lookup-owner-regression-20261029T214418-a66edc45/run.log)
+由政策版本不再吻合所致，保留原紀錄；針對不相容身分及原件變動
+的測試仍要求拒絕重用。
+測試使用網路隔離和正式新聞目錄唯讀；新聞服務、計時器維持維護
+停機，上述修正尚未由正式 owner 載入或驗收，TEJ 不在新聞停機範圍。
+
+## 10/30 維護期間：鉅亨候選補查的面板狀態
+
+下節以耐久 journal 接住 AMP 狀態變更，但原新聞狀態與面板沒有揭露
+這些本機待核對紀錄；不能從正文進度或來源重試數推知其數量。
+[重現測試](../artifacts/operations/agent-workflow/runs/news-cnyes-lookup-progress-red-2-20261029T213715-51c2bf67/run.log)
+確認原 owner 狀態和公開投影都沒有這個欄位。
+
+[原 owner](../downloader/news_fulltext_queue.py)現在透過
+[候選工作程式](../downloader/news_fulltext_cnyes_work.py)讀取 journal
+中的待處理紀錄：最多查看 2,049 筆，少於該數顯示精確數量，達到上限
+則顯示「至少 2,049」；不掃描整個文章表，也不做來源請求。這是待
+檢查的狀態變更，可能後續變成不符合條件，且不包含仍未掃到的舊資料；
+不是文章正文數、唯一文章數或完成率。公開投影只接受符合版本和範圍
+的計數，不傳出網址及私有欄位；舊版或無效快照顯示未知，不當作零。
+[網頁](../services/news_dashboard/app.js)在 owner 未運作時標示上次快照，
+不依這個數值推算全歷史完成時間。
+
+[隔離共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-lookup-progress-share-20261029T213848-c991c7f1/run.log)
+**852 項通過**，涵蓋原佇列交易回滾與補查、計數上限、狀態投影、未知
+及錯誤值、隱私與桌面／手機瀏覽器；未執行整個專案測試。測試隔離
+網路，正式新聞資料根目錄保持唯讀。[本機頁面讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-lookup-live-readback--20261029T213942-51cd88e1/run.log)
+於 05:39（臺北時間）確認網頁腳本已包含新欄位，但正式 API 仍是
+2026-10-28 07:44 的停止快照且沒有該欄位，因此目前實際數量未知。
+此次沒有啟動新聞服務或寫入正式佇列；維護結束後還需要讓原 owner
+及狀態服務載入新程式並驗收，不把測試通過當作現場抓取完成。
+
+## 10/30 維護期間：鉅亨候選漏排與閒置恢復
+
+原 AMP 候選掃描以 host／state 的 rowid 游標前進。隔離測試重現：游標
+先越過某個不能排候選的舊 head，之後正常來源歸屬修正，或實際重試
+由不可處理狀態轉為 502 時，如果沒有再次匯入該網址，主站候選可能
+永遠不會再檢查。另一項重現是補查工作在既有 owner 最後一次掃描後
+提交，而 owner 因沒有 HTTP 工作就結束該輪；待查紀錄沒有及時喚醒它。
+[來源及重試重現](../artifacts/operations/agent-workflow/runs/news-cnyes-native-transition-red-20261029T212740-a6a271ad/run.log)、
+[來源契約變更重現](../artifacts/operations/agent-workflow/runs/news-cnyes-recheck-policy-red-20-20261029T212936-7a084300/run.log)
+和[owner 閒置重現](../artifacts/operations/agent-workflow/runs/news-cnyes-recheck-owner-red-202-20261029T213022-7954b706/run.log)
+均保留原失敗，這些是隔離測試，不能直接推定正式佇列曾漏掉多少筆。
+
+[候選排程](../downloader/news_fulltext_cnyes_work.py)現在以同一交易保存
+狀態變動後的待查 parent，與原有歷史游標輪流處理；失敗回滾時待查
+紀錄及新候選一起回滾，重啟後可續處理。首次升級對 AMP 有界游標回掃
+一次；[來源契約](../downloader/news_fulltext_queue.py)實際改變後也會
+重看原先可能被該契約排除的 AMP。既有[owner](../downloader/news_fulltext.py)
+在沒有 HTTP 工作時仍繼續有界處理補查。原 head 的拒絕、期限、嘗試
+次數、正文、發布時間及來源觀測不因候選建立而改寫；候選不是已驗證
+別名或全文，來源與 robots 限制仍由原 HTTP owner 執行。
+
+在 owner 排他鎖、空 WAL／journal、immutable SQLite 與正式新聞目錄
+唯讀下，[05:31 臺北時間快照](../artifacts/operations/agent-workflow/runs/news-cnyes-recheck-offline-inven-20261029T213118-3e3af120/run.log)
+和[獨立讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-recheck-independent-r-20261029T213147-61f7fce7/run.log)
+核對 187 個 pending／retry／retry_cooldown AMP head：33 個符合目前
+head 層級候選條件，其主站 head 均已存在且有正文指標；另外 154 個
+的紀錄為 `robots_origin_policy_cooldown`，不因這次修正繞過冷卻。
+這不是對來源政策、正文內容或耐久收據的驗證，也不涵蓋其他狀態。
+
+[隔離共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-recheck-shared-regres-20261029T213137-bca3a46e/run.log)
+**1,658 項通過**，包括前述重現、交易回滾與重啟、來源拒絕、掃描與
+補查公平性、其他來源及面板；未執行整個專案測試。[查詢計畫](../artifacts/operations/agent-workflow/runs/news-cnyes-recheck-query-plans-f-20261029T213325-9abaeadc/run.log)
+顯示 AMP 掃描使用 host／state 索引，待查 parent 使用主鍵查找；FIFO
+按切片讀取，不需要反覆掃描整個文章庫。這不是正式來源吞吐量測試。
+
+本輪未呼叫新聞來源、寫入正式新聞佇列或啟動新聞下載。新聞服務和
+計時器依使用者指示維持停機，程式修正尚未由正式新聞 owner 載入；
+使用者已確認 TEJ 可以運作。全部來源的下載及預計完成時間仍未驗證。
+
+## 10/30 維護期間：鉅亨主站候選的當前來源核對
+
+隔離測試重現：匯入 AMP 網址時，註冊表可能把輸入判為鉅亨，但既有
+文章 head 的來源仍是其他 provider；原本只查 head 的狀態和正文，
+會依舊輸入建立主站候選。舊快照的網址和目前 head 不一致時也有同樣
+問題。[修正](../downloader/news_fulltext_cnyes_work.py)只在同一個
+佇列中，以文章 ID、目前 provider 及精確網址核對來源 head，再檢查
+原本的狀態、錯誤與正文條件；正文雜湊只要不是 NULL 就不當成缺正文。
+這是候選排程的身份防護，不複製正文、改寫來源觀測、重設期限或
+放寬來源權限。來源歸屬修正後，正常重新匯入仍可建立該候選。
+
+[修正前的三項隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-parent-fence-red-2026-20261029T212240-e64b4abe/run.log)
+及[修正後的 134 項聚焦測試](../artifacts/operations/agent-workflow/runs/news-cnyes-parent-fence-focused--20261029T212312-5c57e732/run.log)
+保留原失敗、現在來源不符、網址不符、回補切片狀態改變，以及來源
+恢復後再次匯入等情境。這些是測試重現，不代表正式佇列曾發生該錯誤。
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-parent-fence-regressi-20261029T212356-cd6447d6/run.log)
+**1,063 項通過**，涵蓋鉅亨下載與索引、共用恢復、其他來源及面板；
+聚焦測試包含在此範圍內，未執行整個專案測試。
+
+在新聞服務與計時器均停止、取得既有 owner 鎖及 WAL／journal 為空的
+條件下，[唯讀快照](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_native_parent_integrity_20261030.json)
+核對目前的 2 筆主站候選 journal：父網址、目標網址及其目前 provider
+均相符。另有 187 個 pending／retry／retry_cooldown AMP head，目前
+provider 都是鉅亨；該查詢未包括其他狀態。[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_native_parent_readback_20261030.json)
+再次核對兩筆 journal、網址 SHA、來源及相同快照的 187 個 head，沒有
+發現不符。這些檢查沒有驗證全文、收據或過去建立候選時的歷史狀態，
+不能據此宣稱來源全文完整或這 187 個網址都已取得正文。
+
+檢查及測試採網路隔離、正式新聞資料目錄唯讀，沒有呼叫新聞網站或
+寫入正式佇列。新聞服務與計時器維持維護停機，修正尚未由正式新聞
+owner 載入；TEJ 的服務及 API 計時器可繼續運作。維護結束後仍須按
+既有 owner 的來源回應、正文與耐久收據驗收，全部完成時間尚未知。
+
+## 10/30 維護期間：標題稽核與全文稽核分開顯示
+
+此前頁面只顯示全文版本的已知問題；下方另有 136 個 CMNews 標籤
+網址在現行資料集被列為標題，屬不同粒度。現在標題結果使用獨立
+的證據指標：核對原稽核及獨立讀回的雜湊、目前 manifest、路徑與
+計數，同時保留「來源頁內容未核驗、當時來源 head 不代表歷史狀態」
+的限制。標題與全文不相加，也不變更下載進度；一份證據損壞不遮蓋
+另一份，切版或更新失敗顯示未知。兩類結果共用一次 manifest 讀取，
+若讀取之間切版，整組品質投影均撤回。
+
+只在兩份既有報告及現行 manifest 可核對時發布標題稽核參照：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/publish_news_corpus_quality_status.py \
+  --kind cmnews-tag-headlines \
+  --audit artifacts/data_quality/news_offline_inventory_20261029/cmnews_tag_corpus_audit_20261030.json \
+  --readback artifacts/data_quality/news_offline_inventory_20261029/cmnews_tag_corpus_readback_20261030.json
+```
+
+這只更新本機證據參照，不接觸新聞網站、正式佇列或資料集。它不
+代表 136 筆已從現行資料集移除，亦不保證其他標題均正確。
+
+[隔離回歸](../artifacts/operations/agent-workflow/runs/news-headline-quality-regression-20261029T211647-1a45e2bc/run.log)
+新聞及來源清冊 **763 項通過**，共用快取／路由 **11 項通過、178 項未選**；
+後續釐清全文稽核未知時的顯示文案後，[焦點測試](../artifacts/operations/agent-workflow/runs/news-headline-visibility-final-2-20261029T211839-af7c56fe/run.log)
+**38 項通過**。驗證範圍包含一側損毀、缺失後恢復、分組不符、
+切版競態與桌機／手機畫面；未執行整個專案測試。
+本機熱快取連續 12 次讀取兩類稽核及一次 3,338,661 bytes manifest，
+牆鐘中位數 7.7 ms、最大 10.9 ms；不是整頁載入時間或來源下載效能。
+[參照發布](../artifacts/operations/agent-workflow/runs/news-headline-publish-20261030-20261029T211903-70d67f1c/run.log)
+與[候選閘道](../artifacts/operations/agent-workflow/runs/news-headline-gateway-candidate--20261029T211914-6f6032c6/run.log)
+在網路隔離、正式新聞資料目錄唯讀下進行；
+[部署後本機 owner 讀回](../artifacts/operations/agent-workflow/runs/news-headline-gateway-deploy-202-20261029T211930-116013ed/run.log)
+核對 77 個全文版本、136 筆標題及三種畫面寬度，沒有對發布者發請求。
+僅重啟唯讀閘道；TEJ 與三個交易相關程序的 PID／重啟次數前後不變，
+新聞服務及計時器仍停止。這不是外部網域驗收或新聞下載恢復證據。
+
+## 10/30 維護期間：資料集品質警示與下載進度分開
+
+新聞面板原來的已保存正文數來自來源佇列，無法顯示下方已查出的
+現行訓練資料集登入預覽。[唯讀投影](../stockagent/live/news_corpus_quality.py)
+將兩份既有稽核的雜湊、版本、來源快照、命中分組和現行 manifest
+核對後，僅投影來源及「正式受理／私有待受理」的版本數；不傳正文、
+文章身分、原始網址或本機檔案路徑。它不把版本數減進缺文佇列，也
+不把待受理誤稱修復。切版、證據損壞／缺失、超出有界讀取大小或
+更新失敗會顯示未知；沒有命中也只代表該次檢查範圍。
+
+維護期間可在既有兩份報告皆可讀且目前 manifest 相符時，僅發布
+本機的稽核參照，供後續唯讀面板讀取：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/publish_news_corpus_quality_status.py \
+  --audit artifacts/data_quality/news_offline_inventory_20261029/news_corpus_reviewed_versions_20261030.json \
+  --readback artifacts/data_quality/news_offline_inventory_20261029/news_corpus_reviewed_versions_readback_20261030.json
+```
+
+此指令不聯絡新聞來源、不向正式佇列送覆核，也不修改資料集；它
+無法完成下方 76 筆待受理事項，更不表示所有新聞已抓齊。
+本機已有資料熱快取下連續 12 次核對兩份證據及 3,338,661 bytes
+manifest，單次牆鐘中位數 5.9 ms、最大 8.3 ms；這只是該唯讀核對的
+量測，不是完整面板載入時間或其他主機的效能保證。
+
+[最終回歸](../artifacts/operations/agent-workflow/runs/news-corpus-quality-dashboard-fi-20261029T210916-c9d445b2/run.log)
+新聞面板、來源清冊與受理狀態 **745 項通過**，另有共用面板快取／路由
+**11 項通過、178 項未選**。包含證據不符、切版、更新失敗及長來源名稱
+的手機顯示；本次未執行完整專案測試。
+[稽核參照發布](../artifacts/operations/agent-workflow/runs/news-quality-publish-20261030-20261029T211124-d877579f/run.log)
+及[候選閘道驗證](../artifacts/operations/agent-workflow/runs/news-quality-gateway-candidate-r-20261029T211147-dda86123/run.log)
+以網路隔離和兩個正式新聞資料目錄唯讀執行。候選閘道第一次檢查將
+`all_corpus_parts_verified` 誤認成不應公開的分區路徑；已修正驗收程式
+對欄位名稱的檢查，原失敗紀錄仍保留。
+
+已只重啟唯讀閘道；[部署後讀回](../artifacts/operations/agent-workflow/runs/news-quality-gateway-deploy-2026-20261029T211216-ce67608e/run.log)
+在本機 owner 入口核對 77／1／76、桌機與兩種手機寬度、唯讀控制邊界及
+零發布者請求。前後當沖、隔日沖、期貨面板與 TEJ 程序的 PID 和重啟次數
+未變，新聞服務與計時器仍停止；本次沒有驗收外部網域或新聞下載恢復。
+
+## 10/30 維護期間：資料集驗收與說明檔的版本綁定
+
+隔離測試重現：新版資料集的根目錄驗收副本及 README 已更新，但在
+發布 `manifest.json` 指標之前中斷時，目前可讀資料仍是舊版。原先
+儲存清冊只讀根目錄驗收副本，會把舊版誤判為待驗證；若根目錄副本
+仍與舊版相符，而該版專屬收據已損毀，則狀態不會反映收據損壞。這是測試
+情境，沒有證據顯示目前正式資料集曾發生該次中斷。
+
+[版本清冊](../stockagent/data_sync/dataset_version_layout.py)現在優先
+讀取目前 manifest 指向的 generation 收據，核對版本、manifest
+內容雜湊、筆數、分區數與大小及既有品質驗收狀態；只有該版收據
+不存在時，才允許符合相同綁定條件的舊式根目錄收據。該版收據存在
+但不合規、損壞或路徑越界時不退回根目錄；讀取期間根目錄 manifest
+變動也維持待驗證。這仍只是收據核對，並未重新核驗資料檔。
+
+[資料集產生器](../stockagent/data/news_dataset.py)的新說明檔會連到
+它描述的固定版本 manifest、收據、schema 和品質副本，並提示讀取
+範例依根目錄目前指標選版；品質明細以驗收收據內的 `quality` 為準。
+新版本的 schema 亦由[既有私人新聞備份規劃器](../stockagent/data_sync/news_private_backup.py)
+在檔案存在時納入，先前已封存的備份計畫仍可驗證。這不改寫舊版或
+變更新聞來源及使用授權。
+
+[中斷後恢復測試](../artifacts/operations/agent-workflow/runs/news-generation-recovery-focused-20261029T205800-dd2b57c1/run.log)
+在私有資料集恢復候選版本並保留舊版收據；另檢查指標切換、舊版
+相容、錯誤收據及越界路徑。[相關回歸](../artifacts/operations/agent-workflow/runs/news-generation-recovery-regress-20261029T205818-784eb19e/run.log)
+新聞資料集與私人備份 **435 項通過**，選定的版本清冊測試 **18 項
+通過、16 項未選**；後者沒有宣稱涵蓋受既有未登錄根目錄影響的整個
+清冊測試。[現行版本唯讀核對](../artifacts/data_quality/news_offline_inventory_20261029/news_generation_acceptance_readback_20261030.json)
+確認 `versions/20261016T155152Z-890f02f7` 的本版收據與 manifest
+相符，沒有重讀新聞資料列，因此不代表全文內容、全部歷史或前述
+登入預覽已修復。全資料版本清冊另回報既有 `data_fugle` 目錄尚未
+登錄；這不等於新聞收據失敗，亦沒有修改該目錄。
+
+新聞服務與計時器依維護指示仍停止；沒有請求發布者或寫入正式新聞
+佇列及資料集。修正後程式尚未經正式新聞服務恢復驗收。
+
+## 10/30 維護期間：現行資料集的正文版本實際核對
+
+下方提到的登入預覽不只是新版建置器的潛在風險：目前發布的
+`versions/20261016T155152Z-890f02f7` 新聞資料集，**已有 77 筆精確
+相同版本被列為全文**。其中 76 筆是 CMNews 原頁的登入遮罩；另 1 筆
+為 MoneyWeekly 已由來源 owner 正式受理的登入預覽覆核。CMNews 的
+76 筆只有私有待送覆核請求，**尚未由正式 owner 受理**，兩種證據
+狀態不可合併成正式修復數量。
+
+[版本稽核器](../scripts/audit_news_corpus_reviewed_versions.py)固定
+資料集 manifest、來源快照與覆核證據，比對文章與 provider、來源
+檔案及雜湊、擷取時間、正文雜湊；掃描 682 個文章分區的 footer，
+對含有命中項目的 2 個分區完整核驗雜湊。其
+[結果](../artifacts/data_quality/news_offline_inventory_20261029/news_corpus_reviewed_versions_20261030.json)
+確認上述 77 筆；[另一套獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/news_corpus_reviewed_versions_readback_20261030.json)
+重新核對來源原件、收據、身分、時間、正文與資料集分區雜湊，並
+再次檢查 76 份 CMNews 原頁登入遮罩。這些證據僅能確認命中的版本，
+並未對所有分區逐一核雜湊，也不代表其餘新聞全文皆已通過品質審查。
+
+同一 manifest 的[去重文字表稽核](../artifacts/data_quality/news_offline_inventory_20261029/news_corpus_reviewed_documents_20261030.json)
+確認這 77 筆分別對應 **77 份不同的 `documents` 全文文字**；
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/news_corpus_reviewed_documents_readback_20261030.json)
+再次比較文章正文與文字表雜湊、長度及來源分區。文字表檢查了 550 個
+分區的 footer、投影 489 個 row group，命中的 2 個分區完整核驗
+雜湊；不能據此宣稱其他文字已通過內容檢查。相同文字可能同時被其他
+文章版本引用，不能只憑文字雜湊直接刪除所有來源版本。這也沒有證明
+現有模型訓練實際使用了這些文字。
+[相關隔離回歸](../artifacts/operations/agent-workflow/runs/news-corpus-document-review-regr-20261029T205154-157270ec/run.log)
+**413 項通過**。
+
+目前資料集沒有被改寫，因此這 77 筆仍在舊版資料集中；下述新範圍
+只在使用已受理的覆核證據、另建相容資料集並完成驗證後生效。這次
+沒有新聞網站請求、正式佇列寫入或正式資料集寫入；新聞服務和排程
+依維護指示停用，TEJ 可以運作。
+
+## 10/30 維護期間：已覆核的正文版本與資料集範圍
+
+原本資料集只要 head 指向已存正文就當作全文；owner 先前確認該
+**相同正文版本**是登入預覽，卻不會反映在資料集。現以正式保留的
+[MoneyWeekly 原件與覆核收據唯讀重播](../artifacts/data_quality/news_offline_inventory_20261029/news_dataset_reviewed_quality_real_20261030.json)，
+確認一筆正式已受理的正文與現行解析結果皆為 `paywall_or_login`。
+這一筆的證據已存在；下方 76 筆 CMNews 則仍是尚未送入正式佇列的
+覆核請求，不能混為同一次正式修復。
+
+新資料集範圍 `owner_reviewed_exact_body_exclusions_v1` 只根據既有
+owner 成功受理的覆核，在文章、來源、正文雜湊、來源批次與擷取
+時間吻合，且封存請求、收據及原件雜湊均核驗後排除該正文；有效
+標題仍可作為標題資料。其他或後續擷取版本即使文字相同也不會被
+舊覆核移除，僅憑 head 的登入狀態也不移除舊正文。缺少或損壞證據
+會使建置停止，原始正文和收據不刪除；精確請求內容保留在新輸入
+快照中。範圍改變需要**新的資料集根目錄與相容快照**，舊 ABI 1/2
+資料集仍可讀；目前沒有重建或改寫正式資料集。
+
+[私有副本整鏈演練](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_quality_corpus_private_rehearsal_20261030.json)
+以 13 份請求和 124 份原始檔副本驗證 76 筆，既有 owner 全數重分類，
+獨立讀回的新測試資料集排除 76 個相同正文版本並保留 76 則標題；
+再次處理為 no-op，原始檔及其他 head 欄位未變。這是隔離演練，
+不等於正式佇列已受理或全部新聞通過品質審查。
+[相關回歸](../artifacts/operations/agent-workflow/runs/news-dataset-reviewed-quality-fi-20261029T204200-ef223be1/run.log)
+共 **488 項通過**。首輪測試暴露零筆表格說明與 fixture 時間片問題，
+修正後通過；零筆資料集現在能產生說明，說明或覆核報告寫入失敗時
+不會把未完成的 manifest 指標發布給讀者。原失敗紀錄仍保留。
+
+以上沒有對新聞網站送出請求或寫入正式佇列；新聞服務與排程仍維持
+維護停機，TEJ 可運作。維護解除後，先恢復鉅亨既有優先隊列，再由
+原 owner 重新核對並受理 CMNews 待覆核項目；完整資料集重建仍需
+通過實體儲存容量與獨立驗證。
+
+## 10/30 維護期間：CMNews 既存原頁登入遮罩全範圍檢查
+
+延續下方 24 筆時間樣本的發現，依既有來源唯讀快照、已驗證收據和
+原始回應雜湊，檢查 **1,308 個批次、65,933 個既存 head**。
+已知、屬於本篇 DOM 範圍的登入遮罩有 **83 筆**，其餘 **65,850 筆**
+沒有觀察到這一種遮罩；批次失敗及待判定均為零。後者不等於確認全文
+完整，也不排除其他付費牆、缺文形態或網站尚未取得的歷史文章。
+[全量掃描紀錄](../artifacts/operations/agent-workflow/runs/news-cmnews-retained-access-v2-f-20261029T202229-b6f4ab74/run.log)
+從已完成的 8 批檢查點續掃，該次續掃約 360.6 秒；
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_access_v2_archived_readback_independent_20261030.json)
+再次核對每個批次和 head，並逐篇重播 83 份原始回應，現行解析器均
+判為 `paywall_or_login`。這是保存版本的證據，並非目前網站狀態。
+
+83 筆中，**76 筆當時仍標為 complete、7 筆已是登入限制**。76 筆
+包括先前已封存的 22 筆與這次新增的 54 筆；新增項目已通過原件、
+收據、來源與 head 的前置核對，製成 10 份有界的
+[私有覆核請求](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_stored_quality_staged_v2_20261030/manifest.json)，
+並經[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_stored_quality_staged_v2_readback_20261030.json)
+確認。請求尚未送入正式 inbox，沒有修改來源佇列；維護解除後仍須
+由既有 owner 重新核對現況再受理。現有資料集以 body 指標表示有
+內文，這些遮罩的精確證據尚未套入資料集，不能宣稱正式資料已修復。
+
+[可續跑掃描器](../scripts/audit_news_cmnews_retained_access.py)及
+[獨立讀回器](../scripts/readback_news_cmnews_retained_access.py)現以
+來源批次順序一次排序、串流對帳，避免按每個批次重掃整個來源索引；
+批次、head、收據、原頁、程式與快照的身分檢查仍保留。舊版實作已按
+雜湊封存供讀回，掃描合約另升為 v3；損壞原頁會記錄待判定，暫時
+讀不到的批次可在續跑時重試。
+[64 個真實批次的交錯量測](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_head_lookup_abba_20261030.json)
+中，逐批重查四次各約 6.37～7.90 秒，一次排序串流四次各約
+0.102～0.119 秒，結果雜湊相同。這只量測查詢步驟，不含原頁解析
+及網路下載；不能將比率套到整條下載鏈路。
+[新版試跑對照](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_access_v2_v3_pilot_comparison_20261030.json)
+對 64 批、3,338 個 head 及其中 36 個候選逐筆比對，與舊版一致。
+[隔離回歸](../artifacts/operations/agent-workflow/runs/news-cmnews-retained-v3-independ-20261029T203417-bb272123/run.log)
+**301 項通過**，涵蓋續跑、批次重試、範圍不一致、封存程式變動及
+舊請求去重。第一輪因測試連線未關閉而失敗，修正測試後重跑；失敗
+收據保留，不將其視為通過。
+
+所有操作在隔離網路及新聞目錄唯讀下執行，沒有請求新聞網站或寫入
+正式佇列。新聞 service／timer 依使用者維護指示維持停止；TEJ 可
+繼續運作。維護解除後，鉅亨剩餘文章仍是優先下載工作。
+
+## 10/30 維護期間：CMNews 原件時間與登入預覽覆核
+
+在協同鎖、正式來源唯讀掛載及隔離網路下，沿用下方已核驗的批次
+清冊，對 **619 個舊發布字串未確認時區的 head、235 個批次**逐筆
+重讀原始回應，核對 head、收據、原件雜湊與本篇身分；沒有略過批次。
+[結果](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_clock_original_full_20261030.json)
+中，450 筆在來源本篇 `NewsArticle` 宣告有相同可見分鐘、更精確的
+秒數與明示時區；45 筆仍只有未確認時區的分鐘，另 100 筆仍是無
+時區 ISO 時間；24 筆現行解析器判為登入限制。這些是當次擷取原件
+的結果，並非來源最初發布的歷史可用性證明，也沒有改寫舊記錄。
+
+針對 24 筆，[獨立 DOM 讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_clock_full_readback_20261030.json)
+確認原本篇範圍均包含登入遮罩，原始回應及已存正文雜湊均吻合：
+**22 筆 head 仍標成 complete，2 筆已標成 paywall_or_login**。
+這只證明保留的頁面有遮罩，不能推論其他來源必定沒有全文；也不能
+推論其餘 65,933 個既存 head 全部通過現行正文解析。獨立讀回的
+第一個小樣本版本曾錯把 `vip-content` 元素視為 class，該結果不採用；
+保留原紀錄並以 corrected `local-name()` 的讀回重新檢查全部 24 筆。
+
+[時間解析](../downloader/news_fulltext_publishers.py)現在在本篇來源
+宣告與可見分鐘、身分及作者相符時，將發布時間依據標為實際使用的
+來源宣告；有無時區及秒數仍以原文為準。只變更成功解析結果的時間
+依據，新增獨立 capture 指紋；原本 HTTP 容量身分、失敗解析指紋及
+先前逐筆確認的身分問題保持相容，避免因標籤變更重排或重複詢問。
+其他來源 capture 指紋不變；不同授權、來源或解析規則仍需重新判定。
+
+22 筆 complete head 的[正式修復前置核對](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_stored_quality_preflight_clock_basis_v1_20261030.json)
+均符合既有品質覆核的來源、收據、原始回應及正文綁定條件。以原始
+檔案的私有副本分 **8／8／6** 筆，經既有 owner repair inbox 的
+[隔離演練](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_stored_quality_private_rehearsal_20261030.json)
+成功重分類 22 筆，保留其餘 head 欄位、原件雜湊及 ledger，第二次
+處理為 no-op。三份具體請求已[封存於正式來源目錄之外](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_stored_quality_staged_20261030/manifest.json)，
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_stored_quality_stage_readback_20261030.json)
+確認 22 個不同 head、請求雜湊、私有權限及原件見證吻合。這不等於
+正式佇列已修復：維護期間沒有向正式 inbox 送件，也沒有寫入來源
+或執行新聞服務；維護解除後仍須重新核對 head 與當前來源身分，再
+由原 owner 受理，若狀態變動則拒絕舊見證。
+
+現有新聞資料集把具有已存 body 指標的記錄列為 `fulltext`，不能
+只靠 queue 的 `paywall_or_login` 判斷該儲存版本必為預覽：它也可能
+是更早擷取的有效正文。這 24 筆的精確遮罩證據目前尚未套入正式
+資料集，因此不能宣稱該資料集已排除所有預覽或 450 筆時間已回填。
+其餘 head 的同類遮罩檢查結果見上方全範圍覆核。
+
+[隔離回歸](../artifacts/operations/agent-workflow/runs/news-cmnews-clock-basis-green-v2-20261029T201106-521ba6bc/run.log)
+**378 項通過**；包含帶／不帶時區及不匹配更新時間、來源／授權
+變動、舊身分證據、排程與覆核保護。第一輪回歸因測試 fixture 把
+完整 provider 設定的 manifest 根目錄指向暫存目錄而失敗，修正後
+重跑；私有演練初版因新舊 SQLite schema 多出空欄位直接比較 dict
+而失敗，改為先逐欄驗證副本再比較副本變更，原失敗均保留。
+本輪沒有新聞網站請求或正式新聞佇列寫入；新聞 service／timer
+依維護要求仍停止，TEJ service／timer 可繼續運作。
+
+## 10/30 維護期間：鉅亨派送時核對舊候選提示
+
+合成測試重現兩個派送缺口：一般候選的目標 ID 已被修正，但候選所屬
+優先序沒有改變時，舊列仍可能交給 owner；重試、未定日期及既有正文
+重查等公平排程原本則未經同一項提示核對。這些測試不代表正式佇列
+確實發生過相同錯誤。[先前唯讀快照](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_active_provider_hint_audit_20261029.json)
+於 10/29 23:59 台灣時間檢查了 187 個鉅亨待處理缺文 head：候選
+目標與可用性提示均相符，排程計數也一致；這個範圍不等於完整歷史
+或目前每筆資料均已驗證。
+
+[鉅亨候選邏輯](../downloader/news_fulltext_cnyes_work.py)現在修正
+舊提示後重新選列，公平排程也先核對提示再交付；若修正時其他 head
+欄位已改變，就不沿用該舊列。更新提示時同時核對文章 ID、provider
+及網址，避免把過期快照寫進已變更來源的列。這只影響排程提示與
+計數，不改寫原始來源、正文、到期時間或存取規則；候選網址仍不能
+單獨證明正文或文章身分相同。
+
+修正前的[六個候選案例](../artifacts/operations/agent-workflow/runs/news-cnyes-stale-target-return-r-20261029T195402-b0631153/run.log)
+與[三個公平排程案例](../artifacts/operations/agent-workflow/runs/news-cnyes-fairness-lane-hints-r-20261029T195630-6895280b/run.log)
+均能重現；修正後[共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-all-lane-hints-regres-20261029T195725-6ec4d74b/run.log)
+**954 項通過**。後續增加來源變更與 head 變更的[聚焦檢查](../artifacts/operations/agent-workflow/runs/news-cnyes-hint-provider-fence-20261029T195857-befaec0f/run.log)
+3 項通過，其中 head 變更案例已包含在上述回歸，不重複計數。
+
+在隔離網路、暫存記憶體與合成佇列下，[ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_fairness_hints_abba_20261030.json)
+每組四個樣本、每樣本 1,000 次認領及測試資料重設；舊路徑近似組
+仍包含新程式的 import 與空函式呼叫。重試、未定日期、既有正文三種
+情境的平均 CPU 時間分別約為 **282→295、312→360、263→299 微秒／次**，
+一般候選對照為 **827→783 微秒／次**。樣本波動及重設成本都包含在
+內，不能據此推算實際吞吐量或完成時間。第一次磁碟暫存量測因同步
+寫入干擾而中止；保留[執行收據](../artifacts/operations/agent-workflow/runs/news-cnyes-fairness-hints-abba-20261029T195913-eb1966e8/run.json)，
+有效量測使用[合成測試程式](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_fairness_hints_20261030.py)。
+
+這些測試沒有呼叫新聞網站或寫入正式新聞佇列。新聞 service／timer
+依使用者維護指示維持停止，正式 owner 尚未載入修正；TEJ 可繼續運作，
+service／timer 為 active 仍不代表每筆 TEJ 資料都已成功下載。
+
+## 10/30 維護期間：鉅亨候選網址避免重複解析
+
+鉅亨排程在核對主站正文候選時，原本對非 AMP 網址先嘗試 AMP
+查找，再重新解析同一網址辨識手機或桌面變體。現在的[候選判定](../downloader/news_fulltext_cnyes_work.py)
+共用一次網址解析與路徑比對；AMP 的正整數 ID 限制、各網域／參數
+限制、來源歸屬核對與舊提示的有界自我修復不變。這仍只是排程提示，
+不能證明網址等價或接受正文。
+
+[隔離測試](../test/test_news_cnyes_native_lookup.py)以 1,440 種
+協定、網域、路徑與參數組合比對原有規則，另涵蓋 AMP 的 0、前導零、
+不同網域及拒絕參數；[共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-single-parse-regressi-20261029T195053-e786ab3b/run.log)
+**788 項通過**，包括舊提示修復、正文與來源變更、佇列排程、其他
+provider 和網頁。前一組 117 項聚焦測試包含在此範圍，不重複相加。
+
+兩輪隔離 ABBA 測量的結果不一致，不能認定實際下載加速：第一輪
+一般主站候選的 CPU 平均約 **96.27→115.70 微秒**，第二輪約
+**149.07→142.05 微秒**；桌面變體則分別約 **97.30→92.41** 與
+**144.66→151.18 微秒**。第一輪每組兩個樣本、每次選取 5,000 次；
+第二輪每組八個交錯樣本、每次選取 2,500 次。其他案例及原始數值
+保留在[第一輪](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_single_parse_selection_abba_20261030.json)、
+[第二輪](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_single_parse_selection_abba_v2_20261030.json)
+及[重複測量程式](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_single_parse_20261030.py)。
+這些都是合成資料的溫熱快取候選選取，沒有量測完整下載、來源限制
+或完成時間；未變提示不寫資料庫，主要正文仍要依主鍵重新核對。
+
+測試隔離網路和正式新聞目錄，未呼叫新聞網站或寫入正式佇列；新聞
+service／timer 依使用者要求維持停止，正式 owner 尚未載入本次修改。
+使用者已明確說明 TEJ 可運作；其 service／timer 在本輪檢查時為 active，
+這本身不證明資料下載成功。
+
+## 10/30 維護期間：Global Voices 舊格式原件重播相容性
+
+下方 78 個缺 `source_request_url` 的舊 head 位於 28 個批次；原本共用
+批次驗證器能依本列識別舊格式原始回應，逐篇重播器卻直接要求新版
+`source_response_article_id`，使這些已存原件無法重播。現已限縮支援
+Global Voices 的舊版直讀 HTML：兩個新版欄位均不存在、文章 ID 與
+已存網址吻合、原始回應雜湊正確，且原頁各有一個相符的 canonical
+和 Open Graph 網址；不可由這些宣告推定實際 HTTP 請求網址。新版空值、
+其他來源或 feed 不會自動走這個舊格式路徑。批次收據與全文雜湊仍須
+經原有驗證，且舊回應重播不證明目前網站身分、歷史可用時間或權利。
+
+[全 78 筆重播](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_legacy_reference_audit_v2_20261030.json)
+中 **77 筆**的正文、標題、作者清單與原始時間等欄位完全吻合，
+**1 筆**的舊作者清單把同一作者列了兩次；現行 parser 去重後只留一筆，
+正文及其他受檢欄位一致。這筆仍標記為不完全吻合，並額外記錄「作者
+有序去重後相同」，沒有改寫原始紀錄或將它計為精確重播通過。
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_legacy_reference_readback_v2_20261030.json)
+重新核對全部 78 個 head、28 份批次收據與雜湊，另以 Python 標準函式庫
+HTML 解析器核對原頁的兩種網址宣告；它沒有重跑現行正文解析器，因此
+不能作為第二次全文重播的證據。兩次結果都沒有新的發布者請求或正式
+佇列寫入，也沒有新增文章。
+
+[隔離回歸](../artifacts/operations/agent-workflow/runs/news-legacy-selected-replay-fina-20261029T194043-974314b9/run.log)
+**787 項通過**，涵蓋舊格式身分、原件雜湊、作者重複診斷與其他來源
+重播。新聞服務及計時器依使用者的維護指示停機，修正尚未在線上 owner
+載入或驗收；TEJ 可依使用者指示繼續運作。
+
+## 10/30 維護期間：鉅亨原件失敗結案綁定當時狀態
+
+隔離測試另重現兩個漏排：驗證期間文章 head 已改變，舊 head 的失敗
+仍可被寫成結案；或結案後 head 被修正，原本只以收據及 parser 版本
+查重的排程不會重新檢查。這是受控狀態變更的測試結果，並非證明
+正式下載曾發生相同競爭，也不代表目前因此漏抓了特定文章。
+
+[原件重播器](../downloader/news_fulltext_replay.py)現在把失敗結案
+與驗證時的 head 見證綁定；寫入失敗結案時在同一個 SQLite 陳述式
+確認 head 未變。head 已變且仍立即可處理時，只對該原件保存本機
+退避，讓其他到期原件繼續；已有正文、來源終態、租用中或未到期
+則不另建退避。後續 head 改變時，原排程會重新比對來源原件與時鐘，
+仍須經原有授權、身分、認領及耐久收據驗收才能採納正文。這些
+變更不重設來源的請求期限，也不開啟額外下載器。
+
+舊版結案沒有 head 見證，升級時保留既有列；喚醒時間查詢保持唯讀，
+只有原 owner 執行重播時才升級欄位。相關文章必須符合原本的缺文、
+狀態與到期條件才會重驗。停機資料庫的[唯讀快照](../artifacts/data_quality/news_offline_inventory_20261029/retained_checkpoint_head_states_20261030.json)
+有 **12 筆**舊失敗結案，其中 4 筆現在有正文雜湊、8 筆為來源空頁
+終態。此次快照沒有逐一讀回這 4 筆的正文檔與收據，也沒有新找回
+正文。快照使用空 WAL、唯讀掛載及隔離網路，沒有修改正式新聞資料。
+
+後續將這 12 筆結案對應到 **10 份不同原件、10 個不同網址**；8 筆
+空頁結案實際涉及 **6 個網址**。沿用之前已核驗的診斷原件結果，這次
+補查 4 個已有正文的目前 head：它們分布在 **3 個已提交批次**，共
+28 個批次內版本；原始回應、正文雜湊與目前 head 均通過核對。
+四篇較早診斷回應與後來入庫回應的原始雜湊各不相同，但用現行解析器
+解析後，正文雜湊、標題、作者、發布與修改時間等受檢欄位相符。
+另外 6 份已存診斷原件經現行解析器仍為空模板，並不排除其他原件或
+後續來源可能提供內容。
+
+[完整對帳](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_retained_failure_head_audit_20261030.json)
+及[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_retained_failure_head_readback_20261030.json)
+包含來源快照和程式雜湊；讀回以另一程序重新核對 10 份診斷收據、
+3 份正文批次收據及全部 28 個版本，並以標準函式庫核對原頁 canonical。
+正文及空模板判定仍使用共用解析器，沒有獨立實作另一套分類器。
+這不證明舊結案失敗的原因、網站目前狀態或全歷史完整，亦沒有新的
+發布者請求、正式佇列寫入或新增正文。
+
+[共用排程與來源回歸](../artifacts/operations/agent-workflow/runs/news-retained-head-readonly-fina-20261029T192653-37cec482/run.log)
+**748 項通過**，涵蓋舊 schema 唯讀喚醒與升級、重啟、另一原件先
+處理、其他工作者已取得正文、終態及未到期等邊界。測試與修正尚未
+載入停機的正式新聞 owner，不能據此宣稱線上抓取、全歷史或各來源
+已完成。
+
+## 10/30 維護期間：Global Voices ISO 時鐘與舊原件依據
+
+延續下方的郵件日期範圍檢查，這次對同一已核驗快照的 **79,251 個
+ISO 時鐘 head、29,075 個批次**讀取必要欄位。所有 head 都是 HTML
+抽取，沒有符合下方月份 RSS 時鐘衝突規則的項目；這不代表其他發布
+時間都已證實正確。[完整檢查](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_iso_clock_scope_full_20261030.json)
+及[獨立範圍讀回](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_iso_clock_scope_readback_20261030.json)
+保存批次、head 集合和來源快照。檢查約 50.8 秒，使用既有原件證據，
+沒有對外請求。
+
+其中 79,127 筆主站文章網址及另外 [124 筆繁體子站網址](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_zht_iso_clock_diagnostics_20261030.json)
+均有可辨識的日期路徑；網址日期與來源時鐘換算 UTC 日期的差距都不
+超過一天。這只是異常篩查，網址日期不能用來推定發布時間，也不
+證明歷史當時已取得正文。78 筆舊 head 的批次缺 `source_request_url`
+欄位；這些 head 仍是 HTML 抽取，不因此猜測請求網址。
+
+另外 **1,033 筆**舊 head 所在批次缺 `published_time_basis` 欄位。
+這不等於時間錯誤。全範圍結果定位到 426 個早期批次後，逐一核對
+既有批次收據及雜湊、目前 head、原始回應雜湊與請求／最終網址；
+1,033 筆的原始 HTML 各有一個 `article:published_time`，且內容均與
+保存的原始時鐘完全相同。[逐筆見證](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_missing_basis_witness_20261030.json)
+保留來源身分及結果；[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_missing_basis_readback_20261030.json)
+核對全部 head，並用另一個 HTML 解析器重讀 16 份原件。這證明的是
+已保存回應中的來源宣告，不證明當時可用性、權利或網站歷史完整。
+
+本次沒有修改原始資料、正式佇列或現有資料集；舊資料集的空白
+`published_time_basis` 尚未被回填。資料集的 `source_timezone_aware`
+表示字串可解析且含時區，不能單憑此狀態推論其發布語意已核實；
+`available_at_utc` 仍使用實際擷取時間。新聞服務及計時器維持停機。
+
+## 10/30 維護期間：鉅亨原件認領後的三個競爭時點
+
+既有認領失敗的退避之外，隔離測試發現 head 在認領成功後變更時，
+仍可能有三個不同結果：取得認領見證前變更會造成無效見證；寫入
+前變更會丟出 head 變更例外；耐久寫入後提交被新 head 取代時，
+如果新 head 仍立即可重試，就會反覆寫入同一原件。
+[提交競爭重現](../artifacts/operations/agent-workflow/runs/news-cnyes-commit-race-red-20261029T191506-2ca4746d/run.log)
+在持續注入競爭下 0.8 秒寫入 45 次；[認領後重現](../artifacts/operations/agent-workflow/runs/news-cnyes-postclaim-race-red-20261029T191659-81c8d236/run.log)
+與[寫入前重現](../artifacts/operations/agent-workflow/runs/news-cnyes-preaccept-race-red-20261029T191627-7247f103/run.log)
+分別顯示兩種例外。以上均是合成測試，並非正式服務的實測事件。
+
+[原件重播器](../downloader/news_fulltext_replay.py)現在先檢查認領後
+的租約 token、owner 及其他 head 欄位；對寫入前的特定拒絕，還要
+確認 head 確實已改變才視為競爭，其他資料或授權錯誤仍向外回報。
+提交未採用時保留原有耐久證據，不將其記為成功。只有新 head 仍
+無正文、未租用、已到期且屬於可重播狀態時，才對該原件沿用既有
+本機退避；未到期、新租約及終態不新增退避。來源重試期限與其他
+文章不受影響，之後重新驗證當時的 head 和原件。
+
+[常駐排程](../downloader/news_fulltext.py)會把這種已保存的本機退避
+視為有效進展，再選取其他已到期原件，避免首批競爭擋住後續批次。
+[聚焦回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-acceptance-races-fina-20261029T191724-f9d48fee/run.log)
+**51 項通過**，包含三個時點、其他批次續跑、重啟後續跑、較新
+來源 head 保護，以及未到期／租用中／終態不額外退避。
+[共用排程、來源優先、服務及面板回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-acceptance-races-regr-20261029T191758-e1b15797/run.log)
+**741 項通過**，包含上述聚焦案例，兩者不能相加。測試隔離網路及
+正式新聞目錄，未連接發布者。修正尚未在維護停機的正式 owner 載入，
+不能由離線通過推論線上抓取完成。
+
+## 10/30 維護期間：鉅亨原件重播的變動狀態競爭
+
+在先前只處理「認領失敗而 head 未變」的修正之外，仍有另一種情境：
+原件驗證期間 head 改變，但新 head 仍可立即重播；外層喚醒會再次
+選中相同原件。[隔離重現](../artifacts/operations/agent-workflow/runs/news-retained-changed-head-red-20261029T185957-99692c42/run.log)
+模擬持續發生的認領競爭，在 0.8 秒內呼叫了 92 次。這是受控注入，
+不是正式服務確曾發生的次數。
+
+[重播器](../downloader/news_fulltext_replay.py)現在只在新的 head 仍
+無正文、未租用、已到期且屬於可重播狀態時，對該原件的本機重試
+紀錄使用既有退避；首輪 1 秒，後續最長 300 秒。head 轉為終態、
+已有正文、被租用或尚未到期時，不額外建立此重試。退避不改文章
+head、來源請求期限或其他原件；到期後會重新驗證當時的 head、原件
+身分與來源時鐘，並沿原收據路徑保存，不能覆寫較新的來源結果。
+因此其他已到期原件仍可先處理，重啟也不會清除該本機期限。
+
+[隔離回歸](../artifacts/operations/agent-workflow/runs/news-retained-changed-head-regre-20261029T190102-10e81125/run.log)
+585 項通過，涵蓋來源冷卻、佇列 owner、回復及面板；其中固定時鐘
+版本另以[聚焦回歸](../artifacts/operations/agent-workflow/runs/news-retained-changed-head-final-20261029T190218-f6899fff/run.log)
+檢查競爭、另一篇先完成、重啟後到期續跑、較新時鐘拒絕，以及已租用
+或未到期不再建立退避。兩組測試有重疊，不能相加。測試使用隔離
+網路與暫存資料，沒有呼叫新聞來源或修改正式佇列。新聞 service／
+timer 仍依使用者維護指示停止，修正尚未載入現場 owner；TEJ 的
+Smart Wizard 服務與 API 計時器可運作，是否成功下載仍須看其收據。
+
+## 10/30 維護期間：Global Voices 的完整來源時鐘範圍與衝突
+
+先前的最早／最晚範圍只涵蓋 79,251 個 ISO 時鐘。此次沿用同一停機
+快照與已核驗的檔案、收據和 head 身分，只重新讀取另外 31,349 個
+郵件日期格式 head 所在的 2,370 個批次；沒有重抓來源，也沒有重跑
+已完成的其他批次。 [完整來源時鐘彙總](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_complete_clock_bounds_20261030.json)
+及[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_legacy_clock_readback_20261030.json)
+對 110,600 個已核驗 head 的可解析、含時區來源字串做範圍對帳；
+格式可解析並不代表來源時間正確或全文在歷史當時可得。
+
+其中一個來源字串是 `1970-01-01 04:59:59 UTC`，保存的原始 RSS
+回應經雜湊核對後，其相同文章連結及 `pubDate` 確實如此宣告；但
+文章路徑及月份 RSS 範圍均為 2006 年 6 月。這是來源時鐘與範圍
+衝突，不能把 1970 年當作可信的最早新聞，也不能從路徑推定精確
+發布時間。31,349 個郵件日期 head 中還有 29 個來源時間為 2004 年，
+不能因為早於 2005 年就視為錯誤。排除這筆明顯衝突後，此快照中
+來源宣告的最早／最晚時鐘分別為 **2004-10-27 02:03:23 UTC**／
+**2026-10-27 21:10:54 UTC**；這仍是來源宣告的範圍，不是逐篇
+驗證的發布時間或網站全部歷史。
+
+[資料集時鐘判定](../stockagent/data/news_clock.py)僅在 Global Voices
+的已識別月份 RSS、同月份文章路徑與 RSS 時鐘相差超過月份邊界一日
+時標記衝突。[診斷](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_monthly_clock_diagnostics_20261030.json)
+於上述 31,349 個 head 中只標記一筆；79,251 個 ISO head 不在此次
+規則測量範圍內。新的[資料集建置](../stockagent/data/news_dataset.py)
+保留 `published_at_raw` 原值與擷取可用時間，對此衝突將解析後的
+發布日期／UTC 設為空值，並標記 `source_feed_scope_clock_conflict`。
+其他來源不讀取本規則所需的額外 RSS 請求網址欄位。建置指紋隨程式
+變更；[隔離回歸](../artifacts/operations/agent-workflow/runs/news-globalvoices-clock-final-re-20261029T185547-90333fd5/run.log)
+**142 項通過**，涵蓋原始值保留、月份邊界、其他來源投影、增量
+更新與舊版本不變。本次沒有重建正式新聞資料集或啟動新聞服務，
+故現有版本尚未反映該標記。
+
+## 10/30 維護期間：新聞面板狀態加總核對
+
+原本面板只檢查全域與各來源的「總筆數」相等，沒有核對每一個狀態。
+在隔離測試中，若全域仍有四筆待抓、來源卻將這四筆算成完成，總數
+仍相等，舊程式可能把該來源顯示為已知待辦已清。負數、布林值或字串
+等不合法計數也可能被忽略後看似相符。這是以合成快照重現的判斷缺口，
+不是已證實正式佇列損壞。
+
+現在[面板後端](../stockagent/live/news_dashboard.py)會在隱去私人狀態名稱
+前，逐狀態比較全域與各來源的原始加總，並拒絕不合法或缺失的狀態表；
+不能因為不同未知狀態都顯示為 `other` 就誤判相符。若快照不一致，
+面板標為數量異常，隱去無法核對的總數、來源數、比例、完成狀態及
+估時；確認已停止的程序狀態仍保留。原始狀態檔不修改。這只迭代
+已存的狀態快照，不掃描新聞文章或呼叫發布者。
+
+現有停機快照離線讀回時狀態相符，來源觀測時間為臺北 **10/28 07:44**，
+不能當成當下進度。[共用契約及瀏覽器回歸](../artifacts/operations/agent-workflow/runs/news-dashboard-reconcile-final-20261029T184414-86c0daef/run.log)
+涵蓋 669 項，包括相同總數但狀態不符、不合法數值、未知狀態、停機狀態
+與實際畫面；之後對異常快照的總正文位元組數一併隱去，另做聚焦回歸。
+最後的[聚焦回歸](../artifacts/operations/agent-workflow/runs/news-dashboard-counts-final-20261029T184643-42436399/run.log)
+為 323 項通過。[離線微基準](../artifacts/data_quality/news_offline_inventory_20261029/news_dashboard_state_reconciliation_benchmark_20261030.json)
+以同一快照的 952 個來源、889 個狀態項目測量 100 次，逐狀態核對中位
+耗時約 1.91 毫秒；這不是整個面板請求或瀏覽器載入時間。
+目前執行中的共用網站後端仍是舊版本；本次維護不重啟共用網站或任何
+已停止的下載服務，因此不能宣稱這項後端修正在現場已生效。
+
+## 10/30 維護期間：CMNews 六個同名候選的原頁聲明
+
+既有清冊中六個 `/onlynotecontent/` 網址沒有正文，各自有一個已存
+`/article/` 同名候選。同名網址或標題不能證明正文相同，也不能將
+候選正文直接算作原網址已完成。此次沿用已驗證的候選批次與停機
+快照，重新核對六份原始回應的雜湊，離線檢查 HTML 連結、canonical、
+常見網址中繼欄位、表單、JSON-LD，以及常見轉義或百分比編碼形式。
+
+[檢查結果](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_onlynotecontent_declaration_audit_20261030.json)
+合計六份原始回應、576,088 bytes，未找到指向上述特殊路徑的聲明或
+編碼線索；因此六個原網址仍未取得正文，沒有新增別名或複製正文。
+檢查範圍只涵蓋這六份候選原件，沒有查看目標端點的回應，也不排除
+其他版本、其他編碼或外部證據。[離線回歸](../artifacts/operations/agent-workflow/runs/news-dashboard-reconcile-regress-20261029T184035-2a716ed8/run.log)
+涵蓋明確聲明、編碼提示、無效 JSON-LD 與無關連結。全程沒有對外
+呼叫新聞來源，沒有更動正式佇列或正文。
+
+## 10/30 維護期間：CMNews 既存正文與發布時鐘
+
+[批次重疊清點](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_globalvoices_batch_overlap_20261030.json)
+顯示 CMNews 的 65,933 個正文 head 分布於 1,308 個批次，其中 1,062
+個批次曾在 Global Voices 核驗時檢查原件；批次重疊本身不代表
+CMNews 的目前 head 已驗證。[核驗器](../scripts/audit_news_provider_storage.py)
+因此先獨立讀回先前的範圍、原驗證程式、快照及批次證據，再讀取
+必要的 Parquet 欄位，逐一核對本來源 head 的來源、網址、正文雜湊、
+位元組數與擷取時間。原批次或收據身分有變化時拒絕沿用；不在先前
+範圍的批次仍走共用的完整原件與收據雜湊核驗。
+
+[試跑](../artifacts/operations/agent-workflow/runs/news-cmnews-reference-pilot-20261029T182628-b79d2503/run.log)
+核對 32 個批次、1,622 個 head、沒有失敗；續跑後的[完整本機核驗](../artifacts/operations/agent-workflow/runs/news-cmnews-reference-full-20261029T182650-953b0c9e/run.log)
+涵蓋 **1,308 個批次及 65,933 個既存正文 head，零失敗批次**，
+其中沿用 1,062 個先前驗證的批次，另完整驗證 246 個批次。
+批次所含其他來源或舊版本不當作 CMNews 新文章。
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_provider_storage_readback_20261030.json)
+再核對上一輪證據、head 集合、收據登記、檔案身分與彙總；快照中
+總計 66,909 個 CMNews 已知 head，其餘 **976 個沒有正文指標**。
+沒有發現有路徑卻沒有正文雜湊，或狀態完成卻缺正文指標；這不是
+網站歷史範圍完整或現行解析器可重播全部文章的證明。
+
+已核驗的 65,933 個 head 均有非空原始發布字串，65,919 個有非空
+作者陣列；其餘 14 個的既存註記均為來源可見姓名空白，不能據此
+臆造作者或斷言作者不存在；這是[既存中繼資料的統計](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_empty_author_metadata_20261030.json)，
+沒有再次重播原始網頁。65,314 個發布字串是可解析且帶時區的 ISO 時間。其餘
+619 個所在的全部 235 個批次已做[格式檢查](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_clock_formats_v3_20261030.json)：
+100 個是沒有時區的 ISO 時間，519 個在同一字串中包含沒有時區的
+發布及更新時間；沒有發現此格式的無效日期或更新早於發布的情況。
+時間原文不變，也沒有推定時區。帶時區子集的發布範圍為
+2019-12-20 08:53:36 UTC 至 2026-10-27 23:09:15 UTC，不代表
+所有來源文章或全部已存文章的最早、最晚時間。
+
+既有新聞資料集原本把「發布時間（更新：更新時間）」整串判成
+無效。共用[時鐘解析器](../stockagent/data/news_clock.py)現在可保留
+原始字串並辨識其發布日期，狀態仍標為時區未驗證，UTC 發布時間
+保持空值；實際可用時間仍是擷取時鐘。新的解析器納入建置指紋，
+舊的未相容工作不能續接；隔離測試確認增量新版本能更正受影響的
+列，原版本仍可讀。本次沒有重建或發布正式資料集。[最終回歸](../artifacts/operations/agent-workflow/runs/news-combined-clock-final-regres-20261029T183035-86dd5f4b/run.log)
+**106 項通過**，另涵蓋來源與雜湊不符、參考證據變更、途中續跑、
+獨立讀回及時間格式。最初啟動測試時，暫存包裝檔沒有執行權限而
+[結束碼為 126](../artifacts/operations/agent-workflow/runs/news-provider-reference-audit-te-20261029T182523-ae3caced/run.log)；
+改由 `bash` 執行後完成上述回歸。
+
+以上檢查均在新聞維護停機期間執行，沒有呼叫新聞網站或修改正式
+新聞佇列；實際來源追新及剩餘正文仍待維護解除後由既有 owner 處理。
+
+## 10/30 維護期間：Global Voices 既存正文核驗
+
+Global Voices 在先前停機清冊中有 110,600 個附正文指標的網址 head，
+但此前只對部分批次做原件與收據抽樣。此次使用[可續接核驗器](../scripts/audit_news_provider_storage.py)，
+針對停機快照中該來源的既存 head，沿用共用批次驗證器檢查耐久收據、
+Parquet、來源原始回應及正文雜湊，再核對目前 head 的身分與指向。
+同一批次只讀一次，批次內其他來源或舊版本亦依原契約驗證，但不計成
+Global Voices 新文章。檢查點位於新聞資料根目錄之外，來源快照或
+驗證程式身分改變時拒絕沿用；中斷後可從已提交檢查點續接，失敗批次
+不妨礙其他批次。這是限定範圍內的檔案核驗，不是重新下載、現行
+解析器重播、來源歷史完整性或來源授權的證明。
+
+[256 批試跑](../artifacts/operations/agent-workflow/runs/news-globalvoices-storage-pilot-20261029T180645-4a68b5cd/run.log)
+核驗 666 個 Global Voices head、沒有失敗批次；其後沿用相同檢查點
+完成[既存正文核驗](../artifacts/operations/agent-workflow/runs/news-globalvoices-storage-full-20261029T180705-94b60a4e/run.log)：
+**31,445 個批次、110,600 個 head，零失敗批次**。批次總共驗證
+569,838 個不可變正文版本，其中包含其他來源及歷史版本，不是
+Global Voices 篇數，也不是新增下載。[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_provider_storage_readback_v3_20261030.json)
+逐批核對 head 集合、收據登記、檔案身分及彙總數字，並確認此快照
+的 **110,674 個已知 head** 中，沒有「有路徑但沒有正文雜湊」或
+「完成但缺正文指標」的異常；原來 **74 個無正文 head** 仍未取得。
+讀回沒有第二次計算全部正文雜湊或重播現行解析器。
+
+這 110,600 個 head 均有原始發布時鐘與非空作者陣列。初版核驗只
+按 ISO 格式統計出 **79,251** 個含時區時鐘；其餘 **31,349** 個
+分為既存批次的 128／2,242 個兩段檢查，全部可依帶時區的郵件日期
+格式解析。兩段數量及原快照經[獨立對帳](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_clock_format_complete_20261030.json)，
+已核驗的 110,600 個 head 均有可解析時區的來源時鐘。這不證明來源
+所報時間的真實性或歷史點時可用性；原始字串未改動。既有[新聞資料集](../stockagent/data/news_dataset.py)
+本來就支援該日期格式，新版核驗器也已納入統計。
+
+初版 ISO 子集的最早／最晚時間為 2005-01-03 09:12:00 UTC／
+2026-10-23 22:05:56 UTC；此範圍沒有包含郵件日期格式，不能代表
+全部 head 的最早／最晚發布時間。記錄的逐篇授權驗證旗標為
+77,996／110,600，這是舊資料中的欄位值，不是本次對實際授權的判定。
+
+隔離測試中，[共用回歸](../artifacts/operations/agent-workflow/runs/news-provider-storage-final-regr-20261029T181530-478292f8/run.log)
+670 項通過；之後補強時鐘統計及相容性，[最終時鐘與新聞資料集回歸](../artifacts/operations/agent-workflow/runs/news-provider-clock-aware-final--20261029T182048-cd4c0383/run.log)
+92 項通過。兩組範圍重疊，不相加。測試檢查範圍身分遭修改、未完成
+報告、結果統計遭修改、未提交的檢查點 journal、已核驗檔案被替換
+及正文路徑沒有雜湊時，均不會誤報相應範圍完整。新增指標檢查的
+首版錯誤使用只收錄有正文雜湊的部分索引；已改用包含來源全部 head
+的既有 `dispatch` 索引，保留[失敗紀錄](../artifacts/operations/agent-workflow/runs/news-provider-pointer-readback-t-20261029T181221-f0b97478/run.log)。此類完整
+核驗另以[獨立讀回](../scripts/audit_news_provider_storage_readback.py)
+逐批核對來源 head 集合、收據登記、檔案身分與彙總數字。
+
+檢查時另發現，本次核驗檢查點綁定的是所列的主要驗證檔案，尚未把
+可能呼叫的 `news_fulltext_policy.py` 納入該清單。執行中記錄選定依賴
+的 SHA 與檔案時間，檔案修改及狀態變更時間均早於本輪開始；
+[結束後比對](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_dependency_witness_final_20261030.json)
+一致。這項補充只涵蓋列出的檔案及套件版本，不能證明所有載入的
+程式位元組或不可變的檔案系統。核驗器契約 v3 已將相關依賴檔案及
+HTML 套件版本納入往後的檢查點身分，並分別統計可解析時區的 ISO 及
+郵件日期格式；v4 另要求選定 head 的來源及正文雜湊一致，且可在
+獨立讀回原證據後沿用已驗證批次。v1 檢查點不會冒稱新版證據。
+此次使用的[原驗證程式封存](../artifacts/data_quality/news_offline_inventory_20261029/globalvoices_audit_implementation_v1/manifest.json)
+依結果中記錄的雜湊核對，可供獨立讀回，不必重抓原文。
+
+核驗以網路隔離、唯讀正式新聞資料及既有 owner 鎖執行，沒有呼叫
+新聞網站或寫入正式新聞佇列。新聞 service／timer 仍依維護指示
+停止；TEJ Smart Wizard 服務及 TEJ API timer 可運作。
+
+## 10/30 維護期間：鉅亨本機續跑與認領失敗恢復
+
+前述喚醒修正仍有一個排程交互作用：若另一來源的請求尚未完成，
+第一批鉅亨診斷原件完成後，下一批可能仍等到固定輪詢。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-retained-online-starvation--20261029T174647-cb742270/run.log)
+使用五份合成原件與模擬慢來源，顯示第五份在慢回應等待期間沒有繼續
+處理。另一個[注入式測試](../artifacts/operations/agent-workflow/runs/news-retained-claim-no-progress--20261029T174806-48a1b246/run.log)
+讓認領失敗而文章狀態不變，舊排程在 0.8 秒內重試 58 次。兩者均為
+受控情境，不是正式服務曾發生這些問題的證據。
+
+[既有 owner](../downloader/news_fulltext.py) 現在只在本機重播確實
+留下持久檢查點或本機重試紀錄後，重新計算下一批的到期時間；可
+處理時不增加固定等待。每批仍受原有筆數、時間及資料量限制，每輪
+保留其他來源派工。若無進展，維持一般輪詢界限。[重播器](../downloader/news_fulltext_replay.py)
+當時對認領失敗後仍與原快照完全一致的文章，記錄僅用於本機原件的指數
+退避，從 1 秒起、最長 300 秒；文章 head 已改變時未新增退避。
+後續針對改變後仍可立即重播的情況另作上方修正。原始文章、來源額度及來源重試期限不因本機
+退避而改變，紀錄可跨重啟並由既有面板的本機原件重試統計呈現。
+
+[最終隔離回歸](../artifacts/operations/agent-workflow/runs/news-retained-final-regression-20261029T175325-a23d79c3/run.log)
+**1,257 項通過**，涵蓋慢來源仍在等待時的本機續跑、另一來源正文
+和收據、認領無進展退避、重啟後到期重試、狀態變更保護，以及新聞
+下載與面板共用路徑。
+
+另以相同雜湊的九份合成原件及兩個模擬來源做八次交錯比較，四次在
+有進展批次間保留 50 毫秒，四次不保留；完成九份本機原件的中位數
+分別為 **0.284 秒**及 **0.177 秒**。每次都分成 4、4、1 份處理，
+另一來源在本機批次完成前取得派工，並驗證 11 個正文 head 和收據。
+[量測](../artifacts/operations/agent-workflow/runs/news-retained-online-pacing-fina-20261029T175551-667c0cd7/run.log)
+與[獨立讀回](../artifacts/operations/agent-workflow/runs/news-retained-online-pacing-read-20261029T175606-f7aa4b02/run.log)
+核對輸入與程式雜湊。此比較使用隔離 tmpfs 和假網路，磁碟檢查採
+測試替身，且不含建立測試資料及讀回的時間；不代表正式來源的
+下載速度、實際容量或完成時間。
+
+新聞服務與計時器仍維持維護停機，修改尚未載入正式 owner；本次未
+呼叫新聞來源、寫入正式新聞佇列或新增正文。TEJ 的運作不受此次
+新聞停機限制。正式來源及資料完整性仍須維護後透過既有 owner 的
+來源回應與收據驗收。
+
+## 10/30 維護期間：鉅亨診斷原件的有界重播排程
+
+診斷原件預設每輪最多處理四份。舊的喚醒計算只考慮已建立本機重試期限的
+原件，因此還沒處理過的第五份即使已可處理，也可能等到一般閒置時間
+結束；[隔離重現](../artifacts/operations/agent-workflow/runs/news-untried-retained-wake-red-20261029T174016-7df8f066/run.log)
+在第一輪處理四份後觀察到舊程式仍建議等 60 秒。另外，候選清單先取
+128 筆、才在迴圈內檢查單輪大小時，[隔離案例](../artifacts/operations/agent-workflow/runs/news-retained-oversize-window-re-20261029T174253-36f4f06e/run.log)
+以 128 份超過指定預算的合成項目擋住一份合格原件，舊流程當輪未能
+處理它。這兩個案例是受控測試，並非正式環境曾發生停滯的證據。
+
+[重播器](../downloader/news_fulltext_replay.py)現在對同一診斷批次
+中未完成、未被租用、未超過單輪原件預算的項目計算喚醒時間，採用
+文章原有到期時間和本機重試期限的較晚者；已到期則立即進行下一輪。
+超過單輪原件預算的候選也會在套用 128 筆上限之前排除，避免遮住
+其他項目。每輪仍有筆數、時間和位元組界限；來源請求冷卻、授權、
+資料收據與重試期限不因此改變。
+
+[隔離服務驗證](../artifacts/operations/agent-workflow/runs/news-untried-retained-wake-servi-20261029T174108-ecdad17a/run.log)
+在來源仍冷卻時連續處理五份合成原件，逐份通過正文與收據讀回，沒有
+發出 HTTP 或增加診斷額度。[共用回歸](../artifacts/operations/agent-workflow/runs/news-retained-wake-regression-20261029T174311-f61dabd7/run.log)
+**771 項通過**，包含到期時間、本機失敗退避、租約、單輪容量、
+過期狀態保護和其他來源共用路徑。這些測試沒有寫入正式新聞資料。
+
+在 owner 鎖下以唯讀快照檢查，目前設定的批次
+`cnyes-unseen-layout-20261014-v1` 有 23 份已留存原件：17 個文章
+狀態為完成、6 個是來源空模板，沒有待重播的合格項目。
+[查詢計畫與樣本](../artifacts/operations/agent-workflow/runs/news-retained-wake-query-plan-re-20261029T174356-b1268e4c/run.log)
+顯示使用批次／狀態索引及文章、收據主鍵；在該快照以暫時空的重試
+表測 200 次查詢約使用 0.013 秒 CPU。這只是特定快照的查詢成本，
+不是線上端到端吞吐量或完成時間。
+
+新聞服務與計時器仍按使用者要求維持停止，正式 owner 尚未載入上述
+修改；這次沒有請求新聞來源、寫入正式佇列或新增正文。TEJ 不受該
+新聞停機要求限制。
+
+## 10/30 維護期間：鉅亨跨分類線索與既有缺文稽核
+
+使用停機快照，對缺口日期中已有其他分類頁面紀錄的 **129 天**，每個
+分類選取目前頁首最多的單日範圍，檢查 **11,460 個頁面觀察**的雜湊
+與頁碼。相同日期其他分類記錄中，有 **62,947 個不同新聞 ID**未出現
+在當日選定的缺口分類頁面紀錄；其中 **62,844 個**在文章索引已有正文
+雜湊與 Parquet 路徑，另 **103 個**沒有正文指標。這次沒有重驗正文檔
+或收據；頁面觀察所引用的原始請求亦未重新核對，因此這些是線索，
+不是分類頁完整性、已持久保存正文或新增下載的證明。
+
+這 103 個 ID 均不在先前較窄的 320 筆缺文清冊，但[獨立集合讀回](../artifacts/operations/agent-workflow/runs/cnyes-cross-category-prior-readb-20261029T173711-e5a0c4fa/run.log)
+確認它們全部已涵蓋在[5,705 個缺文 head 的原件稽核](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_retained_missing_identity_v2_final_20261029.json)：
+該稽核中有精確請求身分的結果分別為 **100 個來源批次未提供正文**及
+**3 個未通過正文判定**，沒有互相矛盾的結果。本次只比對既有報告，
+沒有重新驗證那些來源原件、目前收據或當前解析版本；結果不能排除
+其他回應或未來取得正文，也不應重新安排相同的舊原件稽核。
+
+[跨分類檢查結果](../artifacts/operations/agent-workflow/runs/cnyes-cross-category-all-20261029T173445-b7fb1d3a/run.log)、
+[檢查程式留存](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_cross_category_probe_20261030.py)
+及[讀回程式](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_cross_category_prior_readback_20261030.py)
+記錄本次限定範圍。檢查在 owner 鎖與唯讀資料庫快照下執行；讀回以
+SQLite 另行核對兩份報告的集合及輸入雜湊。兩者均未請求新聞發布者、
+寫入正式佇列或新增正文。新聞服務與計時器維持停機，TEJ 可以運作；
+新聞恢復後仍須由既有 owner 驗證未解頁面、來源回應和正式收據，
+目前無可信的全部抓完時間。
+
+## 10/30 維護期間：鉅亨舊回應重播的狀態衝突
+
+鉅亨診斷原件重播先讀取文章狀態，再驗證及解析既存回應，最後認領
+工作。原本的提交檢查可防止**認領後**狀態被更新，但在解析期間、
+認領之前出現的新狀態沒有同樣的保護。[隔離重現](../artifacts/operations/agent-workflow/runs/retained-head-red-20261029T172756-53cf6eac/run.log)
+中，兩個合成案例分別插入較新的 `source_not_found` 和重試狀態；
+舊流程都錯誤接受了原件。這不是正式資料曾發生衝突的證據。
+
+[重播器](../downloader/news_fulltext_replay.py)現在將驗證時的文章
+狀態、錯誤、重試時間、租約、正文與來源時鐘等欄位交給[共用佇列](../downloader/news_fulltext_queue.py)，
+在同一個 SQLite 更新中核對後才認領；若狀態已改變，就保留新狀態及
+既有原件，不把這筆重播記為完成。`body_not_found` 仍可在鉅亨診斷
+原件重播的明確模式下被精確認領；其他呼叫者不會因此獲得較寬的
+認領範圍。既有提交、收據與重啟恢復檢查也維持生效。
+
+[共用回歸](../artifacts/operations/agent-workflow/runs/retained-head-regression-20261029T172841-d904bd53/run.log)
+**495 項通過**，包含兩種衝突、原件可正常回補、認領範圍、提交前
+覆寫保護、重啟恢復、鉅亨優先清單及其他來源的共用路徑。
+新聞服務及計時器仍依維護要求停止。以上只在網路隔離、正式新聞
+目錄唯讀的測試環境執行，沒有來源請求、正式佇列寫入或新增正文；
+正式 owner 尚未載入修改，也沒有證明線上下載速度或完成時間。
+
+## 10/30 維護期間：鉅亨優先清單與一般稽核的順序
+
+先前 854 個優先觀察分成 829 個同日、8 個同日循環參照及 17 個較寬
+來源範圍，分別做過離線驗證；這次把它們的 **1,708 份既存原件和
+收據**複製、核對雜湊後，放進同一個隔離 owner 佇列。修正前的實物
+混合測試已核對所有 837 個同日觀察和 17 個較寬範圍，但優先清單
+只追蹤到 **857 個頁面**，其中 5 個觀察在掃描時被列為過期；這會
+低估已建立證據的頁面數。受控測試另重現一般原件稽核可能在優先
+清單登錄目標前先處理其頁首；這不是正式服務已發生錯誤的證據。
+
+[原 owner](../downloader/news_fulltext.py)現在先以原本的有界時間片
+完成有限優先觀察的首次登錄，再啟動[一般原件稽核](../downloader/news_fulltext_cnyes_history.py)；
+其他本機歷史工作及各來源網路派工不因這項登錄停止。優先計畫缺少、
+無效或無法使用時，一般稽核照常執行；真正發生來源頁首變化的
+觀察仍可能被標為過期。這項排序不改寫原件或來源回應，也不放寬
+來源冷卻、429、租約或存取規則。
+
+[修正後的實物混合測試](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_854_mixed_owner_fixture_after_20261030.json)
+追蹤到 **862 個頁面**：**845 個**建立頁面 ID 證據，**17 個**維持
+待核對並排入原來源頁工作；不存在尚待本機稽核的優先頁面。全部
+854 筆來源工作的錯誤碼、嘗試次數及分段狀態均保留，17 筆原本
+成功的來源工作依既有規則提早排入核對。測試在首次短時間片後重開
+私人佇列，再完成後續稽核；另一個合成案例在優先掃描未完時重開，
+並確認另一來源可以先完成正文及耐久收據。這些數字是觀察及頁面
+版本，**不是新增文章或全文完成數**。
+
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_854_mixed_independent_readback_20261030.json)
+核對兩次結果、輸入雜湊及修改前程式身分；[測試程式](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_854_mixed_owner_fixture_20261030.py)
+以零 HTTP 額度和假網路執行，測試磁碟准入則使用隔離替身，因此不
+證明正式網路派工或實體儲存容量。持鎖唯讀檢查顯示目前正式佇列
+尚無此計畫的檢查點與新版優先表；對其他已建立舊檢查點的佇列，本次
+修正不自動改寫先前記錄的過期數。
+
+由於修改了歷史排程檔案，[來源內容讀取器比對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_reader_bridge_after_priority_20261030.json)
+另外確認六個相關函式、匯入及常數與已審查版本一致，並更新精確版本
+橋接，保留前版可重用的內容證據；未審查的讀取器或原件變動仍會拒絕
+重用。這不會把舊證據轉成新的來源觀察或完整歷史證明。
+
+[共用排程與鉅亨回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-priority-order-regres-20261029T171840-2451d2dc/run.log)
+**887 項通過**；[後續原件重用及優先清單回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-reader-bridge-priorit-20261029T172059-517cd250/run.log)
+**295 項通過**，兩組範圍重疊，不能相加。新聞服務及 timer 仍依
+維護要求停止，正式 owner 尚未載入上述修改；本輪沒有新聞發布者
+請求、正式佇列寫入或新增正文。正式回補與完成時間仍待維護後驗證。
+
+## 10/30 維護期間：鉅亨優先原件的本機喚醒
+
+鉅亨歷史回補在本機為既有優先觀察新增頁面時，如果該次優先掃描已經
+執行完畢，且當時沒有任何 HTTP 工作，排程原本即使收到新頁面的喚醒
+旗標，仍會先進入本機閒置等待。隔離測試重現一次 **0.25 秒**的等待；
+這不代表正式服務曾因這個原因變慢，也不代表每次回補都會經過此路徑。
+
+[共用 owner](../downloader/news_fulltext.py)現在在該旗標存在時直接執行
+下一輪優先掃描。它不改變來源限速、429 重試時間或原始資料；如果新增
+頁面的資料庫交易回滾，測試確認只會額外喚醒一次並清除旗標，不會因此
+持續空轉。修正前的隔離回歸會因觀察到 `[0.25]` 等待而失敗；修正後
+[相關測試](../test/test_news_cnyes_original_priority.py)通過。
+
+[八次交錯量測](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_priority_wake_abba_20261030.json)
+在隔離的測試佇列執行相同的 owner 情境，前後流程 wall 中位數為
+**0.265／0.015 秒**，程序 CPU 中位數為 **0.0149／0.0152 秒**；每次都
+讀回 2 個追蹤頁面、新頁面的原件重試、未變更的 429，且沒有對來源發出
+請求。計時涵蓋 `run_cycle`，不含測試資料建立及結束後讀回。這只驗證
+特定本機喚醒延遲的消除，不能推算線上下載速度、頻率上限或完成時間。
+[量測程式](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_priority_wake_benchmark_20261030.py)
+與[執行紀錄](../artifacts/operations/agent-workflow/runs/news-cnyes-wake-abba-20261030-20261029T171011-8a46d210/run.log)保留。
+
+鉅亨優先、原件、來源協作、回補與共用排程等 10 組測試共 **813 項通過**；
+[完整測試紀錄](../artifacts/operations/agent-workflow/runs/news-cnyes-wake-regression-20261-20261029T170820-3f770a1a/run.log)。
+新聞服務及計時器依使用者要求維持停止，正式 owner 尚未使用本次修正；
+先前優先清單是觀察與頁面參考，不等於已修復的新聞篇數。
+
+## 10/30 維護期間：歷史 RSS 收據一致性與讀取成本
+
+沿用下方既有的自由時報原件清冊，沒有重掃 43,510 份正式原件。
+原歷史索引先讀收據取得正文大小，再於驗證原件時重讀同一收據；
+若收據在兩次讀取之間被更換成另一份仍可解析的內容，隔離測試中
+舊流程可能接納該筆，而沒有確認兩次讀取的是同一個檔案版本。
+這是隔離重現，**不是已觀測到正式資料損毀**。
+
+[既有索引 owner](../downloader/news_fulltext_metadata_legacy.py)及
+[原件驗證器](../downloader/news_fulltext_metadata_checkpoint.py)現在
+只讀一次必要收據，以原先的上限驗證大小；仍核對完整收據、原始
+Parquet 雜湊、來源身分、授權、時鐘及解析結果。驗證結束前再次
+確認收據的路徑、裝置、inode、大小及修改時間等身分；若檔案
+消失、被替換或改變，就不提交觀察，沿用本機重試。這不保證最後
+檢查之後沒有其他程序異動，也不改動來源限速或 HTTP 行為。
+
+[前後交錯量測](../artifacts/data_quality/news_offline_inventory_20261029/ltn_legacy_receipt_abba_20261030.json)
+使用同一 feed 依檔名選出的 512 份既有原件，八次各自在隔離佇列
+重建並讀回：每次均為 512 份已驗證原件、512 筆來源觀察和 8,235
+個網址 head；原文時間、欄位、狀態及來源觀察的讀回雜湊一致，
+處理時間戳不列入比較。舊／新流程的 wall 中位數分別為
+**4.644／4.744 秒**，程序 CPU 中位數為 **4.945／4.882 秒**，
+樣本波動重疊，**未證明整段流程加速**；每份減少一次收據讀取
+也增加了結束前的檔案身分檢查。選樣不是隨機樣本，複製與
+建立測試資料不在計時內，不能推估線上下載吞吐或完成時間。
+量測[程式](../artifacts/data_quality/news_offline_inventory_20261029/news_ltn_legacy_receipt_benchmark_20261030.py)
+與[執行紀錄](../artifacts/operations/agent-workflow/runs/news-ltn-receipt-abba-20261030-20261029T170327-320294da/run.log)保留。
+
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-ltn-receipt-regression-2026-20261029T170230-bb96450c/run.log)
+406 項通過；[後續定點測試](../artifacts/operations/agent-workflow/runs/news-ltn-receipt-mutation-202610-20261029T170425-bbad3867/run.log)
+10 項通過，涵蓋兩個原件版本、收據編輯／同內容替換／消失後的
+重試，以及非法與過大 response size 在讀取原件前被拒絕。測試組
+有重疊，不能加總。以上在網路隔離與正式新聞目錄唯讀下執行；
+沒有對發布者發請求、寫入正式新聞佇列或新增全文。新聞 service／
+timer 依維護指示保持停止，改動尚未由正式 owner 載入或驗收。
+
+## 10/30 維護期間：來源審查待辦與完成條件
+
+延用下方已固定的 10/29 本機清冊和來源設定，沒有再次掃描正式佇列。
+舊版規劃程式把「沿用既有執行規則」排除在來源審查待辦之外；若所有
+來源都有規則或部分審查，也可能錯誤回報全部已實地審查。缺少、無時區
+或超過五秒時鐘誤差的未來審查時間，也可能被當成已完成階段。這是規劃清單的問題，
+不是證明來源拒絕或正式下載器正在故障。
+
+[來源規劃器](../scripts/plan_news_sources.py)現在將既有執行規則與獨立
+審查分開：保留既有下載器及限制，對時間無法驗證的紀錄只安排核對，
+不把它變成已完成或開放存取。新增的全範圍未完成清單同時保留轉址、
+社群、沒有本機網址、使用者暫緩的來源鍵，以及已完成階段但仍有
+已記錄問題的鍵；這份清單不是可直接執行的 HTTP 佇列。全文導向的
+原審查順序仍保留原篩選，並補回符合其條件的現行來源；直接呼叫審查
+輔助函式時也執行相同的時間檢查。缺少明確範圍標記的舊格式清冊只
+能宣稱已規劃輸入中的鍵，不能宣稱輸入已包含全來源。規劃契約為
+12（含指定工作順序）／9（不含順序），審查續接契約為 3；舊輸出
+保留其原版語義。全部紀錄階段完成也不能單憑規劃資料證明實地審查，
+因此此時 `all_sites_live_reviewed` 為未知，而不是 true。
+
+[新版清單](../artifacts/data_quality/news_offline_inventory_20261029/work_order_review_scope_v4_20261030.csv)
+和[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/review_scope_plan_readback_v4_20261030.json)
+涵蓋原有 **952 個來源鍵**；其中 **873 個**有未完成的審查階段或
+已記錄的未解問題，鍵可能是別名，不等於 873 家媒體。原全文導向
+待辦從 838 增為 843，補回 `fed_board`、`einfo`、`taichung_gov`、
+`tainan_gov`、`changhua_gov`；已完成階段但仍有問題者另有 14 個，
+包括 CMNews、Global Voices、UDN、MoneyLink、MoneyDJ、LTN 和中時／
+工商。這些問題仍各自受來源規則與使用者暫緩要求約束。
+
+讀回確認來源排序、既有已完成階段、來源許可待辦及已知網址／正文
+標記數與舊清冊一致；145 個鍵的紀錄時間可解析且未在未來，另 807
+個沒有審查紀錄。可解析時間不證明網站已訪問或內容已驗收。新清單
+仍綁定 10/29 22:36 的清冊觀測，不是即時抓取進度；新聞服務及 timer
+繼續維護停機，沒有來源請求、正式佇列寫入或新增正文。[最終隔離回歸](../artifacts/operations/agent-workflow/runs/news-review-final-v4-20261030-20261029T165858-9fd04b3d/run.log)
+**320 項通過**，涵蓋缺失／未來時間、直接函式呼叫、未完成問題、已
+啟用來源、延後來源、權限限制及舊清冊範圍；正式服務仍需維護結束後驗收。
+
+## 10/30 維護期間：重建空間與 TEJ 開機配置
+
+新聞服務及 timer 仍依使用者指示停止；鉅亨有限優先清單的固定檔案
+仍在，SHA-256 與下方 854 個觀察的既有紀錄相同。這只是清單檔案的
+身分核對，不是正式 owner 已接手或原件已修復；不重排既有工作。
+
+00:42（臺北時間）的[實體 backing 取樣](../artifacts/operations/agent-workflow/runs/news-corpus-physical-admission-2-20261029T164240-72887039/run.log)
+為 **41,373,245,440 bytes（約 38.53 GiB）**。扣除既有 25 GiB 保留量及
+下方舊版重建模型的 **13,772,581,022 bytes** 後只剩 **757,118,818 bytes**。
+舊模型不含新版新增資料、完整索引／暫存或其他程序寫入，不能當成
+當前重建的上限或預留；因此這次未建立新版語料或改寫舊語料。
+此樣本是當時的可用量，日後建置前仍需重新查證。
+
+使用者確認 TEJ 可運作；[兩個原 systemd 單元的開機啟用](../artifacts/operations/agent-workflow/runs/tej-boot-registration-20261030-20261029T164404-f18eede8/run.log)
+已恢復，原 TEJ 程序 PID 未變，新聞 service／timer 保持停止。
+[Windows 啟動任務與互動 relay 獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/tej_boot_registration_20261030.json)
+通過，但沒有實際重開機；Smart Wizard 仍需 Windows 使用者登入。
+細節見 [TEJ 開機報告](tej_chain_boot_2026-10-09.md#2026-10-30-維護期間的開機設定讀回)。
+
+## 10/30 維護期間：CMNews 標籤網址的新聞資料集範圍
+
+延續下方已清點的 137 個 CMNews `/tag/` 網址，沒有重抓或重新排程。
+先前精確的 discovery 對照尚未檢查舊新聞資料集是否將這類網址當作
+新聞標題。這次固定既有 manifest、持資料集建置鎖，以唯讀、網路隔離
+方式讀取 682 個文章分區的 `url`／`text_kind`：核對 **2,413,783 筆
+標題**，其中 **136 筆**是直接的 CMNews `/tag/` 路徑；沒有找到嚴格
+解出的 Google literal 指向該路徑。3,864,379 筆全文的 row group 依
+統計略過，沒有讀取正文。這是舊 manifest 的已知標題範圍，不是
+136 篇文章或已下載全文；分區檢查了大小、列數及讀取前後檔案身分，
+沒有重新計算全部分區 SHA。[結果與逐項網址](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_tag_corpus_audit_20261030.json)
+以及[受監督執行紀錄](../artifacts/operations/agent-workflow/runs/news-cmnews-tag-corpus-20261030-20261029T163620-570de3c9/run.log)
+均保留。
+
+另外在新聞 owner 協同鎖、停機且 sidecar 空的條件下，按上述 136 個
+網址[獨立查詢目前 source head](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_tag_corpus_readback_20261030.json)：
+136 個都屬 CMNews、狀態為 `unsupported_article_path`、沒有正文指標，
+目前 metadata 標題都有「文章集合」字樣。這是目前 head 的屬性，不能
+倒推舊資料集當時的來源狀態，也沒有取得或驗證這些標籤頁本身。
+
+[資料集範圍](../stockagent/data/news_dataset_sources.py)升為
+`cnyes_market_and_cmnews_tag_metadata_only_v2`：只有在 **沒有正文**
+時，才將精確的 CMNews 標籤路徑及嚴格解出的 Google literal 指標
+保留為來源 metadata，而不建立新聞標題及股票新聞關聯；既有正文、
+一般文章候選、其他主機與不透明 Google 網址維持原規則。這是未驗證
+路徑的保守分類，不宣稱來源內容永久不存在或有權下載。新的計數分開
+顯示鉅亨市場路徑、CMNews 標籤路徑及總數；[鉅亨專用稽核](../scripts/inspect_cnyes_news.py)
+仍只統計鉅亨，不將 CMNews 結果混入。
+
+這是資料語義變更：舊及第一版範圍快照不得拿來續建新版，必須在
+有足夠實體容量後使用新來源快照和獨立輸出根目錄，完成建置與讀回
+驗收。**現有 `data_news` 尚未重建，這 136 筆目前仍在舊資料集中**；
+沒有改寫舊語料、正式新聞佇列或來源正文。[隔離回歸](../artifacts/operations/agent-workflow/runs/news-cmnews-tag-final-20261030-20261029T163901-ace2b3b5/run.log)
+197 項通過，涵蓋正文保留、直接與 Google literal 路徑、舊快照拒絕、
+資料集建置、原網址與鉅亨稽核；這不是正式語料重建或來源下載驗收。
+新聞 service／timer 仍按維護指示停止，沒有對發布者發請求；TEJ
+Smart Wizard 服務與 TEJ API 計時器可運作。
+
+## 10/30 維護期間：鉅亨衝突修復測試的時間片驗證
+
+先前一組共用回歸出現 948 通過、1 項鉅亨一致性測試失敗；同一案例
+後續單獨與較廣回歸均通過，原日誌未記錄當時是否因時間片到期，
+因此仍不能斷定那次失敗的根因。
+
+這次在隔離佇列模擬查詢範圍時已用盡時間片，重現原先斷言的
+「預期排程一頁、實際為零」：[重現紀錄](../artifacts/operations/agent-workflow/runs/news-cnyes-conflict-slow-seek-re-20261029T163005-d2c929e3/run.log)。
+此時原修復程式會回報尚有未處理範圍；零排程並不等於已檢查且
+不需排程。相關[測試](../test/test_news_cnyes_history_evidence.py)
+現只在首個時間片明確未完成且未檢查任何範圍時，沿用既有優先續跑
+介面再檢查，並要求測試範圍實際被處理，才斷言是否排程。這也避免
+損毀見證的負向測試只因未執行檢查而誤通過；來源失敗、期限、舊
+見證及正文的既有斷言繼續保留。
+
+測試分別以正常及遭竄改的 retry 見證驗證逾時後續跑；鉅亨歷史、
+公平性與掃描鏈的[隔離回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-conflict-final-regres-20261029T163113-1b90beb3/run.log)
+**465 項通過**。這是測試可靠性修正，沒有修改正式下載器行為，也
+沒有證明正式服務曾發生這種逾時。新聞服務及 timer 依維護指示停機；
+測試未請求新聞來源或寫入正式新聞佇列，TEJ 可運作。
+
+## 10/30 維護期間：歷史 RSS 本機索引效能檢查
+
+自由時報原有的 43,510 份 RSS 原件已做過下方的全量驗收，這次沒有重跑
+全量檢查。針對其尚待正式 owner 載入的歷史索引流程，先以同一相容 feed
+目錄依檔名選取 128 份原件，在隔離佇列進行[剖析](../artifacts/data_quality/news_offline_inventory_20261029/ltn_legacy_real_profile_20261030.json)：
+128 份收據被讀取 256 次；URL 正規化也可能在解析與查重時重複執行。
+這份剖析含 profiler 負擔，不能把個別函式累計時間相加或當作線上吞吐。
+
+以重用已由 RSS 解析器驗證的網址作為查重原型，分別對 128 與
+512 份既有原件做[小樣本](../artifacts/data_quality/news_offline_inventory_20261029/ltn_legacy_lookup_abba_20261030.json)
+及[較大樣本](../artifacts/data_quality/news_offline_inventory_20261029/ltn_legacy_lookup_abba_512_20261030.json)
+的 ABBAABBA 比較。512 份不是隨機抽樣；八次各自重建隔離佇列並讀回
+8,235 個網址 head、512 筆來源觀察及 512 筆原始觀察時鐘，資料身分與
+狀態的雜湊一致，處理時間戳不列入比較。較大樣本的現行版本／原型
+中位實際耗時為 **3.970／3.990 秒**，程序 CPU 為 **4.259／4.194 秒**；
+各次波動重疊，不能證明整條流程有穩定改善，因此未把此原型套用到
+正式程式。原件複製與建立私有測試目錄不在計時內，也不能據此推估
+新聞下載或全歷史完成時間。[測試程式](../artifacts/data_quality/news_offline_inventory_20261029/news_ltn_legacy_lookup_benchmark_512_20261030.py)
+與[樣本選取程式](../artifacts/data_quality/news_offline_inventory_20261029/news_ltn_legacy_profile_20261030.py)
+保留以供查證。
+
+本次未請求發布者、未寫入正式新聞佇列；原件是 RSS 資訊而非全文。
+新聞服務仍在維護停機，TEJ 可運作；實際索引與下載結果仍需在維護
+結束後由正式 owner 驗收。
+
+## 10/30 維護期間：CMNews 失敗狀態與保留正文分開驗證
+
+[協同鎖下的唯讀清點](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_identity_frontier_20261030.json)
+確認目前 49 個 `article_identity_not_verified` head：32 個沒有正文指標，
+恰好是先前已核對的 32 個父關係；另外 17 個仍有正文指標。前者沿用
+既有 CMoney Learning 原件與診斷證據，不能推定父網址正文或跨站版本相同。
+
+這 17 個 head 的[本機檔案清點](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_metadata_20261030.json)
+指向 7 個已登記批次，Parquet 共 1,880,102 bytes，7 份收據均存在。
+更正：下方先前的[九組完整保留正文驗收](../artifacts/data_quality/news_offline_inventory_20261029/retained_body_full_selected_groups_20261029.json)
+已涵蓋當時 `cmnews:article_identity_not_verified` 的全部 17 個有正文
+head；本次開始前漏看該報告，因此對已有完整群組驗收的範圍再次讀取與
+驗證。舊報告未保留逐筆 ID，不能僅憑兩次都是 17 筆就斷定集合完全相同。
+原紀錄和本次驗證均保留，不將這次驗證計成新增取得。
+在停機、正式 owner 協同鎖及空 WAL／journal 條件下，分成 16、1 筆，
+不重複讀取兩組之間的批次；[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_verified_20261030.json)
+核驗了這 17 筆的正文指標以及同批次共 237 個不可變正文版本、原始回應
+雜湊與收據。現行解析器離線重播這 17 份舊回應也都通過；17 筆原捕獲時
+的來源設定指紋與現在不同。這不是再次訪問網站，也不能證明最新失敗回應
+的文章身分、兩個來源的等價或完整歷史；17 個目前狀態均保持失敗。
+本次[限定範圍的讀回程式](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_readback_20261030.py)
+保留鎖及快照檢查；正式佇列變動後不會將舊清點當成目前結果。
+這 17 筆的[既有身分 metadata 有界檢查](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_retained_identity_metadata_review_20261030.json)
+在各自檢查日與前一日找到 4 筆可對上原請求的先前 metadata，其來源資料
+指紋均非現行指紋；沒有任何一筆符合現行綁定或先前已審核的舊版 literal
+相容條件。因此不擴大舊證據防重白名單，也不把其餘 13 筆的來源狀況推定為
+不存在；維護結束後仍需依原 owner 和來源規則取得新證據。
+
+[既有選文驗證器](../scripts/audit_news_selected_articles.py)新增明確的
+`--include-retained-heads` 選項，分別回報保留正文與現行解析器重播結果。
+如果最新狀態不是 complete，即使保留資料驗證通過，既有 `accepted` 仍為
+false；此選項的成功結束碼僅表示指定的保留證據及所要求的重播通過，
+不代表目前來源身分已確認。預設行為不變。正文指標不符、收據或批次
+驗證失敗仍不通過；解析器重播失敗與儲存驗證失敗分開呈現。
+
+[隔離共用回歸](../artifacts/operations/agent-workflow/runs/news-retained-evidence-20261030-20261029T161520-3b986204/run.log)
+457 項通過；其後新增 CLI 範圍、結束碼及收據損壞測試，[保留模式針對測試](../artifacts/operations/agent-workflow/runs/news-retained-final-20261030-20261029T161919-7a7bcba3/run.log)
+共 6 項通過，兩組有重疊。測試以私人暫存、網路隔離和正式新聞目錄唯讀遮罩執行；
+真實讀回使用唯讀 immutable SQLite 並核對讀取前後資料庫身分。沒有向新聞
+網站請求或寫入正式佇列，新聞服務和 timer 維持停止，TEJ 未被啟停。
+鉅亨優先、其他來源未完成工作與可信的整體完成時間仍待維護後驗收。
+
+## 10/30 維護期間：鉅亨來源歸屬變更後的排程提示
+
+[離線唯讀核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_active_provider_hint_audit_20261029.json)
+在新聞正式 owner 的協同鎖下檢查目前 187 筆有待處理的缺文 URL：全部
+屬可辨識的候選網址、原本的主站候選 ID 與可用性提示一致，狀態彙總
+也與逐筆結果一致。這只涵蓋當時的 active frontier，不表示所有歷史
+URL 都有正文；其中 186 筆有主站正文指標，也不表示兩個網址的正文
+或文章身分已證實相同。
+
+隔離測試發現，若主站網址的 provider 因來源設定重整而變動，即使
+其正文指標不變，舊的候選提示也可能保留原值：
+[修正前重現](../artifacts/operations/agent-workflow/runs/news-cnyes-provider-hint-red-202-20261029T155813-a2fb0f38/run.log)。
+上述正式 frontier 沒有觀測到此差異；不能把隔離重現當成實際故障
+或鉅亨減速的根因。
+
+[共用鉅亨排程](../downloader/news_fulltext_cnyes_work.py)現在在
+provider 變更時於同一交易更新候選提示和既有計數；來源 owner 的
+`reconcile_policy` 也會經過此路徑。對舊版已遺留的提示，只有在
+排程考慮該 URL 時才重新核對，單次至多處理八個同類候選，不掃描
+全部歷史；不支援的網址在匯入分類時不發出多餘的更新語句，真正被
+選取時才清除錯誤排程提示。提示僅影響優先順序，
+不作為原文接受或網址等價證明，也不改來源回應、正文、失敗原因、
+重試期限與租約。尚未領取的舊項目不保證立即完成提示校正。
+
+測試使用隔離網路、暫存資料庫與正式新聞目錄唯讀遮罩，涵蓋正反
+provider 變更、正文與 provider 同時變更、rollback、舊資料庫重開、
+舊提示的兩種方向，以及超過八筆時的有界修復和正常 owner 領取。
+[真實 owner 政策重整隔離驗證](../artifacts/operations/agent-workflow/runs/news-cnyes-hint-policy-owner-202-20261029T160410-f3a9cf72/run.log)
+確認主站網域被移出設定時，原正文指標保留、手機候選提示正確更新；
+這不是正式資料庫的修改。新聞 service／timer 仍依要求停止，正式
+owner 尚未載入本次修正；TEJ 不受停機指示限制。沒有向新聞網站發出
+請求，也沒有寫入正式新聞佇列。
+
+[鉅亨與共用新聞回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-provider-hints-comple-20261029T160207-87f383c1/run.log)
+共 6,895 項通過（在移除不支援網址多餘更新之前）；將政策重整案例
+納入永久測試後，
+[針對性回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-hint-durable-test-202-20261029T160726-42a9feea/run.log)
+另有 77 項通過。移除不支援網址的多餘更新後，
+[最終共用與鉅亨回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-hint-final-regression-20261029T160838-c6fe87c0/run.log)
+775 項通過，涵蓋上述排程、真實政策重整、來源限制及面板；各組
+測試有重疊，不能加總。
+
+這次正確性檢查增加本機查詢成本，並非已證實的下載加速。
+[隔離 ABBA 選取微基準](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_hint_selection_microbench_20261030.json)
+及[程式](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_hint_selection_20261030.py)
+每輪各選取 5,000 次，兩個樣本的 CPU 均值：一般主站 URL 約
+82→93 微秒、無主站正文的候選約 74.65→114.15 微秒、有正文指標的
+候選約 78.49→102.36 微秒。這是溫熱快取的合成資料與小樣本，
+測值有波動，不代表線上吞吐量、來源限速或整條下載鏈路；候選多
+一次依主鍵查詢，未變更的提示不寫入資料庫。正式服務尚未運行，
+因此無法估計本次修改對實際抓取速度或完成時間的影響。
+
+## 10/29 維護期間：本機鎖等待的面板可見性
+
+直接文章批次已保存正文與收據後，若提交遇到另一個 SQLite 寫入者，
+原 owner 會等待並重試，但狀態快照可能暫時仍顯示正在抓取及舊估時。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-busy-liveness-red-20261029-20261029T154434-de2cb734/run.log)
+使用真正的寫入鎖；這不是正式服務或鉅亨曾發生相同鎖定的證明。
+
+[既有 owner](../downloader/news_fulltext_queue.py)現在以小型生命週期
+紀錄回報本機等待，重試期間約每 15 秒更新；不另起下載器或向來源
+發請求。單次 SQLite 呼叫受既有 busy timeout 影響，更新不保證精確
+每 15 秒。若生命週期檔案無法寫入，正文批次不因此丟棄；面板只能
+依既有快照及過期規則顯示，不能推定目前是否鎖定。
+
+[面板後端](../stockagent/live/news_dashboard.py)核對程序身分及紀錄
+時間，才將近期觀測顯示為「等待本機資料庫寫入鎖」；超過 45 秒未
+更新則顯示觀測過期。等待或過期期間保留舊快照的數量與時間，撤下
+舊速率及完成估時，不把本機鎖當成媒體網站限流。已發出的來源請求
+可能仍在處理。重試結束只代表抵達重試邊界，直到下一次真正的資料
+快照發佈前都不能判定提交成功。瀏覽器使用後端公布的有效期限，
+即使下一次狀態請求遲遲未返回，也會撤下已過期的等待宣稱；新快照
+不會被舊計時器覆蓋。背景分頁可能受瀏覽器計時器節流，恢復顯示時
+仍會依觀測時間重新判斷。
+
+隔離測試包含真實 SQLite 寫入鎖、重試心跳、觀測過期、程序停止、
+原批次讀回、生命週期寫入失敗，以及桌面與手機面板的狀態轉換；
+[較慢的狀態請求重現](../artifacts/operations/agent-workflow/runs/news-browser-inflight-lock-red-2-20261029T155207-2db4532d/run.log)
+驗證原本請求進行中時無法即時撤下過期狀態。
+[共用下載器、面板及恢復回歸](../artifacts/operations/agent-workflow/runs/news-local-lock-final-regression-20261029T155249-08823042/run.log)
+共 811 項通過；後續僅調整畫面文案，再做
+[30 項針對性驗證](../artifacts/operations/agent-workflow/runs/news-local-lock-final-focused-20-20261029T155503-9e84e882/run.log)，
+這些案例與前述回歸有重疊。
+[本機閘道讀回](../artifacts/operations/agent-workflow/runs/news-local-lock-gateway-v3-20261-20261029T155503-6ab7d02d/run.log)
+核對頁面顯示停止、沒有可用估時，提供的前端程式雜湊與工作區相同，
+沒有外站請求或瀏覽器錯誤；這不證明正式 owner 已載入後端修正。
+測試不呼叫新聞網站或寫入正式新聞佇列。正式新聞 service／timer
+仍停機，修正尚待維護結束後載入及線上驗收。
+
+## 10/29 維護期間：執行時間界線與正文提交重試
+
+新聞的一次執行時間原本是停止領取新工作、讓已領取的工作完成的軟
+界線。以模擬時鐘跨過界線、另一個連線持有真實 SQLite 寫入鎖，
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-busy-cycle-deadline-red-202-20261029T153902-637f929f/run.log)
+發現直接文章已保存正文與收據，但提交遇鎖時，既有重試把這個界線
+當成停止訊號而拋錯；循環中的批次與最後 flush 都受影響。這是受控
+案例，沒有證明正式服務或鉅亨曾發生相同故障。
+
+[下載器](../downloader/news_fulltext.py)現在仍在界線後停止領取新工作，
+但已下載批次會繼續以同一收據重試暫時性本機鎖；明確的 owner 停止
+訊號仍會中斷等待。若鎖持續不釋放，完成時間並無硬上限，停止訊號
+仍可能等待正在執行的 SQLite 呼叫返回。非鎖定錯誤、來源拒絕、租約
+與證據驗證沿用原有處理，不因此重新請求或宣稱正文已入庫。
+
+[隔離測試](../artifacts/operations/agent-workflow/runs/news-busy-deadline-service-20261-20261029T154001-d0e55ee9/run.log)
+涵蓋一般循環和常駐服務各自的循環內提交及最後 flush；真實鎖釋放後
+都以同一收據完成並讀回正文，循環測試的另一個網址保持待處理，沒有
+重送已完成請求。加上先前鎖定、明確停止及證據變更案例共 16 項通過。
+[來源排程、容量及恢復回歸](../artifacts/operations/agent-workflow/runs/news-busy-deadline-regression-20-20261029T154024-323a27c6/run.log)
+共 504 項通過，包含上述 16 項。
+測試未向媒體網站發請求，未寫入正式新聞佇列；新聞服務和 timer 仍
+維持維護停止，此修正尚待正式 owner 重新載入與線上驗收。
+
+## 10/29 維護期間：避免 SQLite 鎖定時反覆雜湊正文
+
+在隔離環境用另一個 SQLite 連線持有真實寫入鎖，
+[重現](../artifacts/operations/agent-workflow/runs/news-busy-rehash-red-20261029-20261029T153212-6c0a4f31/run.log)
+同一批已持久化正文在四次等待期間被讀取及驗證四次；這是可重現的
+本機額外工作，並非正式鉅亨曾遇到此問題的證明。
+
+[共用提交](../downloader/news_fulltext_queue.py)在首次遇鎖後先檢查
+原始收據與正文，再以短暫、無寫入的 SQLite 交易偵測寫入鎖是否可用。
+鎖仍被持有時不反覆雜湊同一正文；鎖可用時再驗證一次後才交由原有
+提交程序處理。如果原批次其實已提交，即使其他寫入者仍持鎖，也會先
+驗證原證據並按原批次讀回。這個探測不是預留鎖：後續若再次競爭，
+仍依原提交與重試條件處理。SQLite 單次呼叫仍受既有 busy timeout 影響，
+停止訊號在呼叫返回後才能檢查。
+
+[隔離測試](../artifacts/operations/agent-workflow/runs/news-busy-rehash-guards-fixed-20-20261029T153453-7d532e11/run.log)
+涵蓋真實持鎖、收據損毀、提交結果不明、較新來源回應及停止；12 項
+通過。在上述四次等待的固定案例中，正文驗證由四次減為兩次：首次
+遇鎖一次、釋鎖後提交前一次，並獨立讀回同一收據及正文。這不代表
+整體下載速度提升一半；尚未量測正式服務端到端吞吐量。
+[共用排程及跨來源回歸](../artifacts/operations/agent-workflow/runs/news-busy-probe-regression-20261-20261029T153513-66a501bc/run.log)
+共 416 項通過，包含上面的 12 項；測試在網路隔離與正式新聞目錄
+唯讀遮罩下進行。
+
+## 10/29 維護期間：正文提交遇到 SQLite 鎖定
+
+隔離測試使用另一個真正的 SQLite 寫入交易，
+[重現](../artifacts/operations/agent-workflow/runs/news-live-sqlite-busy-red-202610-20261029T152103-13800304/run.log)
+直接文章抓取在正文 Parquet 與收據已落盤後，提交資料庫時遇到
+`SQLITE_BUSY` 會讓 owner 退出。原收據可在下次啟動時恢復，但正式
+資料庫含大量歷史收據，整個啟動驗證仍需時間。這是受控重現，不表示
+維護前的正式鉅亨抓取已證實遭遇相同鎖定。
+
+[共用正文提交](../downloader/news_fulltext_queue.py)現在只在既有 owner 的
+直接文章批次、資料庫已退出交易、錯誤確屬 `SQLITE_BUSY` 或
+`SQLITE_LOCKED` 時，於本機等待並重試同一批提交。首次遇鎖及真正
+提交或認定已提交前核對原收據內容、Parquet 路徑及雜湊；若提交其實已成功，就以原批次身分
+讀回，不重新寫一份或重送來源請求。文章租約及較新來源結果仍受
+既有提交條件保護。等待可由停止訊號中斷；其他資料庫錯誤、仍在
+交易中、收據或正文遭變更時保留錯誤，不宣稱成功。本機退避由
+0.05 秒增至最多 2 秒，不改變來源配額或 HTTP 限速。
+
+[九項隔離測試](../artifacts/operations/agent-workflow/runs/news-live-sqlite-busy-verified-2-20261029T152350-c868d776/run.log)
+包含真實寫入鎖、連續鎖定、提交結果不明、較新的 403、停止、非鎖定
+錯誤及原收據／正文遭變更，並讀回唯一收據與正文。為避免重試本身
+把損毀證據當作成功，另保留[檢查加入前的失敗案例](../artifacts/operations/agent-workflow/runs/news-live-retry-evidence-red-202-20261029T152254-23e37cdb/run.log)。
+[跨來源及恢復回歸](../artifacts/operations/agent-workflow/runs/news-live-sqlite-recovery-regres-20261029T152410-b113d22f/run.log)
+共 850 項通過；全部在網路隔離及測試資料目錄中進行。
+收據落盤以前的故障、非鎖定錯誤，以及停機時尚未完成的交易仍需
+既有重啟恢復或重新請求，不能宣稱這次涵蓋所有寫入故障。
+
+下載程序在狀態快照中逐來源記錄涉及的本機批次提交鎖定次數；同一
+批次可能涉及多個來源，不可跨來源加總。新聞頁將這種**曾發生的本機
+事件**與網站限流分開，停止或快照過期時標為「上次快照」。事件
+計數仍須等下次狀態發佈；近期等待則另由本節上方的生命週期觀測
+提供，兩者不應混為一談。
+[面板與生命週期回歸](../artifacts/operations/agent-workflow/runs/news-local-busy-dashboard-regres-20261029T152802-dab6d814/run.log)
+共 356 項通過，包含隔離瀏覽器的畫面、停機語意與無外部請求檢查。
+[真實 SQLite 鎖定串接測試](../artifacts/operations/agent-workflow/runs/news-local-busy-owner-dashboard--20261029T152942-f7ebbbe5/run.log)
+也核對下載器產出的狀態確實帶有事件，且可由面板後端讀出；這是測試
+環境證據，尚非正式 owner 或正式網站程序已載入本次修改的證據。
+
+新聞 service／timer 仍依使用者指示停止，TEJ 可運作。測試使用隔離
+網路與正式新聞目錄唯讀遮罩，沒有發布者請求或正式新聞佇列寫入；
+此修改尚待維護結束後由正式 owner 載入及以實際收據驗證。
+
+## 10/29 維護期間：正文持久化與本機恢復排程
+
+新聞 service 與 timer 依使用者指示維持停止，TEJ 不受此維護指示限制。
+本輪以隔離網路及正式新聞目錄唯讀遮罩測試既有新聞 owner，沒有請求
+發布者或寫入正式 queue。
+
+[故障重現](../artifacts/operations/agent-workflow/runs/news-checkpoint-fairness-red-202-20261029T151610-7427670a/run.log)
+顯示：正文已由模擬來源取得、尚在記憶體等待批次寫入時，若狀態輸出
+超過本機恢復輪詢間隔，鉅亨及 metadata checkpoint 可能先進行下一個
+恢復切片。批次頁面 checkpoint 另缺少本機專用工作時的正文 flush；
+缺少該條件時，正文可能等到既有的批次大小、位元組或定時條件才落盤。
+正式設定的定時條件為 30 秒，但實際迴圈中的本機工作也可能超時，
+它不是硬性的持久化時間上限。這些是隔離故障注入的結果，不代表
+正式鉅亨缺文已被證明由此造成。
+
+[共用排程](../downloader/news_fulltext.py)現在在已知 checkpoint 尚有
+工作、已有待寫正文且沒有進行中的請求時，先讓線上分派有機會補滿
+批次；若沒有可分派的工作，先落盤、寫入收據並提交佇列，再執行下一個恢復
+切片。批次頁面 checkpoint 也加入既有的本機工作 flush 條件。原本的
+來源節流、權限、冷卻與已保存證據不因此改變。
+
+[隔離測試](../artifacts/operations/agent-workflow/runs/news-checkpoint-fairness-green-2-20261029T151633-fe2dd02a/run.log)
+針對三種 checkpoint 各驗證單篇持久化、兩篇合併寫入，以及第三篇仍
+等待時恢復工作有機會前進；九項均通過。測試在下一次恢復之前獨立
+讀回正文版本及 durable receipt，而不只看 queue 的完成標記。實際
+速度及服務恢復後的線上資料仍須另以正式 owner 與來源收據驗證。
+[共用排程及恢復回歸](../artifacts/operations/agent-workflow/runs/news-checkpoint-regression-20261-20261029T151651-6fc1c20a/run.log)
+共 438 項通過，涵蓋上述測試、鉅亨、metadata 與批次恢復、來源
+冷卻、owner 喚醒及磁碟准入；九項測試已包含在這個數字中。
+
+## 10/29 維護期間：新聞面板快照失效與恢復
+
+依使用者的維護指示，新聞 service 與 timer 維持停止；TEJ 可繼續運作。
+本輪先沿用既有鉅亨缺口清點及原件查證，沒有重新安排已完成工作，
+也沒有向新聞發布者發請求或寫入正式新聞 queue。
+
+隔離瀏覽器[重現](../artifacts/operations/agent-workflow/runs/news-dashboard-stale-red2-202610-20261029T150123-53907db9/run.log)：
+快照請求失敗時，警示雖標示過期，但執行摘要仍可能顯示舊的「立即續抓」；
+如果新回應在繪製途中出錯，未完成的資料可能取代最後成功快照，並讓
+錯誤處理再次拋出例外。[另一個測試](../artifacts/operations/agent-workflow/runs/news-dashboard-expiry-red-202610-20261029T150626-bb045383/run.log)
+重現瀏覽器從背景恢復、上次即時快照已過期，而新請求尚未返回時仍顯示
+舊即時狀態。這些測試不證明正式新聞下載器曾在線遇到相同故障。
+
+[面板](../services/news_dashboard/app.js)現在以最後一次完成同步繪製的資料
+處理失敗，整體重新呈現過期狀態、撤下即時速度和估時，保留來源數量
+與使用者篩選；快照已逾期時在等待新回應前先撤下即時敘述。首次快照
+繪製失敗時，隱藏尚未成功呈現的數量。摘要的鏡像更新有動畫幀延遲，
+[測試](../artifacts/operations/agent-workflow/runs/news-dashboard-mirror-red-202610-20261029T150333-ac58de67/run.log)
+重現恢復時可能閃出不完整數字；現於鏡像完成後才重新顯示。若摘要
+模組在第一次錯誤之後才載入，[原先也會露出未驗證數字](../artifacts/operations/agent-workflow/runs/news-dashboard-mount-red-2026102-20261029T150852-7ce93c2e/run.log)，
+因此保護不再依賴模組載入順序。恢復時只顯示目前版本，避免後續
+快照取代前一筆時由舊畫面解鎖顯示。
+
+[最終面板回歸](../artifacts/operations/agent-workflow/runs/news-dashboard-stale-final-v4-20-20261029T150914-53b6260c/run.log)
+共 **565 項通過**，涵蓋面板投影、快照替換、鉅亨階段及瀏覽器操作；
+全部在隔離網路及正式新聞目錄唯讀遮罩下執行。[本機閘道瀏覽器讀回](../artifacts/operations/agent-workflow/runs/news-dashboard-local-final-v4-20-20261029T150941-e2b3774d/run.log)
+顯示新版腳本、新聞已停止、速度與估時待觀測；非本機請求和頁面
+錯誤均為零。閘道實際提供的腳本及樣式雜湊與工作區一致。
+閘道讀取到的來源觀測仍是 10/27 23:44 UTC（台灣時間 10/28 07:44），
+不是目前正在下載的證據。鉅亨尚有本頁下方清點的 7,022 個無正文標記
+head，完成時間仍未知；維護結束後仍須核驗正式來源回應與耐久收據。
+
+## 10/29 維護期間：候選診斷的本機故障恢復
+
+沿用既有新聞 owner，在網路隔離及正式新聞目錄唯讀遮罩下，
+[故障注入](../artifacts/operations/agent-workflow/runs/news-candidate-recovery-red-2026-20261029T144920-439671d8/run.log)
+重現三項程式缺陷：暫時性讀取錯誤會被當成壞檔隔離、無效網址的
+`NewsError` 可能中斷 owner，以及已登記請求檔遭變更時不會喚醒 owner。
+這些是隔離測試發現的缺陷，並非證明正式鉅亨缺文都由它們造成。
+
+[候選診斷](../downloader/news_fulltext_candidate_diagnostics.py)現在保留暫時
+無法讀取的請求，輪替其他工作；讀取、隔離或封存的本機故障依
+1、2、4、8、16、最多 30 秒等待重試，檔案變更時重新判斷。無效請求
+保留隔離證據，已完成但暫時無法封存的工作只做本機重試，不重送
+來源請求。[常駐排程](../downloader/news_fulltext.py)會在本機重試到期
+時喚醒，停機和磁碟准入仍優先；重新啟動後也不把未知來源結果當成
+允許重送。這些延遲只處理本機故障，不修改來源速率、配額或拒絕。
+
+狀態快照加入本機讀取、隔離、封存待重試數；
+[網頁投影](../stockagent/live/news_dashboard.py)只公開經檢查的彙總，
+[畫面](../services/news_dashboard/app.js)區分來源錯誤與本機重試，
+並在停止或快照過期時標示為上次快照。舊版本沒有該欄位時仍是
+未知，不會推定為零；私有檔名、網址及正文不會透過此欄位公開。
+
+修正後的[共用恢復、鉅亨及面板回歸](../artifacts/operations/agent-workflow/runs/news-recovery-dashboard-final-20-20261029T145419-8107b8e5/run.log)
+886 項通過，另有[共用排程及原件稽核回歸](../artifacts/operations/agent-workflow/runs/news-recovery-final-complement-2-20261029T145548-2e53682f/run.log)
+275 項通過；兩組均包含同一個瀏覽器案例，不直接相加。
+該案例再以明確的停止及執行狀態[重跑通過](../artifacts/operations/agent-workflow/runs/news-retry-stopped-browser-20261-20261029T145625-64fffb60/run.log)。
+另執行 JavaScript 語法與 Git whitespace 檢查。上述測試均沒有連接
+發布者或寫入正式新聞佇列，不能代替正式 owner 載入、線上來源及
+正文收據驗收。
+
+本次確認新聞 service／timer 仍停止；TEJ Smart Wizard 服務為 running、
+TEJ API 計時器為 waiting，沒有更動它們。服務狀態本身不證明 TEJ
+已成功抓取。鉅亨仍以本頁下方 10/29 唯讀清冊的 7,022 個無正文標記
+head 為已知待查範圍，完成時間在停機與來源回應未核驗時未知。
+
+## 10/29 維護期間：重開機後的全來源清點與既有工作沿用
+
+先前全量清冊和目前設定只差兩個鉅亨優先計畫，但重開機後資料庫
+所在裝置編號由 2096 變為 2112；inode、大小及修改時間相同不足以
+證明跨開機是同一快照，因此沒有直接把舊清冊宣稱為現況。持既有
+owner 排他鎖、隔離網路，對空 WAL 的資料庫重新做[全量唯讀清點](../artifacts/data_quality/news_offline_inventory_20261029/inventory_current_locked_20261029.json)，
+再用獨立 SQL 分組[核對各來源的網址、正文標記及狀態](../artifacts/data_quality/news_offline_inventory_20261029/inventory_current_locked_readback_20261029.json)：
+兩者均為 **6,352,201 個已知 URL head、3,917,924 個有正文標記**，
+各來源狀態及計數沒有差異。這是資料庫標記的核對，沒有逐篇驗證
+正文檔、收據或來源的完整歷史；持合作鎖也不是檔案系統凍結快照。
+來源 owner 的狀態檔時間仍是 10/27，不能據此宣稱維護期間正在下載。
+
+目前清冊涵蓋 **91 個已設定來源鍵及 861 個未登記主機名稱鍵**，
+以及 167 個已設定端點／路徑能力；主機名稱鍵可能包含轉址、聚合
+或同一媒體的不同網域，不是 861 家不同媒體。根據本次清冊、最新
+來源審查與使用者工作順序重新產生[全部已知鍵的工程清單](../artifacts/data_quality/news_offline_inventory_20261029/work_order_current_20261029.json)：
+鉅亨優先，其他指定來源按既有順序背景處理，中央社暫緩。已有
+審查結果繼續沿用；仍有 802 個鍵標為尚未審查，47 個鍵等待來源
+許可路徑。工程清單不是來源權限、已啟動排程或全歷史完成的證明。
+清單、輸入雜湊及 91 個來源指紋已[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/current_plan_independent_readback_20261029.json)；
+與舊清單逐鍵比較的四項工作分類沒有變動，沒有重新排入已完成審查。
+
+例如 Google News 是轉址鍵，不是原始發布者。[小型計數表讀回](../artifacts/data_quality/news_offline_inventory_20261029/google_routing_counters_current_20261029.json)
+顯示目前 **1,285,023／1,285,023 個轉址已檢查**，其中 946,017 個
+含明示原址、339,004 個是不透明代碼、2 個仍無法解析；616 個既有
+主機路由範圍已處理。這不等於全部原文已入庫。讀回只讀既有計數與
+主機計畫，明確禁止掃描文章及原址 proof 表，也沒有重新執行解碼。
+
+鉅亨的 3,693,925 個已知 head 中，3,686,903 個有正文標記；
+**7,022 個無正文標記**包括 187 個待重試／冷卻、4,626 個空模板、
+1,269 個來源未找到、578 個未支援路徑、346 個行情片段、13 個圖片
+正文及 3 個測試內容。這些是既有分類，不能把它們混為已完成或
+推論各網址一定曾有可取得文章。CMoney 的 278,700 個已知 head
+沒有正文標記，其中 237,343 個是待處理工作，41,357 個路徑未支援；
+先前的來源拒絕及冷卻紀錄應保留。
+
+本次沒有新聞網站請求、正式新聞佇列寫入或啟動新聞 service／timer；
+TEJ 依使用者指示可以運作。已修改的新聞程式仍需在維護結束後由
+正式 owner 載入並以實際收據、各來源配額與來源回應驗收。
+
+## 10/29 維護期間：新聞測試的完整檔案範圍回歸
+
+保留前述已驗證的 63 個受影響測試檔，將其餘 413 個新聞測試檔
+按檔案分為四組，在網路隔離、正式新聞目錄空白唯讀遮罩下執行。
+第三組有七個狀態快照替換測試失敗：[原始收據](../artifacts/operations/agent-workflow/runs/news-remaining-shard-2-20261029-20261029T143639-d2b49678/run.log)
+顯示它們都在同一個測試檔。原因是共享讀取器透過獨立的
+`_decode_snapshot_json` 入口使用私有 JSON 解碼器，舊測試卻替換
+`json.loads`；在目前的原生解碼環境下沒有觸發模擬的原子換檔。
+
+先以只調整注入點的[隔離副本](../artifacts/operations/agent-workflow/runs/news-snapshot-seam-repro-2026102-20261029T144209-c18874d7/run.log)
+重現並驗證 13 個案例，再修改[原測試](../test/test_news_snapshot_replacement.py)
+的注入點；實際測試檔[重新執行](../artifacts/operations/agent-workflow/runs/news-snapshot-actual-20261029-20261029T144512-73e2fb33/run.log)
+13 項均通過。測試仍驗證換代後讀取新內容、連續換代時拒絕舊內容、
+格式錯誤及大小上限；沒有因此變更正式讀取器。
+
+[收據與雜湊核對](../artifacts/data_quality/news_offline_inventory_20261029/news_all_regression_readback_20261029.json)
+確認先前通過的 3,472 項、其餘檔案成功案例及修正後的 13 項互不
+重複，合計 **476 個 `test_*news*.py` 檔、28,232 個案例通過**。
+其中第三組原本失敗的七項只在修正後納入，原失敗收據仍保留。
+已核對指定 658 個輸入除了這個測試檔外未變；其他既有輸入僅核對
+檔案時間等限定證據。這不是整個專案測試、不可變檔案系統、正式
+部署或線上來源與歷史完整性的驗收。
+
+## 10/29 維護期間：中繼資料重播與診斷佇列前進
+
+擴大離線回歸發現，鉅亨原始正文若帶有當時的租約或無租約見證，
+中繼資料重播曾把舊見證複製到新的重播紀錄。兩種提交見證互斥，
+因此新正文 head 被拒絕，但舊程式仍可能把該工作標成
+`verified_repair`。現在重播版本升為 3：沿用原始 Parquet 路徑及
+耐久收據保存舊證據，新版本只使用本次的完整 head 見證；舊版 1、2
+的收據仍須通過原有的完整性與 head 條件才能恢復。小表與大表都必須確認該文章確實被採用，才標記
+完成；未採用時保留原件並記錄有界的本機重試，不改寫來源拒絕或
+HTTP 時鐘。[中繼資料重播](../downloader/news_fulltext_metadata_replay.py)、
+[大表 owner](../downloader/news_fulltext_large_replay_owner.py)。
+
+另一項失敗顯示，候選診斷的初始化若已用完軟時間片，以前可能一筆
+也不處理；現在每片在沒有停止要求時至少處理一個有界請求，並以
+獨立排程表的持久游標輪替，避免第一筆已就緒工作反覆擋住後續工作；不
+改變來源權限、HTTP 配額與拒絕狀態。[診斷佇列](../downloader/news_fulltext_candidate_diagnostics.py)。
+另外，隔離案例重現同一觀察被並行提交成兩份不同檔案時，資料庫
+只保留一個工作，但第二份仍使 idle owner 不斷被喚醒。現在依已
+驗證的觀察身分判定重複：真正的新請求、無法讀取或改變的檔案
+仍會喚醒 owner。身分快取以檔案裝置、inode、模式、大小及時間
+確認未變，並與面板使用相同的驗證；不同檔名的請求不僅憑名稱
+判定為同一觀察。
+同一個就緒工作重複巡檢，游標沒有改變時也不再重寫 SQLite 游標；
+隔離重現原本第二次巡檢多一次資料庫變更，
+[修正後測試](../artifacts/operations/agent-workflow/runs/news-cursor-write-and-liveness-2-20261029T141604-80e400d9/run.log)
+須以實際收據為準；這不是實際線上 CPU 或吞吐量的測量。
+兩個舊測試也改成分別驗證真正的耐久收據重啟與沒有 token 時拒絕，
+以及工作超過軟時間片後先處理一筆、再輪替的現行契約。
+
+較早的擴大回歸中，游標曾放入 `queue_settings`；測到 20 個來源
+保護測試失敗，均涉及該表新增或變動。游標已移到
+`native_candidate_schedule`，配額設定表及其原有測試保持完整。
+[失敗收據](../artifacts/operations/agent-workflow/runs/news-affected-source-regression--20261029T141628-c26341ef/run.log)
+保留當時結果，不能當成修正後驗收。
+
+移到獨立表後，原先失敗的 20 個案例與相關輪替測試合計
+[113 項通過](../artifacts/operations/agent-workflow/runs/news-cross-provider-isolated-cur-20261029T142108-a5da994c/run.log)。
+接著在隔離網路與測試暫存內重跑 **63 個受影響的測試檔，3,472 項通過**；
+[測試收據](../artifacts/operations/agent-workflow/runs/news-final-affected-source-regre-20261029T142201-260c44eb/run.log)
+及[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/news_affected_suite_readback_20261029.json)
+核對 658 個指定輸入的前後雜湊。此範圍不是全部新聞測試，也不是凍結
+檔案系統、正式部署或來源歷史完整性的證明。
+
+[關鍵測試](../artifacts/operations/agent-workflow/runs/news-witness-and-liveness-focuse-20261029T140543-1dd3bb9e/run.log)
+10 項通過。持有新聞 owner 鎖，對停機資料庫做唯讀快照，核對
+**3,797 筆**既有 `verified_repair`：全部目前指向不同於其來源的
+正文路徑，沒有符合此次「路徑與正文仍相同」的誤標形狀，沒有缺失
+head 或同路徑雜湊衝突；[清點](../artifacts/data_quality/news_offline_inventory_20261029/metadata_verified_frontier_20261029.json)
+與[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/metadata_verified_frontier_readback_20261029.json)
+只排除這個形狀，沒有逐筆驗證中繼資料或宣稱歷史完整。這些修正
+尚未由正式新聞 owner 載入；維護期間沒有發布者請求或正式佇列寫入。
+
+## 10/29 維護期間：鉅亨原件稽核的證據重用
+
+離線回歸發現，鉅亨歷史程式更新後，既有原件稽核仍固定檢查舊版
+程式雜湊，因此拒用先前的內容驗證證據，改為重新讀取原件。這個
+失效是保守重驗，沒有發現它會把錯誤資料當成正確資料，但會造成
+不必要的本機讀取。
+
+已比較先前審查過與目前的讀取器：影響原件及頁面見證的 6 個函式、
+相關匯入及常數一致，其他被固定的讀取依賴也未變；[比較證據](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_reader_bridge_compatibility_20261029.json)
+保留兩個版本及原審查輸入的雜湊。據此更新[稽核程式](../scripts/audit_news_cnyes_retained_missing.py)
+的已審查版本；未審查的程式改動仍會要求重驗，來源授權、原請求、
+檔案身分和已提交批次成員的檢查仍然有效。另一個測試的替身原本
+影響 pytest 暫存清理，已縮小其作用範圍。
+
+[修正後的相關測試](../artifacts/operations/agent-workflow/runs/news-cache-reader-bridge-fix-202-20261029T134540-8220da47/run.log)
+108 項通過，包含未審查依賴變動必須拒用舊證據；這不證明來源歷史
+已完整。新聞 service 與 timer 在維護期間保持停止，修正尚未由正式
+新聞 owner 載入；沒有呼叫發布者或寫入正式新聞佇列。
+
+擴大回歸時，首輪測試使用可見上限 48 GiB 的記憶體暫存，低於正式
+設定的 64 GiB 預留；CNews 完整流程因此按設計不派工。相同案例在
+隔離、可見上限 80 GiB 的測試暫存中[重新通過](../artifacts/operations/agent-workflow/runs/news-cnews-capacity-repro-202610-20261029T135023-2d43e41e/run.log)。
+測試暫存上限不是預先配置的記憶體容量，也沒有調低正式磁碟預留。
+四組更大範圍的測試以獨立網路與掛載進行，結果必須以各組收據為準。
+
+## 10/29 維護期間：59 頁的舊式原件索引
+
+接續下節，針對相同 59 個精確請求，檢查舊式 `quarantine/` 及
+`discovery_responses/` 直接子層的 **105,957 份 Parquet** 請求網址
+索引；[結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_59_legacy_envelope_versions_20261029.json)
+為 105,957 份索引可讀、0 個命中、0 個讀取錯誤。資料庫的這 59 個
+範圍／頁碼也沒有其他既存頁面觀察 metadata。檢查只使用符合格式的
+Parquet row-group 統計排除不可能的網址；不代表逐一解碼或驗證了
+所有原件、收據與資料內容，也不涵蓋其他目錄。不同版本即使將來
+找到，仍只能證明其自己的觀察時間，不能補稱舊版本。
+
+掃描器以六個有／無統計及不同分組的隔離案例，驗證目標網址過濾，
+另驗證缺少網址欄位時不當成已檢查。這次持有 owner 鎖、檢查資料庫
+與目錄前後身分，但不宣稱檔案系統為凍結快照。報告和輸入雜湊已
+獨立讀回；未呼叫發布者、寫入正式 queue 或新增正文。59 頁仍缺可
+核驗的原請求證據，維護結束後須由既有 owner 繼續處理。
+
+## 10/29 維護期間：59 頁依請求索引的其他回應版本
+
+在正文批次及兩個批次目錄名稱清冊之外，另檢查 59 個待查頁面在
+`discovery_responses/by_request/` 中，依精確請求網址及**目前授權
+指紋**計算出的目錄；[唯讀結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_59_request_index_versions_20261029.json)
+為 **59 個目錄均不存在、0 個候選**。沒有找到可供核驗的不同回應
+版本；這只涵蓋上述索引與目前授權指紋，不能排除舊式目錄或其他
+位置有不同版本，也不能把不同版本當作當時的缺失原件。
+
+隔離夾具檢查兩個有效同請求原件、錯誤雜湊、異常名稱、符號連結
+及不存在的目錄；正式資料只讀，持 owner 鎖並檢查資料庫和目錄的
+前後身分。報告及輸入雜湊已獨立讀回；檔案系統不是凍結快照。
+沒有發布者請求、正式 queue 寫入或新增正文，59 頁仍未恢復。
+
+## 10/29 維護期間：未登記收據與正文檔的名稱清冊
+
+先前 59 頁的查找只讀取了已登記正文批次，尚未排除同一批次目錄中
+另有未登記檔案。這次在新聞 owner 鎖下，以停機唯讀資料庫核對
+`receipts/` 的直接子層 JSON 名稱及 `bodies/` 下的 Parquet 名稱：
+**223,582 個已登記收據路徑**與 **223,582 個 JSON 名稱**一一對上；
+**223,582 個已登記正文路徑**與 **223,582 個 Parquet 名稱**也一一
+對上。這兩個目錄均沒有找到名稱未登記的候選或登記後缺少名稱的
+項目；正文目錄掃描了 21 個目錄，沒有略過符號連結。
+
+[收據名稱清冊](../artifacts/data_quality/news_offline_inventory_20261029/news_receipt_frontier_20261029.json)
+與[正文名稱清冊](../artifacts/data_quality/news_offline_inventory_20261029/news_body_frontier_20261029.json)
+只證明本次名稱集合吻合，**沒有逐一驗證這 223,582 份收據或正文
+內容**。兩個清冊各以隔離夾具驗證未登記、缺失與特殊目錄項目的
+分類；報告及輸入雜湊也已獨立讀回。持鎖及前後目錄／資料庫身分
+檢查不能阻止不遵守鎖的其他程序修改個別檔案，所以不稱全檔案系統
+為不可變快照。其他目錄、未保留的來源回應及來源未來版本不在此
+範圍，59 頁仍未恢復；本次沒有來源請求、正式 queue 寫入或新增正文。
+
+## 10/29 維護期間：28 頁直接原件的目前正文收據
+
+六個鉅亨來源範圍內先前找到 28 頁請求身分相符的直接原件。先沿用
+已檢查的 17 頁，對另外 11 頁核對原件、收據、來源權限、精確請求、
+頁碼及現行解析結果；它們不在先前 17 頁或 1,411 份缺文原件稽核的
+回應集合中。11 頁共 330 列可解析正文，對應 **313 個不同文章 head**，
+目前 head 的正文雜湊均相符。再依 head 指向的 **41 個已登記批次**，
+逐批檢查原件、Parquet、正文與耐久收據；313 個 head 均找到身分、
+正文雜湊、取得時間及授權指紋相符的紀錄。結果及原件身分見
+[11 頁對帳](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_11_direct_body_witness_20261029.json)。
+
+先前 17 頁的正文雖已核對雜湊，當時沒有重驗 head 指向的正文批次。
+本次補驗 **21 個已登記批次、356 個不同正文 head**，均找到相符的
+耐久紀錄；原頁另有 31 列未提供正文，對應先前已查過的 20 個缺文
+head，沒有改稱取得正文。[17 頁收據核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_17_direct_body_witness_20261029.json)
+保留原來源時間與範圍。兩組不同頁面可能指向重複文章，因此 313 與
+356 不相加為全局唯一篇數，也沒有宣稱歷史上的 head 狀態已被還原。
+
+兩份報告的輸入及程式雜湊、頁面計數和驗證結果已獨立讀回；測試持有
+既有 owner 鎖，前後檢查資料庫與原件檔案身分，但不聲稱檔案系統是
+不可變快照。沒有發布者請求、正式佇列寫入或新增正文。這些證據
+不代表六個來源範圍或全部鉅亨歷史已完成；其餘 59 頁的直接原件仍
+未找到，仍須等維護結束後按既有 owner 流程處理。
+
+## 10/29 維護期間：鉅亨已存頁面的文章 head 查詢
+
+鉅亨清單中每篇文章原本分別查詢兩個既知 print 別名與標準網址的
+文章 ID；30 篇頁面共執行 90 次文章查詢。現在每篇以一個使用 ID
+及網址索引的查詢取回這三個獨立 head，仍依原順序處理別名，各自
+保留文章見證、租約、重試期限與提交時的較新 head 檢查；其他 provider
+的查詢不變。[隔離測試](../test/test_news_cnyes_record_selection.py)
+涵蓋兩個別名的不同狀態、查詢後被其他工作者更新冷卻或租約、正文
+收據讀回；[相關共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-combined-lookup-regre-20261029T131805-5ab0d2db/run.log)
+共 **1,242 項通過**。
+
+[交錯量測](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_combined_lookup_abba_20261029.json)
+每個版本各 16 次，涵蓋模擬 HTTP、解析、頁面提交和讀回。30 篇人造
+已存頁的中位 CPU 由 11.41 ms 降至 10.23 ms，牆鐘由 25.67 ms 降至
+18.73 ms；用一份收據與雜湊核對過、原標記為不發布的鉅亨隔離原件
+在獨立暫存佇列重播，中位 CPU 由 17.97 ms 降至 17.42 ms，牆鐘由
+41.62 ms 升至 44.24 ms。磁碟提交波動與解析成本仍在，這不足以
+宣稱真實網路抓取速度變快或所有歷史完成；隔離重播也不更改原件
+的不發布狀態。
+
+另比較過[整頁一次查詢原型](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_page_lookup_prototype_abba_20261029.json)：
+雖可由 90 次查詢降到 1 次，真實原件中位 CPU 僅由 17.88 ms 變為
+17.76 ms，牆鐘由 42.75 ms 變為 46.35 ms；尚不足以證明比已採用
+的較簡單作法更好，因此未納入正式程式。測試未連線發布者，也未
+修改正式新聞佇列；新聞 service 與 timer 仍依使用者要求停機，TEJ
+可運作。新程式尚未由正式新聞 owner 載入。
+
+## 10/29 維護期間：合併小頁面的恢復交易，避免大頁面阻塞
+
+RSS／WordPress 已解析頁面沒有新正文時，原本文章登記與恢復 journal
+分開提交；在來源條件、頁面 head 與既存正文見證均合格、沒有需先完成
+的獨立正文重新驗證時，現在小於等於 1 MiB 的回應將兩者合併為一次
+SQLite 交易。頁面狀態仍另一次提交，成功後同交易刪除 journal；提交
+前故障會一起回滾，提交後故障可用相同原始回應在本機恢復。若同正文
+仍待重新驗證，維持先處理文章、再登記 journal 的順序，避免恢復頁面
+卻遺漏文章狀態。來源限制、文章租約與較新 head 的保護不變。
+
+大於 1 MiB 的頁面沿用分開提交，在寫入交易外壓縮回應，避免大型
+壓縮占用 SQLite 寫入鎖；這個分支界線是本機工程取捨，不是來源流量
+限制或保證最優。原有 32 MiB journal 上限及超過上限的正常重試行為
+不變。所有情況仍可能在 journal 成功提交之前中斷而需要重新請求。
+[隔離測試](../test/test_news_bulk_page_checkpoint.py)共 43 項通過，
+包含提交前回滾、提交後恢復、需先驗證的正文、較新文章狀態、
+超大頁與大頁鎖外壓縮／中斷恢復。完成大型頁分支前的共用與鉅亨
+[擴大回歸](../artifacts/operations/agent-workflow/runs/news-merged-transaction-regressi-20261029T130458-28dddafb/run.log)
+為 2,210 項通過；最終程式的[同範圍回歸](../artifacts/operations/agent-workflow/runs/news-merged-large-guard-final-re-20261029T130838-ac1f516a/run.log)
+為 **2,212 項通過**，不是完整來源上線或全新聞歷史完成的驗收。
+
+[最終程式交錯量測](../artifacts/data_quality/news_offline_inventory_20261029/bulk_merged_commit_large_guard_abba_20261029.json)
+使用隔離 queue、模擬 HTTP、SQLite WAL／FULL，兩個版本均保留恢復
+journal；每側 24 次，包含取得、解析、提交與 SQLite 讀回。145 bytes
+空 RSS 中位時間由 13.75 ms 變 11.33 ms，已保存 100 篇的 WordPress
+54,270 bytes 頁由 45.80 ms 變 38.81 ms。CPU 中位數分別由 2.09 ms
+變 1.90 ms、31.19 ms 變 29.27 ms；這是溫快取本機工作量，不代表
+實際新聞站的網路速度、整體下載速度或已達理論上限。
+
+本輪沒有發布者請求或正式新聞 queue 寫入。新聞 service 與 timer 維持
+使用者指定的維護停機，TEJ service／timer 可運作；新程式尚未由正式
+新聞 owner 載入，因此不宣稱新聞已恢復抓取或所有來源已完成。
+
+## 10/29 維護期間：沒有新正文的頁面恢復與全批次版本比對
+
+四個隔離案例重現 RSS／WordPress 空頁及所有正文已存的頁面：原始回應
+已取得，但來源頁交易失敗後沒有本機恢復紀錄。現在既有 owner 對可保存、
+已成功解析而沒有新正文批次的 200 回應，在原 queue 的同一 SQLite 交易
+記錄來源 head、取得時鐘、政策指紋與有界壓縮回應；來源頁及其 journal
+在頁面成功提交時同一交易清除。這是暫時恢復資料，不是新增來源全文
+存檔。重啟或本機暫時故障時先核對政策、head、回應雜湊及分頁再恢復；
+損毀及較新 head 不能推進來源頁，skipped 診斷資料保留。32 MiB 以上、
+受限制混合內容、RSS metadata-only、304 與不符合見證條件的回應仍走
+既有來源政策及重試路徑。中斷在 journal 寫入之前，也仍可能需要重新
+請求，不能保證所有故障都零請求恢復。
+
+[針對性測試](../test/test_news_bulk_page_checkpoint.py)共 33 項通過；
+包含四種空頁／已存正文中斷、執行中單次來源請求後本機恢復、損毀、
+較新 head、超大頁及成功提交不殘留 journal；混合限制頁另有隔離驗證。
+全新聞回歸進行到 1% 時出現三項失敗，已停止該次執行並保留
+[原輸出](../artifacts/operations/agent-workflow/runs/news-bulk-journal-regression-202-20261029T125111-f2498a8b/run.log)；
+[第一個失敗重現](../artifacts/operations/agent-workflow/runs/news-first-failure-20261029-20261029T125557-538e1e18/run.log)
+為 224 通過、1 失敗，原因是測試要求兩個獨立 queue 的隨機租約 owner
+與 token 相同。已改為比較實際選取內容，並各自核對 token／owner 與
+資料庫租約一致；[修正後該檔](../test/test_news_article_readiness_probe.py)
+23 項通過。這是測試契約修正，沒有改成共用租約或降低實際租約隔離。
+[修正後相關擴大回歸](../artifacts/operations/agent-workflow/runs/news-first-regression-fixed-2026-20261029T125708-b494a4e6/run.log)
+共 1,398 項通過，涵蓋共用佇列、RSS／WordPress、部分來源解析及
+owner 生命週期；不是完整新聞測試套件或正式下載驗收。
+[同一隔離工作量的交錯比較](../artifacts/data_quality/news_offline_inventory_20261029/bulk_no_body_abba_bench_20261029.json)
+每側 24 次，包含模擬 HTTP、解析、耐久本機提交及讀回；空 RSS 145 bytes
+的中位時間由 5.62 ms 變 11.56 ms，100 筆 WordPress／54,270 bytes 由
+46.78 ms 變 60.10 ms。測試同時有本機歷史批次掃描，波動可見；這是
+恢復能力增加的本機成本，不能當作 WAN 速度或整體吞吐量倍數。
+
+對下方鉅亨 59 頁，已由 [全批次不同版本比對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_59_all_registered_any_version_20261029.json)
+檢查全部 223,582 個已登記批次：0 個同網址不同雜湊候選、0 批次錯誤；
+共有七種合成索引案例及一筆真實原件正向檢查。這比下方僅檢查 89 個
+head 批次的範圍更完整，仍不排除其他位置、未登記檔案或來源日後的
+回應；檔案系統並非凍結快照。即使找到其他版本也不能把它當成當時
+的原始回應。沒有發布者請求或正式新聞 queue 寫入；新聞 service 與
+timer 停止，TEJ 可運作。新程式尚未由正式新聞 owner 載入。
+
+## 10/29 維護期間：全文清單提交中斷後的本機恢復
+
+RSS 與 WordPress 全文頁先提交正文及其不可變收據，再提交來源頁的
+checkpoint。隔離測試證實兩步之間中斷時，正文已保存但來源頁仍待抓；
+這是程式的可重現故障邊界，**不是已證明正式停機前發生過的事故**。
+
+[既有 owner 的恢復程式](../downloader/news_fulltext_bulk_checkpoint.py)
+現於正文批次接受交易中記錄精確來源頁的見證，重啟時也由既有孤兒
+收據恢復路徑登記；排程對該頁先做本機核驗，不阻塞其他頁與來源。
+核驗包括來源網址、授權及資料指紋、收據、原始回應雜湊、取得時間、
+分頁與未被較新狀態取代的來源 head。通過後，以原取得時鐘原子提交
+頁面狀態及下一頁；較新的錯誤、其他頁的來源冷卻及不允許保存的混合
+內容均保留。本機讀取暫時失敗會重試；無法核驗的見證記錄為 skipped，
+不把它當成下載成功，再由原排程決定後續來源請求。
+
+當時這版只涵蓋已有新正文批次且含合格原始回應的全文頁；沒有新正文
+批次的後續修復見上節。受限制混合頁、304 或無法核對的轉址，不會
+憑空製造原件或恢復證據。已重現的頁面中斷、孤兒
+收據、執行中暫時故障、毀損收據、較新 head／範圍、provider 冷卻與
+本機重試見[隔離測試](../test/test_news_bulk_page_checkpoint.py)。
+
+原[第一次較廣回歸](../artifacts/operations/agent-workflow/runs/news-bulk-checkpoint-regression-20261029T123644-f48b6f10/run.log)
+為 948 通過、1 個鉅亨一致性測試未通過；該案例單獨重跑通過，單次
+失敗的原因尚未證實，原結果保留。加入另外的較新範圍、來源冷卻及
+本機重試案例後，[重跑共用回歸](../artifacts/operations/agent-workflow/runs/news-bulk-checkpoint-regression--20261029T123925-cc8ffc98/run.log)
+為 **953 項通過**。維護期間無 publisher 請求或正式
+新聞 queue 寫入；正式 owner 尚未載入此修改。
+
+## 10/29 維護期間：59 頁的其他回應版本
+
+對下節 59 頁之前找到的不同請求原件，取出 **1,753 個不同文章 head**，
+在其 **89 個目前 head 對應的已登記批次**中找「同請求、不同回應
+雜湊」的版本；[離線結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_59_alternate_head_versions_20261029.json)
+為 89 批均讀取、0 候選、0 批次錯誤。報告輸入雜湊與計數已另行讀回；
+亦以另一筆有真實收據的原件和人工不同雜湊驗證候選判斷與原件讀取。
+當時僅覆蓋目前 head 批次，其他已登記舊批次的後續結果見上節；即使
+找到較新的不同版本，也不能直接當成舊頁當時的原始回應。沒有來源請求或正式
+queue 寫入，59 頁仍需相應證據或維護後由既有 owner 處理。
+
+## 10/29 維護期間：59 頁的全部已登記批次查證
+
+承接下方六個鉅亨來源範圍中尚無相同請求證據的 **59 頁**；這不是全站
+缺文數，也不是先前已掃描的 854 組。對停機資料庫的所有 **223,582 個
+已登記正文批次**逐一讀取 metadata，查找每頁精確的原始請求與回應雜湊：
+[結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_59_full_registered_batch_scan_20261029.json)
+為 **0 個候選、0 個批次讀取錯誤**，用時 277.168 秒。掃描前先以一筆
+已驗證的不同頁面及其真實收據做正向測試，確認相同請求與回應可被
+找出；[執行進度與最終結果](../artifacts/operations/agent-workflow/runs/news-cnyes-59-full-registered-20-20261029T122204-538834eb/run.log)
+保留，報告輸入雜湊及筆數亦已獨立讀回。
+
+此結果只說明當次已登記批次的 metadata 沒有相符候選，不能排除其他
+位置、未登記檔案或來源日後的回應。掃描持既有 owner 鎖、檢查資料庫
+及 sidecar、逐檔比對讀取前後身分；其他不遵守鎖的程序仍可能在檔案
+讀取後修改它，因此不宣稱整個檔案系統是單一凍結快照。搜尋時不向
+發布者發請求，也沒有寫入正式新聞 queue；新版 owner 未載入，這 59 頁
+仍未恢復。下方已確認的 38 頁原件及其優先清單不受影響；維護結束後
+由既有 owner 按原本來源期限及本機盤點機制處理其餘待驗頁面。
+
+新聞 service 與 timer 保持停機；TEJ Smart Wizard 服務及 API timer
+依使用者確認可運作。服務為 active 只代表啟動狀態，不代表資料已抓齊。
+
+## 10/29 維護期間：舊游標之後接收批次的頁面恢復
+
+隔離佇列重現了兩個可能遺漏本機核驗的情況：舊的非零頁面及批次
+盤點已經完成，之後才接收相同請求的正文批次；或者重啟時先恢復
+已落盤、尚未提交的收據，而該批次不在舊批次游標尚會走過的範圍。
+兩種情況都會登錄候選，但原程式未必安排對應的頁面核驗。這是受控
+測試重現的邊界，**沒有證據說正式停機前已發生**。
+
+[既有鉅亨歷史 owner](../downloader/news_fulltext_cnyes_history.py)現在在
+正常批次提交後，針對已走過的頁面喚醒本機候選核驗；若是在完整
+歷史表遷移前恢復孤兒收據，則在同一接受交易保留本機批次重試。
+未開始的掃描及游標尚會訪問的路徑繼續交給原掃描，避免多做一次
+批次讀取；已存在的重試期限與次數不重設。未知版本游標仍保留並
+維持等待。來源工作原有的錯誤、429、期限與正文均不因喚醒而清除；
+候選仍須核對實際請求、原始回應、來源授權、收據與取得時間。
+
+[針對性測試](../test/test_news_cnyes_late_committed_batch.py)涵蓋游標
+前後、新舊資料表、第二次中斷、交易回滾、來源退避、錯誤授權及
+不同請求的相同內容；最新結果為 12 項通過。
+[共用回歸](../artifacts/operations/agent-workflow/runs/news-late-committed-regression-2-20261029T121509-269d35c7/run.log)
+通過 815 項；其測試範圍與新增測試重疊，不能相加。
+[真實原件隔離測試](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_late_orphan_real_fixture_20261029.json)
+從下節已找到相同請求的 38 頁選取三個範圍各一頁，複製原始批次
+與收據到私人佇列，先完成無批次盤點，再模擬孤兒收據接手；三頁
+均經本機核驗恢復，並在再次重啟後讀回。夾具初始無批次盤點曾
+調整三個複製工作的期限及 ETag；此後的恢復與讀回均保留調整後的
+夾具狀態，因此不能說這三個欄位在整個測試中與正式快照一致。
+
+新聞服務與 timer 維持停機，以上沒有來源請求或正式佇列寫入。
+停機快照中批次索引與非零頁面盤點均尚未開始，批次本機重試表也
+尚不存在；新版尚未由正式 owner 載入。這三頁不是下節仍未取得
+相同請求證據的 59 頁，也不是正式下載進度或全歷史完成證明。
+
+## 10/29 維護期間：鉅亨其餘 59 頁的本機證據
+
+下節的 38 頁相同請求成功樣本，其保留批次的取得時間比舊頁面紀錄
+早約 0.04–0.35 秒。因此，以頁面紀錄前後時間為**搜尋線索**，對其餘
+59 頁核對附近已登記正文批次的 metadata。前後五秒掃描 373 個批次；
+[前後五分鐘](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_six_scope_timestamp_batches_300s_20261029.json)
+掃描 8,077 個批次，涵蓋前者，均沒有找到相同請求與回應雜湊的候選，
+也沒有檔案讀取錯誤。批次檔名時間只能縮小搜尋範圍，不能推論其他
+時間或尚未登記的檔案一定沒有原件；全庫已登記批次索引仍須繼續。
+
+對這 59 頁現有的**不同請求**原件，核對其收據、授權、實際請求及
+回應雜湊後，得到 1,753 個不同的可解析公開正文；其正文雜湊與目前
+文章 head 一致。head 指向的 89 個已登記批次另經完整收據、批次
+雜湊、正文和原始回應驗證，1,753 個 head 均能在指向的批次中找到
+身分、取得時間、授權及正文雜湊相符的紀錄；見[離線對帳](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_59_legacy_body_and_witness_v2_20261029.json)。
+這證明快照中的正文可讀，並非 1,753 篇新增下載，也不能證明目標
+頁面的原始請求身分、目標範圍完整，或當時的 head 歷史狀態。舊
+佇列沒有新版頁面見證表，且這 59 頁的解析指紋與現行版本不同；
+不能把相同回應內容當成相同請求。
+
+此次只讀本機快照，沒有發布者請求、正式佇列寫入或正式恢復。新聞
+服務及 timer 維持停機；TEJ 可以運作。後續要由既有 owner 繼續全庫
+已登記批次索引與來源頁面驗證，完成時間目前無法可靠預估。
+
+## 10/29 維護期間：17 個跨範圍鉅亨原件的正文與來源頁
+
+對下節尚未能證明目標範圍完整的 17 份原始回應，沿用實際收據、原件
+雜湊、來源授權及既有正文解析器做[唯讀對帳](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_17_body_triage_v6_20261029.json)。
+它們包含 478 個回應列、376 個去重文章 ID；其中 356 個 ID 的原回應
+有可解析正文，其正文雜湊與目前 head 的正文雜湊相同。這次沒有重新
+讀取 356 個 head 指向的正文檔與入庫收據，因此不把索引雜湊相同說成
+356 個完整耐久鏈已重新驗證或新下載的文章。
+
+剩下 20 個去重 ID 在這些回應中均未提供正文，目前 head 均為先前的
+`source_article_empty_template`。它們全部已出現在較早的 25 份
+[來源原件覆核](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_source_only_final_20261029.json)，
+其中 7 個也有其他同請求原件的缺文結果；本次沒有重複執行該全量稽核。
+這只說明已保存的所選回應沒有提供正文，不能推定其他來源回應或未來
+版本一定沒有全文。先前的有限診斷記錄不含這 20 個網址，但這不證明
+它們沒有任何其他種類的原件。
+
+17 份原件實際屬於 6 個較寬的來源範圍，這些範圍在停機快照中各自
+沒有新版頁首；其來源工作、既有清單證據及原始回應符合現行非零頁面
+盤點的候選條件。每個來源範圍都跨多頁，所以單頁 ID 相同仍不足以
+證明較窄的目標範圍完整。
+[六個範圍的唯讀盤點](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_6_source_scopes_originals_v5_20261029.json)
+涵蓋來源所列的 125 頁：28 頁找到請求身分相符的直接原件，包含上述
+17 頁；其餘 97 頁的直接候選記錄不同日期範圍的實際請求，雖有相同
+頁面 ID 和總數，仍不能當成這 97 頁的直接原件。已接受正文批次尚未
+完成候選索引，因此這 97 頁不等於必須重新請求的頁數。
+[有界本機批次對帳](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_six_scope_head_batches_20261029.json)
+只循這 97 頁的文章找目前 head 指向的已接受批次：2,004 個文章 head
+指向 95 個批次，其中 38 個批次分別保存 38 頁的相同請求和回應雜湊，
+批次登記、收據、檔案雜湊、授權與原回應均通過核對。這不是對所有
+已接受批次或全部文章歷史的掃描，其餘 59 頁仍可能在舊批次找到原件。
+
+為避免這 38 個已知候選排在全庫批次掃描之後，新增只含本機批次路徑的
+[雜湊固定優先清單](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_accepted_batch_priority_20261029_v1.json)。
+它只將目前仍登記的批次交給既有本機索引及原件核驗，不作來源請求、
+不把提示當成成功，不覆寫既有本機重試期限，也不變動來源限制。
+清單可在重啟後續用；路徑、清單雜湊、來源與授權識別不符時，優先
+提示停用，正常的全量索引仍保留。後到的新候選現在會喚醒等待該全量
+索引的同一請求及相同雜湊工作，舊重試先保存；不符的候選會回到
+原本的索引等待，不會提前放行來源重查。
+[優先排程的隔離實物測試](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_6_scopes_priority_fixture_v3_20261029.json)
+以實際原件及 38 個正文批次建立私人佇列，刻意阻塞全量批次索引：
+優先工作先核對 38 頁，加上 28 個直接原件共恢復 66／125 個來源
+查詢頁；其餘 59 頁保持等待本機全量索引。125 個來源工作的原錯誤、
+拆分控制和期限均未更動，沒有來源請求或正式佇列寫入。這是頁面
+證據的離線測試，不是正式網站已抓取的新增正文，也不能推算正式
+節省的請求數或整體完成時間。
+[125 頁隔離實物測試](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_6_source_scopes_fixture_20261029.json)
+以既有 owner 恢復 28 頁，97 頁保持請求不符，125 個工作原有的錯誤
+及拆分控制不變；28 個成功頁也未改變原來源期限。此夾具沒有匯入
+已接受正文批次，測試中安排的 97 個後備重查不能拿來預測正式請求數。
+[隔離實物測試](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_17_source_restore_real_20261029.json)
+只複製這 17 個來源頁及相應目標頁，以現有 owner 分別測試「先查目標」
+和「先盤點來源」兩種順序：兩種情況均恢復 17 個原始查詢頁、保留
+其實際取得時間，17 個目標頁仍標記待驗且安排原頁重查；來源工作的
+原期限及兩側既有失敗控制均保留。這個夾具並未包含各來源範圍的所有
+頁面，不代表六個範圍或目標歷史已完成。
+
+新聞服務及 timer 按維護要求仍停止；此次沒有來源請求、正式 queue
+寫入或新增正文。現行非零頁面盤點尚未由正式 owner 載入，正式候選
+能否實際恢復、目標頁重查與完成時間都須在維護結束後驗證；TEJ 服務
+及 API timer 目前為啟動狀態。
+
+## 10/29 維護期間：鉅亨原件循環參照與進度
+
+承接下節的 25 組，8 組的原始請求頁首其實存在，但指向目標頁的
+間接參照，沒有原始請求自己的觀察。下載器現可在核對同日、兩頁
+身分、來源收據、原始檔及各自的時間後，從保留的真實原件建立原始
+觀察並修復參照；真實取得時間和兩頁各自的最後確認時間分別保留。
+原件、舊觀察、舊參照與原件請求不符事件仍保留。稽核若先遇到間接
+頁面，也會先檢查可恢復的直接頁面，避免自己建立的待驗證標記阻擋
+修復；同一輪稍後遇到已處理頁面時不再產生不必要的重試。
+
+原本面板會把修復造成的頁首更新算作「頁首已變更」，導致本機核驗
+進度低估。現在將前後頁面版本和封存事件在同一交易記錄，進度快照
+以第 2 版分類「已建立頁面 ID 證據」，只有目前頁首與事件、來源及
+頁面參照仍能對應、事件雜湊和儲存的頁面證據一致、沒有待驗證標記
+才列入；異動或損毀時回到「頁首已變更」。第 1 版舊快照沒有這個
+分類，面板顯示未知。進度仍以頁面
+版本為單位，不是文章篇數、正文完成率或完整歷史完成率。統計時
+不重新讀取原件或驗證完整觀察，後續損毀由既有本機巡檢發現。
+
+[合成成本量測](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_progress_utf8_benchmark_20261029.json)
+在記憶體 SQLite 放入 854 個已恢復的頁面版本，ABBA 各執行 25 次：
+目前核驗統計約 16.82–21.04 毫秒 CPU／次，舊的簡化統計約 0.74–0.99
+毫秒／次；舊方法不檢查新證據，兩者不具相同語義。這是驗證帶來的
+成本，不是速度提升；正式 owner 目前約每 15 秒寫入一次狀態，實際
+磁碟、整個狀態寫入及下載吞吐量仍須在正式恢復後量測。[前一版本](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_progress_digest_benchmark_20261029.json)
+及[更早版本](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_progress_benchmark_20261029.json)
+的測量均保留，未覆蓋其結果。
+
+在[私人隔離佇列](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_equal_day_real_cycles_priority_20261029.json)
+透過實際設定的優先清單處理 8 組，16 個頁面版本均建立證據；來源
+原件、正式佇列和來源工作的冷卻未改動，也沒有來源請求。854 個提示
+中的其餘 846 個在這個只匯入 8 組的測試佇列中找不到，**不能**用作
+正式缺口或完成數。原先 829 組也已用新程式在[隔離環境逐筆重驗](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_equal_day_real_cohort_20261029.json)，
+均建立頁面 ID 等價，沒有正式佇列寫入或來源請求。
+
+其餘 17 組的原件屬於較寬的來源日期範圍，缺少該請求的直接頁首；
+文章 ID 相同仍不足以證明目標範圍完整。停機快照中它們的原目標頁
+均有正常且排在未來的來源工作。[隔離全鏈路測試](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_17_real_schedule_20261029.json)
+顯示既有優先清單會先標示 17 組原件請求不符，本機候選核對後安排
+17 個原頁重查，保留舊頁首及待驗證標記；錯誤次數、錯誤碼及拆分
+狀態不變。正式執行仍取決於維護結束後的實際狀態、來源和冷卻。
+
+新聞服務及 timer 仍維持停機，上述修復與進度分類尚未在正式 owner
+套用，無法據此估計全歷史或全文完成時間；TEJ 運作許可不改變新聞
+的停機狀態。[共用歷史下載器、原件核驗與網頁回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-utf8-contract-regress-20261029T113826-f02b82b2/run.log)
+共 1,173 項通過，包含桌機與手機的離線瀏覽器顯示；不等同正式網站
+或恢復後的下載驗收。完整程式、測試與快照均保留於本機工作區。
+
+## 10/29 維護期間：鉅亨同來源日的請求不符
+
+停機快照的 854 組不符是頁面觀察與原件請求的關係，不是 854 篇新聞。
+舊保存路徑以回應雜湊命名，同內容的兩個來源請求可能共用第一個請求
+的原件。對全部 854 組[重新核對原件、收據及頁面資訊](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_equal_day_mismatch_audit_20261029.json)：
+829 組具有同來源日、同頁及相同文章身分等條件；另 8 組缺少可直接
+引用的原始請求觀察，17 組來源日不同，後續檢查詳見上節。
+[25 組的後續本機檢查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_25_remaining_mismatch_triage_20261029.json)
+顯示原件的非空文章清單都與目標頁一致，但均沒有可直接引用的原始
+請求觀察；其中 17 組的來源日不同。這些條件仍不足以套用現行同日
+引用契約，不能只憑內容相同就宣稱修復。
+原件保存時間和後續紀錄時間在本次樣本相差 0 至約 55 分鐘，不能要求兩者字串相等；
+[時鐘檢查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_equal_day_mismatch_clocks_20261029.json)
+分別保留這些時間，也不把後來的原件冒充較早的請求。
+
+[鉅亨原 owner](../downloader/news_fulltext_cnyes_history.py)現在只在舊原件
+確為不同請求時，重新驗證原件雜湊、收據、來源權限、完整查詢參數、
+來源日、每篇身分及原始頁清單，才按既有契約建立**頁面 ID 等價**。
+舊觀察、目標頁原時間、舊標記和兩個真實來源時鐘均可追溯；來源
+429、失敗和期限不會因此重設。即使來源日超過 30 頁，可驗證的單頁
+仍可沿用，但整日的超額缺口保留，不能據此宣稱全日、正文或歷史
+即時版本完整。快取只保留有大小界限的小原件，仍重新驗證檔案雜湊。
+
+以保留原件的私人複本建立隔離佇列，對 829 組候選[逐筆實跑並讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_equal_day_real_cohort_20261029.json)，
+829 組均保留目標時間並建立等價頁面，沒有來源 HTTP 或正式佇列寫入。
+這是隔離資料的結果；正式服務仍須在維護結束後逐筆重新驗證採用。
+[相關回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-equivalence-final-20261029T110447-323530ea/run.log)
+847 項通過；另外 [14 項聚焦測試](../test/test_news_cnyes_equal_day_recovery.py)
+涵蓋頁數超額、重開、來源冷卻、內容或身分不符、其他標記和交易回滾，
+兩組範圍有重疊。
+
+第一次隔離樣本誤用了硬連結，雖未寫入來源內容，但改變了 32 份原件
+及其 32 份收據的檔案中繼時間，原[測試失敗紀錄](../artifacts/operations/agent-workflow/runs/news-cnyes-equal-day-real-sample-20261029T110141-f0b69ca2/run.log)
+保留；隨後改用雜湊核對的複本，829 組的目前來源內容及收據已重新驗證。
+因舊證據也依賴檔案中繼時間，[舊報告鏈讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-historical-chain-rech-20261029T110555-6ee97c34/run.log)
+現在只能直接沿用 822 組不符診斷，32 組需要新的檔案身分證據；不得
+把舊的 854 組可沿用數當成目前結果。[32 份補充唯讀證據](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_ctime_32_fresh_witness_20261029.json)
+分別比對舊報告保存的原件雜湊與目前原件，均相同，也驗證目前收據與
+原件一致；舊報告沒有固定收據自身的雜湊，因此不宣稱收據位元組與
+當時完全相同。補充證據沒有改寫舊報告鏈，正式 owner 採用時仍會逐筆重驗。
+新聞服務與 timer 照維護要求停用；TEJ Smart Wizard 服務和 TEJ API
+timer 保持運作，服務狀態本身不代表其全部資料已完成。
+
+## 10/29 維護期間：新頁面接手前保存損毀標記
+
+下節只保證先被範圍稽核發現的損毀標記會被保存。針對尚未經過稽核
+的標記，[隔離故障注入](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-write-red-20261029T104139-c16ed4c0/run.log)
+重現新頁面、相同頁面別名及不同頁面別名接手時，舊程式會先移除或
+取代標記，導致損毀原值消失。這是隔離情境，不表示停機快照曾有
+同樣的損毀。
+
+[歷史下載器](../downloader/news_fulltext_cnyes_history.py)現在在這三條
+路徑共用標記處理：無法辨識的值先以精確內容、範圍及頁碼封存，再於
+同一交易移除；封存鍵已存在但內容不符時，保留原標記及未完成狀態。
+正常標記仍依既有來源證據規則處理。原件巡檢、較舊原件重放和本機
+工作結束後的檢查也能處理損毀或過深的標記，不因此抹除來源 429 的
+期限。[45 個聚焦情境](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-select-cases-20261029T104450-54e592d4/run.log)
+通過，涵蓋 BLOB、錯誤結構、三種接手、封存衝突及交易回滾。
+完成更新後的[歷史、原件、優先工作與共用恢復回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-write-regressi-20261029T104627-94baf8bc/run.log)
+共 **842 項通過**；與聚焦情境有重疊，不可相加。
+
+正常沒有標記時，先以索引讀取可避免無謂的刪除，也不依賴 SQLite
+`RETURNING`。在隔離記憶體 SQLite 中，對 30,000 次操作做 ABBA 比較：
+標記比例 0% 時先讀取需 0.039–0.041 秒，`DELETE ... RETURNING` 需
+0.071–0.077 秒；1% 時分別為 0.033–0.036 秒與 0.069–0.088 秒。
+[量測](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-removal-abba-20261029T104528-bd4bef5f/run.log)
+也包含 100% 的情況。這不包含正式磁碟耐久寫入、來源請求或完整
+下載流程，不能用來推算實際下載速度。
+
+此次沒有改動原件內容讀取器，已依精確程式雜湊重新審核舊版內容
+證據的相容性。[16 份既有報告的唯讀鏈檢查](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-write-chain-20261029T104729-aef95493/run.log)
+仍讀回 73,644 個觀測鍵及 854 組請求不符；因仍有未解問題而以非零
+結束。這 854 組不是新聞篇數，也沒有因本次離線修正而完成。
+新聞服務與 timer 仍依使用者維護指示停止，新程式尚未由正式 owner
+載入；TEJ 可運作。尚未發出新聞來源請求或寫入正式佇列，實際來源
+結果、全量進度及完成時間仍需維護後驗證。
+
+## 10/29 維護期間：損毀的鉅亨未證明標記
+
+[隔離故障注入](../artifacts/operations/agent-workflow/runs/news-cnyes-corrupt-marker-red-20261029T103626-43f49871/run.log)
+重現未證明頁面標記無法解析時，該次範圍重建會直接因 JSON 例外
+中斷。停機快照先前查到標記表為空；這項測試不代表正式資料庫已
+發生相同損毀。
+
+現在範圍重建遇到無效標記時，先以原值和精確雜湊保存本機稽核
+紀錄，將該頁維持待查證，並依既有來源工作狀態安排一次原始頁
+檢查；來源已失敗或受 429 限制時，原期限和錯誤不變。封存衝突時
+維持未完成並不由此路徑加速來源檢查。已偵測的損毀標記之後即使
+被新的真實來源回應取代，原值仍有本機稽核紀錄。
+
+[28 個隔離情境](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-restart-confli-20261029T103943-4bbf3a99/run.log)
+通過，涵蓋損毀 JSON、錯誤結構、非有限數值、深度過大的資料、
+429、重複重建、重啟、封存衝突、交易回滾，以及下節的原始頁版本
+接手。相關[範圍、原件、共用排程及讀回回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-scope-regressi-20261029T103803-3b1a08b6/run.log)
+**824 項通過**；測試範圍有重疊，不能相加。稍後的正確來源回應是
+測試模擬，沒有發出新聞網站請求。正式 owner 尚未載入此程式，實際
+來源回應、正式收據及完整進度仍待維護結束後驗證。
+
+## 10/29 維護期間：鉅亨別名先發現問題後，原始頁的修復接手
+
+[隔離佇列重現](../artifacts/operations/agent-workflow/runs/news-cnyes-late-direct-red2-2026-20261029T102945-1591438f/run.log)：
+當原始頁暫時不存在，別名頁先發現同一觀測的原件請求不符並記錄
+事件；原始頁稍後恢復時，舊程式可能因事件已存在而不安排原始頁
+核驗。這是故障注入證實的程式缺口，不代表正式停機快照中的 854 組
+都發生過這種時序。
+
+[歷史下載器](../downloader/news_fulltext_cnyes_history.py)現在將
+「觀測事件」與「原始頁修復接手」分開記錄。真正的原始頁出現後，
+原 owner 以交易保存一次接手紀錄，依既有工作版本安排本機核驗；
+既有相同的終結結果不會因重啟而無條件反覆排回。若較舊工作尚未完成，先保留
+其處理次序與結果，再接續新的原始頁；其他原因的未證明標記也不會
+被新的紀錄覆寫。來源 429、已設定的截止時間與原始收據不會被此
+修正清除；模擬來源稍後返回正確原件時，仍須按其請求、授權及雜湊
+核驗，舊的錯誤原件留有稽核紀錄。
+
+[16 個隔離情境](../artifacts/operations/agent-workflow/runs/news-cnyes-direct-final-cases-20261029T103515-1033bd8d/run.log)
+涵蓋請求與授權身分不符、其他未證明標記、既有工作版本、重啟和
+限速等待；另有[鉅亨歷史、原件、優先排程、收據與多來源共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-direct-regression-20261029T103343-71d677e4/run.log)
+**780 項通過**，兩組範圍重疊，不可相加。以上不含對新聞來源的
+實際 HTTP 或正式下載服務驗收。
+
+本次相關變更包含修復派工、損毀標記處理及本機版本銜接，未改動
+觀測解碼或原件內容驗證；舊報告唯讀相容性依精確程式雜湊重新審核。
+既有[16 份報告鏈讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-marker-chain-readback-20261029T103816-da510527/run.log)
+仍為 73,644 個觀測鍵、854 組請求不符；工具因未解問題回傳非零，
+不能把離線讀回說成修復完成，也不能拿舊報告直接以新版程式續掃。
+
+新聞服務與 timer 仍依維護指示停止，新程式尚未由正式 owner 載入。
+未呼叫新聞來源或寫入正式佇列；維護結束後需要由原 owner 執行、
+讀回資料與收據，才能評估實際完成進度及 ETA。TEJ 服務可運作。
+
+## 10/29 維護期間：owner 啟動失敗的鎖與停機面板驗收
+
+檢查恢復路徑時發現，原先只對部分初始化階段釋放 owner 鎖；若
+SQLite 開啟、已接受批次索引、鉅亨歷史或公開索引初始化失敗，呼叫
+端仍保留例外追蹤時，下一次啟動可能誤判「已有 owner」。隔離測試
+[修正前重現四種情況](../artifacts/operations/agent-workflow/runs/news-startup-failure-lock-red-20-20261029T102239-2b4f18b0/run.log)；
+這不是目前停機中的正式 owner 已發生這些故障的證據。
+
+[共用佇列](../downloader/news_fulltext_queue.py)現在由同一入口處理
+所有初始化例外；即使清理階段出錯，也按順序嘗試關閉讀取器、SQLite
+連線和 owner 鎖，保留原始啟動錯誤並附上清理錯誤類型。資料庫未提交
+工作依 SQLite 交易語意回滾；不重設來源錯誤或重試期限。[測試](../test/test_news_acceptance_recovery.py)
+涵蓋保留例外追蹤、一般例外與中斷、資料庫未開啟、部分清理失敗、
+已保存收據與正文、交易回滾和重新取得 owner。其餘共用下載器、有限
+批次、生命週期、鉅亨優先與多來源排程的[回歸](../artifacts/operations/agent-workflow/runs/news-startup-owner-regression-20-20261029T102410-8238a3ab/run.log)
+**310 項通過**；新增清理順序測試後的[收據與恢復回歸](../artifacts/operations/agent-workflow/runs/news-owner-cleanup-followup-2026-20261029T102503-202c7247/run.log)
+**81 項通過**，兩組測試範圍重疊，不能相加。另對 metadata 讀取、
+鉅亨歷史原件和收據路徑的[延伸回歸](../artifacts/operations/agent-workflow/runs/news-owner-resource-regression-2-20261029T102603-de6971eb/run.log)
+**831 項通過**。
+
+原有程式在正式 owner 下次啟動時會為鉅亨頁首及待處理表建立兩個
+此前缺少的索引。本次在排他鎖與空 sidecar 下，只讀取停機快照的
+75,347 筆頁首、5,520 筆工作與 SHA 固定的 854 個優先觀測，在私人
+記憶體 SQLite 中[量測](../artifacts/operations/agent-workflow/runs/news-cnyes-resume-index-measure--20261029T102126-196bd71a/run.log)：
+兩次無索引查詢為 8.03／13.74 秒，有索引為 5.97／4.96 毫秒，四次
+結果一致，找到 862 個頁首引用；此計數不是文章數。兩個索引在該
+副本分別用約 0.143／0.009 秒建立，邏輯頁面約 13.4／1.4 MiB。
+這不含正式磁碟、耐久寫入或整個 owner 啟動，不能推算正式恢復時間；
+正式佇列尚未建立這兩個索引。
+
+另一份[停機快照檢查](../artifacts/operations/agent-workflow/runs/news-all-unproven-overlap-202610-20261029T101739-fdcc2b16/run.log)
+發現整張舊的未證明頁面標記表在該時點有 0 筆，因此 854 個優先觀測
+沒有與既有標記重疊；這不是原件驗證，也不代表那些觀測已修復。
+
+本機正式網站的[只讀瀏覽器檢查](../artifacts/operations/agent-workflow/runs/news-stopped-dashboard-gzip-2026-20261029T102445-c4fb242d/run.log)
+確認桌機與 320 像素畫面均顯示下載器停止、全量 ETA 未知；頁面
+JavaScript 與工作區版本一致。網站來源快照仍是 **10/28 07:44:25
+臺北時間**，不能當作現在的下載進度；狀態 JSON 原文約 3.99 MB，
+本機 gzip 傳輸約 130 KB。此驗收沒有讀取正文或請求新聞網站，也未
+證明停止的下載 owner 已載入新程式或 854 個觀測已完成。
+
+新聞服務與 timer 繼續依維護指示停止，沒有啟動、來源請求或正式
+佇列寫入；TEJ 歷史服務與 API timer 可運作。維護結束後仍須由原
+owner 建立索引、處理優先觀測、取得來源與耐久收據，再驗收正式
+進度及完成時間。
+
+## 10/29 維護期間：鉅亨優先觀測的後續頁面與單次執行等待
+
+隔離佇列重現：優先計畫掃過一筆觀測後，既有流程可能再將同一
+觀測引用到另一個頁面；舊的一次性掃描不會把後加入的頁面排入
+本機原件核驗。這是[可重現的程式缺口](../artifacts/operations/agent-workflow/runs/news-late-cnyes-alias-red2-20261-20261029T100027-4ab7233a/run.log)，
+不是正式資料庫已發生漏排的證據。
+
+現在仍由原有單一 owner 處理：有限的 SHA 固定計畫登記觀測監看，
+新頁首與待處理紀錄在同一 SQLite 交易寫入；已掃描的目標出現新
+頁面時喚醒原 owner，以有界時間片補登核驗。舊結果、重試次數及
+期限沿用，不改動來源 HTTP 工作或 429 期限；回滾不會留下獨立
+的待處理紀錄。舊版游標與停用後重新啟用會保存原游標並有界重掃，
+未知監看項目或無法辨識的紀錄保留證據並阻擋，避免宣稱完成。
+隔離測試涵蓋完成掃描後新增頁面、游標之前的頁面、重啟、回滾、
+停用再啟用、舊版升級、缺少監看、未知紀錄及來源退避保留。
+
+本機回補剛新增頁面時，即使沒有網路請求，原 owner 也會繼續處理
+而非直接進入閒置。另一方面，單次診斷模式不處理這個優先計畫，
+現在也不會因其喚醒旗標反覆忙等；此情況的[修正前測試](../artifacts/operations/agent-workflow/runs/news-late-alias-oneshot-poll-red-20261029T101141-e2068361/run.log)
+可重現空轉，[修正後的優先計畫與多來源合作測試](../artifacts/operations/agent-workflow/runs/news-late-alias-oneshot-green-20-20261029T101157-711cd7ac/run.log)
+**64 項**通過。
+
+[面板](../services/news_dashboard/app.js)將進度明確標為觀測掃描，
+不是文章下載或修復完成率；即使游標已掃到末端，只要仍有後續
+頁面待安排，也不顯示核驗完成。[面板與桌機／手機瀏覽器測試](../artifacts/operations/agent-workflow/runs/news-late-alias-browser-20261029-20261029T100628-dc80b2e9/run.log)
+**197 項**通過；最後修改後的[鉅亨／多來源排程回歸](../artifacts/operations/agent-workflow/runs/news-late-alias-postfix-regressi-20261029T101219-47b7e029/run.log)
+**480 項**通過。測試範圍可能重疊。
+
+[私人記憶體 SQLite 量測](../artifacts/operations/agent-workflow/runs/news-late-alias-trigger-cost-202-20261029T100733-d5070cde/run.log)
+使用 8,192 次頁首寫入、854 個監看觀測及 82 個新增符合頁首；
+不含觸發器的 CPU 為 14.35–14.66 毫秒，使用新觸發器為
+32.11–47.17 毫秒。兩者工作量不同：後者額外保存 82 筆待處理。
+另一種觸發條件的結果有波動，未證明整體較快，因而沒有採用。
+此測試不含正式 owner、磁碟耐久寫入或來源 HTTP，不能推論下載速率。
+
+新聞服務及計時器仍依維護指示停止；未向新聞網站發請求或寫入
+正式新聞佇列，新程式及網站尚未由正式服務載入與驗收。TEJ 歷史
+服務為運行中，TEJ API 計時器為等待中；這是服務狀態，不能作為
+TEJ 資料完整的證明。鉅亨實際原件核驗與其他來源回補仍須維護結束
+後依收據確認，整體完成時間目前未知。
+
+## 10/29 維護期間：鉅亨優先游標的計數一致性與自動恢復
+
+隔離佇列重現三種游標：格式符合 v1，但已處理且非過期的觀測數，
+多於曾登記的頁面數；或頁面游標已前進，但沒有登記過頁面。舊判斷
+仍可能顯示計畫完成，跳過應核驗的提示。這是故障注入找到的程式
+缺口，不代表正式資料庫已出現相同問題。
+
+[優先提示處理](../downloader/news_fulltext_cnyes_priority.py)現在先檢查
+這項數量不變量。只對可辨識的 v1 計數矛盾，在同一交易封存原始
+游標，從 SHA 固定的原清單重新安排；停止或交易失敗不會只保存
+其中一半。已核驗結果沿用，不重排已完成的本機核驗；原件仍無法
+驗證而遺失的本機重試會重新登記，既有本機重試期限與次數不變。
+舊頁首恢復為目前頁首時重新安排核驗。未能辨識的版本與封存證據
+衝突維持阻擋並保留原值，不猜測其格式。來源 429、探索工作的
+期限、原始收據及 HTTP 排程均不由這個修復重設。
+
+[新聞面板](../services/news_dashboard/app.js)將封存衝突顯示為明確
+原因，並將「已有重試」改為「已有核驗或重試」，避免恢復期間把
+沿用的已核驗頁面誤說成重試。隔離測試涵蓋重啟續跑、已完成項目
+沿用、未驗證項目補登、舊重試期限、已變更頁首、停止、交易回滾、
+封存衝突及未知版本。[鉅亨／多來源回歸](../artifacts/operations/agent-workflow/runs/news-priority-cursor-recovery-fi-20261029T095329-620ab395/run.log)
+**441 項**、[面板與桌機／手機瀏覽器回歸](../artifacts/operations/agent-workflow/runs/news-priority-cursor-dashboard-2-20261029T095224-cd6eb8fc/run.log)
+**197 項**通過；測試範圍可能重疊。這次修改未做同條件下載吞吐
+比較，不宣稱下載加速。
+
+臺北時間 17:50 的[排他鎖與空 sidecar 唯讀檢查](../artifacts/operations/agent-workflow/runs/news-priority-counter-readback-2-20261029T095010-06ce3355/run.log)
+確認清單有 **854 個觀測提示**，正式資料庫當時尚無此計畫游標與
+追蹤表；[16 份既有報告的獨立讀回](../artifacts/operations/agent-workflow/runs/news-priority-counter-chain-2026-20261029T095010-9bbd1790/run.log)
+仍有 **854 組未解請求／回應／原件不符**，這些不是 854 篇新聞。
+檢查沒有向新聞來源發請求，也沒有寫正式佇列。新聞服務及計時器
+依維護指示維持停止；新下載程式尚未由正式 owner 載入，面板修改
+僅完成離線驗證，正式網站尚未驗收。TEJ 服務則維持運行。鉅亨實際
+核驗與其他來源回補仍須維護結束後按來源及
+耐久收據驗收，全歷史完成時間目前未知。
+
+## 10/29 維護期間：鉅亨批次索引與優先核驗的時間片取捨
+
+先沿用已完成的 223,582 批定點掃描；該掃描沒有保證全程檔案系統
+快照，仍不能代替正式 owner 的批次索引圍籬。這次只取當時登記路徑
+最前及最後各 256 批、共 55,841,397 bytes，在 owner 排他鎖與空
+WAL／journal 下讀到私人 tmpfs 副本；逐檔讀前後核對身分及大小，
+主資料庫與 sidecar 身分也未變。樣本及暫存佇列只用於離線試驗，
+沒有來源請求或正式佇列寫入；零候選是該測試佇列的結果，不能推論
+正式佇列或全部批次沒有候選。
+
+[單純批次掃描 ABBA](../artifacts/operations/agent-workflow/runs/news-cnyes-slice-abba-fixed-2026-20261029T094240-ff58e618/run.log)
+使用相同 512 個副本與私人 SQLite：將既有每輪 50 毫秒本機工作預算
+中給批次掃描的 1/8 調為 1/2，兩次總時間由 0.383／0.379 秒變成
+0.311／0.305 秒；但每輪 p95 由約 8.65–8.77 毫秒增為 26.34–26.58
+毫秒。這只包含暖 tmpfs、空的相關候選佇列及本機切片，不能外推為
+正式磁碟或網站下載速度。
+
+再加入 64 個合成優先原件，分別跑到批次與優先核驗**都完成**：
+[混合工作 ABBA](../artifacts/operations/agent-workflow/runs/news-cnyes-slice-both-complete-2-20261029T094358-1f984cb0/run.log)
+顯示固定放大時間片的總時間雖由 0.780／0.669 秒變成 0.623／0.569 秒，
+64 個優先核驗完成時間卻由 0.384／0.329 秒延至 0.623／0.569 秒；
+每輪 p95 也由 16.26–18.98 毫秒升至 42.59–47.63 毫秒。因此沒有採用
+固定放大。測試沿用各來源工作，保留 429 的原期限及次數；這些
+合成原件完成不代表正式 854 個原件已修復。
+
+[條件式候選 ABBA](../artifacts/operations/agent-workflow/runs/news-cnyes-slice-adaptive-202610-20261029T094445-5cabee2c/run.log)
+僅在合成優先核驗與可立即執行的本機復原工作均不等待時放大時間片，
+並額外加入四個合成本機復原；四次均保留原 429 工作且四筆復原。
+候選兩次總時間 0.471／0.494 秒，基線 0.540／0.804 秒，但基線兩次
+波動大，候選每輪 p95 約 26.52–29.16 毫秒，基線約 15.38–16.49
+毫秒；這些數字不含真實 HTTP 派工與多來源壓力。條件式方法僅留作
+候選，沒有修改正式下載器。相關測試程式分別為
+[單純掃描](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_batch_slice_20261029.py)、
+[混合工作](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_batch_slice_mixed_complete_20261029.py)
+與[條件式候選](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_batch_slice_adaptive_20261029.py)。
+首次測試夾具誤移除已審閱的端點清冊而被政策拒絕；保留該清冊後重跑
+成功，原失敗收據仍保存。
+
+新聞服務及計時器繼續依維護指示停止，TEJ 可以運作。正式 owner 尚未
+載入先前離線修復，鉅亨 854 組不符、其餘來源下載與全量 ETA 仍待
+維護結束後的來源及收據驗證；不以這些離線數字宣稱正式工作完成。
+
+## 10/29 維護期間：鉅亨原件優先重試的選取與等待成本
+
+在隔離佇列中重現：優先清單和較早排序的一般本機重試都已到期時，
+舊巡檢仍只依到期時間與網址排序，優先清單不一定先被核驗。這是可
+重現的程式問題，**不是**正式停機資料庫已發生該情況的證據。
+現在既有原件巡檢會在到期的首次優先核驗與一般到期順序之間交替；
+一般順序本身仍可能選到優先項目，計畫是有限清單。原有全量巡檢
+與重試交替不變。輪次和核驗結果在同一交易保存，重啟後延續；
+優先重試不會提前更動本機到期時間或來源的 429 與其他退避。
+例行全量巡檢仍按既有排程，且可獨立檢查原件。
+
+另一個合成測試顯示，全部優先重試都尚未到期時，反覆查詢會一再
+掃描相同集合。現在同一 owner 暫存最近到期時間：新提示登記、
+核驗結果變更或程序重啟都會重新查詢。該快取只控制本機選取，
+不改變來源工作或重試時間；若資料庫交易回滾，保守失效只會多查一次。
+本機試驗含 75,000 個一般到期重試、20,000 個尚未到期優先頁，
+重複選取中位由約 **16.65 毫秒**降到 **0.0032 毫秒**；新版的
+首次檢查約 **34.53 毫秒**。兩次量測使用隔離的合成記憶體資料，
+不是交錯同場測試，也不包含磁碟耐久寫入、原件檢驗或 HTTP。
+詳見[修改前](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_retry_selection_cost_20261029.json)、
+[修改後與查詢計畫](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_retry_selection_cached_20261029.json)
+及[測試程式](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_priority_retry_20261029.py)。
+
+核心巡檢與排程回歸 **416 項**、舊原件分段與證據相容回歸 **131 項**
+通過；測試範圍可能重疊。隔離測試涵蓋優先選取、一般工作前進、
+全量巡檢前進、重啟續接、到期時間、429 保留、交易回滾與新提示
+清除等待快取。重新檢查現行
+原件讀取語義後，[舊報告鏈的獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_retry_chain_readback_20261029.json)
+仍為 16 份報告、73,644 個觀測鍵、854 個未解不符；這不是新增正文
+或本次問題已在線修復的證據。新聞服務及計時器維持停止，程式尚未
+被正式 owner 載入，完整來源下載與 ETA 仍須維護結束後驗收。
+
+## 10/29 維護期間：鉅亨優先頁面的核驗階段
+
+上一節的 854 個觀測優先清單只顯示安排進度，無法分辨頁面是否已
+嘗試原件核驗。[既有優先處理](../downloader/news_fulltext_cnyes_priority.py)
+現在為已安排的每個**頁面版本**保留核驗狀態；安排游標、重試提示與
+追蹤登記同一交易提交。原件巡檢以相同來源身分、頁面及觀測雜湊更新
+結果，並和既有原件重試狀態同一交易提交。計畫暫時停用時，已登記的
+工作若仍由既有巡檢處理，也會更新所有相符計畫；不重置來源錯誤、
+429 期限或原始收據。重複核驗得到相同結果不重寫追蹤紀錄。
+
+網頁分開顯示等待、最近核驗通過、請求或授權不符、無法驗證、不屬
+原件核驗及頁首已變更；頁首改變不當作已修復。清單全部安排且追蹤
+數量能對上時，另顯示已嘗試本機核驗的比例；這不是修復率、文章數
+或全歷史完成率。追蹤與安排數不一致時只顯示已登記部分並明示，
+不把舊計畫缺少的追蹤紀錄當成零。結果是最後一次本機檢查的紀錄，
+後續仍須依原巡檢確認原件及來源變化。
+
+停機、owner 排他鎖與空 sidecar 下的唯讀對照，854 個觀測中 **88 個**
+對應既有 `retained_invalid` 工作，**766 個**尚無對應工作；這不是
+缺文數或必須發出來源請求的數量。正式資料庫目前尚未建立新追蹤表，
+尚無這一階段的正式核驗或修復結果。新的[本機成本量測](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_stage_cost_20261029.json)
+使用實際停機快照的 854 個觀測／862 個頁面引用與隔離記憶體 SQLite：
+25 次暖查詢中位約 **2.46 毫秒**、p95 約 **4.31 毫秒**；額外檢查
+8,192 個非優先頁面的兩次查詢各約 **32.8／35.3 毫秒**，均未改動
+追蹤資料。此量測不包括完整狀態發布、耐久寫入、原件讀取或來源 HTTP，
+不代表正式下載速度或整條管線的上限。
+
+核心 owner／巡檢回歸 **411 項**、面板及手機／桌面離線瀏覽器回歸
+**183 項**、原件分段及舊證據相容回歸 **131 項**通過，範圍可能重疊。
+測試涵蓋計畫停用後復用、重開續跑、多計畫、頁首改變、原件不符、
+檔案缺失、相同結果不重寫、交易回滾及來源 429 保留。第一次新增的
+重開測試因夾具沒有鉅亨文章狀態而失敗，補齊後通過；另一測試重現
+停用計畫期間漏記核驗，修正後通過。兩組正在進行的舊版回歸在發現
+後者時主動中斷，沒有作為通過數。
+
+獨立報告鏈讀回工具原先在沒有 `PYTHONPATH` 的子程序下找不到專案；
+已修正[工具入口](../scripts/audit_news_cnyes_retained_missing_chain.py)，
+並測試由其他工作目錄直接執行。按新增狀態記錄的變更重新審查原件
+讀取器後，保留舊證據的精確身分限制；[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_priority_stage_chain_readback_20261029.json)
+仍為 **16 份報告、73,644 個觀測鍵、854 個未解不符**，沒有新增
+來源請求或正式佇列寫入。
+
+新聞服務和計時器繼續依維護要求停止；新版下載器與網頁尚未正式載入。
+維護結束後仍要由原 owner 接手、驗證實際收據與來源限制，才能回報
+實際核驗數及 ETA；其他來源和全部歷史亦未完成。TEJ 未受此變更影響。
+
+## 10/29 維護期間：鉅亨已知原件問題優先核驗
+
+先前 16 份稽核報告已定位的 **854 個觀測紀錄**，不應等待一般原件
+巡檢依序走過全部頁面才開始處理。由既有的
+[未解原件計畫](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_mismatch_sourceonly_plan_v2_20261029.json)
+產生[私人優先清單](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_original_audit_priority_20261029_v1.json)，
+固定檔案 SHA-256 `9a1b70a4b3841bfa1ee34a1bd41cd9bb8566167febb702559c01b5492203c505`。
+清單只含觀測雜湊與來源身分，是待核驗提示，**不是已驗證原件、
+已修復的問題或新聞篇數**。歷史掃描繼續保留。
+
+新的[本機提示處理](../downloader/news_fulltext_cnyes_priority.py)在正常
+新聞 owner 的既有鉅亨維護迴圈中分片執行，按觀測雜湊索引尋找當前頁面，
+把頁面放進既有原件重試表。每批提示與續跑游標同一 SQLite 交易提交；
+重啟後從游標繼續，同頁既有重試的期限和次數不改寫。來源或授權身分
+改變、檔案不存在／校驗失敗，或游標為未知版本／不可辨識異常時，
+只暫停這份提示並顯示原因；可辨識的計數矛盾恢復方式見本文最上方。
+既有下載、核驗、來源政策、受限回應及退避各自仍由原 owner
+處理。排入提示不改寫原件、文章、HTTP 狀態或來源失敗紀錄，也不讓
+已接受批次索引圍籬直接完成。頁面新增的進度條只表示這份有限清單
+已安排的觀測數；不是修復率、下載率或全歷史完成時間。
+
+在服務停止、取得 owner 排他鎖且 WAL／journal 空的情況下，唯讀檢查
+清單 SHA、來源身分和當前頁首：854 個觀測均存在，對應 **862 個頁面
+引用**，其中 8 個是相同觀測的其他引用，並非額外 8 篇新聞。沒有
+來源或授權指紋不符；目前正式資料庫尚無新版原件重試表，正常 owner
+初始化才會建立，因此沒有任何正式提示已排入。讀取前後主資料庫與
+sidecar 的裝置、inode、大小、mtime、ctime 一致；沒有新聞 HTTP 或
+正式佇列寫入。這不是所有來源原件的全域快照，也不是完成證明。
+再以相同停機與鎖條件核對 854 份目前的觀測資料：全部符合現行觀測
+格式、具備含時區的來源觀測時間，且原件類型均為已登記隔離檔；其中
+88 份已有對應相同回應的舊原件工作、766 份尚無該工作。這些是本機
+工作登記數，不能表示 766 份一定要向來源發請求。
+
+另一隔離記憶體 SQLite 試驗使用該停機快照的 75,347 個頁首、現行索引
+與相同 854 個提示，14 個有界切片安排 862 個頁面，總計 0.074 秒；
+查詢計畫使用 observation covering index。此數字只涵蓋記憶體提示
+安排，**不包含磁碟原件核驗、SQLite 正式耐久寫入、啟動或網路下載**，
+不能用作正式吞吐或完成時間。隔離測試驗證提示在正常 owner 迴圈
+被接手、真正原件缺失進入既有本機重試、HTTP 429 期限不變、停止與
+重啟續跑、alias、損毀／身分變更及交易回滾；相關原件與批次測試
+392 項通過，面板／提示相關回歸 177 項通過（包含桌機與手機離線
+瀏覽器），後續新增的清單重建測試共 7 項通過。測試集合有重疊。
+
+優先清單接手的既有原件巡檢另有游標恢復風險：程式先前會把未知
+版本當作損毀重掃；留存鍵衝突時可能未確認原值就繼續覆寫。現已
+改為未知版本與留存衝突僅暫停該巡檢；可辨識損毀必須先保留並
+核對原值，停止訊號或資料庫交易失敗不覆寫。游標雖標示完成但
+固定範圍內仍有當前頁首時，繼續巡檢；其他可執行工作仍能前進，
+頁面僅顯示固定問題分類。這是隔離故障注入找到的風險；正式停機
+快照在 owner 鎖與空 WAL／journal 下唯讀檢查，尚無此來源身分的
+巡檢游標，也沒有新版重試表，因此不能說正式資料庫已出現該故障。
+針對新版程式的 owner／原件／
+批次測試 405 項、面板 174 項通過；16 份歷史報告唯讀再核對仍為
+854 個未解不符，check-only 因未解問題回傳非零。
+
+更新巡檢程式後，一個舊相容性測試先失敗：它把舊 audit 腳本雜湊
+搭配目前 history 程式雜湊，該混合組合並非受審核的舊讀取器。
+測試已改用整組固定的舊版身分，沒有放寬任意其他程式或來源指紋；
+同時重新審核目前程式的巡檢游標變更不影響逐份原件的內容驗證。
+重新執行相容性與原件分段測試 **130 項通過**。
+
+如清單檔遺失，可由仍保留的原報告及已固定設定重建；指紋不符或
+既有不同檔案會拒絕覆寫。此命令不啟動服務、不呼叫來源、不寫正式佇列：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/prepare_news_cnyes_original_priority.py \
+  --report artifacts/data_quality/news_offline_inventory_20261029/cnyes_mismatch_sourceonly_plan_v2_20261029.json
+```
+
+目前新聞服務和計時器仍依使用者維護要求停止；新程式及面板尚未由
+正式新聞 owner 載入或驗收。恢復後仍須核對 owner 版本、清單實際
+接手及原件／收據，再依來源政策處理真正缺口；全來源、全部正文
+和完成 ETA 仍未知。TEJ 可運作，未因這次新聞工作而重啟或停止。
+
+## 10/29 維護期間：鉅亨已接受批次索引的游標保護
+
+既有 owner 的已接受正文批次索引用來尋找歷史原件候選，候選仍須另外
+核驗原請求、原始回應、來源契約、收據及內容。隔離測試發現，舊
+游標處理會把明列的不支援版本當成損毀重設；損毀值是二進位時，
+原本的稽核鍵計算也可能失敗；若稽核鍵已有不同值，舊流程可能刪除
+唯一的原游標。這些是程式故障情境，不能據此推定正式資料已損壞。
+
+現沿用既有歷史 owner：只對可辨識的損毀游標，先在同一 SQLite
+交易中保存精確原值並檢查留存結果，再開始可重複的本機重掃；
+交易失敗時原游標保留。明列但不支援的版本、留存衝突及停止訊號
+不覆寫原游標。不相容或衝突時只隔離批次索引，其他可執行的本機
+工作可繼續，無法越過索引圍籬的來源重查保持等待，也不因該等待
+每兩秒空轉。原先已索引候選及既有 HTTP 429 的來源期限不因本機
+重掃而刪除或重設。檢查點狀態、來源圍籬與頁面採同一個解碼驗證；
+頁面只顯示固定異常代碼，不公開游標或內部路徑。
+
+此外，即使游標的字串格式有效，也不能只因寫了「完成」就忽略
+游標後方、前緣終點以內已登記的批次。完成判定會先查該範圍是否
+仍有路徑；若有就續掃，來源重查圍籬繼續保留。游標超過凍結終點
+則視為損毀並先保留原值。以正式停機快照執行的
+[500 次暖快取唯讀索引存在性查詢](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_frontier_exists_cost_20261029.json)
+使用 covering index，中位數 0.0028 毫秒、p95 0.0088 毫秒；此量測
+不是完整啟動、冷磁碟或下載效能。
+
+[正式資料唯讀檢查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_accepted_checkpoint_readonly_20261029.json)
+在原 owner 排他鎖下，使用空 WAL／journal 的 immutable 連線，未
+發現任何該版批次索引游標，也未發現新候選與本機重試表；前後資料庫
+及 sidecar 身分未變。正式啟動尚未建立這些表，故本次修復沒有在
+正式 owner 實跑，也不能稱為已驗證正式下載。這不是全文完整性檢查。
+
+[游標、候選與排程回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_accepted_checkpoint_v2_regression_20261029.log)
+122 項通過，包括二進位損毀、留存衝突、交易中斷、停止訊號、
+錯誤完成標記、重啟續掃、429 期限、其他工作前進及等待圍籬；
+[相關歷史原件回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_accepted_checkpoint_v2_history_20261029.log)
+81 項通過；[原件證據及報告鏈測試](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_accepted_checkpoint_v2_proof_20261029.log)
+33 項通過；[面板回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_accepted_checkpoint_v2_dashboard_20261029.log)
+166 項通過，包括離線手機與桌面瀏覽器。這些測試範圍可能重疊。
+重新核對歷史原件讀取語義後更新目前程式的精確指紋；改動以外的
+舊證據仍須通過原有身分檢查。
+
+[既有 16 份報告鏈的再讀回](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_accepted_checkpoint_v2_chain_readback_20261029.json)
+仍顯示 73,644 個觀察鍵及 854 組原件請求不符，工具依尚有問題
+回傳非零狀態；不符尚未修復。先前對這 854 組及當時 223,582 個
+已登記批次的零候選掃描只適用該組合，不能拿來宣稱所有候選索引
+完成。本次沒有重複該掃描、呼叫新聞網站或寫入正式新聞佇列。
+新聞服務及計時器遵照維護指示停止；TEJ Smart Wizard 服務及 API
+計時器允許運作，服務活動不等於下載資料已驗收。
+
+## 10/29 維護期間：舊整理游標與歷史稽核報告的續查
+
+沿用鉅亨原本的本機整理 owner，修正三種先前未處理的游標損毀：
+原件不符結果整理、缺失原件的後續證據整理，以及舊空清單範圍
+整理。隔離故障注入顯示，舊程式遇到損毀游標會停止相應整理；
+這是可重現的程式問題，不代表正式服務曾發生同一故障。
+
+可辨識的損毀游標現在先於 SQLite 交易中留存精確原值，再從頭做
+可重複的本機整理；支援文字與二進位損毀。停止訊號、留存衝突與
+未知版本不覆寫現有證據；未知版本或衝突只暫停該項整理，其他
+可執行工作仍可繼續，也不因受阻而持續空轉。舊空清單的既有規則
+會排程重新核對尚未失敗的舊結果，HTTP 429 等失敗工作的期限不會
+因此被重設。面板新增三項整理狀態與固定的異常代碼；舊快照沒有
+這些欄位時顯示未知，不傳送游標或私有網址。
+
+臺北時間 16:46 的[唯讀停機清點](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_legacy_checkpoint_readonly_20261029.json)
+未發現這三項整理的任何契約游標，因此不能宣稱正式系統已因游標
+損毀而停住。檢查使用原 owner 排他鎖、空 WAL 的唯讀 immutable
+連線，前後資料庫與 WAL 的 inode、大小及 mtime 相同；未比較 ctime，
+這也不是全檔案系統快照。
+
+下載器檔案更動曾使既有稽核器拒絕重用已審核的舊原件證明，相關
+[相容性測試](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_legacy_reader_compat_red_20261029.log)
+如預期失敗。重新核對目前觀察雜湊、原始請求、來源契約及原件讀取
+依賴後，更新精確的已審核程式指紋；原件、收據與目前觀察仍要符合
+各自檢查，不沿用完成狀態。新舊程式指紋未被允許的其他變動仍會
+停用此相容性。
+
+16 份舊分段報告的程式指紋是更早的精確版本，不能拿它直接在新版本
+續跑。[既有分段工具](../scripts/audit_news_cnyes_retained_missing_chain.py)
+現在只對該已審核版本提供唯讀檢查及見證規劃：須取得來源 owner
+鎖、核對整條報告雜湊與原始輸入、來源契約、資料庫身分，以及目前
+讀取器在檢查前後的指紋。舊與目前資料庫身分完全相同，而兩側 WAL／
+journal 都空時，允許空 sidecar 的身分或時間戳不同；非空 sidecar、
+資料庫身分異動、owner 忙碌或檢查中讀取器變動均拒絕。唯讀結果明確
+標示不能用目前讀取器續跑舊報告；不重寫報告，也不把報告鏈完成當作
+全文完成。本輪觀察到正式空 WAL 的 ctime 與舊報告不同，原因未知；
+資料庫身分不變，不能只憑這個時間差推論資料變動。
+
+[正式停機資料的最終唯讀回讀](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_historical_chain_final_readback_20261029.json)
+核對到 **16 份報告、73,644 個觀察鍵與 854 組原件請求不符**；
+854 是待處理的觀察／回應／原件組合，不是缺文篇數，也尚未修復。
+這次沒有重跑既有 854 組規劃、連線新聞來源或寫入正式新聞佇列。
+
+[游標、面板與公平性回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_legacy_checkpoint_regression_20261029.log)
+**227 項通過**，其中含手機與桌面寬度的離線瀏覽器檢查；
+[舊證據相關回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_legacy_evidence_regression_20261029.log)
+**47 項通過**；[分段鏈與原件稽核回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_historical_chain_final_regression_20261029.log)
+**118 項通過**；補上舊快照缺欄位的顯示後，
+[面板回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_legacy_dashboard_final_20261029.log)
+**161 項通過**。範圍可能重疊，不相加。第一次游標測試錯誤假設
+空清單整理不會排程任何成功舊工作，修正為分別檢查正常重查和 429
+期限後通過；[原失敗紀錄](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_legacy_checkpoint_first_20261029.log)保留。
+
+新聞服務與 timer 依維護要求仍停止，新程式尚未由正式下載 owner
+載入；TEJ 可以運作，程序狀態不代表 TEJ 下載已驗收。鉅亨實際來源
+重查、其他新聞來源、持久收據與正式面板仍待維護結束後驗收，全量
+完成時間未知。
+
+## 10/29 維護期間：鉅亨兩種舊原件盤點游標的安全恢復
+
+鉅亨超過單日分頁上限的舊範圍，在還原同日共用的頁面 ID 前，須先
+索引所有符合條件的範圍；非零歷史盤點則有逐範圍圍籬。這些證據
+邊界仍然保留。隔離測試發現舊超額分頁盤點的游標若變成無法解析
+或不符合目前 v1 格式，會一直回報無效，待核驗頁面無法越過全
+範圍索引的閘門；另一個非零歷史盤點則會把不認識的游標版本當成
+損毀重設，且無法正確留存部分二進位損毀值。此為合成故障重現，
+沒有證據表示正式系統曾因這些原因停住。
+
+[原本的鉅亨歷史 owner](../downloader/news_fulltext_cnyes_history.py)
+現在對兩種盤點可辨識的損毀游標均先在 SQLite 交易中保存原始值，確認
+留存值一致後才刪除游標並從頭重做可重複的本機索引；既有待辦、
+原件及分頁證據不刪除。若寫入留存失敗，交易回滾並保留原游標；
+若留存鍵已有不同內容，保留兩份資料並只暫停這項盤點。明列但不
+支援的版本不猜測、不重寫，其他可執行的本機工作仍可前進。停止
+訊號在讀取游標期間到達時不啟動修復。原始來源請求、HTTP 429、
+退避與來源配額均未重設，也不因本機工作完成而宣稱全文完整。
+停止訊號在逐項整理舊來源契約圍籬期間到達時，也不再啟動下一項。
+非零盤點若因版本或留存衝突受阻，圍籬後不能執行的工作及本機
+重試不再被算成可立即執行，避免維護迴圈每兩秒空轉；其他範圍可
+執行的待辦與到期重試仍會執行。閒置重試沿用原有最多 300 秒節奏，
+並非來源下載的完成時間。
+
+新聞狀態投影與[頁面](../services/news_dashboard/app.js)現在可分別
+顯示游標異常、版本不支援及留存紀錄衝突；只投影固定的狀態代碼，
+不向瀏覽器傳送游標或來源原件。服務停止時相關內容標示上次快照。
+若要處理不支援版本或留存衝突，仍須先檢查相應程式與本機證據，
+不能靠覆蓋原始紀錄強行繼續。
+
+[超額分頁唯讀停機快照](../artifacts/data_quality/news_offline_inventory_20261029/news_overflow_checkpoint_readonly_20261029.json)
+在 16:35 Asia/Taipei 顯示目前來源契約的這項盤點尚未開始；
+[非零歷史停機快照](../artifacts/data_quality/news_offline_inventory_20261029/news_nonzero_checkpoint_readonly_20261029.json)
+在 16:38 顯示該項目前來源契約盤點也尚未開始。全契約
+待辦表有 5,080 列 `retained_unavailable`、88 列 `retained_invalid`、
+226 列 `restored`、126 列 `forward_evidence_available`。這些是舊
+本機頁面工作狀態，不是缺少新聞篇數，也未逐筆重新驗證原件。檢查
+持原 owner 鎖、確認新聞服務與 timer 停止、WAL 為空，並比較資料庫
+及 WAL 的讀取前後檔案身分；未呼叫新聞網站或寫入正式佇列，檔案
+身分比較不是完整檔案系統快照。
+
+損毀游標、未知版本、停止訊號、留存衝突與圍籬空轉的修復前失敗
+紀錄分別保留；[鉅亨舊原件回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_checkpoint_evidence_final_v2_20261029.log)
+**23 項通過**，[游標、面板、跨來源派工及鉅亨公平性回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_checkpoint_regression_final_v2_20261029.log)
+**284 項通過**，包含兩種寬度的真實離線瀏覽器檢查；兩組範圍
+可能重疊，不相加。第一次擴大回歸因實體磁碟同步寫入過慢而主動
+中斷，pytest 在中斷收尾時留下 traceback；該次沒有完成的測試結果，
+原[紀錄](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_overflow_checkpoint_regression_20261029.log)
+保留，不計作通過。後續驗證使用隔離測試資料，沒有模擬結果充當
+正式資料或實測來源吞吐量。
+
+新聞服務和 timer 仍遵照使用者維護要求停止，新程式尚未由正式
+owner 載入。TEJ 依使用者確認可運行。鉅亨其餘原件及來源重查、
+其他新聞來源、正式恢復後的收據與面板驗收仍未完成，全量 ETA 未知。
+
+## 10/29 維護期間：新聞排程的時間邊界與已領取工作
+
+延續既有 owner 的時間片與共用佇列，使用隔離資料庫及模擬來源重現：
+本機 CMoney 路徑整理或下一個 provider 的清單查詢逾時後，舊程式仍
+可能依較早的排程快照領取新的工作；舊 RSS 原件回補與來源錯誤彙整
+也有相同的跨片邊界。這是受控故障注入的程式問題，沒有證據說明正式
+服務曾發生同一事件。修正前測試分別留下
+[前半段失敗紀錄](../artifacts/data_quality/news_offline_inventory_20261029/news_cycle_deadline_red_20261029.log)
+、[後半段失敗紀錄](../artifacts/data_quality/news_offline_inventory_20261029/news_cycle_deadline_late_red_20261029.log)
+與[來源查詢準備失敗紀錄](../artifacts/data_quality/news_offline_inventory_20261029/news_cycle_deadline_prepare_red_20261029.log)。
+
+原 `run_cycle` 現在於本機切片之間、來源查詢後及下一筆派工前重新
+確認停止旗標與時間；超時不再開始新的收件匣、來源排程與本機整理
+切片。時間限制是**新工作准入界線**，不是強制中斷 I/O 的期限：
+已經開始的本機動作或已領取的來源工作仍可能超時，已領取的任務會
+繼續處理並保存其結果與收據。候選來源查詢在超時後完成時，先提交
+結果，下一輪再歸檔待處理檔案；隔離測試確認不會重複請求。磁碟、
+來源限速、拒絕及原收據政策不因此放寬。
+
+新測試涵蓋初始追新、收件匣、CMoney、鉅亨本機歷史、舊 RSS、來源
+錯誤彙整、來源間公平性、逾時前領取、停止訊號及候選查詢跨片歸檔。
+最後一項清單準備邊界修正之前的[相關回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cycle_deadline_final_regression_20261029.log)
+為 899 項通過；之後的派工、鉅亨與候選查詢回歸為 443 項通過，見
+[最新測試紀錄](../artifacts/data_quality/news_offline_inventory_20261029/news_cycle_deadline_dispatch_regression_20261029.log)。
+兩組測試範圍重疊，不將數量相加。
+這些都是隔離驗證，不能證明正式服務吞吐量或來源完整性；目前新聞
+服務和計時器仍按使用者維護要求停止，正式 owner 尚未載入這次修正。
+TEJ 依使用者確認可以運作，未在本次變更中重啟。鉅亨 854 組不符
+觀察與其他新聞來源的實際重查仍須在維護結束後驗收，整體完成時間
+仍無可靠估計。
+
+## 10/29 維護期間：CMNews 標籤網址的既有清單證據
+
+沿用已完成的 CMNews 非正文分類，針對尚未釐清的 137 個 `/tag/`
+網址，在停機資料庫以精確網址比對現有 `discovery` 工作：
+[只讀結果](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_tag_exact_discovery_snapshot_20261029.json)
+顯示 **0 筆相符清單工作、0 個 head 留有檢查時間、0 個已存正文**。
+這些網址關聯 79 個既有 metadata 匯入來源，合計 177 筆關聯列；
+關聯列不是文章數。head 的 attempts 合計 136 次，但該計數不能單獨
+證明實際 HTTP 請求或來源回應，不能推定它們從未被抓取。
+
+本次只核對精確網址的目前 head 和清單工作，未窮盡其他路徑的原件
+或網址變體，也沒有分析標籤頁內容；因此它們既不是已抓正文，也不能
+直接視為 137 篇缺失文章。未來仍須在維護結束後確認可使用的來源
+回應與清單範圍，再判斷是否值得接入原下載器。稽核持共用 owner 鎖、
+檢查停機狀態與資料庫／sidecar 身分，沒有對新聞網站送請求、沒有
+寫入正式 queue；檔案身分核對不是全檔案系統快照。
+
+## 10/29 維護期間：本機批次前緣進度與完整唯讀掃描
+
+新聞下載 service 和 timer 持續停機，TEJ 依使用者確認可以運行。鉅亨
+面板的原件盤點原本只有已嘗試批次數，沒有可核對的分母。現沿用原
+owner 的 checkpoint 與 `accepted_batches` 索引，在狀態發布時計算
+「已嘗試批次＋本輪前緣內目前登記且尚未嘗試的批次」；checkpoint
+或數量無法一致核對時顯示未知，兩次讀取期間 checkpoint 改變也不
+輸出分母。前緣完成、缺檔／異常待重試與原件候選核驗各自獨立，
+不得把此比例當作新聞正文或全歷史完成率。服務停止或快照過期時
+頁面標示上次快照；無可靠資料時完成時間仍為未知。新登記的批次
+可能改變估計，前緣終點以外的批次不屬於本輪分母。
+
+實作位於現有 `downloader/news_fulltext_queue.py`、公開狀態投影與新聞
+頁面，沒有建立另一個下載器。針對當時 223,582 個登記批次的只讀
+[SQLite 範圍計數量測](../artifacts/operations/agent-workflow/runs/news-cnyes-frontier-count-cost-20261029T075904-dea3706b/run.log)，
+使用覆蓋索引，111,790 筆的暖快取單次查詢約 10.4–21.2 毫秒；這是
+新增計數的成本，不是整個心跳或下載吞吐量的測量。相關語義、公開
+投影與 1440／390／320 寬度離線瀏覽器驗證通過，另外 65 項狀態發布、
+盤點恢復與共用進度回歸通過。頁面與 owner 的新版本仍須在維護結束
+後透過原本的載入及正式收據流程確認；這些測試不是線上部署驗收。
+停機中的正式資料庫尚無新版的本機重試與批次盤點資料表，舊狀態快照
+也沒有這個盤點欄位。隔離的舊結構啟動測試已確認 owner 會建立缺少
+的表並以「尚未開始」發布前緣；正式資料庫尚未執行此次遷移，不能
+把隔離測試視為正式啟動成功或將缺少的重試數量當作零。
+[正式停機快照的只讀結構預查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_legacy_schema_preflight_20261029.json)
+另發現目前初始化程式會在既有的頁面 head 表及待處理工作表建立兩個
+缺少的索引；這兩表當時各有 75,347 與 5,520 列，必要欄位均存在。
+預查只讀取資料庫結構與計數，沒有執行索引建立；實際啟動耗時與磁碟
+寫入量尚未測量，也沒有據此給出完成時間。
+
+## 10/29 維護期間：鉅亨批次索引讀取量測
+
+尚未建立的已接受批次候選索引，必須讀取既有批次的 Parquet 中繼
+資料；不能因目前文章 head 指向其他批次，就排除舊批次可能包含較早
+的原始回應。先對停機資料庫路徑前後各 512 個已登記批次做
+[唯讀測試](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-column-abba-20261029T074747-44686bdd/run.log)：
+改用三個必要欄位的位置讀取，和目前逐欄建立索引的方法，各批次輸出
+雜湊一致；這個局部測試中 CPU 較低，但不是收據、正文或完整 owner
+的速度。
+
+另以 1,024 個隔離合成批次，從原 `backfill` 開始至盤點前沿完成做
+[ABBA 測量](../artifacts/operations/agent-workflow/runs/news-cnyes-bounded-index-abba-20261029T074859-17c7a28a/run.log)：
+兩種方法的盤點數、候選數與完成狀態相同；四輪牆鐘約 1.26–1.38 秒，
+先後波動大於可穩定證明的改善。測試使用暖 tmpfs、硬連結與零候選
+資料，不包含實際正文、冷磁碟、網路或其他服務；不能據此推估正式
+索引速度或完成時間。因完整流程尚無穩定收益，且更改歷史解析程式
+會影響既有離線稽核的程式身分，本輪沒有採用該候選。
+
+[同一組 1,024 個真實批次的只讀測試](../artifacts/operations/agent-workflow/runs/news-cnyes-parallel-footer-20261029T075115-73518a61/run.log)
+比較 1、2、4、4、2、1 個執行緒的有序中繼資料讀取，輸出雜湊一致；
+單執行緒牆鐘 1.21–1.27 秒，兩執行緒 1.27–1.33 秒，四執行緒
+1.41–1.42 秒，並行的 CPU 時間較高。這只涵蓋暖快取的路徑及 footer，
+不包含收據驗證、候選寫入或冷磁碟，因此不能否定其他硬體或其他負載
+下的並行收益；目前也沒有理由在正式 owner 增加執行緒。
+
+578 個不支援鉅亨路徑已有下文的市場頁、舊新聞及其他路徑清點，本輪
+比對時結果未改變；既有分類沿用，不當成新發現或重新送來源請求。
+新聞 service 和 timer 依維護要求保持停止，TEJ 依使用者確認可運作。
+
+854 組不符觀察已在目前停機資料庫逐項讀回：854 個觀察的儲存結構、
+觀察內容雜湊及目前來源範圍檢查通過，形成 854 組不同的請求／
+回應雜湊；另與[原規劃交叉核對](../artifacts/operations/agent-workflow/runs/news-cnyes-target-plan-crosschec-20261029T075642-0945481a/run.log)，
+回應雜湊、來源指紋及五個解析程式身分均一致。這不等於已驗證原始
+回應。已完成一次
+[只讀已登記批次掃描](../artifacts/operations/agent-workflow/runs/news-cnyes-854-retained-batch-sc-20261029T075311-ba3cbf1e/run.log)，
+以既有 metadata 讀取程式尋找這些精確組合：**223,582／223,582**
+個當時登記批次皆已讀取，**0 候選、0 讀取錯誤**，耗時約 617 秒。
+這只排除了這些批次的 metadata 候選，不等於其他位置、其他表述或
+來源網站沒有可用原件；854 個不符觀察仍未修復。程式持共用 owner
+鎖、檢查資料庫 sidecar 與每個檔案讀取前後
+身分，但無法阻止不遵守該鎖的程序變動其他檔案，故不主張全程為單一
+檔案系統快照。掃描不發出新聞網站請求，也不寫正式 queue；來源與
+正式 owner 的後續驗收仍要在維護結束後進行；本次量測時間不能作為
+新聞全文或全部歷史完成時間。
+
+## 10/29 維護期間：854 組鉅亨不符觀察的定點續查
+
+沿用前述第一版規劃的 854 組不符觀察與已完成的 27 組定點核對；
+本輪只擴查尚未處理的 827 組。對其精確請求與回應雜湊所導出的
+[1,654 組指定原件及收據路徑](../artifacts/operations/agent-workflow/runs/news-cnyes-827-alternative-20261-20261029T073527-128f646a/run.log)，
+每組至少缺少一項；沒有找到可驗證的同請求替代原件。這只涵蓋指定
+路徑，不排除較早的正文批次或其他別名。
+
+827 組所在的頁面可由目前正文 head 定位到
+[1,110 個不重複已登記批次](../artifacts/operations/agent-workflow/runs/news-cnyes-827-current-batch-pla-20261029T073635-a19059b5/run.log)，
+合計約 55.9 MB。對這些批次只讀 Parquet 中繼資料篩選
+[1,638 組目標批次／精確請求及回應雜湊](../artifacts/operations/agent-workflow/runs/news-cnyes-827-head-batch-probe-20261029T073742-ed0374b5/run.log)，
+沒有符合的組合，因此沒有進入完整收據與原件驗證；讀取和篩選未
+產生新正文。另將其中 49 個觀察涉及的 93 個不重複批次
+[完整讀回原始回應欄位抽驗](../artifacts/operations/agent-workflow/runs/news-cnyes-854-heads-sample-2026-20261029T073902-b7f48e57/run.log)，
+未發現相同請求／雜湊，也未發現中繼資料篩選的漏判。抽樣不能證明
+所有批次無漏判，這些批次亦只代表目前 head，不能代替全歷史搜尋。
+
+同一停機快照下，854 組觀察的頁面 ID 對應到 **18,407 個既有文章
+head**：17,180 個有正文及路徑指標，**1,227 個兩者均無**。後者的
+既有狀態分別為 1,201 個 `source_article_empty_template`、24 個
+`source_body_quote_only`、1 個 `source_article_test_only`、1 個
+`source_body_image_only`。這些是去重後的既有網址 head，不是 854 組
+觀察的額外錯誤數；有指標也不等於正文及收據已重新驗證。狀態是
+既有解析結果，不能推斷來源所有歷史版本永遠沒有正文。
+
+[唯讀排程輸入](../artifacts/operations/agent-workflow/runs/news-cnyes-854-recovery-input-20261029T074205-d676fca6/run.log)
+顯示 854 個觀察各有相符的直接 head 和不同的既有來源請求；該快照
+的來源工作均為先前成功、原到期時間在未來。當時沒有新原件稽核
+事件標記，且有 88 筆舊 `retained_invalid` 工作；
+[版本核對](../artifacts/operations/agent-workflow/runs/news-cnyes-prior-work-revision-20261029T074347-d8337681/run.log)
+顯示 88 筆的請求、回應及頁面期待與目前觀察相同。現有資料庫尚未
+建立新的已接受批次候選索引；維護解除並由正式 owner 載入目前程式
+後，仍需完成有界索引及原件稽核，才能知道實際排程與來源結果。
+不能把原有到期時間當成完成時間，也不能由目前資料保證來源必定有文。
+
+[隔離整鏈測試](../artifacts/operations/agent-workflow/runs/news-cnyes-mismatch-chain-20261029T074320-ac2e04ea/run.log)
+分別涵蓋沒有舊工作及有同版本舊無效工作：原件請求不符先標示未
+驗證、本機檢查後跨重啟排定原來源頁面重查，再以合成回應確認可
+恢復並保留舊證據。**2 項通過**；合成回應不代表正式下載成功，
+亦未對新聞網站送出請求或寫入正式佇列。
+
+涵蓋歷史原件、觀察稽核及正文重試的[較廣回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-mismatch-regression-20261029T074416-80f4d2d1/run.log)
+**482 項通過**；其中包含前述兩項，不能相加。測試使用隔離的 tmpfs
+合成資料，未連線來源或寫入正式佇列。該回歸目錄目前保留約 364 MiB，
+另有聚焦測試目錄約 1.7 MiB；先前清除合成測試現場的操作遭自動審查
+拒絕，本輪未嘗試以其他方式清理。
+
+另對已登記收據做一次[目錄名稱唯讀核對](../artifacts/operations/agent-workflow/runs/news-receipt-presence-snapshot-2-20261029T073403-4a6b17ff/run.log)：
+223,582 個已登記批次都有對應目錄項目，沒有未對應的 JSON 名稱。
+這僅核對名稱，並未確認每個項目的類型、收據內容、正文雜湊或來源
+完整性；也不應因此重複掃描全部批次。各次使用共用 owner 鎖、唯讀
+immutable SQLite，並比對前後資料庫與 sidecar 檔案身分；這不能阻止
+不遵守該鎖的其他程序。與先前規劃相比，空 WAL 的 ctime 有變化，
+其餘既有身分相符；本輪逐項重驗目前觀察，檔案身分比較並非內容雜湊。
+
+新聞 service／timer 依使用者維護指示維持停止；TEJ 可以運作。剩餘
+全歷史批次、別名和來源重查尚未驗收，仍無可信全量完成時間。
+
+## 10/29 維護期間：收據目錄不可用時的啟動恢復
+
+新聞正文收據恢復原本將不存在的 `receipts` 目錄或同名普通檔案，
+都當成空清單，可能在資料庫已有已提交批次時誤報掃描完成。
+[隔離測試](../artifacts/operations/agent-workflow/runs/news-receipt-root-red-20261029-20261029T072559-b1a364ec/run.log)
+重現了兩種情境；本輪只查到正式收據與正文目錄存在，沒有證明正式
+服務曾遇到這種故障。
+
+[既有佇列恢復](../downloader/news_fulltext_queue.py)現在於完整啟動
+掃描時嚴格檢查目錄：目錄不存在且資料庫已有已提交批次，或路徑
+不是目錄時，保留原始錯誤並停止恢復；中斷的啟動會明確釋放 owner
+鎖及 SQLite 連線，讓目錄恢復後可重新啟動。既有 systemd 單元設有
+失敗後重啟，但本輪沒有實測正式服務的重啟或儲存裝置故障。空的
+舊佇列可能尚未建立收據目錄：沒有已提交批次時仍可啟動，並在
+觀測資料標示 `receipt_directory_state=absent`；這不能證明未提交
+的舊收據從未存在。明確指定的測試路徑及原有輔助函式行為維持不變。
+
+這項檢查只防止整個目錄不可用時把已知批次視為空；即使目錄存在，
+單個已提交收據是否缺失、原件雜湊是否相符仍需獨立的正文驗證，
+不能由恢復迭代完成推定。本輪未變更來源要求、下載租約或配額。
+
+首次較廣回歸中，一個舊測試將已提交文章人為改成 pending，卻期待
+具有舊租約見證的正文覆蓋它；實際資料和
+`article_capture_superseded_at_commit` 顯示恢復拒絕了不相符的 head。
+測試改成由真實的「收據已落盤、SQLite 尚未提交」邊界模擬中斷，另
+保留相符收據不能覆蓋已變更 head 的反向測試。
+[六項聚焦測試](../artifacts/operations/agent-workflow/runs/news-receipt-orphan-fixture-gree-20261029T072832-dd2621ea/run.log)
+通過；[收據、生命週期與新聞管線較廣回歸](../artifacts/operations/agent-workflow/runs/news-receipt-root-regression-gre-20261029T072853-e2089ca8/run.log)
+**753 項通過**；[磁碟檔案系統隔離測試](../artifacts/operations/agent-workflow/runs/news-receipt-root-disk-20261029-20261029T072940-ab627bb0/run.log)
+**18 項通過**。測試範圍有重疊，不能相加；均未向新聞網站送出
+請求，也未寫入正式新聞佇列。自動審查拒絕清除約 148 MiB 的首次
+失敗回歸 tmpfs 目錄 `/dev/shm/news-receipt-regression-5hDREU`，理由是
+禁止 `rm -f` 類操作，因此該合成測試現場仍保留；其他成功測試的
+合成暫存已清除。
+
+新聞 service 與 timer 仍依維護指示停止，新程式尚未由正式 owner
+載入。TEJ 服務可以運作；程序 active 並不證明資料下載成功。
+
+## 10/29 維護期間：同次回應原文宣告的耐久交接
+
+CMNews 回應若宣告 CMoney Learning 的原文，原本在父文章失敗交易中
+先完整驗證該宣告，驗證發生例外時只增加程序內計數；父文章仍可能
+提交為終結狀態，而同次回應的原文待辦沒有留下。另若 outbox 寫入
+本身失敗，原程式也可能吞掉資料庫錯誤。這兩種情境由[隔離故障注入](../artifacts/operations/agent-workflow/runs/news-declaration-loss-red2-20261029T071737-657e0788/run.log)
+重現，不能據此判定先前偶發測試失敗或正式服務一定由此造成。
+
+[既有交接程式](../downloader/news_fulltext_original_declarations.py)現在
+先在父文章失敗的同一交易中登記有界的同次回應事實，再由既有 owner
+完整檢查宣告、父 head、來源／授權指紋、時鐘及原文範圍。登記不是
+核准下載、別名或正文；驗證時暫時讀不到資料則保留待辦並讓其他項目
+繼續，無效見證仍拒絕。此路徑不再對同一筆成功交接重複做完整見證
+驗證，但尚無證據可將這個減工外推為整體下載加速。
+
+若 SQLite 或本機 I/O 連待辦都無法寫入，父文章失敗與待辦一起回滾，
+保留原租約供同一回應重試；如果程序先重啟，原 owner 的 abandoned
+work 恢復會重排父文章。未提交且只存在記憶體的回應無法跨重啟保存，
+因此這種情況可能需要再向來源請求一次。服務仍依原設定管理，沒有
+繞過拒絕或配額。這不是宣稱所有磁碟故障都已實地驗收。
+
+[四項隔離測試](../artifacts/operations/agent-workflow/runs/news-declaration-guard-restart-20261029T071900-0761c5a9/run.log)
+分別確認驗證暫時失敗後重試、寫入失敗交易回滾、錯誤見證拒絕，及
+重啟後重新取得未提交回應；[較廣相關回歸](../artifacts/operations/agent-workflow/runs/news-declaration-durable-regress-20261029T071925-ab671424/run.log)
+在 tmpfs 合成夾具中 **989 項通過**，包含共用管線及網頁生命週期。
+相同四項亦在[實體磁碟合成夾具](../artifacts/operations/agent-workflow/runs/news-declaration-disk-recovery-20261029T072130-83d29b12/run.log)
+通過。各組測試有重疊，不可相加，且均無真實新聞網站請求；通過後的
+合成夾具已刪除。新聞 service 與 timer 按維護指示仍停止，新程式尚未
+由正式 owner 載入。
+
+## 10/29 維護期間：共用收件匣的慢讀取與本機證據恢復
+
+隔離重現發現，修復請求與網址登記收件匣若在列目錄或讀取請求時
+用盡軟時間片，可能反覆零進度；已發現的原始網址 outbox 與一般網址
+也可能在每輪只准一筆時互相搶占。原有單一 owner 現在在慢讀後仍給
+一項有界工作機會，修復請求沿用耐久輪巡位置；網址及 outbox 的輪巡
+提示留在程序內，重啟後各請求的已提交游標仍由資料庫決定。一次本機
+讀取或登記本身可能超過軟時間片，停止訊號與來源限制仍優先。
+
+本機請求讀取的暫時 I/O 錯誤現在保留原檔等待重試，並讓其他請求
+前進；實際符號連結或目錄等不安全輸入仍隔離。來源原件的不可變
+證據檔若有內容衝突，保留檔案與待辦，不將它判為來源見證無效；
+錯誤可由 owner 效能計數辨識。這些計數屬程序生命週期，待辦狀態才
+是耐久依據。若衝突持續存在，仍須修復本機證據才能完成該項。
+
+來源範圍登記現在使用資料庫保存點；拒絕的見證不能留下部分文章
+head。網址批次中途發生本機寫入錯誤時，整個當輪交易回滾，回報
+暫緩並保留原請求；資料庫狀態、範圍、游標及資料庫計數一起提交。這些
+動作不接受正文、不授權來源，也不重置拒絕、租約或來源冷卻。
+隔離測試重現了[證據衝突被誤判](../artifacts/operations/agent-workflow/runs/news-declared-proof-conflict-red-20261029T065750-083b8c84/run.log)
+和[拒絕後殘留部分 head](../artifacts/operations/agent-workflow/runs/news-declared-partial-head-red-20261029T065831-3240a2bd/run.log)；
+另以實際合成衝突檔核對保留、修正和重試。這些都是測試情境，
+未證明正式 owner 曾發生同樣錯誤。
+
+[停機佇列唯讀回讀](../artifacts/operations/agent-workflow/runs/news-admission-inbox-snapshot-20261029T065159-4aeb4279/run.log)
+當時兩個本機收件匣均為零個待辦檔，原始網址 outbox 也沒有列；
+這不是全部缺文或其他下載佇列的數量。回讀前後資料庫及 sidecar
+身分相同，但身分比較不是寫入鎖。
+
+一次較廣回歸在合成測試中出現「無法領取原始網址」，後續單獨五次
+及原先的兩檔測試順序重跑均通過；當時失敗的暫存目錄已被測試工具
+清理，因此根因未知。現在加入登記及 outbox 的明確斷言，並在領取失敗
+時輸出合成 head、範圍成員及當下時鐘；[補充診斷測試](../artifacts/operations/agent-workflow/runs/news-claim-diagnostic-check-20261029T071339-b953b373/run.log)
+通過，但不能證明原先失敗的根因。新的完整回歸使用獨立暫存目錄
+保留失敗現場。這不構成正式服務已驗收的證明。
+另一輪在磁碟日誌提交等待時，兩個舊測試假設隔離無效檔與處理下一個
+有效請求必須在同一個時間片完成而失敗。保留下的合成目錄顯示無效
+檔已隔離、有效檔仍待處理；測試已改為要求有限輪內完成，維持既有
+時間片，不把等待的有效檔當成已完成。
+
+[完整相關回歸](../artifacts/operations/agent-workflow/runs/news-admission-tmpfs-regression-20261029T070748-22c89174/run.log)
+在 tmpfs 合成夾具中 **621 項通過**，涵蓋本機收件、來源範圍、證據、
+交易回滾、重啟及鉅亨輪巡；測試後約 305 MB 合成夾具已刪除以釋放
+記憶體。另在[實體磁碟合成夾具](../artifacts/operations/agent-workflow/runs/news-admission-disk-recovery-20261029T070933-9df5a650/run.log)
+驗證了 **12 項**隔離、衝突、讀取錯誤、交易回滾及重啟續跑，測試
+成功後清除該次合成夾具。這些結果不能代替正式資料與服務驗收。
+
+[網址登記 ABBA／BAAB 量測](../artifacts/operations/agent-workflow/runs/news-url-intake-tmpfs-final-abba-20261029T071032-c6de90bf/run.log)
+使用 tmpfs 與 64 個合成網址，各次均以兩輪完成登記，並核對相同結果。
+舊／新版牆鐘中位數為 13.18／13.34 毫秒，CPU 中位數為 13.94／
+14.26 毫秒；各四次、波動明顯，不能據此宣稱效能提升或退化，也不
+代表實體磁碟持久化或新聞網站的下載速度。量測沒有連線新聞來源、
+沒有寫入正式佇列。
+
+## 10/29 維護期間：鉅亨候選輪巡的慢讀取恢復
+
+鉅亨本機候選分類原先按固定主機與狀態順序檢查，每輪的軟時間片
+包含游標讀取。若每次讀取游標都比時間片久，舊程式可能每輪都還沒
+檢查候選就結束；停止訊號已發出時仍會讀取游標。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-slow-work-seek-red-20261029T063643-b7d56be2/run.log)
+確認該程式情境，不能據此宣稱正式服務此前已發生同樣問題。
+
+[既有 owner 的候選輪巡](../downloader/news_fulltext_cnyes_work.py)現在
+對三個主機及三種狀態輪流尋找工作；正時間片中的一次慢讀取不再讓
+當輪永遠無法處理首個候選。空狀態也會輪轉，避免後面的狀態被前面的
+慢查詢餓死。已掃過全部狀態且沒有候選時恢復原有五秒閒置間隔，避免
+持續快速空轉。輪巡位置只是程序內的排程提示；原有每狀態 rowid 游標
+仍是重啟後的耐久依據。停止要求優先，單筆資料庫或檔案操作本身可能
+超過軟時間片；來源拒絕、到期時間、租約、原件及正文接受規則不變。
+本次沒有增加來源請求，也沒有將候選當成已驗證正文或別名。
+
+[較廣回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-work-slow-seek-regres-20261029T063900-e43d4add/run.log)
+**904 項通過**；後續加入忙碌狀態與其他狀態公平輪巡的
+[聚焦回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-slow-seek-fairness-fi-20261029T064148-b988e4ec/run.log)
+**100 項通過**，兩組範圍重疊不可相加。另涵蓋停止、重啟及分類交易
+失敗時游標回滾。新聞 owner 尚未載入修正，正式服務和 timer 依維護指示
+維持停止；TEJ 可以運作。
+
+[隔離 SQLite 的 ABBA 比較](../artifacts/operations/agent-workflow/runs/news-cnyes-slow-seek-abba-20261029T064044-727145ea/run.log)
+每輪分類 240 筆並核對結果相同，舊／新牆鐘中位數分別約 **0.127／
+0.140 秒**，CPU 中位數約 **0.0210／0.0213 秒**；樣本小、磁碟負載
+有波動，不能據此宣稱正常吞吐量提升或無額外成本。另以人工注入每次
+45 毫秒游標等待，在 12 輪有限測試中，舊版處理 0 筆、新版處理 3 筆；
+這證明測試情境的前進能力，不是來源網路速度或最高速率。正式資料庫及
+sidecar 在隔離測試前後的檔案身分相同，但身分比對不是寫入鎖。
+[停機快照唯讀檢查](../artifacts/operations/agent-workflow/runs/news-cnyes-candidate-cursor-read-20261029T064228-0a339198/run.log)
+在九個既有主機／狀態游標之後均看到零筆候選；這只描述此輪巡的目前
+前沿，不是全部鉅亨缺文為零，也不能證明正式 owner 曾經飢餓或已載入
+新版。先前記錄的 854 組原件請求不符及其他缺文仍維持未解。
+
+## 10/29 維護期間：用來源原件見證重用不符診斷
+
+前一版規劃的 27 個待核對觀察，其同報告另有 76 筆來源結果，記錄了
+原件 Parquet 雜湊、實際來源請求雜湊及不符的觀察身分。現在
+[續查驅動器](../scripts/audit_news_cnyes_retained_missing_chain.py)的
+`cnyes_unchanged_mismatch_plan_v2` 可重用這類來源原件見證：逐項核對
+目標 ID 與數量、現存原件的內容雜湊、目前收據與原件及回應的對應，
+並確認實際來源請求不同於觀察請求。原件與留存雜湊不符、目前收據
+不能綁定、掃描期間檔案變動、目標不一致、跨報告借用或證據不完整時，
+不會沿用診斷。舊報告沒有保存當時收據
+的檔案身分，因此只能說**目前收據**與原件相符，不能宣稱收據從舊
+稽核以來未變。
+
+[本次 v2 規劃](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_mismatch_sourceonly_plan_v2_20261029.json)
+及[獨立讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-sourceonly-independen-20261029T063142-64019192/run.log)
+確認相同快照的 **854 個不符候選**皆可沿用既有診斷，其中 827 個是
+同報告精確請求見證，另 27 個是來源原件見證；那 27 個包含的 76 筆
+來源結果不是 76 篇已補齊正文。這是減少重複解碼的離線稽核改善，
+**854 個請求不符仍未修復**，沒有新增或接受正文、連線新聞網站、
+重解碼原件或寫入正式佇列。已接收正文批次的完整候選索引尚未建立，
+不能以此斷言缺失的原件永遠不存在。全站歷史進度與完成時間仍未知。
+本次[相關回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-sourceonly-regression-20261029T063141-a5273d86/run.log)
+**390 項通過**，包括原件與收據不一致、跨報告借用和中途變動；這是
+離線程式與資料快照驗證，並非新聞下載服務已載入或已完成的證明。
+
+新聞 service 和 timer 繼續依使用者的維護指示停止；TEJ Smart Wizard
+服務及 API timer 維持運作。TEJ 的程序狀態不代表已核驗資料下載成功。
+
+## 10/29 維護期間：鉅亨待核對原件及查詢候選的整鏈量測
+
+新聞 service 與 timer 維持停止；TEJ 依使用者確認維持原有運作，
+本輪沒有重啟任何服務、向新聞來源請求或寫入正式新聞佇列。先前已有
+見證的 827 個不符原件沒有再下載或重新解析。本輪只檢查尚缺見證的
+27 個觀察是否另有同一請求的本機原件：
+
+- [原件位置定點核對](../artifacts/operations/agent-workflow/runs/news-cnyes-pending-alternatives-20261029T061816-32c6942a/run.log)
+  對每個觀察核對資料庫快照、來源與解析器身分、原始回應雜湊和
+  登錄路徑，並檢查同請求的原件目錄；沒有確認到可驗證的替代原件。
+  已接收批次候選索引在這份快照中尚不存在，因此此項不是全批次查驗。
+- [同頁文章的目前批次定點核對](../artifacts/operations/agent-workflow/runs/news-cnyes-pending-head-batches-20261029T062053-72a47aba/run.log)
+  依 27 個來源頁中 778 個 ID 位置找到 **46 個目前正文批次候選**；
+  使用既有檢查器逐個核對原請求、回應、收據、授權和擷取時鐘，沒有
+  確認到符合這些觀察的原件。778 是頁內 ID 位置數，46 是各頁候選
+  引用數，均不是新增或缺失的唯一篇數。較舊批次、別名及完整候選
+  索引未窮盡；不能因此宣稱 27 個觀察永遠沒有本機原件或已修復。
+  前後正式 SQLite／空 WAL 身分不變，檢查沒有接受、回填或複製正文。
+
+效能檢查也排除了兩個看似合理的推測：正常鉅亨正文批次只在第一筆
+保存共用原始回應，並非每篇都註冊一次。兩個別名各自查詢改成一個
+`IN` 查詢的[唯讀測試](../artifacts/operations/agent-workflow/runs/news-cnyes-alias-lookup-abba-20261029T061526-01d44a4b/run.log)
+兩輪方向不一致，不能證明較快。再將每篇的兩個別名及主網址合為
+一筆查詢，在[真實佇列的唯讀局部測試](../artifacts/operations/agent-workflow/runs/news-cnyes-alias-current-abba-20261029T061617-9d21442d/run.log)
+中，4,000 次查詢的 CPU 約從 0.283–0.300 秒降至 0.204–0.217 秒，
+結果雜湊一致；但這不是整段下載的收益。
+
+進一步在隔離環境對同一份合成來源頁跑八輪解析、接受、耐久寫入和
+獨立正文讀回，每輪均驗證 50 個版本且內容雜湊相同。這次[整鏈量測](../artifacts/operations/agent-workflow/runs/news-cnyes-head-query-chain-20261029T062005-ac4cf6b7/run.log)
+的牆鐘中位數分別為原方法 **0.183 秒**、合併候選 **0.216 秒**，
+各輪波動較大，沒有證明可穩定縮短整鏈時間；查詢合併候選已撤回。
+此量測不含網路、正式大小佇列與線上服務，不代表網站速度或官方
+上限。局部測試第一輪快取條件也不同；不可把局部 CPU 百分比外推
+為實際下載加速。
+
+## 10/29 維護期間：第一版鉅亨請求不符證據規劃
+
+第一版規劃時，前述分段稽核完成後，可沿用 3,829 個精確請求／文章／觀察組合；
+但同一停機快照仍有 **854 個觀察／回應／原件不符組合**。其中 827 個
+可在記錄該不符的**同一份報告**找到同原件、同回應的精確請求見證；
+當時的原件和收據檔案身分也與見證一致。其餘 27 個不具備可按第一版
+規則沿用的見證；後續 v2 採用的來源原件見證詳見上節。這 27 個是原有 854 個之內，
+不是新增錯誤；827 個也只是可沿用「不符」診斷，**不是已修復或有正文**。
+這 27 個在既有報告中有 76 筆僅屬原始來源回應的結果，皆為來源未提供
+正文，並保存原件內容雜湊；它們沒有本規劃要求的同報告精確請求見證
+及原件／收據檔案身分，不能當作該觀察的請求已驗證。
+
+既有[續查驅動器](../scripts/audit_news_cnyes_retained_missing_chain.py)
+的 `--check-only --plan-mismatches` 只在完整分段報告鏈、資料庫
+快照、來源及解析程式身分相符時建立唯讀規劃。它按觀察與原件分組，
+確認同報告的見證、請求差異及原件／收據身分；任何見證不足、跨報告
+借用或不同請求混合的項目仍列待核對。同一回應雜湊可能對應不同原件，
+因此也會顯示與待核對項共用雜湊的數量。讀取前後會重新檢查快照、
+報告雜湊和被沿用的檔案身分，但這不是對其他程序的寫入鎖。
+
+[本次規劃明細](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_mismatch_reuse_plan_20261029.json)
+保存各項觀察、原件及報告雜湊，不複製新聞內文。這次 27 個待核對
+項有 27 個不同回應雜湊，且沒有和 827 個可沿用項共用回應雜湊；此結論
+僅限這個快照。若以回應雜湊定點重查，仍必須依當時快照重新規劃，
+不能假設其他快照沒有碰撞。規劃不自動派工，也不修改線上下載器；
+報告鏈中的來源結果和不符問題維持原狀。
+
+在原快照仍相同時，可用下列指令重新輸出完整規劃（輸出含內部證據
+路徑，應留在本機）：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/audit_news_cnyes_retained_missing_chain.py \
+  --exclude-audit artifacts/data_quality/news_offline_inventory_20261029/cnyes_selected_original_revalidation_20261029T0525Z.json \
+  --output-dir artifacts/data_quality/news_offline_inventory_20261029/cnyes_scan_chain_real_20261029 \
+  --check-only --plan-mismatches
+```
+
+[獨立讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-mismatch-plan-indepen-20261029T060647-93d229a1/run.log)
+以另一程序核對 16 份報告鏈、3,829 個精確組合、5,705 個指定狀態的
+head、854 個不符觀察與同報告見證；核對前後比對資料庫、原件、收據及
+報告身分。此次規劃與讀回沒有重新解碼來源原件、呼叫新聞網站或寫入
+正式 queue。[相關回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-mismatch-plan-regress-20261029T060709-e29b9c27/run.log)
+共 679 項通過，涵蓋不符見證、檔案變動、雜湊碰撞、分段續查和原件
+證據；這不是正式下載服務的驗收。沒有量到完整線上下載加速或全部
+歷史完成時間；新聞服務與 timer 持續依維護指示停止，TEJ 不受本次
+工作影響。
+
+## 10/29 維護期間：鉅亨原件稽核分段與自動續查
+
+原本不指定回應的缺文稽核掃過十萬筆觀察就拒絕繼續，不能處理未來更大
+的歷史佇列。[既有稽核器](../scripts/audit_news_cnyes_retained_missing.py)
+現在提供分段模式：依六欄主鍵做 keyset 續查，每段限制觀察數；單段因
+時間或原件數中斷時，記住已處理的原件組，重跑該段只處理後續組。慢
+掃描耗盡時間片時仍允許至少處理一個原件，避免永遠只掃描而無進度。
+
+每份分段報告使用獨立契約，保存原始請求、收據、結果、失敗及可續查
+位置。續查前核對資料庫與空 WAL／journal 的檔案身分、來源及程式指紋、
+排除清冊雜湊和同段候選集合；不符合就停止。每份報告的身分比對不構成
+寫入鎖，也不保證其他原件在所有報告之間未改變。相同內容的不同請求
+可能分在不同段，段內的來源原件線索不能直接加總成全站完成數；既有
+發行人比對器也會拒絕把分段報告當成完整 v4 證據。
+
+[續查驅動器](../scripts/audit_news_cnyes_retained_missing_chain.py)按順序
+寫入不可覆蓋的分段報告，另更新可重建的狀態檔。不同程序對同一輸出
+目錄使用鎖；報告寫完而狀態檔尚未更新時，重啟可沿報告雜湊鏈恢復。
+原件失敗或請求不符保留在各段，後續段仍可處理；掃描走到末端也不代表
+錯誤已修復、新聞正文齊全或歷史完成。可用 `--max-reports` 限定單次
+新增報告數、`--check-only` 只讀回既有進度；正常執行會自行續接。為
+控制報告體積，單份超過 128 MiB 會停止；完成一段後可縮小下一段，
+同一段尚在續查時則必須保持段大小不變。輸出須在新聞資料根目錄以外。
+
+[正式停機快照主鍵讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-observation-keyset-re-20261029T053450-80d2fe8a/run.log)
+把 73,644 筆觀察分為 25,000／25,000／23,644 筆，與一次掃描的主鍵
+雜湊相同；續查查詢使用既有主鍵索引，不建立正式索引。一次掃描與
+分段掃描牆鐘分別約 1.04／1.13 秒，只比較主鍵讀取，不驗證原件、正文
+或線上速度。[30 組舊證據讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-reviewed-v4-final-rea-20261029T054551-eeefbd6e/run.log)
+可沿用，原本 1 筆不符觀察仍未被當成有效證據。
+
+正式停機快照先用兩個無候選觀察驗證跨程序續查，再繼續掃描其餘範圍。
+[目前狀態](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_scan_chain_real_20261029/status.json)
+為 16 份分段報告、73,644 個觀察鍵全部掃過，狀態是「掃描完成但有
+問題」；[獨立程序回讀](../artifacts/operations/agent-workflow/runs/news-cnyes-chain-complete-indepe-20261029T055051-d8c2b8ad/run.log)
+核對報告雜湊鏈、資料庫快照、程式及來源指紋，回讀本身沒有再次解碼
+原件。這次只對桌面版網址且屬六種指定缺文狀態的 5,705 個 head
+尋找候選，既有 30 組已驗證結果已排除；不是所有網址、所有原件或
+全部歷史的驗收。
+
+分段中共記錄 1,653 次原件核驗和 854 個不同的「觀察／回應／原件」
+請求不符組合，未出現原件讀取失敗；跨段原件核驗次數不等於不同原件數。
+精確請求身分成立的結果包括 3,715 筆 `bulk_body_not_provided` 紀錄
+與 84 筆 `body_not_found` 紀錄，分別涉及 2,227 與 82 個不同新聞 ID；
+兩組 ID 可能重疊，不能相加。另有 76 筆僅能證明原始來源回應的
+`bulk_body_not_provided` 結果，不能當作原觀察請求已驗證。這些結果
+均沒有找到可用正文，並不排除未納入的其他本機候選或未來來源重查。
+最後一輪程序因回報「完成但有請求不符」依契約以 exit 1 結束，獨立
+回讀確認此狀態及證據鏈；不符項仍須由維護結束後的正式 owner 尋找
+精確請求的原件或依來源規則重查。
+
+比對先前的 v2 全量報告，這次有 **3,799 個精確請求／文章／觀察組合**
+是重新核驗，並非新下載；兩版的結果、正文雜湊、來源文章雜湊及觀察
+時間等七項欄位一致。舊報告缺少原件與收據的檔案身分及原件路徑，
+而本機也曾重開機，無法直接滿足現行沿用契約。現在新增報告保存這些
+證據；[沿用讀回](../artifacts/operations/agent-workflow/runs/news-cnyes-chain-proof-reuse-rea-20261029T055346-7244392e/run.log)
+在目前快照和檔案身分下，確認 13 份有精確結果的分段加原先 30 組 v4
+結果，可沿用共 **3,829 組**，不用再次解碼其原件。可將這 14 份報告
+作為 `--exclude-audit` 輸入；無精確結果的三份空段不需輸入。這只排除
+已驗證的個別組合，854 個請求不符候選仍須保留；來源、解析程式、觀察
+或原件／收據身分改變時，仍須按契約重新核對。
+隔離測試另涵蓋超過十萬筆、同內容不同請求跨段、時間片中斷、來源
+失敗、續查輸入改變、同時執行、報告缺頁及報告發布後狀態更新失敗；
+[相關回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-chunk-chain-final-reg-20261029T054407-1166bb96/run.log)
+共 670 項通過。
+新聞 service／timer 仍依維護指示停止，TEJ 可運作；本次沒有呼叫
+新聞網站、寫入正式 queue 或載入正式下載服務。
+
+## 10/29 維護期間：優先來源清冊與鉅亨定點稽核
+
+新聞 service 與 timer 依維護指示保持停止；TEJ 可以運作。本次未啟停
+TEJ，也未呼叫新聞來源或寫入正式新聞佇列。臺北時間 13:17:50 的
+[十個優先來源唯讀清冊](../artifacts/data_quality/news_offline_inventory_20261029/priority_provider_inventory_20261029T052000Z.json)
+與[依既有工作順序產生的規劃](../artifacts/data_quality/news_offline_inventory_20261029/priority_provider_plan_20261029T052100Z.json)
+只涵蓋本機已知網址，不是各站全部文章的分母：
+
+| 來源 | 本機已知網址 | 已保存正文的網址 | 尚待處理或需查明 |
+| --- | ---: | ---: | --- |
+| 鉅亨 | 3,693,925 | 3,686,903 | 7,022 個網址無保存正文，其中 187 個是待處理工作；另有 423 個已存正文的重查工作。 |
+| CMoney | 278,700 | 0 | 237,343 個待處理；其中 1,327 個已有來源 403 拒絕紀錄，另有 41,357 個網址路徑目前不支援。 |
+| Global Voices | 110,674 | 110,600 | 74 個目前無保存正文，終結分類仍需按來源事實理解。 |
+| CMNews | 66,909 | 65,933 | 部分無正文項目標為付費／登入、找不到或其他狀態；舊正文及目前來源狀態分開保留。 |
+
+另有 CMoney Learning 44 個網址、44 個已保存正文；UDN、中時／工商、
+MoneyLink、MoneyDJ、LTN 目前各自標為等待可用授權路徑。這不表示
+所有可能的授權方式已窮盡，也不能把「等待」當成已完成。清冊和
+規劃本身不證明正式服務已排入或任何來源的全歷史完整。
+
+既有[鉅亨缺文稽核](../scripts/audit_news_cnyes_retained_missing.py)
+有兩個可重現問題：歷史下載器其他部分變更後，已審核的舊版原件證據
+即使讀取契約未變也被拒絕重用；而指定少數回應時仍把所有觀察搬進
+Python，超過 100,000 筆就提前失敗。前者重新核對原件、觀察、檔案
+身分及 digest 依賴後，僅更新精確程式指紋；來源契約、請求、原件、
+收據、已提交批次與檔案身分仍須符合，程式再次變動仍會停用此橋接。
+後者在 SQLite 以參數化條件挑選回應，計數明確標為所選範圍；無指定
+回應而未使用分段模式的舊式全量掃描仍有 100,000 筆上限；上方分段
+模式已對所選缺文 head 掃過停機快照的全部觀察，但尚未驗收所有原件
+或全站全文。原始失敗見[定點稽核重現](../artifacts/operations/agent-workflow/runs/news-cnyes-targeted-scan-red2-20261029T052036-2e0b04bc/run.log)
+及[證據相容測試](../artifacts/operations/agent-workflow/runs/news-cnyes-proof-compatibility-r-20261029T051936-9dd0e637/run.log)。
+
+一個現存回應的[唯讀 ABBA 比較](../artifacts/operations/agent-workflow/runs/news-cnyes-selected-observation--20261029T052427-2f5c6db6/run.log)
+結果一致：舊方法每次傳 73,644 筆至 Python，新方法傳 2 筆；兩次新方法
+牆鐘 0.050／0.048 秒，舊方法 2.718／0.972 秒。SQLite 仍為表掃描，
+且緩存條件不一致，這只衡量選擇階段，不是線上下載速度或整批 ETA。
+[重新核驗的實際原件](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_selected_original_revalidation_20261029T0525Z.json)
+有 30 個目標結果與先前一致，均未提供正文；另 1 筆觀察的原請求仍不符，
+因此該次稽核以 exit 1 保留未解問題。重開機後裝置識別由 2096 變為
+2112，舊檔案身分不能直接沿用；[比較結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_selected_revalidation_prior_comparison_20261029.json)
+只排除檔案身分與新版收據路徑後比較相同事實。這不是新增正文。
+
+[修正後共用回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-proof-shared-regressi-20261029T052259-9435dc5d/run.log)
+652 項通過，涵蓋原始請求、收據損壞、已提交批次與證據沿用；定點範圍
+在超過十萬筆無關觀察時也能完成。此次程式尚未由正式新聞 owner 載入；
+維護結束後仍需由該 owner 執行、讀回收據並確認實際進度。
+
+## 10/29 維護期間：歷史原件與較新請求版本
+
+本機原始批次可能保留較早的請求及回應，但批次索引原先只比對
+`discovery` 當前的回應雜湊。若清單頁 head 仍引用早期觀測，當前
+請求的回應雜湊已改變，就算批次裡有該早期觀測的原件，也會略過。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-historical-revision-r-20261029T051032-869abc0d/run.log)
+驗證了這種情境及舊版掃描游標已完成時無法重新發現候選；這是
+可重現的潛在缺口，並非正式資料已出現此狀況的證明。
+
+唯讀 SQLite 將每個 `cnyes_history_page_heads` 連到其觀測，再以
+觀測記錄中的實際 `request_url` 查 `discovery`：**75,347 個頁面
+head 的雜湊全部相同**，其中 **73,605 個是觀測本身的範圍，1,742
+個是引用別的範圍觀測的別名**；共有 73,605 個不同觀測。這只是
+觀測和當前佇列雜湊的比對，沒有驗證來源原件、別名請求或全文。
+唯讀前後主資料庫、空 WAL 及 journal 的檔案身分不變；這不是鎖。
+當時正式庫沒有批次索引表，也沒有舊版批次掃描游標。
+
+[原有本機批次索引](../downloader/news_fulltext_cnyes_history.py)現在
+額外接受具有完整合法觀測、相同來源／授權契約、精確網址及雜湊
+的歷史 head 作為**候選**；候選仍須由既有驗證器檢查批次收據、
+原始回應、授權、內容與時鐘，不能只憑雜湊或別名推定原件有效。
+既有佇列的較新回應、429 與重試期限不變，失敗或中斷時索引及
+喚醒在同一交易回滾。掃描鍵改為 v2，保留 v1 游標供追溯；已有
+v1 游標的安裝會重新掃描既有本機批次一次，以免漏掉舊規則跳過的
+項目。此本機工作會產生額外磁碟讀取，並不代表對網站增加請求。
+
+隔離測試包含重啟後讀回、不同網址但相同內容、來源／授權契約
+變更、損壞觀測及中途失敗回滾；[8 項聚焦測試](../artifacts/operations/agent-workflow/runs/news-cnyes-historical-revision-a-20261029T051237-002f4de3/run.log)
+與[684 項較廣回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-historical-revision-r-20261029T051137-b6c68375/run.log)
+通過，兩組範圍重疊不可相加。修正尚未由正式新聞 owner 載入；
+新聞 service 和 timer 仍依維護指示停止。TEJ 可運作；服務狀態
+不代表已確認實際下載或完整性。
+
+## 10/29 維護期間：鉅亨缺口修復時間片公平性
+
+歷史 owner 每輪先執行多個本機掃描，再用剩餘時間檢查未完成範圍。
+如果掃描持續超過工作時間片，後面的範圍修復即使已經有待辦也可能
+永遠得不到執行機會。[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-repair-fairness-red-2-20261029T045804-4b104978/run.log)
+分別涵蓋正常來源工作、429 及重啟後持續慢掃描；這是程式條件的重現，
+不是正式服務目前正在飢餓的證明。
+
+[共用 owner](../downloader/news_fulltext_cnyes_history.py)現在會在修復
+工作因時間片耗盡而未執行時，讓它在下一輪先處理；查詢本身變慢時，
+正時間片允許最多先處理一個範圍，停止要求仍優先。範圍進度仍由既有
+持久游標保存。已完整掃過、證據未變的範圍不會因每輪慢掃描反覆空轉；
+新的範圍證據或本機候選工作變化會使快取失效，最遲維持既有的
+300 秒閒置重查週期。這不是對來源失敗增加冷卻，429 與其他來源期限
+由原排程維持。
+
+若較早範圍在掃描游標通過後才有新證據，會先完成目前游標，再從頭
+補掃。重啟時如有未完成游標，也會在游標走完後多做一輪，避免中斷
+前的變化被漏掉。這使單次慢範圍可能超出名義時間片，但各範圍之間
+仍會回到正常 owner；沒有新增下載程序或平行帳號。
+
+[停機佇列唯讀回讀](../artifacts/operations/agent-workflow/runs/news-cnyes-repair-scope-readback-20261029T050551-06acafee/run.log)
+當時只有 3,720 個 `list_complete`、86 個 `list_complete_by_page_ID_equivalence`
+及 1,116 個 `partition_list_complete` 的範圍狀態；這些是舊清單狀態，
+不表示原件身分、全文或全歷史已驗證。唯讀前後資料庫及 sidecar 身分
+未變，該比較不是鎖。
+
+[較廣回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-repair-fairness-regre-20261029T050330-e1a5352f/run.log)
+801 項通過；其後增加的顯式掃描快取失效及重查測試與相關游標測試，
+另有[20 項通過](../artifacts/operations/agent-workflow/runs/news-cnyes-repair-cache-final-20-20261029T050511-9cf25066/run.log)，
+範圍重疊不可相加。隔離測試覆蓋持續慢掃描、429 不變、停止、最後
+候選落定、新證據及游標中斷後補掃。測試不代表正式服務已載入或
+來源已下載完成；新聞服務和 timer 依維護指示保持停止，TEJ 可運作。
+
+## 10/29 維護期間：鉅亨本機頁面與批次索引並行恢復
+
+舊的非零頁面盤點需要先等待整個既有正文批次索引到達前沿；在這段
+期間，已經有原件及收據的頁面也無法從此路徑開始核驗。另外，當頁面
+游標已經通過，而批次主掃描稍後才找到候選原件時，主掃描沒有把這個
+頁面喚醒。最後，前面某次慢檔案查詢耗盡時間片時，即使已有可處理的
+本機工作，驗證階段也可能一直沒有機會執行。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-parallel-red-20261029-20261029T044940-f7fe3199/run.log)
+涵蓋這三個問題及中途失敗時的候選回滾。
+
+[原有 owner](../downloader/news_fulltext_cnyes_history.py)現在交錯推進
+頁面盤點與批次索引：已知本機原件先進入驗證；較晚找到的批次候選
+則在同一批次交易內喚醒已掃過的頁面。批次讀取或喚醒失敗時，候選
+與喚醒一同回滾並保留重試。正時間片在前置工作變慢時至少給一筆
+可執行的本機驗證機會；停止要求仍立即生效。原有來源重查圍欄、
+HTTP 排程及 429 狀態保留；候選仍不是有效原件，必須獨立驗證原請求、
+收據、授權、內容與實際時鐘。
+
+[正式停機佇列唯讀篩選](../artifacts/operations/agent-workflow/runs/news-cnyes-unheaded-indexed-read-20261029T045406-7f224003/run.log)
+在私人記憶體中索引待驗範圍後，得到 **11,227 個範圍、221,369 個
+舊頁面**的候選上界。這些數字沒有驗證端點、檔案或收據，既不是待抓
+文章數，也不是可恢復原件數。唯讀前後資料庫及 sidecar 身分相同，
+但身分比較不是鎖。正式舊資料庫當時尚沒有待驗工作範圍索引；程式
+原本已在 owner 初始化建立索引。[隔離遷移測試](../artifacts/operations/agent-workflow/runs/news-cnyes-parallel-migration-20-20261029T045431-4b7f41df/run.log)
+確認舊 schema 初始化後查詢由表掃描變為索引搜尋，重新開啟後仍存在。
+這只驗證程式行為，正式服務停機期間不建立該索引。
+
+[離線完整流程 ABBA](../artifacts/operations/agent-workflow/runs/news-cnyes-parallel-abba-final-2-20261029T045455-fc0f146d/run.log)
+以 500 個非鉅亨小批次和 1 個鉅亨批次、每組兩輪比較；獨立回讀均有
+501 批次、3 個頁面 head 和 3 筆恢復工作，來源工作未改變。首次驗證
+頁面的牆鐘中位數由約 2.29 秒降到 0.17 秒；完整夾具分別約 2.50 與
+2.44 秒。另一次與回歸測試同時執行的[比較](../artifacts/operations/agent-workflow/runs/news-cnyes-parallel-abba-2026102-20261029T045146-5e6a13bb/run.log)
+中，新版本完整夾具較慢。樣本小且受其他工作影響，不可推算正式
+下載速率、全部批次完成時間或聲稱整體吞吐量提升。
+
+[較廣離線回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-parallel-regression-2-20261029T045047-ee75dff9/run.log)
+699 項通過；另有 34 項[遷移與恢復回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-parallel-migration-20-20261029T045431-4b7f41df/run.log)
+通過，範圍重疊不可相加。本次未呼叫新聞來源或寫入正式佇列。
+新聞 service／timer 依使用者維護指示保持停止；TEJ 可以運作。修正
+尚未由正式新聞 owner 載入，維護結束後仍需依收據和實際進度驗收。
+
+## 10/29 維護期間：批次中斷、缺檔轉異常及讀取器升級恢復
+
+既有 owner 的缺檔重試若遇到重新出現但格式損壞的 Parquet，原先把
+`ArrowInvalid` 當成本機 I/O 問題，反覆嘗試解碼，最長退避至 300 秒；
+這與初次掃描將同類錯誤視為異常批次的處理不一致。現在保留舊缺檔
+紀錄，把該批次轉入既有異常重試；穩定異常確認後每小時檢查檔案
+身分，改變時才重讀，真實 I/O 和記憶體壓力仍走原本的暫時重試。
+
+同一個批次讀到一半時若失敗，初次掃描和缺檔重試原先會留下已登記的
+部分候選、喚醒工作及索引計數。現在以批次為單位回滾這些暫存改動，
+已成功的其他批次仍可繼續；外層掃描交易遭未預期中斷時，成功批次
+與游標一同回滾後續跑。候選仍須原請求、來源授權、內容和收據核驗，
+這些改動不會把候選直接當作完成。缺檔與 I/O 重試每次也重新查目前
+登記的收據；登記暫時不存在時保留重試，不用舊收據冒充目前登記。
+
+[九種隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-retry-red-20261-20261029T043650-384c47c0/run.log)
+及其[修正後驗證](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-retry-green-202-20261029T043755-77b83a86/run.log)
+涵蓋重新出現的損壞檔、讀取中失敗與收據更換。這是程式邊界的重現，
+不是正式資料實際有相同損壞的證明。
+
+此外，舊異常檔即使本機檔案未變，讀取程式或 PyArrow 升級也可能使
+結果改變；原見證只含檔案身分，會一直跳過重新判讀。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-reader-upgrade-red-20-20261029T044120-d9a7ef0a/run.log)
+確認此情況。現在見證額外包含已載入讀取程式的指紋與 PyArrow 版本：
+下一次到期本機檢查若任一者變更，就重新判讀；都沒變則繼續只檢查
+檔案身分。這不改來源退避，也不保證任何特定版本更新一定修好檔案。
+[聚焦測試](../artifacts/operations/agent-workflow/runs/news-cnyes-reader-upgrade-green--20261029T044154-7a80cb78/run.log)
+涵蓋版本變動、程式指紋變動、未變時不重讀及修復後恢復。
+[最終相關回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-reader-final-20-20261029T044306-fcd2893d/run.log)
+37 項通過；另外兩項[工作喚醒測試](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-wakeup-rollback-20261029T044546-f926cb70/run.log)
+確認部分候選回滾時，原先的失敗工作與其結果仍保留，完整讀取後才
+喚醒。讀取器指紋加入前的[較廣回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-recovery-final--20261029T043858-bedb7373/run.log)
+通過 176 項，含相關面板投影；各輪範圍重疊，不能相加成獨立案例數。
+
+[小型本機 ABBA 比較](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-savepoint-bench-20261029T044221-a5c73437/run.log)
+以每輪 1,000 個相同、非鉅亨候選的小 Parquet 批次及獨立 SQLite 回讀
+比較，新舊每組各兩輪，CPU 中位數約 0.453／0.449 秒、牆鐘中位數
+約 0.473／0.486 秒。樣本與檔案緩存狀態有限，不能據此宣稱線上
+下載速度提升或推估正式 223,582 個全來源批次耗時。
+新聞服務和 timer 保持停止，正式佇列、來源及頁面仍需維護結束後驗收；
+本次沒有新聞來源請求或 TEJ 啟停。
+
+## 10/29 維護期間：本機異常補登的進度狀態
+
+既有正文批次的主掃描結束，不等於舊異常紀錄已補登，也不等於異常
+批次已復原。修正前的隔離測試[重現](../artifacts/operations/agent-workflow/runs/news-cnyes-invalid-progress-red--20261029T042637-ba8e19f4/run.log)
+了補登狀態未提供；程式碼檢查另發現待復原批次可能與「盤點結束」
+同時出現。現在後端和[頁面](../services/news_dashboard/app.js)區分
+補登尚未開始、進行中、完成與未知；仍有本機重試或缺檔時顯示等待，
+有異常批次待復原時也不報盤點完成。舊版紀錄沒有補登資訊、或檢查點
+損壞時顯示未知；損壞檢查點依既有程序保留後重新補登。
+
+沒有可用來源設定時，尚未查詢的本機重試數原本錯顯為零，而將未知
+值送給頁面時又會整個隱藏這個區塊。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-unknown-progress-red--20261029T043136-551d33c2/run.log)
+證實兩種情況；現在保留未知並分別顯示，不能推定沒有待辦。
+這些狀態僅描述本機原件盤點與復原，不是新聞全文、來源或全歷史完成率，
+也不改變來源請求、429 冷卻或下載排程。
+[最終隔離回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-invalid-progress-fina-20261029T043212-2378d536/run.log)
+49 項通過，涵蓋補登、損壞檢查點、無來源與舊版狀態、本機復原、
+來源 429 不變，以及桌面與手機的離線網頁渲染。這不證明正式網站已
+載入新版，亦不證明來源下載已恢復。
+
+[正式停機佇列唯讀 schema 回讀](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_invalid_migration_schema_readback_20261029.json)
+顯示五個相關新表尚不存在；唯讀前後資料庫及 sidecar 檔案身分未見變化。
+這證明本次修復尚未由正式 owner 載入，不能據此說正式資料有多少損壞
+或已恢復。檔案身分比對不是鎖，也不保證稽核結束後的狀態。
+新聞 service 和 timer 依維護指示保持停止；TEJ 可運作，沒有因本次工作啟停。
+
+## 10/29 維護期間：已接收異常批次的本機恢復
+
+既有鉅亨歷史 owner 在清點全來源已接收的正文批次時，若遇到損壞的
+Parquet 或循環符號連結，會記錄異常並繼續，但原本不會在檔案修好後
+重新索引。這可能錯過可供核驗的既有原件。隔離測試重現了兩種情況，
+見[修正前結果](../artifacts/operations/agent-workflow/runs/news-cnyes-invalid-accepted-reco-20261029T040528-cdd3ef88/run.log)；
+這不是正式資料確實存在該問題的證明。
+
+[既有 owner](../downloader/news_fulltext_cnyes_history.py)現在持久記錄
+異常批次並於約 2 秒後確認；確認仍異常且檔案未改變時，約每小時只
+檢查檔案身分，避免反覆解碼。檔案或已登記的收據改變時會重新索引；
+讀取過程中檔案若變動則回滾候選並稍後重試。舊異常紀錄以可續跑的
+有限批次補入檢查，包含曾經恢復但之後可能又變動的路徑。新候選仍須
+通過原請求、收據、授權、內容及時鐘核驗，才可認定為有效原件。
+這些檢查不呼叫來源，也不修改來源的 429 與截止時間。
+
+若批次已建立候選後更換登記收據，原先的 `INSERT OR IGNORE` 會留下
+舊收據路徑，使候選無法通過目前登記核驗。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-replaced-receipt-red--20261029T041547-9712852a/run.log)
+確認此缺陷。現在只在新路徑與該批次目前的登記一致時更新候選，記錄
+舊與新收據路徑並喚醒既有本機驗證；收據原檔保留。舊掃描不得將索引
+改回過期收據，也不把更新視為新增一個候選。
+[修正後兩項隔離測試](../artifacts/operations/agent-workflow/runs/news-cnyes-replaced-receipt-gree-20261029T041652-ba26144f/run.log)
+涵蓋先前有、沒有候選兩種情況，以及來源 429 的不變性。
+
+[進度頁](../services/news_dashboard/app.js)新增已盤點之全來源異常
+批次待本機復原數；舊版本沒有此資料時顯示為未知，不將其視為零。
+這個數字不是鉅亨缺文數，也不代表所有批次已經盤點。
+[早期隔離驗證](../artifacts/operations/agent-workflow/runs/news-cnyes-invalid-accepted-reco-20261029T040931-6dcd3846/run.log)
+涵蓋修復後再發現、重啟後避免重複解碼、舊異常遷移及讀取期間變動
+回滾。[收據候選修正前的隔離回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-final-focused-2026102-20261029T041255-ab20e561/run.log)
+通過 149 項，包含舊版本相容與實際桌面／手機網頁渲染；
+最新的[鉅亨 owner 相關回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-relevant-regression-2-20261029T041859-c0f0901b/run.log)
+通過 54 項，範圍為原件身分、別名、批次索引和本機重試。
+新聞 service、timer 依維護指示仍停止，正式 owner 尚未載入修正；
+TEJ 保持可運作，沒有因本次新聞工作啟停。
+
+## 10/29 維護期間：鉅亨原件不符修復避免反覆排回
+
+新聞 service、timer 維持停止，TEJ 可運作；以下均為隔離資料，沒有
+來源請求或正式 queue 寫入。既有 owner 遇到原件請求身分或授權身分
+不符時，會保留問題並嘗試本機修復；但嘗試完成後，原本的重考函式
+會把同一份工作立即排回 `pending`。當前面持續有無法修復的工作時，
+可能反覆解碼與排程，也可能讓後面的有效原件無法輪到。
+[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-mismatch-self-requeue-20261029T035436-889ec4fa/run.log)
+中，六輪後同一項仍為 `pending`；這是程式缺陷的重現，不表示正式
+停機佇列已經反覆執行，也不代表所有 25,515 個不符 head 都受影響。
+
+[既有鉅亨 owner](../downloader/news_fulltext_cnyes_history.py)現在依
+請求、回應雜湊、scope、頁碼及預期筆數／ID 雜湊辨認修復工作：同一
+版本剛處理完不再自行重排，較舊但預期不同的終結工作會先連同其
+outcome 留存，再以目前觀測建立工作。已接收的正文批次新增精確
+候選時仍沿用既有事件喚醒；單獨復原的原件也會由下一次原件完整
+巡檢發現，巡檢週期目前為 24 小時，實際時間會受停機與工作負載影響。
+別名在有自身獨立、可核驗的候選時，可以先復原，不必等另一個
+原件有問題的 exemplar；恢復仍要核對請求、授權、原始回應、收據、
+雜湊和時鐘，不會將相同內容假冒為同一次請求。
+
+[兩個補充失敗重現](../artifacts/operations/agent-workflow/runs/news-cnyes-independent-original--20261029T035957-55a158ab/run.log)
+涵蓋仍有 exemplar 的別名、以及相同回應雜湊卻有不同舊預期；
+[修正後測試](../artifacts/operations/agent-workflow/runs/news-cnyes-independent-original--20261029T040059-b991753c/run.log)
+通過 10 項，[別名與舊預期交叉測試](../artifacts/operations/agent-workflow/runs/news-cnyes-revision-alias-final--20261029T040210-95ffbe44/run.log)
+通過 3 項。另以每輪僅處理一筆的隔離佇列驗證：前面四個無可用原件
+的項目不再卡住後面的可復原頁面；見[公平性測試](../artifacts/operations/agent-workflow/runs/news-cnyes-mismatch-fairness-202-20261029T035742-57b542bf/run.log)。
+測試均核對來源 429 與截止時間不變；這是功能驗證，並非線上下載速度
+或全歷史完成證明。上述 54 項相關回歸已通過，正式新聞 owner 尚未載入修正。
+下方全量唯讀清點記錄的是修正前程式雜湊，並不聲稱本次修正已在正式
+資料上執行。
+
+[停機佇列唯讀回讀](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_queue_readback_20261029.json)
+在 10/29 12:04 臺北時間看到目前來源合約的原件巡檢 checkpoint 尚未
+建立、未證明頁面標記為 0，已接收正文批次候選索引尚不存在。這表示
+下方唯讀工具辨識的 25,515 個請求不符 head 尚不能當成正式 owner
+已逐筆登記或修復。既有 retained work 有 5,080 筆 `retained_unavailable`、
+88 筆 `retained_invalid`、226 筆 `restored` 和 126 筆
+`forward_evidence_available`；它們與頁面清點不是同一分母，不能相加
+或認定全都出自上述缺口。佇列中 223,582 個已接收批次涵蓋所有新聞
+來源，並非鉅亨批次數。唯讀查詢前後資料庫和 SQLite sidecar 的檔案
+身分未見變化，但沒有寫入鎖或稽核結束後的狀態保證。
+
+## 10/29 維護期間：鉅亨舊歷史頁面全量唯讀清點
+
+新聞服務與 timer 保持停止；本次沒有來源請求、正式 queue 寫入或
+TEJ 啟停。以[唯讀清點工具](../scripts/audit_news_cnyes_history_originals.py)
+沿用現有鉅亨原件、收據、雜湊、授權及實際請求身分驗證，對停機資料庫
+中 **75,347 個歷史頁面 head**逐筆檢查；與 11,003 個公開清單 head
+是不同範圍，不應合併當作文章總數。[完整結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_original_inventory_20261029.json)：
+
+| 原件檢查結果 | head 數 | 意義 |
+| --- | ---: | --- |
+| 原件與該觀測紀錄的請求相符 | 49,778 | 其中 1,734 個 head 指向另一個 scope 的觀測；這次檢查沒有驗證別名本身的獨立請求證據。 |
+| 原件的請求與該觀測紀錄不符 | 25,515 | 其中 8 個是別名 head。原件不能直接證明記錄的請求；這不是 25,515 篇缺文或來源提供錯誤資料。 |
+| 不屬於本次原件格式 | 54 | 47 個引用已接收的正文批次，7 個為受限的公開 metadata；須依各自契約核對，不能直接視為損壞。 |
+
+後一項的格式由[獨立唯讀分組](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_head_artifact_kinds_20261029.json)
+核對；該分組本身沒有讀取或重新驗證正文。全量核對期間，資料庫、空
+WAL、journal、程式雜湊，以及 96,578 個引用路徑從首次檢查到結束的
+檔案身分未觀察到變化；沒有不可讀路徑。這些身分比對不構成寫入鎖，
+也不保證稽核結束後狀態不變。本次耗時約 607 秒，是停機主機當時負載下
+的一次本機讀取，不能推定來源下載速度或完成日期。
+
+正式 owner 的原件巡檢與修復檢查點仍未執行；維護結束後應由既有 owner
+逐筆記錄不符、尋找精確請求的本機原件，並在必要時依來源排程重查。
+別名、正文完整性、來源發布時間和全歷史範圍都需要各自證據，不能由
+這份頁面清點直接推定。隔離[清點測試](../artifacts/operations/agent-workflow/runs/news-cnyes-history-readonly-inve-20261029T033140-bccbc55b/run.log)
+涵蓋原件、別名、缺件、損壞及檔案變動，不能替代正式服務恢復後驗收。
+
+[本機替代原件抽查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_mismatch_local_candidate_sample_20261029.json)
+在排序後三個窗口各檢視 256 個 head；其中兩個窗口各取前 20 個非別名
+請求不符項，未在既有原件候選位置看到其他完整原件與收據。另一窗口
+沒有抽到請求不符項。這 40 筆不是隨機樣本，不能外推其他缺口；停機
+資料庫尚沒有已接收正文批次候選索引，本次也沒有掃描該類批次，因此
+不能據此斷定沒有其他本機證據或一定需要向來源重抓。既有 owner 啟動
+時會建立索引，後續掃描仍須驗證候選的精確請求、原始回應與收據。
+
+## 10/29 維護期間：新聞本機來源路徑的故障隔離
+
+依指示，新聞 service 與 timer 保持停止；TEJ 可運作，未啟停 TEJ。
+隔離測試發現 Python 3.12 解析循環符號連結時會丟出 `RuntimeError`，
+既有路徑處理沒有將它歸入無效原件，因此一份壞檔案可中止鉅亨歷史
+原件巡檢，亦可中止 FinMind 新聞收據清冊；FinLab 收據路徑解析也有
+同一問題。[鉅亨重現](../artifacts/operations/agent-workflow/runs/news-replay-symlink-red-20261029-20261029T032651-9886054a/run.log)、
+[FinMind 重現](../artifacts/operations/agent-workflow/runs/news-metadata-symlink-red-202610-20261029T033252-7f3fff0b/run.log)
+及[FinLab 重現](../artifacts/operations/agent-workflow/runs/news-finlab-metadata-symlink-red-20261029T033346-120dda26/run.log)
+均使用隔離資料，不表示正式來源檔案已發生循環。
+
+[共用路徑入口](../downloader/news_fulltext_queue.py)現在把路徑循環
+歸入既有的無效路徑契約，其他 I/O 錯誤仍保留原類型；
+[新聞清冊匯入](../downloader/news_fulltext_metadata_ingest.py)在解析
+收據路徑失敗時記錄該項錯誤、釋放既有 reader，繼續其他收據。已修好
+的收據在下一輪按原有收據、雜湊及斷點契約重試，不跳過核驗。
+[隔離整鏈測試](../artifacts/operations/agent-workflow/runs/news-finlab-metadata-symlink-gre-20261029T033413-99ed3a1f/run.log)
+涵蓋鉅亨、FinMind 與 FinLab；正常項目可繼續，修復後重新驗證；
+鉅亨來源 429 及其原截止時間不變。正式新聞 owner 尚未載入本次修正。
+[完整回歸](../artifacts/operations/agent-workflow/runs/news-source-path-final-regressio-20261029T033434-58c9f5bf/run.log)
+通過 523 項；另以 4,500 筆隔離資料驗證讀取一半後發生路徑循環時，
+已開啟的 reader 和暫用快取會釋放，原件修復後從 4,096 筆的斷點續跑，
+沒有遺失或重複來源關聯，見[斷點測試](../artifacts/operations/agent-workflow/runs/news-partial-reader-cycle-recove-20261029T033622-b168e6a7/run.log)。
+本機檔案錯誤與新聞來源錯誤分別處理，這些測試沒有重新抓取來源。
+
+## 10/29 維護期間：鉅亨清單稽核的檔案快照核對
+
+新聞 service 與 timer 依指示持續停止；TEJ 可運作，本次沒有啟停 TEJ。
+先前已完成的鉅亨公開清單逐份核驗使用 v1 稽核工具，但其「輸入快照
+穩定」只比對資料庫、WAL 及目錄，沒有在整輪結束時重新核對每份原件
+和收據。隔離測試分別在讀取前或讀取後原位修改檔案，目錄時間不變，
+舊工具都仍聲稱穩定；[失敗重現](../artifacts/operations/agent-workflow/runs/news-cnyes-audit-stability-red-2-20261029T031735-c830f61b/run.log)
+不代表正式原件當時真的被修改。單份原件和收據讀取時的既有雜湊與
+穩定性檢查仍有效，先前觀察不因這個缺陷而被視為偽造。
+
+[v2 唯讀稽核](../scripts/audit_news_cnyes_public_index_originals.py)在列舉
+時保存每個檔案的身分、大小、模式與時間，在全部讀取結束後重新比對；
+發現變動或無法取得檔案資訊時，保留異常並拒絕宣稱快照穩定。資料庫、
+WAL 和 rollback journal 也分別核對；啟動時 journal 非空不使用
+`immutable` 讀取。[隔離重現](../artifacts/operations/agent-workflow/runs/news-cnyes-audit-journal-red-202-20261029T031816-d2bce5b6/run.log)
+顯示舊版未拒絕這個情境。檔案身分比對是兩次觀察，並非寫入鎖、檔案
+系統快照或對稽核結束後的保證。報告改用耐久的原子寫入；輸出目錄與
+輸出目的地都必須在資料根目錄之外，避免以符號連結繞過唯讀邊界。
+相同的輸出路徑問題亦已修正於[資訊 RSS 稽核](../scripts/audit_news_metadata_feed_originals.py)。
+
+[新版唯讀全量核驗](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_public_index_original_audit_v2_20261029.json)
+於 10/29 11:22 臺北時間完成：**11,003** 份原件、**11,003** 份收據、
+11,003 筆觀測及同數 head 通過既有身分、雜湊、內容、來源規則與索引
+核對；22,006 個檔案的列舉與結束身分沒有觀察到變化，沒有遺失 head
+或其他稽核問題。所有原件本機觀測時鐘與佇列觀測時鐘均不同，兩者不能
+互換成來源發布時間。此次耗時約 59.3 秒，是當時主機負載與讀取條件下
+的一次唯讀結果，不能與舊版單次時間直接比較，也不能推論線上吞吐。
+該結果只涵蓋已保存的公開清單，不是全文或全站歷史的完整證明。
+
+[鉅亨接收、歷史證據與面板回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-audit-v2-regression-2-20261029T031918-d09fb4de/run.log)
+通過 531 項；它在最後的報告符號連結保護之前啟動。最後兩個稽核工具
+的[聚焦測試](../artifacts/operations/agent-workflow/runs/news-cnyes-rss-audit-final-20261-20261029T032205-3bb3b283/run.log)
+通過 44 項，兩輪範圍重疊。檢查期間沒有向新聞來源送出請求、寫入正式
+queue 或重新下載正文。正式 owner 尚未載入修正，鉅亨剩餘來源工作、
+實際恢復及整體完成時間仍待維護結束後驗收。
+
+## 10/29 維護期間：舊 RSS 原件完成掃描後的再次發現
+
+依使用者指示，新聞 service 與 timer 維持停止；TEJ 可以運作，本次沒有
+啟停 TEJ。只繼續先前未完成的本機 RSS 索引，不呼叫新聞來源或寫入正式
+新聞佇列。先前文件所稱「目錄被改動時重掃」，其實只涵蓋**掃描進行中**
+的變動；若目錄掃描完成後才恢復舊原件，原排程沒有再次檢查，連重啟
+owner 後也會漏掉。[隔離重現](../artifacts/operations/agent-workflow/runs/news-legacy-directory-missed-red-20261029T030027-e0c02eb3/run.log)
+涵蓋原本有／沒有目錄及有／沒有重啟，四種情境均未發現新原件；這是
+程式缺陷的重現，沒有證據表示正式停機佇列已發生同樣情況。
+
+既有[本機索引器](../downloader/news_fulltext_metadata_legacy.py)現在保存
+掃描時的目錄身分與變動時間，定期逐個檢查；目錄未變時不重新列舉或
+解析原件，變動時以原有可續跑、有界切片重掃。原不存在的目錄出現後
+也會被發現；舊版已完成但沒有目錄見證的紀錄，升級後掃描一次再建立
+見證。暫時無法讀取目錄時保留失敗及重試期限。已索引的原件沿用原來
+的觀測及收據，不改寫既有文章、發布時間或來源錯誤。該週期目前為本機
+一小時，並非來源 API 限速；停機、磁碟等待和 I/O 阻塞會使實際發現更晚。
+日常新抓到的 RSS 原件仍由既有線上寫入流程直接索引，不必等此巡檢。
+曾被標為 invalid 的原件，先在兩秒後做一次確認；之後每小時只比對該
+原件及收據的本機檔案身分、大小與時間，確定變動才重新讀取並依原政策、
+收據及雜湊核驗。同目錄的其他新檔不會觸發該原件重讀；檔案在核驗中
+變動或本機 I/O 出錯則保留重試。原異常歷史另行保存，舊紀錄沒有可靠
+時間時保留未知而不推測。這依賴檔案系統的 metadata，不等於定期對所有
+已驗檔案重新計算雜湊，也無法創造來源沒有的原件；未通過核驗仍未完成。
+[網頁](../services/news_dashboard/app.js)也說明目錄完成只代表最近一輪觀察。
+此外，[隔離重現](../artifacts/operations/agent-workflow/runs/news-legacy-symlink-loop-red-202-20261029T031242-83e4b752/run.log)
+發現目錄路徑的符號連結循環會在 Python 3.12 產生未處理的 RuntimeError；
+現在轉成該目錄的安全路徑錯誤並依既有退避重試，移除循環後可繼續掃描。
+[修正測試](../artifacts/operations/agent-workflow/runs/news-legacy-symlink-loop-green-2-20261029T031314-4fe15a9c/run.log)
+涵蓋初次掃描及已完成後的兩種情境，均在隔離目錄執行。
+
+[兩份既有自由時報 RSS 原件的隔離整鏈驗證](../artifacts/data_quality/news_offline_inventory_20261029/ltn_later_original_isolated_20261029.json)
+先索引一份、關閉並重開隔離佇列，再加入第二份並執行到期巡檢；兩份
+均經原收據及內容核驗，第一份所建立的 40 個 URL head 全部保持，第二份
+加入後隔離佇列共有 80 個不同 URL head，原觀察時鐘分別保留。這是非
+隨機兩份資訊原件，不是 80 篇新增正式新聞或全文。來源原件及正式
+queue／空 WAL／status 前後身分未變；檔案身分比較不是寫入鎖。
+
+[異常收據的隔離實物驗證](../artifacts/data_quality/news_offline_inventory_20261029/ltn_invalid_receipt_isolated_20261029.json)
+只在一份自由時報 RSS 原件的隔離副本上故意損壞並原位修復收據；修復後
+重新核驗成功，先前兩次錯誤均保留，隔離佇列保留 40 個 URL head 及原
+觀察時鐘，沒有新增全文。過程未呼叫來源或寫入正式佇列，來源原件及
+正式 queue／WAL／status 前後身分未變；這不是正式環境的完成證明。
+
+[本機索引聚焦測試](../artifacts/operations/agent-workflow/runs/news-legacy-recheck-focused-2026-20261029T030210-dd1aeddd/run.log)
+22 項通過；[下載器、排程與面板共用回歸](../artifacts/operations/agent-workflow/runs/news-legacy-recheck-regression-2-20261029T030246-0c5854d9/run.log)
+468 項通過；補上完成／未完成畫面後的[兩種寬度瀏覽器測試](../artifacts/operations/agent-workflow/runs/news-legacy-recheck-browser-2026-20261029T030501-6730a4f1/run.log)
+4 項通過。這些測試範圍有重疊，均不等於正式 owner 已載入或網站來源已
+恢復。異常原件修復後的[共用回歸](../artifacts/operations/agent-workflow/runs/news-legacy-final-regression-202-20261029T031202-07d3d55c/run.log)
+通過 476 項；它在上述符號連結修正之前啟動。符號連結修正後的
+[索引、排程及面板聚焦回歸](../artifacts/operations/agent-workflow/runs/news-legacy-final-focused-202610-20261029T031354-93fa05ca/run.log)
+通過 203 項，涵蓋原件修復、正常目錄、循環連結及瀏覽器。兩輪測試有
+重疊，不能相加，也不證明正式 owner 已載入新程式。鉅亨仍優先；所有
+來源、全文、全歷史與可信整體 ETA 尚未完成。
+
+## 10/29 維護期間：沿用已完成的 CMNews 診斷
+
+先前工作清單有兩個 CMNews 診斷標為 `pending`；核對停機快照後，兩筆
+實際已在 10/28 07:39（臺北時間）完成來源觀察。這兩筆宣告的原網址
+已有 CMoney Learning 正文，並與 10/20 的既有[正文、原回應和收據讀回](../artifacts/data_quality/news_goal_stage01_20261009/cmnews_original_scope_20261020/readback.json)
+中的網址、正文雜湊與批次路徑相符。此次沒有重新讀取正文檔或重新雜湊，
+也沒有向來源發請求。這更正下方 10/28 當時「兩筆仍待診斷」的快照，
+不表示這兩個 CMNews 父網址的全文或別名已驗證。
+
+[唯讀對帳](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_completed_observations_reuse_20261029.json)
+確認目前 32 個缺文身分狀態與先前父關係清單相同；其宣告的 32 個原網址
+目前 head 均與先前記錄的正文雜湊相符，並指向已提交批次。其中 28 個父
+head 已有已觀察的候選診斷，包含上述兩筆；其餘四個沿用原先的失敗回應
+宣告。前述 32 個原網址 head 的對帳沒有逐個重驗內容或宣稱 32 個父網址
+可作為相同版本。已更新[來源工作清單](../configs/news/source_reviews_20261009.json)，
+不再重排這兩個已完成的問題；其餘身分、來源 404、登入與路徑缺口仍留待
+新證據。舊診斷及正文收據均保留。
+
+進一步核對發現，這兩個問題在先前的失敗回應中已有來源明示的原網址，
+但記錄的文章解析契約為第 7 版，現在的契約為第 8 版；舊檢查器要求
+資料指紋完全一致，因此又安排了相同的診斷。對這一組已核對、來源設定
+及授權相同的指紋，現在僅在兩筆已核對的網址、失敗檢查時間與舊收據雜湊
+完全相符時，沿用舊觀察來避免重複提問；其他紀錄、換授權、來源、網址、
+檢查時間或證據損壞仍需重新判定。
+這項相容性**只用於避免重複診斷**，不使舊證據成為下載授權、原文等價
+或父頁正文的驗證。[隔離唯讀核對](../artifacts/data_quality/news_offline_inventory_20261029/cmnews_previous_literal_guard_readback_20261029.json)
+對兩筆舊紀錄確認新防重判定成立、正式取得原文所需的現行證據仍不成立。
+這不代表正式 owner 已套用，也不代表已實測來源下載吞吐。
+
+[完整隔離回歸](../artifacts/operations/agent-workflow/runs/news-cmnews-pinned-evidence-fina-20261029T025013-a3231c48/run.log)
+通過 659 項；隨後將不相符紀錄的時間解析與雜湊延後，最終程式的
+[相關防重、宣告與擷取回歸](../artifacts/operations/agent-workflow/runs/news-cmnews-final-fastguard-focu-20261029T025129-47f32b04/run.log)
+再通過 315 項。此調整只減少本機無關紀錄的處理，不宣稱來源下載更快。
+
+此檢查前後新聞服務和 timer 維持停止，正式 queue、空 WAL 及 journal
+身分未變；這些檢查不等於寫入鎖。程式尚未恢復正式下載或重新驗收實際
+網頁。使用者確認 TEJ 可以運作，本次沒有啟停 TEJ。鉅亨優先與新聞全歷史
+目標仍未完成，無可信整體完成時間。
+
+## 10/29 維護期間：鉅亨清單缺頁的估時與有限掃描
+
+新聞服務及計時器維持停止；此次沒有向新聞來源發請求，也沒有寫入正式
+新聞 queue、WAL 或原件。既有正文與已完成的來源稽核不重抓。這次修正
+的是隔離測試重現的階段估時缺陷，不宣稱它是停機前下載緩慢的原因。
+
+[鉅亨清單進度](../downloader/news_fulltext_cnyes_index.py)原先只看單頁
+metadata 失敗見證，多頁尚未完成時，缺頁的本機原件、收據或 304 證據
+錯誤不會暫停階段完成估時。現在先用已觀察頁面確定該階段真正的缺頁，
+再以每頁的既有 URL 主鍵讀取這三類本機錯誤；期限尚未到顯示等待，
+到期後顯示待重驗，直到該頁有合格 head 才從估時計數排除。metadata 與本機
+錯誤分別計入，既有來源拒絕、退避、排程和健康頁派工均不改。沒有
+工作紀錄可能只是前頁尚未安排後續頁，不當作來源成功。此檢查只涵蓋
+尚缺頁；已計入 head 的原件可用性仍依原件巡檢另行核對。
+
+逐頁失敗見證也不再因超過 128 筆就立即放棄：能確認屬於其他日期或
+已驗證頁的舊紀錄不會遮住目前階段的失敗；舊版單一端點見證仍須精確
+相符。每次最多檢視 4,096 筆／1,048,576 個字元、4,096 個缺頁及
+16,384 個已觀察頁；超過限制、來源身分／工作期限不一致、證據損壞
+或頁面集合變動時顯示未知，不編造完成時間。這些是本機估時工作界限，
+不是來源流量上限。相同見證文字才重用有界解析快取；實際 head、工作
+期限和來源授權每次仍重新核對，系統時鐘倒退也重新驗證。
+SQLite 文字長度可能在內嵌空字元處截斷；逐筆見證及舊式端點見證另外
+核對儲存文字位元組數與完整字元數，過大的損壞內容不進入 JSON 解析。
+
+[最終隔離回歸](../artifacts/operations/agent-workflow/runs/news-witness-local-guard-final-2-20261029T023354-8c4b230c/run.log)
+**320 項通過**，涵蓋大小上限、130 筆失敗、不同日期、兩種錯誤同時存在、期限
+過後、有效成功、錯誤狀態、快取失效、排程及面板投影。先前完整回歸
+指出一個舊測試仍要求本機收據錯誤堵住整個端點；該要求已依既有
+「本機錯誤只影響該頁」契約修正，來源級 429 等測試仍保留。另一次
+回歸因主機重開中斷，原[中斷收據](../artifacts/operations/agent-workflow/runs/news-witness-local-final-2026102-20261029T021031-96e72517/run.log)
+保留，重跑通過後才接受結果。
+
+[合成記憶體量測](../artifacts/operations/agent-workflow/runs/news-witness-cache-guard-benchma-20261029T023507-7d8dcc80/run.log)
+使用相同 149 個缺頁：130 筆其他日期見證時，未使用快取的 CPU 中位數
+約 14.09 ms，暖快取約 2.39 ms；4,096 筆見證時分別約 369.88 ms 與
+30.63 ms。這只量測本機估時投影，不代表磁碟冷讀、正式 owner、來源
+下載吞吐或全資料完成時間。[唯讀停機快照](../artifacts/operations/agent-workflow/runs/news-local-errors-snapshot-20261-20261029T023148-747e1d92/run.log)
+中，鉅亨公開清單沒有這三類本機證據錯誤工作；查詢使用 URL 索引，
+資料庫及空 WAL／journal 身分未變。這不是全文或全歷史完整證明。
+
+程式尚未由正式新聞 owner 採用；必須等維護結束，再核對實際來源回應、
+收據及網站載入。鉅亨與其他來源的剩餘下載、完整歷史和可信整體 ETA
+仍未完成。主機重開後，新聞服務及 timer 仍停止；TEJ Smart Wizard
+服務於 10:16 由外部啟動，本次沒有啟停該服務。
+
+## 10/29 維護期間：鉅亨巡檢的未知資料與復原
+
+依使用者指示，下載服務和計時器維持停止。本節只檢查尚未處理的
+中繼資料分類，不重抓已完成正文，也沒有呼叫來源或寫入正式新聞佇列。
+[隔離重現](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_unclassifiable_original_red_20261029.log)
+證實，損壞或缺少頁面觀測時，舊巡檢把無法判斷算成「範圍外」，
+不建立本機重驗工作，且可能保留舊的清單完成狀態。
+
+[既有鉅亨 owner](../downloader/news_fulltext_cnyes_history.py)現在把
+這類頁面列為未驗證並建立精確本機重驗；符合目前來源及授權契約的
+範圍會重新核對，先嘗試已保留的本機候選資料。原件恢復或其他本機
+工作補回中繼資料後，重新建立範圍證據。掃描途中觀測 head 換版也
+列為未驗證並排入目前 head，避免被算成已略過；若 head 消失則重新
+核對目前範圍。正常頁面沒有待證標記時直接略過 JSON 解析，避免
+逐頁產生不必要的例外。來源 429、失敗次數和既定截止時間不因此被清除。
+不同端點、授權或資料契約的範圍不會被當成目前契約去修寫。
+
+舊版未完成的檢查點先保存再從頭盤點，已完成的舊檢查點則保留原
+排定時間；因舊版「範圍外」數字可能含有中繼資料異常，
+[畫面](../services/news_dashboard/app.js)改稱未由該輪原件身分核驗，
+不把這些數字當作無誤或全部歷史完成。
+[獨立相容性核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_metadata_audit_compatibility_final2_20261029.json)
+確認來源內容證據的讀取與雜湊依賴未變，既有證據仍依原範圍使用；
+新排程和全部歷史是否完成仍需日後執行與讀回才能判斷。
+
+隔離測試包含損壞、遺失、來源契約變更、舊檢查點遷移、掃描時
+換版及本機恢復；測試不等同正式來源掃描。移除空標記解析前的
+[新聞共用回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_unclassifiable_original_shared_20261029.log)
+通過 1,147 項，包含瀏覽器；最終版本的
+[鉅亨 owner 與內容證據回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_unclassifiable_original_final_owner_20261029.log)
+通過 454 項，另有 24 項[針對性測試](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_unclassifiable_original_final_focused_20261029.log)。先前的
+[唯讀停機快照](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_original_audit_checkpoint_recheck_20261029.json)
+尚無這項正式巡檢的檢查點，75,347 個頁面 head 不是已驗證的數量。
+
+## 10/29 維護期間：鉅亨原件精確重試
+
+繼續處理前一節尚未完成的重複檢查；維護期間保留新聞服務與計時器
+停止，不呼叫來源、不寫正式新聞 queue／WAL。鉅亨依舊優先，中央社
+仍依使用者指示暫緩；不重抓已完成的正文。
+
+[隔離故障重現](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_targeted_original_retry_red_20261029.log)
+顯示 12 個頁面只有 1 個原件待驗，原本的一小時重試仍會重驗 12 個。
+既有[鉅亨 owner](../downloader/news_fulltext_cnyes_history.py)現在把
+待驗工作依來源授權、頁面與觀測身分持久化，正常情況只重驗到期的
+原件；完整掃描仍定期覆蓋全部頁面。兩種工作同時到期時有持久輪替，
+可在重啟後續跑。舊版未完成的掃描先保留檢查點再重掃，以免漏掉
+舊版已走過的缺件；舊版已完成但有缺件的掃描則依原截止時間建立
+新清單。若 head 已變，舊觀測與新觀測分開核對；本機資料異常、
+原件無法讀取、來源 429 與原本期限不因重試而被清除。
+
+[同資料 ABBA 比較](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_targeted_audit_abba_20261029.json)
+使用 64 個本機頁面、1 個缺件：重試時舊版兩次各檢查 64 個原件，
+新版兩次各檢查 1 個；頁面狀態一致，429 原期限均保留。舊版 CPU
+分別約 105／109 毫秒，新版約 3.6／2.5 毫秒。這只涵蓋該受控的
+本機重試切片，不是全量初次巡檢、網站下載吞吐或全部歷史的估時。
+[獨立重跑](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_targeted_audit_abba_repro_20261029.json)
+仍是 64 對 1 次，CPU 和耗時受當時環境影響而不同。
+[共用回歸](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_targeted_audit_regression_20261029.log)
+1,135 項通過，含瀏覽器；另有[主迴圈整合測試](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_targeted_owner_integration_20261029.log)
+確認到期重試由既有 owner 執行。測試均使用隔離資料。
+
+[網頁](../services/news_dashboard/app.js)分別顯示最近一輪完整巡檢
+結果和目前已記錄待本機重驗的頁數；巡檢尚在進行時，待驗清單可能
+尚未包含所有缺件。沒有可驗證的舊清單則顯示未知。停機快照的下次
+時間只是原排定時間，不能代表已經執行，也不能推論所有正文已抓齊。
+
+[獨立相容性核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_targeted_audit_compatibility_20261029.json)
+比對前版 owner 的完整雜湊與來源內容稽核依賴：舊的來源內容證據可
+按原有範圍重用，不代表新巡檢已在正式資料執行。最新
+[唯讀停機快照](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_original_audit_checkpoint_recheck_20261029.json)
+仍無這項巡檢檢查點，75,347 個頁面 head 和 0 個待證標記不能解讀為
+已完成驗證；正式速度與缺件數仍待日後原 owner 執行並讀回。
+
+## 10/29 維護期間：鉅亨原件週期巡檢
+
+沿用上一節已完成的鉅亨原件身分與回補修正，未重新下載已完成正文。
+維護期間新聞服務與計時器維持停止；以下只使用隔離佇列、合成來源
+回應和唯讀停機快照，沒有呼叫新聞網站或寫入正式新聞佇列／WAL。
+
+[隔離重現](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_periodic_audit_red_20261029.log)
+證實：舊原件巡檢若以零個未驗證原件完成，之後即使新增頁面、檔案
+遺失或重啟，該巡檢也不會再次執行。現有另一項週期巡檢只驗證資料庫
+中繼資料，不能代替原件、收據和雜湊檢查。
+
+既有[鉅亨 owner](../downloader/news_fulltext_cnyes_history.py)現在在每輪
+乾淨原件巡檢完成後安排 24 小時後再做有界分片巡檢；有未驗證原件時
+沿用一小時後重試。舊版乾淨檢查點沒有完成時間，恢復時先重新巡檢，
+不推定舊結果仍有效。原件缺失會標記待證，本機恢復後再次核驗；來源
+429、失敗及原截止時間不受影響。這是最早的下次本機檢查時點，不保證
+該時刻已完成，更不代表新聞全文已齊。
+
+[面板投影](../stockagent/live/news_dashboard.py)和[畫面](../services/news_dashboard/app.js)
+僅在完成的檢查點提供可解析時區的下次巡檢時間；舊快照或停機時會
+明示上次快照，不把到期視為已執行。舊資料或無效時間維持未知，不
+顯示私有路徑或自由文字。[停機資料庫讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_original_audit_checkpoint_snapshot_20261029.json)
+顯示目前沒有這項原件巡檢檢查點，因此尚無正式掃描結果；資料庫、空
+WAL 和 rollback journal 身分未變。這份停機快照有 75,347 個清單頁面
+head，待證標記為零只是巡檢尚未執行，不能視為全部原件正確。
+
+[相容性核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_periodic_audit_compatibility_20261029.json)
+重建並比對上一版 owner 完整雜湊，確認獨立來源內容稽核的函式未變；
+舊內容證據可依原範圍重用，不等於新一輪原件巡檢已執行。隔離
+[排程與恢復測試](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_periodic_audit_core_20261029.log)、
+[面板投影測試](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_periodic_audit_dashboard_20261029.log)
+及[桌面／手機瀏覽器測試](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_periodic_audit_browser_20261029.log)
+分別通過 3、18、4 項；涵蓋歷史證據、收據回放、來源排程及面板的
+[共用回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_periodic_audit_shared_regression_20261029.log)
+共 1,107 項通過。
+
+此版一小時重試仍可能重讀其他原件；後續已實作精確待驗清單，見上節。
+正式資料的掃描時間及對下載吞吐的影響尚未量測，不能宣稱性能已達上限。
+
+## 10/29 維護期間：鉅亨本機回補收據與資料庫交易完整性
+
+使用者指定維護停機。本次只使用隔離測試及唯讀停機快照，未啟動新聞
+服務或計時器、未呼叫新聞網站、未寫入正式新聞佇列／WAL。先前已完成
+的正文與來源內容稽核不重抓；鉅亨仍優先，其他來源維持原排程與紀錄。
+
+[隔離重現](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_retained_receipt_bypass_red_20261029.log)
+發現六種互相矛盾的原件收據會繞過歷史讀取器的驗證，被回補流程錯標
+為已恢復；[未來取得時間](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_retained_future_clock_red_20261029.log)
+和[讀取中替換收據](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_retained_receipt_race_red_20261029.log)
+也能造成錯誤。這些是合成案例，不代表正式原件存在同樣問題。
+
+[既有鉅亨 owner](../downloader/news_fulltext_cnyes_history.py)現在使用
+共用收據驗證後的同一筆原始資料回補，核對檔案、身分、取得時間與
+來源頁；未來取得時間不列為歷史證據，快取也會在系統時鐘倒退時重新
+判斷。已接受批次和歷史原件在驗證前後及寫入時檢查檔案身分，偵測到
+變動時回滾資料庫寫入並排入本機重試，保留來源的 429 等原有期限。
+不能核實的原件與原始失敗紀錄不會被覆寫或憑相同位元組改標成另一個
+請求；本機重試不等於來源已恢復。
+
+[獨立相容性檢查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_backfill_audit_compatibility_20261029.json)
+重建並核對先前 owner 的完整雜湊，確認來源內容稽核使用的觀測、檔案
+身分、已接收批次和 digest 函式未變；舊來源內容證據可按原範圍重用，
+不代表這次回補或新增收據檢查已在正式資料跑完。
+
+[唯讀抽查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_retained_backfill_snapshot_20261029.json)
+依資料庫順序讀取 4,423 筆觀測，兩種原件格式各抽 50 份；17 份請求
+身分相符、83 份不符，與先前樣本一致，不能推估全部缺口。冷／熱快取
+及直接檢查結果一致，正式資料庫、WAL、rollback journal 和抽查檔案
+的身分皆未變。真正的正式回補須等維護結束後由原 owner 執行及驗收。
+
+[首次共用回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_backfill_shared_regression_20261029.log)
+964 項通過、一項失敗：該合成舊格式測試把含新檔案路徑的收據複製到
+另一個檔案，新驗證正確拒絕矛盾收據。測試現已改為建立實際的舊版
+收據，並保留獨立的矛盾收據拒絕測試；[相關重跑](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_backfill_legacy_fixture_20261029.log)
+10 項通過。[最終共用回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_backfill_shared_regression_final_20261029.log)
+965 項通過，涵蓋鉅亨歷史證據、批次下載、快取稽核、佇列、失敗恢復
+及新聞面板；這些隔離測試不代替維護結束後的正式下載與資料讀回。
+
+## 10/29 維護期間：鉅亨歷史原件收據與讀取競爭
+
+沿用已完成的原件身分檢查，繼續核對尚未涵蓋的歷史清單收據。使用者
+指定維護停機，沒有呼叫新聞來源、啟動服務或寫入正式新聞 queue／WAL。
+本次的[隔離故障重現](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_history_receipt_red_20261029.log)
+顯示，舊讀取器可能把檔案路徑、收據契約、原始回應位元組數或正文接收
+宣告互相矛盾的原件判為有效。這是合成資料上的程式缺陷，不代表正式
+資料已出現相同收據毀損。
+
+既有[歷史清單 owner](../downloader/news_fulltext_cnyes_history.py)現在
+會核對收據實際聲稱的欄位、原件格式及隔離收據中的文章／錯誤筆數；
+明確宣告目前契約的收據必須包含該契約必填欄位。只包含舊版雜湊與
+私有標記的收據仍按舊證據範圍處理，不把不存在的欄位當成已證實。
+有矛盾的原件不會被當作有效證據或覆寫；後續真正取得同一來源回應時
+可保存獨立新原件。[中斷恢復](../downloader/news_fulltext_cnyes_checkpoint.py)
+也使用相同核驗，保留原有 head 與異常證據。
+
+另以[隔離讀取競爭](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_history_receipt_race_red_20261029.log)
+重現核對期間收據被替換的情況。直接核驗現在檢查檔案身分前後一致；
+競爭作為本機 I/O 失敗交由原流程重試。快取鍵包含原件格式與路徑，且
+快取仍逐次重算兩份檔案雜湊、分別核對每個請求及授權。
+
+先前完成的缺文來源內容稽核有獨立讀取器，不呼叫上述三個修改的 owner
+元件。[相容性核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_reader_compatibility_20261029.json)
+重建先前核准程式並核對完整雜湊，確認該稽核所用的觀測、已接收批次
+與 digest 函式未變；[核准橋接](../scripts/audit_news_cnyes_retained_missing.py)
+因此可沿用相符的舊來源內容證據。這不把舊稽核結果升格成新收據欄位
+已通過驗證，也不代表全文已完成。
+
+[最終唯讀抽查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_receipt_snapshot_journal_verified_20261029.json)
+依資料庫順序檢視 4,423 筆觀測，抽到兩種格式各 50 份不同原件；直接
+核驗與快取冷、熱讀取結果一致，17 份請求身分相符，83 份與原觀測請求
+不符。這是下方已記錄的舊問題，樣本並非隨機，不可外推全部缺口。這些
+問題仍要在維護結束後交由既有 owner 掃描與回補；本次沒有聲稱已修好
+正式資料。讀取期間資料庫、空 WAL、rollback journal 與抽樣檔案的身分未變。
+
+[歷史證據回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_history_receipt_history_final_20261029.log)
+324 項通過，[共用下載與恢復回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_history_receipt_shared_regression_final_20261029.log)
+579 項通過，包含中斷恢復、舊證據相容、來源錯誤及排程。曾因主機負載
+使一個僅測來源判定的測試碰到 50 ms 分片期限，現已讓該測試時鐘固定；
+實際分片過期與恢復另有測試。首次共用回歸的中止與四項失敗保留在
+[紀錄](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_history_receipt_shared_regression_20261029.log)。
+
+[本機 ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_history_receipt_20261029.json)
+以 20 份既有原件、每組 100 次暖快取直接核驗比較：舊讀取各 0.340、
+0.962 秒，新讀取各 0.573、0.357 秒。[再測](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_cnyes_history_receipt_journal_verified_20261029.json)
+分別為舊讀取 1.678、0.382 秒，新讀取 0.292、2.558 秒。結果波動
+明顯；這不是線上吞吐、全部原件掃描時間或性能改善的證據，新增核驗
+亦有成本。
+
+## 10/29 維護期間：條件請求證據與本機恢復
+
+使用者確認正在維護，新聞服務與計時器維持停止。本節只使用隔離佇列、
+合成 HTTP 和停機快照；沒有向新聞來源請求，也沒有寫入正式 queue 或
+WAL。先前完成的 11,003 份鉅亨清單與 43,510 份 RSS 原件全量核驗見下節，
+沒有因本次測試而重抓或重新宣稱全文完整。
+
+[RSS 隔離故障](../artifacts/data_quality/news_offline_inventory_20261029/news_rss_receipt_reuse_red_20261029.log)
+重現五個缺口：舊路徑可能接受錯誤收據欄位，或替缺收據的損壞原件建立
+新收據。[鉅亨 304](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_index_304_evidence_red_20261029.log)
+有五個合成案例，只有資料庫觀測時，即使原件／收據遺失或筆數不符也會
+當作成功；[鉅亨 200](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_index_200_evidence_red_20261029.log)
+另重現無效原件時鐘被封裝，以及原件遺失時以新觀察時間重建舊路徑。
+這些是隔離重現，並非聲稱正式資料發生相同毀損。
+
+RSS 現在使用既有[原件核驗契約](../downloader/news_fulltext_metadata_checkpoint.py)
+確認來源、授權、原始位元組、時間、解析結果及完整收據，304 也核對
+head 筆數、發布時鐘與路徑；接受重複 200 時重用當次已解析的 XML，
+無需再次解析。鉅亨[清單 owner](../downloader/news_fulltext_cnyes_index.py)
+與[唯讀稽核](../scripts/audit_news_cnyes_public_index_originals.py)共用
+[原件核驗](../downloader/news_fulltext_cnyes_index_checkpoint.py)，支援既有
+兩代收據。原件與收據讀取有大小及穩定性檢查；不以新時間覆寫舊證據。
+
+缺收據的完整原件可以恢復；對無法證明的 304，保留錯誤及退避，清除
+該請求的 ETag／Last-Modified，讓後續取得完整回應。鉅亨本機證據錯誤
+只延後該頁，既有的來源級限制仍然有效。隔離測試驗證實際派送標頭、
+原件不變、收據重建、其他頁未受阻及原有 429 冷卻未被放寬。
+若原件已毀損或遺失而無法還原原觀察時鐘，系統會繼續保留異常及證據；
+本次沒有宣稱能自動重建所有這類資料。
+
+[停機快照唯讀回讀](../artifacts/data_quality/news_offline_inventory_20261029/news_conditional_evidence_real_snapshot_20261029.json)
+檢查 14 個註冊 RSS 中已有 head 的 13 個，並抽查鉅亨兩代格式各 12 份
+近期觀測；[抽樣再驗](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_conditional_reader_post_repair_snapshot_20261029.json)
+通過修正後共用讀取器。結果均無問題、來源檔案及資料庫／WAL 身分不變；
+這些樣本不能證明即時下載、其餘全文或所有歷史已完整。
+
+[最終共用回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_conditional_evidence_final_shared_regression_20261029.log)
+887 項通過，涵蓋排程、中斷恢復、舊格式與面板；另有
+[條件重試端到端](../artifacts/data_quality/news_offline_inventory_20261029/news_conditional_evidence_recovery_end_to_end_20261029.log)
+三項通過。本機[ABBA 比較](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_index_200_reuse_20261029.json)
+使用 30 列合成清單、每組 60 次同一原件的完整 200 接收及獨立讀回：
+新路徑 CPU 時間下降約 11.27%，總耗時增加約 0.28%；樣本小且舊路徑
+缺少新驗證，不能換算為線上吞吐、上限或完成時間。
+[量測程式](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_index_200_reuse_20261029.py)
+的首次執行因模組路徑失敗，[原紀錄](../artifacts/data_quality/news_offline_inventory_20261029/benchmark_index_200_reuse_20261029.log)
+保留；修正路徑後才得到上述結果。
+
+維護期間 owner 尚未載入修正，仍須在使用者結束維護後驗證實際服務、
+來源、進度頁及後續資料。中央社依指示暫緩；所有新聞來源的目標仍未完成。
+
+## 10/29 維護期間：舊清單原件清點與 RSS 歷史索引
+
+依使用者指示，新聞服務與計時器保持停止；本節沒有向新聞網站發請求，
+也沒有寫入正式新聞佇列或 WAL。兩種資料的離線清點範圍與結果如下：
+
+| 範圍 | 實際證據 | 尚不能推論 |
+| --- | --- | --- |
+| 鉅亨公開清單 | [唯讀逐份核驗](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_public_index_original_audit_20261029.json)：兩代來源目錄共 11,003 份原件、11,003 份收據及 11,003 筆既有觀測，原件內容、雜湊、收據、頁面身分及索引皆相符，無遺失 head。舊版「快照穩定」只比對資料庫、WAL 與目錄，沒有涵蓋整輪稽核期間的逐檔原位修改；單份原件及收據的讀取期間則各有穩定性檢查。 | 這是清單原件的核對，並非全文、所有新聞或歷史完整率。原件本機時間與佇列處理時間均不相同；兩者不能被當作來源發布時間。 |
+| 自由時報資訊 RSS | [唯讀完整內容核驗](../artifacts/data_quality/news_offline_inventory_20261029/ltn_rss_original_content_full_20261029.json)：兩代格式、14 個註冊 feed 的 28 個可能目錄中有 26 個目錄；43,510 份原件及同數收據逐份通過身分、雜湊、來源規則、時鐘和現行解析器檢查，讀取期間檔案及目錄身分未變。另以[收據大小檢查](../artifacts/data_quality/news_offline_inventory_20261029/ltn_rss_receipt_size_guard_20261029.json)核對 43,510 份均在索引器的大小限制內。停機快照中尚無歷史觀測表。 | 1,740,400 是各原件中的資訊列次數，同一新聞可能重複出現在多個原件；不是獨立文章或全文數。原件中的本機觀察時鐘不是 HTTP 回應時間或來源發布時間。 |
+
+現有 owner 加入[舊 RSS 原件本機索引](../downloader/news_fulltext_metadata_legacy.py)：
+按來源、註冊 feed 與相容格式分批掃描；逐份核對政策、原件和收據的
+身分、雜湊、時間與解析結果後，才在同一交易加入歷史觀測及尚未入列的
+文章網址。已存在的文章、較新的錯誤與 feed head 不受舊原件覆蓋。目錄
+被改動時重掃，中斷後能續跑；暫時讀取失敗會退避，損壞或政策不符的
+資料保留異常，與其他原件分開。這只重用本機資訊 RSS 原件，不請求
+來源，也不取得文章全文。掃描與處理採有界切片，先讓線上來源派工；
+單次檔案 I/O 的阻塞時間並非硬性上限。
+
+索引紀錄的 `processed_at_utc` 是本次實際處理時間；舊原件的
+`observed_at_utc` 另存於恢復紀錄，不倒填為索引時間。這兩個本機時鐘
+都不被稱作來源發布時間。
+
+[修正時鐘後的隔離實物樣本](../artifacts/data_quality/news_offline_inventory_20261029/ltn_legacy_real_sample_clocks_20261029.json)
+複製 104 份既有原件及收據到臨時佇列，兩種格式均通過核驗並建立 104 筆
+觀測，原件觀察時鐘與實際處理時鐘分別保存，得到 2,421 個去重網址、零篇
+正文。此數字是小型非隨機樣本在空佇列的結果，不能代表正式佇列新增量；
+2.111 秒僅涵蓋隔離處理，不含
+複製，也不能用來估計正式服務吞吐或完成時間。
+
+後續[只讀稽核工具](../scripts/audit_news_metadata_feed_originals.py)已逐份
+核對全部 43,510 組原件與收據，使用現有原件讀取及解析契約，不寫入
+正式佇列。完整內容稽核耗時 352.494 秒；這是當次離線工作量，並非
+正式服務或網路吞吐。大小限制以另一次全收據檢查補證，之後也已加入
+稽核工具；加入後另以 [100 份原件抽樣](../artifacts/data_quality/news_offline_inventory_20261029/ltn_rss_original_content_post_guard_20261029.json)
+及[14 項測試](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_readonly_audit_final_20261029.log)
+核對，包括超限、缺收據與核驗中變更。兩次全量檢查沒有把資料索引到
+正式 owner，亦沒有取得正文。
+
+[面板投影](../stockagent/live/news_dashboard.py)與
+[畫面](../services/news_dashboard/app.js)將舊原件分成目錄檢查與已發現
+候選原件的已驗、待驗、重試和異常數；已在索引內的原件不列為新候選。
+掃描尚未結束時分母會增加，因此不是全歷史完成率；舊快照或缺少證據
+顯示為上次快照或未知，不用猜測的速度倒數。瀏覽器及 owner 的離線
+[聚焦測試](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_legacy_resident_browser_20261029.log)
+涵蓋兩種版面寬度、停止快照及本機錯誤到期自動重試。
+
+[共用回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_legacy_shared_selected_20261029.log)
+先通過 861 項排程、清單、收據與面板測試。後續另以[隔離案例](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_legacy_one_shot_red_20261029.log)
+發現一次性資訊 RSS 查詢會因常駐索引工作被誤認為可執行而忙迴圈；
+已限制只有常駐 owner 啟用該工作，[修正後的相關回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_legacy_one_shot_final_20261029.log)
+322 項通過。一次以 450 個檔案參數啟動的測試因收集重複掃目錄而停止、
+沒有執行測試；另一次全新聞選集跑到 348 項通過後主動中斷，兩次結果
+不計為完整回歸，原日誌保留。
+
+下載 owner 尚未載入這些程式；正式網站目前顯示版本尚未驗收。43,510 份
+的正式索引與後續實際下載、來源可用性和完成時間仍待維護結束後驗證。
+中央社仍依指示
+暫緩，新聞來源的完整目標並未結案。
+
+另針對先前鉅亨 API 已標記 `body_not_found` 的剩餘資料做
+[唯讀內容形狀核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_bulk_short_body_shape_20261029.json)：
+84 個文章／回應組合涉及 82 個網址與 62 份已驗證原件；當時 API 的
+正文欄位皆只有 1–26 個字元，均沒有基本中日韓漢字且少於八個詞，
+其中 79 個含數字。原有拒絕不能因此改成全文成功或斷言來源無全文。
+[停機快照再比對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_short_bulk_existing_head_overlap_20261029.json)
+這 82 個網址當時的原頁狀態分別為引述型 79、測試頁 2、空模板 1；
+其中 6 個有有限診斷原件紀錄，屬先前已核驗的既存診斷範圍。這些是
+先前觀察的狀態，不證明現在的原頁內容，也不表示其餘 76 個必然沒有
+其他證據；不因 API 欄位過短而把既有來源分類重排為新正文。
+
+## 10/29 維護期間：九個非完成狀態群組的既存正文驗證
+
+先前只抽樣九個 head；本次依同一份停機清冊列出九個來源／狀態群組內
+所有 **494 個保留正文的 head**，其中鉅亨 426 個。透過既有批次驗證器
+檢查其 **97 個已提交批次、1,596 個正文版本及全部 494 個目前 head**，
+核對原件與正文雜湊、共享原始回應、已提交收據和 head 引用；全部通過。
+資料庫、WAL 與所核對檔案的前後身分未變，沒有請求來源或寫入正式 queue。
+詳見[唯讀結果](../artifacts/data_quality/news_offline_inventory_20261029/retained_body_full_selected_groups_20261029.json)。
+
+這是九個已知群組的既存資料完整性驗證，不代表來源目前仍提供全文、
+其他正文批次已全驗或全站歷史已完整；其最新來源狀態和權利分類不變。
+新聞服務與計時器繼續依維護要求停止。
+
+## 10/29 維護期間：鉅亨公開清單本機中斷恢復
+
+[隔離重現](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_index_orphan_recovery_probe_20261029.log)
+顯示，公開清單的原件已存但收據或清單交易尚未提交時，舊 owner
+不會自行找到該原件。這是合成故障，不表示正式資料已發生同一狀況。
+現在[清單 owner](../downloader/news_fulltext_cnyes_index.py)先建立受限
+[恢復檢查點](../downloader/news_fulltext_cnyes_index_checkpoint.py)，記錄
+原派送狀態、來源／授權指紋、頁面修訂、請求表頭、觀察時鐘及回應雜湊。
+原件落盤後即使程序中止，也可由既有 owner 本機核對原件及重建欠缺的
+收據，繼續原交易與後續分頁，而不增加來源請求。只有被中斷的確切
+網址暫停派送，其他頁面可繼續；無原件、損壞或授權改變時保留失敗
+結果並釋放該網址。新來源狀態或修訂已取代舊回應時，只保留有證據的
+觀測與未知網址，不覆寫較新的狀態或既有文章。
+
+完整清單原件、收據、清單頁面 head 和文章正文是不同證據。恢復只
+登記清單與候選網址，並未取得全文。面板新增本機待恢復原件的數量與
+重試時刻；舊快照或無效資料顯示未知，停止時標示上次快照，不把它
+當作缺少的篇數或全部歷史的完成進度。
+
+[中斷回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_index_checkpoint_shared_regression_final_20261029.log)
+的 1,465 項涵蓋鉅亨分頁、正文、排程、資訊 RSS 和面板；包含收據前、
+交易前及隔離子程序被終止等案例。後續針對極端無效時間戳的測試
+[先重現恢復崩潰](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_invalid_clock_red_20261029.log)
+並[驗證修正](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_invalid_clock_green_20261029.log)；
+面板也將無法轉換的時間視為未知。後續
+[283 項聚焦測試](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_checkpoint_final_focus_20261029.log)
+包含瀏覽器、面板、公開清單及正文生命週期。所有來源回應都是模擬資料。
+
+[ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_index_checkpoint_abba_20261029.log)
+在臨時 SQLite 與 Parquet 各提交 12 個 30 筆的合成清單頁，四回合的
+文章和清單觀測快照雜湊相同；單回合約 0.41–0.95 秒，暖機與波動
+過大，不能據此估計檢查點成本或推論來源吞吐。量測排除網路及正式佇列。
+
+此檢查點只涵蓋新版建立的工作；先前鉅亨公開清單原件的離線清點結果與
+RSS 舊原件索引修正見上節，不能視為全部正文已恢復。依使用者要求，新聞
+服務及計時器維持停止，正式佇列未寫入；新版抓取、正式面板、實際
+來源可用性及全部歷史完成時間仍未驗收。
+
+## 10/29 維護期間：舊正文收據及資訊 RSS 中斷恢復
+
+本次只在臨時佇列、模擬 HTTP 及隔離子程序中操作。第一版無租約正文
+收據沒有保存請求開始時間，不能以回應完成時間推斷它一定比現有正文
+或 429 更新。[重現測試](../artifacts/data_quality/news_offline_inventory_20261029/news_v1_receipt_recovery_red_20261029.log)
+顯示舊版恢復可能取代正文或清掉錯誤；修正後，未提交收據恢復時只在
+無排序衝突下接收，已有正文及無法證明先後的錯誤狀態保留。若缺正文，
+可補入原有正文證據但不清除錯誤；完整原件與兩個版本的收據仍保留。
+原有已提交收據不改寫，活躍第一版流程維持原契約；新流程繼續使用有
+請求起點的第二版見證。[正文提交契約](../downloader/news_fulltext_queue.py)
+更新為 7。[四種隔離案例](../artifacts/data_quality/news_offline_inventory_20261029/news_v1_receipt_recovery_green_20261029.log)
+及[共用恢復回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_v1_recovery_shared_regression_20261029.log)
+通過；這不能證明正式佇列曾經發生該合成競態。
+
+資訊 RSS 使用新的[本機中斷檢查點](../downloader/news_fulltext_metadata_checkpoint.py)：
+先保存來源派送 head、觀察時鐘、政策指紋、受限表頭與原件雜湊，再落盤
+RSS 資訊原件。既有 owner 以有限批次重讀，核對當前來源權限、原件、
+內容、雜湊及收據；只有仍符合原派送 head 才更新來源 head 與排程。
+被較新狀態取代時只登記有效觀測與未知文章連結，不清除較新的錯誤或
+改寫既有文章。恢復排程沿用實際原先觀察時間，不以重啟時間延後追新。
+本機暫時讀寫失敗有有限次退避；原件不存在、損壞、權限改變或重試耗盡
+保留結果並釋放該原有來源排程，不將它標為成功。恢復中的單一 feed
+先讓本機完成核對，其他來源及 feed 仍可執行。
+
+[隔離測試](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_checkpoint_final_browser_regression_20261029.log)
+包含直接終止子程序、收據前及資料庫提交前中斷、原件損壞、來源權限
+改變、較新 head、無原件、有限次本機錯誤及執行中立即喚醒；測試使用
+模擬 HTTP，未重複請求新聞網站。RSS 仍僅保存標題、摘要、連結及來源
+時間，沒有因此取得全文權限。
+[21 個相關測試檔回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_metadata_checkpoint_full_regression_20261029.log)
+有 **1,140 項通過**；新增的面板狀態會區分本機恢復及可派送的來源追新。
+
+此中斷索引只涵蓋新版建立的觀測；先前資訊 RSS 原件的檔名清點與
+分批索引修正見上節，不能根據檔名推定來源 head 或宣稱已全部恢復。維護
+期間新聞 service／timer 保持停止，正式佇列和 WAL 未寫入；新程式、
+實際來源與正式網站尚未在恢復運行後驗收，不能據此推定下載已完成。
+
+## 10/29 維護期間：請求期間的文章與正文競態
+
+離線測試在來源清單 head 沒有改變時，重現了鉅亨分類及公開清單、RSS、
+WordPress 與資訊 RSS 以舊標題覆蓋其他請求的新標題；相關
+[跨來源](../artifacts/data_quality/news_offline_inventory_20261029/news_same_source_article_clock_red_20261029.log)
+及[鉅亨分類](../artifacts/data_quality/news_offline_inventory_20261029/news_cnyes_inflight_article_clock_red_20261029.log)
+失敗紀錄保留。另以[不同正文及相同正文](../artifacts/data_quality/news_offline_inventory_20261029/news_inflight_body_clock_semantic_red_20261029.log)
+重現：較舊的 WordPress 回應會取代請求期間更新的正文，或將較新的 429
+重試誤標為完成。這些都是合成案例，不能據此推斷正式資料已損壞。
+
+[現行 owner](../downloader/news_fulltext.py)在開始來源請求前記錄本機 UTC，
+並將其與收到回應的時間分開；若時間明顯倒退，請求起點視為未知。寫入
+文章時，在同一交易中核對來源 head 及逐篇文章的觀察、檢查和正文時鐘。
+文章在請求開始後已更新、或時間不能比較時保留其現狀；先前未知網址
+仍可入列。查詢依正規化網址分批，每批最多 500 個，並有 1,201 個網址
+與不同拼寫的隔離測試。請求起點是本機觀察的保守界線，不是發布時間；
+它不能證明來源沒有回傳過期快取，也不能保證跨程序系統時鐘未跳動。
+
+[正文佇列](../downloader/news_fulltext_queue.py)當時的提交契約標記改為 6，
+新的無租約正文見證使用第 2 版保存請求起點；第 1 版歷史見證不能
+回推出其原本的請求起點，其恢復規則隨後依上節更新。請求早於現有正文時，舊回應
+可保存為有收據的版本，但不替換正文 head；若只有較新的錯誤而正文
+尚缺，可保存正文並保留重試。
+相同正文的重驗仍記錄實際觀察時間，使用請求起點做順序核對，避免把
+檢查時間倒填。無法排序時不清除狀態。[中斷後重新開啟佇列](../artifacts/data_quality/news_offline_inventory_20261029/news_inflight_body_clock_recovery_focus_20261029.log)
+的隔離測試也驗證保留較新的正文，且兩個版本的收據可讀回。
+
+[48 個新聞、來源、收據重播與面板測試檔的離線回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_request_start_source_body_final_regression_20261029.log)
+共 **2,614 項通過**。[ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/news_request_start_source_body_abba_20261029.log)
+在臨時 SQLite 各以空 RSS 頁與 30 篇既有正文的頁面重複提交，兩組穩定
+欄位的快照雜湊一致；每回合 80 次、共四回合，波動仍不足以可靠估計
+核對成本。[重現程式](../artifacts/data_quality/news_offline_inventory_20261029/news_request_start_source_body_abba_20261029.py)
+沒有向來源送請求，也不測網路、初次擷取或正式吞吐。
+
+新程式尚未由正式服務載入；維護期間不啟動新聞服務或計時器，也不對
+新聞網站發送請求。資訊 RSS 在原件已落盤、索引提交前整個程序終止時
+的新增恢復機制與驗證結果見上節；實際來源與面板尚未重新驗收。
+
+## 10/29 維護期間：公開清單與其他來源的舊回應隔離
+
+接續前節檢查，[鉅亨公開清單](../downloader/news_fulltext_cnyes_index.py)
+原本已辨識過期的分頁修訂，但會在辨識之前先更新文章標題；其 200、
+304 與來源錯誤也沒有比對發送時的完整 discovery head。隔離測試重現
+了舊回應覆蓋較新標題、429、重試期限或頁面 head；沒有據此推斷正式
+資料曾發生相同情況。現在先保存公開清單原件與收據，再在同一交易內
+比對來源工作與修訂版本；舊頁只能登記先前未知的公開文章，不會
+覆寫既有文章或推進已被取代的頁面。304 與失敗也保留較新 head。
+
+[共用清單流程](../downloader/news_fulltext.py)對 RSS、WordPress 及一般
+清單的來源 head 套用相同核對。過期回應中符合原來源規則的正文仍
+經原佇列與收據保存，既有文章資訊、較新的錯誤、頁面證據與後續
+排程不被舊結果覆蓋；未存的網址仍可登記。需要檢查大量舊網址時，
+先依既有規則正規化，再以每批 500 個網址的索引查詢過濾已有項目。
+混合受限頁面繼續禁止保存受限的共用原件或正文。來源失敗與未送出的
+延後工作也只在派送 head 未被更新時才能改寫其排程。
+
+[自由時報等僅資訊 RSS](../downloader/news_fulltext_metadata_feeds.py)的
+原件及收據仍先落盤；資訊 head、文章網址與排程現在在同一個交易中
+提交。舊回應保存為 `metadata_feed_observations` 中可追溯的本機觀測，
+不更換最新 head 或放寬全文權限。這個新增表只登記新版處理的回應，
+不代表舊版所有觀測已回填。隔離測試讓排程寫入失敗後確認整筆交易
+回滾，重試相同回應時沿用已落盤原件；此測試不是獨立重啟後自動尋找
+孤立原件的證明。
+
+首次[跨來源回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_multi_provider_source_fencing_regression_20261029.log)
+為 2,057 通過、1 項失敗：測試在一個 304 已更新來源 head 之後，仍以
+舊快照模擬下一次派送。依實際排程改為重新讀取 head 後，相關 149 項
+聚焦測試通過；[36 個測試檔的重新回歸](../artifacts/data_quality/news_offline_inventory_20261029/news_multi_provider_source_fencing_regression_final_20261029.log)
+為 **2,058 項通過**。舊回應不得清除較新錯誤的情況另有測試覆蓋。
+
+[ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/news_generic_source_guard_abba_20261029.log)
+以臨時 SQLite 比較空 RSS 頁與 30 篇正文已存在的 RSS 頁，每回合 20 次
+重複提交。[重現程式](../artifacts/data_quality/news_offline_inventory_20261029/news_generic_source_guard_abba_20261029.py)
+不連網、不寫正式佇列；其間量測波動較大，無法據此判定新增核對的
+效能差異，也不能推算實際下載速率。
+
+此次均在臨時佇列及模擬 HTTP 執行，依維護要求新聞服務及計時器保持
+停止，正式佇列與 WAL 未寫入。新程式尚未由正式 owner 載入；來源 head
+未變但另一個請求已更新同一文章的情況，已續於上節處理。資料、實際
+來源恢復、頁面連動與全部歷史的完成時間均未因此驗收。
+
+## 10/29 維護期間：鉅亨並行頁面與文章的狀態順序
+
+在隔離佇列與模擬 HTTP 中重現：某個鉅亨歷史頁的回應還在處理時，
+同一清單 head 可能已被較新的 429、重試時間或歷史區間分割取代；
+即使清單 head 沒變，文章 head 也可能先被其他請求更新。舊成功、
+失敗、未送出的延後任務或解析失敗時登記備援網址，原先都可能覆蓋
+較新的資訊。這是合成情境，不能推定正式資料曾發生相同競態。
+
+[下載器](../downloader/news_fulltext.py)現在於寫入時鎖定並比對原本
+派發的鉅亨清單 head；舊頁的正文及耐久收據仍可保留，但不會把已被
+取代的舊頁重新列為最新進度、改寫較新的錯誤或建立舊分頁。文章連結
+則另行核對既有文章的觀察時鐘，避免用較舊頁面的標題、日期或
+`last_seen` 覆蓋新資訊；若無法比較時鐘，保留現有資料。每個已驗證
+頁最多 30 個不同文章 ID，使用一次索引查詢取得現有文章狀態；
+新的文章與可確認較新的頁面仍可登記。只含標題的 live 回應在原 owner
+附加本次處理時鐘，不改動歷史原件驗證使用的解析器契約。
+
+[共用文章佇列](../downloader/news_fulltext_queue.py)對無租約批次正文
+使用實際記錄的觀察時鐘與 head 見證：較舊正文可保存為有收據的版本，
+但不能清除較新的檢查錯誤或取代較新的正文；相同正文的重驗觀察時鐘
+也必須晚於既有檢查與既有正文時鐘才可更新。寫入契約標記更新為 5；
+保留原有正文、收據和無法排序的狀態。這些時鐘是程式處理時的觀察，
+不是出版社發布時間，也尚非精確網路接收完成時間。
+
+兩頁模擬並行測試中，先返回的頁面分割歷史範圍，晚返回頁面的 30 篇
+正文仍經原 owner 入庫並讀回；被取代的清單 head 不會重開。另驗證較新
+429、未送出的延後任務、相同正文、只含標題、解析失敗、未知時鐘及
+真正較新的頁面。[24 個測試檔的離線回歸](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_live_source_article_fencing_final_20261029.log)
+共 **1,878 項通過**；回歸啟動後補上的兩項標題更新／失敗備援測試
+[另各通過](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_article_metadata_additional_20261029.log)。
+一次曾直接改動歷史解析器，導致三項舊驗證指紋的重用測試
+失敗；改回原解析器並將時鐘留在 owner 後，相關測試及上述回歸均通過。
+
+[隔離 ABBA 量測](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_article_metadata_guard_abba_20261029.log)
+使用臨時 SQLite、每頁 30 個既有文章、每次 300 個相同操作；單看這一段
+狀態比對，平均多約 **0.19 毫秒／頁 CPU**。[重現腳本](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_article_metadata_guard_abba_20261029.py)
+不連網、不使用正式佇列。這不是完整下載流程，不能據此估計正式吞吐或
+全部完成時間。
+
+依維護要求新聞 service／timer 持續停止；此次不向新聞網站發送請求，
+不寫入正式新聞佇列。新程式尚未由正式 owner 載入；其他 provider 的
+清單 head 順序、舊收據及無精確接收時鐘的競態，仍需分別檢查。實際
+來源、面板連動及所有歷史完整度均未因此驗收，整體目標仍未完成。
+
+## 10/29 維護期間：鉅亨無新正文清單的續接
+
+在隔離環境再現另一組尚未完成的邊界：歷史清單回應是空頁、只有
+標題及待抓 HTML，或文章正文均已存妥時，原始回應即使已保存，
+清單提交前中斷仍可能重請同一頁；其中只有標題的頁面還可能在
+網址排入佇列之前中斷。這是合成測試結果，不推斷正式資料曾發生。
+
+[下載器](../downloader/news_fulltext.py)現在對可確認身分的鉅亨
+歷史頁先保存該次來源查詢的見證，正常提交清單與下一頁後清除。
+[恢復程序](../downloader/news_fulltext_cnyes_checkpoint.py)以完整
+來源 head、網址、回應雜湊、權限、解析契約和本次見證，核對已保存的
+原件及收據；相同內容可沿用原有正文批次、來源回應或已驗證的舊儲存
+位置，不再複製原始回應。只有標題的頁面會排回缺少的 HTML 工作；
+現有較新文章狀態不會被覆蓋。原件的實際取得時鐘保持原樣，本次
+見證記錄的是本次回應處理時鐘，不冒稱新聞發布時間。見證、原件或
+收據損壞、來源／權限變更、不同請求有相同內容、較新 429，以及中途
+再次失敗均有隔離測試；缺少本機檔案時先有界重試，再保留失敗結果
+並交回既有來源排程，不偽造完成。
+
+[16 個相關測試檔](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_no_body_checkpoint_regression_20261029.log)
+共 **1,317 項通過**，包含 30 篇僅有標題的分頁、下一頁及原 owner 的
+模擬 HTTP 流程；測試期間沒有向新聞來源送出請求。以已留存原件的
+固定合成頁各跑 20 次、ABBA 對照，[本機量測](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_no_body_checkpoint_synthetic_abba_20261029.log)
+的平均額外牆鐘時間約為空頁每頁 **18.4 ms**、30 筆僅有標題頁每頁
+**12.3 ms**，屬於增加耐久見證的成本。此量測不含實際網路與來源限速，
+不能用來推估正式抓取吞吐或完成時間。
+
+維護要求仍生效：新聞 service／timer 保持停止，正式佇列與 WAL 的
+檔案大小及修改時間未變。新版尚未由正式 owner 載入，既有舊收據、
+身分不明轉址、其他 provider、實際服務恢復與網頁進度尚未因此驗收；
+新聞總目標仍未完成。
+
+## 10/29 維護期間：鉅亨清單的存檔錯誤與單張收據復原
+
+延續下節已有的歷史清單中斷復原，隔離測試再現兩種**程式仍在執行**的
+本機 I/O 失敗：正文原件及收據已落盤、正文 SQLite 提交失敗，或正文已
+提交但清單頁提交失敗。原主迴圈會把本機錯誤寫成來源頁 `worker_OSError`，
+改變清單 head，使原本有完整見證的續接被視為狀態已變；這是隔離重現，
+不能推定停機前的正式資料發生過相同錯誤。
+
+[共用佇列](../downloader/news_fulltext_queue.py)在前者記下該次耐久收據
+的精確恢復意圖；[鉅亨頁面恢復](../downloader/news_fulltext_cnyes_checkpoint.py)
+先核對來源、完整舊 head、原件、收據、雜湊、來源與解析契約，再只重播
+這一張收據，完成後才推進清單和下一頁，不需重新掃描所有歷史收據或
+重發 HTTP。後者保留已提交批次及原 head，走相同本機頁面恢復。檔案
+缺失或損毀、權限／契約變更以及較新的來源觀察均不當作成功；本機 I/O
+沿用有界重試及原有排程，並以本機觀察時間、錯誤類型、errno 和次數保存
+事件，不將這些事件冒稱來源發布時鐘。若清單 head 在錯誤處理前已有較新
+的 429 等狀態，原 owner 以原子條件保留較新的狀態與期限。
+
+首次[16 檔回歸](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_live_commit_recovery_regression_20261029.log)
+為 **1,213 通過、2 失敗**：舊測試將一個已成功的文章手動改成 pending，
+卻不保留其租約，期待舊收據覆寫現況；這不符合既有租約防護。現已將
+[測試](../test/test_news_receipt_batched_io.py)改為真實模擬收據落盤後、
+SQLite 提交前的中斷，並經既有重啟釋放租約路徑恢復；損毀摘要、筆數、
+契約及 JSON 的拒絕檢查保留。修正後相同範圍的[回歸](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_live_commit_recovery_final_20261029.log)
+**1,216 項通過**，包括新舊 head、損毀／缺件、持續 I/O 失敗與無額外
+HTTP 的合成整鏈，並非正式來源或所有歷史完成驗收。
+
+依維護要求，新聞 service 和 timer 持續停止，正式 SQLite／WAL 大小及
+修改時間未變；本輪沒有新聞來源請求或正式佇列寫入，新程式尚未由正式
+owner 載入。該輪修正只適用有新版完整見證的鉅亨歷史正文批次；
+無新正文的清單後續處理見上節。舊收據、其他 provider 及維護結束後
+的實際抓取／網頁更新仍待分別處理和驗證，總新聞目標未完成。
+
+## 10/29 維護期間：鉅亨已存正文的清單頁中斷恢復
+
+隔離測試再現一個不同於文章 head 的斷點：歷史清單頁的公開正文與
+原始回應、收據已耐久保存，但下一頁及來源清單 head 尚未提交時
+中斷，重啟後原排程可能重請同一頁。這是受控測試的結果，沒有證據
+證明正式佇列曾發生該斷點，也不代表所有來源歷史已完成。
+
+[本機頁面恢復](../downloader/news_fulltext_cnyes_checkpoint.py)現在將
+來源網址、完整舊清單 head、回應雜湊、取得時鐘及來源／解析契約見證
+寫入該次正文批次；批次登記與待恢復標記同一交易提交。正常完成時，
+原 owner 將清單結果、下一頁及標記移除一起提交。中斷後只讀取已提交
+收據和原始 Parquet，逐項驗證內容、網址、原始時鐘、來源規則及現行
+head，才從原件恢復；保留當時時鐘，沒有第二次 HTTP。後來的 429、
+來源冷卻、較新狀態或不相符見證都不會被舊回應覆寫。原頁的本機 I/O
+重試最多五次，等待 2、4、8、16 秒；仍無法讀取則保留失敗結果、放回
+原有來源排程，而不是阻塞其他頁或其他 provider。排程只在本機恢復
+待處理時排除該確切網址，並在標記釋放時使[空選擇快取](../downloader/news_fulltext_cnyes_dispatch_cache.py)
+失效；空佇列的輪詢間隔為一秒，不是每 50 毫秒反覆查詢。
+
+當時的恢復只適用新版啟用後，**有接受正文且有完整見證**的歷史批次；
+沒有新正文的清單回應後續處理見上節，轉址身分不明或舊格式收據不因
+本次修改自動取得同等證明。停機的正式資料庫尚沒有新版頁面恢復表，無法藉此推定
+既存有多少頁曾發生此斷點；其他來源與 RSS／WordPress 的相同邊界也
+不在此項修復的驗收範圍。
+
+[30 個相關測試檔的擴大回歸](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_page_checkpoint_regression_20261029.log)
+於最後補上時間排序防護前有 **1,449 項通過**；之後的[八檔回歸](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_page_checkpoint_final_20261029.log)
+有 **677 項通過**。最後將空佇列輪詢從 50 毫秒調整為一秒後，再以
+[五個排程／生命週期測試檔](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_page_checkpoint_schedule_final_20261029.log)
+驗證 **181 項通過**；三次範圍重疊，不相加。受測情境包括兩個中斷點、
+恢復時再次中斷、較新來源失敗、錯誤見證、I/O 重試與原 owner 零 HTTP
+恢復。沿用原先固定的[四批唯讀抽樣](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_checkpoint_recent_readback_20261029.json)，
+**68 個正文版本及 68 個目前 head** 通過讀回，只涵蓋該四批。
+
+依維護要求，新聞服務及 timer 持續停止；正式資料庫及 WAL 檔案尺寸與
+修改時間未變，本輪沒有發送新聞來源請求或寫入正式新聞佇列。新版尚未由正式 owner
+載入，因此實際續抓、網頁狀態及完成時間仍需維護結束後驗收。
+背景檢查沿用既有 Global Voices `3474/` 空頁與 CMNews 特殊路徑證據，
+沒有重抓；另對 CMNews 現有 49 筆身分未驗證 head 的唯讀逐筆比對遇到
+磁碟 I/O 等待而主動中止，沒有產生完整比對結果或修改原佇列，不能把
+這 49 筆當成已解決。
+另以 systemd 唯讀檢查，FinLab 的 day-trade 與 FinLab／FinMind 配額
+取樣 timers 仍在等待執行，私人新聞備份監督工作也仍在執行；它們
+不等於已停止的新聞下載服務，本輪沒有改動它們的狀態。FinLab 的
+day-trade priority timer 在有待辦時可能直接執行優先下載；既有
+FinLab 期貨有限優先工作另排定臺北時間 10/29 08:01 起嘗試，實際
+執行仍取決於容量及其他條件。這些是既存工作，不能描述為全部
+下載相關工作都已停機。
+
+## 10/29 維護期間：批次正文中斷恢復與既有證據沿用
+
+隔離測試重現兩個邊界：鉅亨清單批次的正文與收據已落盤，但 SQLite
+尚未提交時若中斷，已知列印網址可能停在舊的路徑分類；本機快取
+重播較早原件時，則可能把後來的來源錯誤、冷卻與檢查時間覆蓋。
+這些是測試重現的問題，尚無證據表示正式佇列發生過相同中斷。
+
+現在[共同下載器](../downloader/news_fulltext.py)將無租約批次文章的
+原始 head 快照寫入正文紀錄，[佇列提交與恢復](../downloader/news_fulltext_queue.py)
+均原子核對快照；若期間有新工作或來源狀態，保留新狀態並將先前正文
+保留為歷史版本，不把未採用的版本計為新增 head。鉅亨本機快取重播
+同樣比對 head；較新或同一時間的來源檢查結果不會被較早原件清除，
+只補入可驗證的舊正文與其實際取得時鐘。鉅亨歷史清單現在直接引用
+此次提交的正文批次及收據，即使第一個文章 head 被較新工作取代，也
+不會誤指另一個批次。無法證明身分或狀態的舊格式收據仍採保守恢復，
+不能因新契約推定舊收據一定已補齊。
+
+既有缺文稽核 v3／v4 的讀取與驗證邏輯沒有因新批次寫入修正而改變；
+僅對完整符合已審核程式指紋、來源身分及檔案／收據條件的舊證據沿用，
+變更後仍重新檢查。停機快照中原有的[30 個 v3 核驗組合](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_v3_reuse_after_bulk_writer_fix_20261029.json)
+符合沿用條件；這不是全量證明。另依相同快照限定檢查，鉅亨既有
+578 個路徑不支援 head 中[沒有數字列印路徑](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_unsupported_print_candidate_census_20261029.json)；
+原有市場頁與舊 `.shtml` 的分類及待查證事項沿用既有結果，不重排為
+已下載正文，也不宣稱本次已補回這 578 筆。
+
+完整與有限讀回契約更新為 v6，共用正文批次驗證為 v5，新增快照見證
+的身分和格式核對。同一組[四個既存批次抽樣](../artifacts/data_quality/news_offline_inventory_20261029/bulk_fencing_v6_sample_20261029.json)
+的 68 個正文版本和 68 個目前 head 通過，並非新下載或全歷史驗收。
+[28 個相關測試檔](../artifacts/data_quality/news_offline_inventory_20261029/bulk_fencing_regression_20261029.log)
+共 1,691 項通過，含中斷恢復、較新冷卻、同時鐘、失效見證及舊證據
+相容；只證明受測情境。依使用者要求，新聞服務與 timer 仍停止，
+沒有來源請求、正式 queue 寫入或服務重啟；新版尚未由正式 owner
+載入，實際抓取、面板更新及剩餘完成時間須於維護結束後再驗收。
+
+## 10/29 維護期間：文章租約與中斷收據恢復
+
+離線測試重現：較早送出的 304、來源失敗或 200 正文，可能在另一個
+工作已取得租約或保存較新正文後才完成，覆寫新狀態或釋放新租約。
+即使工作 owner、租約截止時間與嘗試次數相同，也可能是不同請求；
+重啟時若把租約身分直接清空，舊收據也可能被當成最新中斷工作重播。
+
+[原新聞佇列](../downloader/news_fulltext_queue.py)為每次個別文章請求
+保存獨立租約識別，304、失敗與正文提交以文章狀態及租約原子比對。
+重啟釋放中斷工作時另外保存該次租約，只有相同租約的耐久收據能
+恢復 head；過期正文仍保留為歷史版本，但不覆寫現行 head、來源冷卻
+或新工作。舊格式收據沒有租約識別，僅在沒有較新租約、檢查與正文
+時間證據允許時恢復；不推測其歷史發布時間。
+
+三條已核准的既有原件重播路徑也同時核對來源證據與實際租約；舊格式
+只有目前沒有新租約時才沿用原恢復規則。重播結果現在以資料庫實際
+採用的 head 計數，並列出被後續工作取代的網址，不把僅保存的歷史
+版本計為新增正文。被後續租約取代的鉅亨本機失敗原件不會被永久
+標記為完成：若新工作之後仍未取得正文，原件可在期限允許時重新核對。
+整批與有限讀回的驗證契約更新到 v5，共用正文
+批次驗證為 v4，核對兩種見證是否對應同一請求。
+
+[停機抽樣](../artifacts/data_quality/news_offline_inventory_20261029/capture_fencing_v5_final_20261029.json)
+以新驗證契約核對最新四個已提交批次，共 **68 個正文版本及 68 個目前
+head**；只涵蓋抽樣，不代表全部歷史完成。隔離測試包含重啟後新舊
+租約的 owner／期限／次數相同、已保存與未保存正文、舊版收據，以及
+被取代的重播不能算為完成。最後調整本機原件可重試邊界前，28 個
+相關測試檔的[擴大回歸](../artifacts/operations/agent-workflow/runs/news-retained-lease-final-202610-20261028T212612-4411f779/run.log)
+為 **1,680 項通過**；最後調整後的七個受影響測試檔另有 **362 項通過**，
+兩次範圍重疊。來源批次清單／RSS 的無租約批次路徑有
+自己的既有檢查，本次個別文章租約驗證不能推論其所有並發情境。
+
+依維護要求，新聞服務與 timer 持續停止；本次沒有來源請求、正式
+佇列寫入或服務重啟。新版尚未由正式 owner 載入，恢復後仍須以正式
+收據、來源請求與面板進行端到端驗收，亦無法據此預估全歷史完成時間。
+
+## 10/29 維護期間：304 沿用正文的身分與收據
+
+條件式追新原本只檢查封存檔的雜湊及正文 head 的部分欄位，沒有
+核對已提交收據實際指向的檔案、收據／紀錄版本、批次筆數、網址身分
+與 head 的正文長度。隔離測試重現七種不一致仍可能把 HTTP 304 計為
+完成，另一種不一致可能讓舊 ETag 被錯誤綁定到來源網址。
+
+現在[共同收據檢查](../downloader/news_fulltext_queue.py)同時供完整
+批次驗證與 304 路徑使用；304 附加核對 Parquet 筆數、網址與文章 ID、
+紀錄版本及正文 head，缺少可驗證證據時保留既有正文及取得時間，
+清除條件式驗證器並排回待重試。日常追新只讀所需的 Parquet 中繼欄位
+並驗證封存檔雜湊，不解碼正文或原始回應；逐篇正文與原件的內容雜湊
+仍由完整批次驗證負責，不應把 304 核對當成全量內容稽核。
+舊驗證器綁定也加入原子比對：網址、正文 head、ETag、Last-Modified、
+授權或綁定狀態在核對期間改變時，不將舊綁定交給請求；八個隔離
+並發變更案例均重現原問題並在修正後通過。
+
+[停機快照抽樣](../artifacts/data_quality/news_offline_inventory_20261029/saved_body_revalidation_sample_20261029.json)
+從九個保有舊正文的來源／狀態群組各讀一個 head，九個通過新核對；
+其中一個另有 ETag／Last-Modified 可核對。這不是對其餘 head 或整個
+歷史的結論。最終 11 個相關測試檔 **775 項通過**。正式 queue 和日誌檔案狀態未變，
+沒有呼叫新聞來源、啟動服務或重抓資料；實際 304 追新仍待維護結束
+後以正式 owner 和收據驗收。
+
+## 10/29 維護期間：批次讀回與全量驗證採同一證據契約
+
+有限批次讀回原本只核對 Parquet／原件／正文雜湊和目前 head，未核對
+收據指向的 Parquet 路徑、收據契約版本、原件／正文位元組數，以及
+正文紀錄的部分用途與發布標記。隔離測試證實，這些資料損壞時有限
+驗證可能通過，而全量驗證會拒絕；另發現兩者都沒有核對正文紀錄的
+契約版本及「紀錄的請求網址是否對應其文章 ID」。
+
+現在[共用驗證器](../downloader/news_fulltext_queue.py)以相同程序核對
+完整收據、每個正文及共用原件；[有限批次讀回](../scripts/verify_news_recent_batches.py)
+也使用此程序，維持原先對歷史版本與目前 head 的區分。全量與有限
+報告均更新至驗證契約 v3，有限讀回另記錄共用程式的雜湊。不存在的
+提交批次、重複批次路徑及無法解碼的 Parquet 都會回報錯誤；不會將
+尚未取得的正文推定為已完成。
+
+同一批多篇文章引用同一回應時，原件 SHA 現在按**回應 ID 每批一次**
+計算，仍逐篇核對各自宣告的雜湊及正文。四個[既存批次抽樣](../artifacts/data_quality/news_offline_inventory_20261029/recent_batch_contract_v3_sample_20261029.json)
+共驗證 41 個正文版本、27 個目前 head 和 14 個已被後續版本取代的
+紀錄；[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/recent_batch_contract_v3_independent_20261029.json)
+逐篇重新計算原件與正文雜湊，結果一致。其中一個鉅亨批次的 20 篇
+共用 68,079 bytes 回應，原件雜湊輸入量由 1,361,580 降為 68,079 bytes；
+這不是新增下載，也不能推論其他批次或全歷史的品質。
+
+[隔離 ABBA／BAAB 測量](../artifacts/data_quality/news_offline_inventory_20261029/shared_response_verification_abba_20261029.json)
+以 100 篇共用一份合成回應、相同身分／收據／正文檢查比較，四次中位數
+牆鐘由 0.718 秒降至 0.224 秒，CPU 由 0.789 秒降至 0.252 秒。量測包含
+Parquet 讀取、雜湊、解碼及驗證，但不含收據 JSON 讀取、queue head
+查詢或網路下載；檔案快取已暖，不能推論整體抓取速度或官方上限。
+
+十個相關測試檔 **693 項通過**；補上 Parquet 例外、重複路徑及報告
+身分測試後，六個受影響測試檔另有 **355 項通過**，兩次範圍重疊。
+正式新聞服務和 timer 依維護要求保持停止，沒有來源請求、正式 queue
+寫入或服務重啟；尚未以新程式完成全湖驗證或恢復後的端到端下載驗收。
+
+## 10/29 維護期間：CMoney 舊路徑分類已完成
+
+依目前來源 fingerprint 讀取[維護前 owner 快照](../artifacts/data_quality/news_offline_inventory_20261029/cmoney_note_detail_completed_20261029.json)，
+先前因磁碟准入等待的 `note-detail.aspx` 既存資料分類 checkpoint 已走完
+兩個協定前綴，記錄分類 **40,367 個 head**。這個範圍目前共有
+**40,512 個 head**，全部已是 `unsupported_article_path`、沒有正文指標，
+也沒有待分類的 pending；其中 3 個 head 記錄過先前嘗試。這更新了本文
+10/28 05:29「40,367 個尚待分類」的當時狀態，無須重排同一分類工作。
+
+分類完成不代表 40,512 篇正文已下載，也不能斷定來源原文不存在；
+它只表示現有來源規則不支援這批網址。CMoney 整體的其他缺文與來源
+存取問題仍未完成。這次僅唯讀索引與 checkpoint，資料庫／日誌前後未變，
+沒有呼叫來源、寫入正式 queue 或啟動服務。
+
+## 10/29 維護期間：保留正文的完整性驗證
+
+續查尚未完成的資料時，發現原本的全量正文驗證只核對 `complete` head；
+來源重試、找不到文章或權利狀態變更後仍保留的舊正文，不會被驗證。
+另有三個隔離測試可重現的誤判：完成 head 的路徑及雜湊都空時仍可能
+通過；未提交的收據副本可能被當作已提交證據；已提交的舊批次即使
+收據不見，若不再是目前 head 也可能漏報。
+
+[共用 queue 驗證器](../downloader/news_fulltext_queue.py)的新契約 v2
+核對所有有正文指標或宣稱完成的 head、原件／正文雜湊與確切提交收據；
+舊正文和最新來源狀態仍分別保留。已檢查數與成功驗證數分開統計，
+既有已存正文增量計數也與實際資料核對。未提交或重複收據可以被讀取，
+但不能取代提交收據。收據身分沿用既有索引，每批最多 128 個查詢；
+完整稽核仍需要讀取整個驗證範圍，不加入日常下載循環或網頁輪詢。
+
+[維護前的唯讀快照抽樣](../artifacts/data_quality/news_offline_inventory_20261029/retained_body_sample_20261029.json)
+的狀態計數顯示 **494 個非 complete head 保留正文指標**，其中鉅亨
+`retry` 423、`source_not_found` 3；這些是快照中的既存資料，不是本輪新增
+或全數已驗證的文章。從九個來源／狀態群組各抽一個 head，核對九個
+已提交批次、192 個批次正文版本及九個抽樣 head，並獨立讀回其身分，
+結果通過。這不能推論另外 485 個 head 或全部歷史均通過，也不代表
+最新來源狀態已修復。
+
+五個相關測試檔 **334 項通過**，含部分指標、收據損壞、重複收據及
+非完成狀態等情境。新聞服務與 timer 依使用者要求維持停止；未呼叫
+新聞網站、重抓正文或寫入正式 queue，也尚未以新版執行全湖驗證。
+
+## 10/29 維護期間：已接收批次的缺文證據鏈
+
+繼續檢查尚未完成的鉅亨缺文證據時，發現本機歷史清單也可能指向
+`accepted_body_batch`，但原缺文稽核只認得另外兩種原件格式。現在
+[缺文稽核](../scripts/audit_news_cnyes_retained_missing.py)的 v4 會檢查
+批次是否已提交、獨立收據、原始回應雜湊、實際請求、授權與取得時間；
+同一批次的相同內容若來自不同請求，按請求分組，並分開顯示請求組數與
+實際原件數。發行人比對、43-1 候選及 FinLab 線索鏈路也保留這些身分，
+不把清單線索當作新聞正文或正式發布時間。
+
+只沿用經明確核對的 v3 原有單回應格式證據：來源和收據未改、觀察
+身分有效，且舊版與目前程式雜湊均符合已審核版本時才能略過；程式
+變更會停用此相容判定，直到重新審核。已接受批次的舊證據還要重新
+核對正式批次名冊；名冊或收據缺失時保留錯誤，不掩蓋缺口。
+
+[停機快照實證](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_accepted_batch_crosscheck_final_20261029.json)
+對一個既存已接收批次逐項驗證成功；該頁本來已有 30 篇通過正文驗證，
+並非新增下載。先前已核驗的 30 個缺文交叉檢查結果仍可沿用；另外
+一筆請求不符觀察繼續保留待查。這個抽樣不能推論有多少新增可回補
+正文，也不能證明全歷史完整。
+
+本次六個相關測試檔 **232 項通過**；既有 owner 的歷史證據測試另有
+**311 項通過**，最後針對跨元件鏈路及舊證據相容再驗證 **2 項通過**
+（與前者重疊）。正式新聞服務和 timer 依維護要求保持停止；沒有來源
+請求、正式 queue 寫入或服務重啟，維護結束後仍須以正式收據驗收。
+
+## 10/29 維護期間：已接收批次與同範圍不同請求
+
+離線盤點到 **49 筆**清單觀察指向已接收正文批次；逐份核對批次、
+收據、原始回應、來源請求和授權後，49 筆均能找到相符原件。批次的
+原始取得時鐘與後續清單記錄時鐘是兩個事件，不能互換。此結果只涵蓋
+停機快照中這 49 筆，不代表其他原件或全歷史完整。
+
+隔離測試另重現尚未發生在上述 49 筆的邊界：不同實際請求可能因查詢
+參數順序不同而正規化到同一 scope，且回應位元組相同；舊程式會把舊
+批次直接沿用為新觀察。現在既有 owner 僅在實際請求相同、已提交批次
+及收據有效、原始回應雜湊／授權／時鐘相符時重用。不同請求保存各自
+的原件，舊觀察及關聯 head 先保存至既有稽核紀錄；較舊的本機回放不
+覆蓋較新的 head。損壞收據或不符的原始請求、授權、內容都不會被
+視為有效來源證據；已存正文不因此重抓，也不更改來源冷卻。
+
+[獨立批次核對](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_accepted_batch_request_identity_20261029.json)
+及[現行 owner 驗證函式讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_accepted_batch_owner_proof_20261029.json)
+都驗證 49／49，沒有來源請求或正式 queue 寫入。後者單次讀取的牆鐘
+0.252 秒、CPU 0.217 秒，個別驗證中位數 2.347 毫秒；快取與系統負載
+未控制，不能推論正式服務的吞吐或網路速度。
+
+15 個相關測試檔 **908 項通過**；另針對批次原始請求／授權／內容
+損壞的 3 個案例及最後修正後的 4 個離線稽核測試檔 **118 項通過**。
+這些測試範圍重疊，不可相加。正式 owner 與 timer 仍停止，新程式尚未
+由正式服務載入，實際恢復、後續來源請求和收據仍待維護結束後驗收。
+
+## 10/29 維護期間：新版清單原件與續查
+
+依使用者要求，新聞下載服務與 timer 保持停止。離線檢查發現現有缺文
+稽核只辨識舊的 `canonical_quarantine`，不認得歷史下載器已使用的
+`cnyes_history_source_envelope`；維護結束後產生的新原件會因此被列為
+未辨識，而不是實際核對。現在[缺文稽核](../scripts/audit_news_cnyes_retained_missing.py)
+以 v3 同時辨識兩種原件，按「原件路徑、回應雜湊、原始請求」區分。
+相同回應內容若來自兩個實際請求，分別核對來源、收據、觀察時間與
+文章；計數也分開列不同回應雜湊數、來源原件數及原件／文章組合數。
+不符的觀察仍保留為待查，不會被另一個請求的證據取代。
+
+新版原件必須符合既有 owner 的路徑與收據格式；逐筆核驗原始請求、
+授權、取得時間、回應內容和檔案雜湊。續查時只有觀察與解析版本相同、
+且原檔及收據的裝置、inode、大小和高解析時間戳仍與核驗時相同，才
+沿用先前結果；改動後重新核對。這是原件變動偵測，不等於來源完整
+或歷史發布時間證明。v2 報告保留原樣；v3 因證據契約改變，不直接
+拿 v2 結果跳過檢查，也不會自動重跑已完成的全量稽核。
+
+跨來源發行人比對和後續 43-1 離線候選清單已能接收新版原件證據，
+保留每個請求原件而不合併各自的取得時間；舊版輸入仍沿用舊契約。
+這些結果仍只是研究線索，不是新聞正文、正式公告身分或發布時間。
+
+隔離測試包括兩個不同請求保存相同回應、分批續查、損壞收據或原檔、
+錯誤觀察關聯，以及跨來源比對的整條離線鏈路。受影響的 11 個測試檔
+**772 項通過**。停機快照的[單份舊原件抽樣](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_envelope_v3_final_sample_20261029.json)
+核對 30 個文章結果及 1 筆請求不符觀察；[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_envelope_v3_independent_20261029.json)
+重新核對原件、清單與既有 v2 結果，全部一致，原件和 queue 快照未變；
+後續程式修正後的抽樣結果與獨立讀回樣本[逐項相同](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_history_envelope_v3_final_independent_20261029.json)。
+這個真實樣本仍是舊格式；新版格式目前僅以隔離測試證明，不聲稱已在
+正式來源下載驗收。此次沒有呼叫新聞網站、修改正式 queue 或啟動服務。
+
+## 10/29 維護期間：缺文原件的請求身分與獨立來源證據
+
+使用者要求維持維護停機。對最後一份正式 owner 快照做唯讀檢查，六種
+缺文狀態中有 5,705 個鉅亨主站數字 ID；其中 2,327 個 head 在已保存
+清單觀察中有候選。這不是全站歷史分母，也不包含所有其他缺文狀態。
+涉及的 2,481 筆觀察之中，**854 筆的觀察請求與所指原件實際請求不同**；
+相同原始回應雜湊不能證明它們是相同的來源請求。
+
+舊版[缺文交叉檢查](../scripts/audit_news_cnyes_retained_missing.py)核對
+原件、收據、回應和單篇雜湊時，沒有核對每筆觀察的請求身分，因此
+下方「未核對的鉅亨 API 原件交叉檢查」所列 v1 報告仍是對所讀原回應
+內容的證據，但不能作為各觀察請求均相符的證明，也不能直接用來略過
+新的身分核對。v1 原報告及其雜湊保持原樣，這裡補正其證據範圍。
+
+新版 v2 先檢查觀察自身及原始收據，再按原件實際記錄的請求選擇單篇；
+不符的觀察另列，不得借用同內容原件的請求、來源時間或授權。來源
+原回應本身如果確實含有目標文章，仍會以該原件自己的請求和觀察時間
+列出獨立結果，並標明它**沒有驗證不符的清單關聯**。已完成的 v2
+結果只對同一觀察沿用；損壞或變更的目前觀察先驗證，不能被舊結果
+掩蓋。本機唯讀快照也要求 WAL 與 rollback journal 均為空。
+
+[全量離線結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_retained_missing_identity_v2_final_20261029.json)
+核對 **1,652 份原回應、3,874 個文章／回應組合**，無原件驗證失敗：
+其中 3,829 組有同請求觀察，3,745 組未提供正文、84 組未通過正文
+判定，沒有可直接接收的全文。另 45 組缺同請求觀察，分布在 25 份
+原回應、34 個 head；[最終程式的針對性原件覆核](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_source_only_final_20261029.json)
+確認這 45 組原回應也未提供正文。原回應內容不等於新聞來源永遠沒有
+正文。[目前 head 唯讀分類](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_mismatch_head_scope_20261029.json)
+確認 854 筆不符觀察都有直接的目前 head，另有共享參照，合計影響
+862 個目前 page head。它們仍須由既有 owner 依實際原件及來源期限
+處理，這不是 862 篇缺文或已安排來源重抓的數量。
+
+全量檢查後另補了「沿用舊結果前先檢查目前觀察」的防護；全量那次
+並沒有沿用舊版觀察結果，故其結果仍只代表當次快照，最後的 25 份
+覆核則使用包含此防護的版本。原件讀取也改為解析已核對雜湊的同一
+份位元組，結束前再核對檔案與收據，讀取中替換不能誤判通過。
+[獨立讀回](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_request_identity_independent_20261029.json)
+重新核對全部 854 筆請求不符、抽查 64 組相符結果，以及 45 組只由
+原回應證實的內容；後者以另一套 HTML 文字讀取確認都只有空字串或
+`null` 文字。讀回期間資料庫、空 WAL、journal、所讀原件及收據前後
+一致；檔案身分檢查不是正式 owner 的互斥鎖。
+新聞原件、鉅亨歷史、佇列和面板等九個測試檔 **732 項通過**。
+沒有送出來源請求、複製正文或寫入正式 queue；服務與 timer 仍停止。
+
+## 10/29 維護期間：鉅亨舊原件稽核的重複解碼
+
+依使用者要求維持停機，繼續檢查尚未完成的鉅亨原件稽核。停機快照中
+75,293 筆待核對原件記錄，包含 27,004 次重複指向相同原件、收據和
+預期回應雜湊的情況；這不是確定錯誤或缺少正文的數量。依既有掃描
+順序模擬，64 個位置的快取可涵蓋其中 26,960 次；實際可用次數仍要
+逐一驗證，不能將這個推估當成已完成的稽核結果。
+
+原 owner 在多個有界掃描片段間重用已解碼的原件身分，不快取先前對
+不同網址或授權的判定。每次重用仍確認路徑、重新計算 Parquet 與收據
+雜湊，並逐筆核對請求網址及授權；原件或收據變動、讀不到、讀取中
+變更時不使用舊判定。快取不保存新聞正文，不修改既有來源重試期限。
+[測試](../test/test_news_cnyes_history_evidence.py)特別模擬檔案內容
+改變而檔案系統回報相同身分與時間戳；修正前會錯誤判為通過，現在
+能偵測並與不使用快取的結果一致。
+
+[唯讀量測與隔離結果](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_original_audit_cache_20261029.json)
+取停機資料庫排序中的三段、共 768 筆頁面記錄；兩組有快取及兩組
+無快取核對結果一致，皆為 564 筆通過、204 筆請求不符。有快取各
+解碼 500 份 Parquet，無快取各 768 份。兩組無快取牆鐘 4.78、
+1.87 秒，有快取 1.77、1.93 秒；快取冷暖與樣本次數不足，不能據此
+宣稱正式完整流程的速度提升。另以 128 個合成頁面執行完整分片稽核
+及 SQLite 狀態更新，四組輸出一致，32 個不符頁面均被識別，128 個
+既有 429 工作及其期限均保留；時間亦有波動，不構成線上吞吐承諾。
+唯讀量測前後資料庫、空 WAL、journal 與抽樣檔案的身分未變，但這些
+檢查不是寫入者互斥鎖。
+
+原件、新聞清單、全文、佇列、收據及面板相關八個測試檔 **672 項
+通過**。正式服務與 timer 維持停止，沒有呼叫新聞來源或寫入正式
+佇列；修改尚未由正式 owner 載入，實際回補數和完成時間仍待維護
+結束後以正式收據驗證。
+
+## 10/29 維護期間：已保存原件的自動恢復補強
+
+延續下方的舊原件身分稽核，隔離測試發現：原件缺檔或損壞時，之前會標記
+待證並定期再查，但即使本機已有相同請求的另一份原件，仍可能停在等待。
+現在會把本機候選交回既有 owner 驗證；共享頁也只使用該頁自己的實際
+請求與觀測，不能借用其他網址的相同回應。候選稍後消失、內容不符或
+目錄暫時無法讀取時，保留本機重試，不重設來源的失敗與 429 等待期限。
+新的已接受批次被索引時，相關待證頁面可以立即重新驗證；同時核對授權
+與資料契約，避免把舊授權資料當成目前授權的資料。
+
+同一網址有不同歷史版本時，未完成的舊版本先保留原工作；舊版本完成後
+原工作與結果先歸檔，再讓較新版本使用同一 owner 的工作位置。本機修復
+工作及候選識別可在 owner 重啟後接續。新稽核資料表尚未遷移的舊資料庫
+也可以先完成既有收據重播，再建立新表，不會因此阻止啟動。
+
+上述是在暫存資料庫及本機檔案的測試，不是正式資料的已修復筆數；目前
+新聞服務與 timer 依維護安排仍然停止。正式下載、本機回補總量、剩餘
+時間和服務重啟後的實際表現，都尚待維護結束後以原 owner 和收據驗證。
+最後對鉅亨原件與清單、新聞全文、佇列、收據重查和進度顯示執行的
+八個測試檔共 **665 項通過**，牆鐘 79.31 秒；這不是整個儲存庫的測試，
+也不是正式服務已載入或所有來源抓完的證明。
+
+## 10/29 維護期間：鉅亨原件身分與本機回補
+
+使用者確認停機是維護安排。`stockagent-news-fulltext.service` 和 timer
+均維持 `inactive`，服務 MainPID 為 0；以下是程式、隔離測試及停機快照，
+不是已部署或重新下載的證據。沒有呼叫新聞來源，也沒有寫入正式佇列。
+
+鉅亨清單的舊原件以回應內容雜湊命名，但不同查詢有可能得到相同的空回應。
+因此第二個查詢的觀測記錄可能指向第一個查詢的原件。以 WAL 空白、唯讀
+`immutable=1` 的[停機資料庫抽查](../artifacts/data_quality/news_offline_inventory_20261029/cnyes_original_request_audit_sample.json)，頁面 head 指向 73,605 個不同觀測，
+其中 24,886 個原件路徑被不同請求共用，涵蓋 50,148 個觀測；這個數字
+不是全文缺口或確定錯誤總數。依引用數排序抽查前 64 個路徑，逐一驗證
+收據、檔案及回應雜湊後，確認其中 440 個觀測的請求與所指原件不同。
+抽樣不是隨機抽樣，不能外推全部錯誤數。檢查前後資料庫和 WAL 的大小與
+修改時間一致；這也不單獨證明其他程式沒有讀取該檔案。
+
+修正保留原有唯一 owner、來源限制和公開／私有邊界：
+
+- 新原件以「實際請求、授權指紋、回應雜湊」識別；同一請求的同一有效
+  原件可重用，但不同請求不可互借。舊路徑仍可讀取，必須先核對身分、
+  收據、回應內容與時間。損壞或孤兒檔不覆寫。
+- 新增分片、可恢復的既有原件稽核。可確認不符的頁面記錄先標為待證，
+  交給既有本機原件回補流程；有正確原件時保留原始觀測時間。仍找不到
+  時才依原排程查來源，失敗、429 及其等待期限不重設。本機檔案暫時
+  不能讀時只排本機再核對，不直接當成來源空資料或要求來源重抓。
+- 新實際觀測修復錯誤指向時，舊觀測與相關 head 先記入稽核表；共享頁
+  不得繼續引用已標為待證的原頁。清單頁是否有完整正文另行判斷。
+- 新進度投影區分已檢視、身分核驗通過、不符、本機無法驗證及不在此
+  核驗範圍的頁面記錄；不公布路徑或網址。停機時前端標示「上次快照」。
+  完成一輪掃描不是全部新聞歷史已抓齊，也沒有全歷史完成時間。
+
+本機隔離測試覆蓋相同回應的不同請求、舊錯誤指向、重啟續掃、429、
+原件缺失恢復、損壞保留、共享頁與授權變更；無頭瀏覽器另核對停機
+快照和手機／桌面顯示。效能只抽看 512 個舊原件的壓縮檔案大小：
+中位數 15,462 bytes、最大 27,697 bytes，不能推論全部檔案大小或
+正式重啟後的掃描速度。較廣的 545 項新聞相關測試通過；另針對原件
+稽核及重複回應重跑 10 項，並驗證 4 個停止快照的瀏覽器案例；
+這不是完整 repository 測試。系統恢復之前不能確認新程式已載入、
+舊原件全部掃完、來源回補完成或實際 ETA。
+
+## 10/29 維護期間：完整來源鍵唯讀清點與工作順序
+
+新聞服務和 timer 依使用者指示維持停止。本次只讀取原 owner 的資料庫及
+設定，沒有呼叫來源或寫入正式佇列；[完整清冊](../artifacts/data_quality/news_offline_inventory_20261029/inventory_v2.csv)、
+[端點清冊](../artifacts/data_quality/news_offline_inventory_20261029/inventory_v2.endpoints.csv)
+及[工作順序](../artifacts/data_quality/news_offline_inventory_20261029/work_order_v2.csv)
+以原本的來源鍵為單位，並以鉅亨優先，其他來源照使用者指定的順序處理。
+計數所依據的 owner 狀態停在 **2026-10-28 07:44:25 台北時間**；
+清點是在 10/29 02:53 進行，不代表這段時間有新增下載。
+
+本機辨識到 **952 個來源鍵**：91 個有設定，其中 57 個在設定中啟用；
+另有 861 個未註冊的 hostname 鍵。設定啟用不表示服務正在執行，也不
+表示各站全文或歷史已完整。共 **6,352,201 個已知 URL head**，其中
+3,917,924 個有正文指標、2,434,277 個沒有；無正文也包括不支援路徑、
+非文字、來源限制或待核對狀態，不能視為可下載篇數或全站歷史缺口。
+鉅亨有 3,693,925 個已知 URL head，其中 7,022 個沒有正文指標。
+原始網址中繼資料另有 946,017 個關聯；關聯可能重複，不是唯一文章數。
+
+較早的 934 鍵工作清單與這份清冊相比，多出 38 個鍵、少了 20 個舊鍵；
+這 20 個舊的未註冊 hostname 現在都能由目前設定匹配到具名來源。
+這只確認目前的分類關係，不能推定 38 個全是新網站，也不證明舊正文
+已遷移或全部下載。清冊內各來源的狀態數與 URL 數、JSON 與 CSV、
+工作順序及來源設定雜湊已[獨立讀回對帳](../artifacts/data_quality/news_offline_inventory_20261029/independent_readback_v2.json)；
+本次未逐篇重驗正文檔案及收據，也沒有宣稱全站歷史完成。
+
+[清點程式](../scripts/audit_news_providers.py)新增維護用的
+`--offline-immutable`：只在外部已確定佇列沒有寫入時使用，要求 WAL
+和 rollback journal 為空，並比較資料庫、狀態檔和所有來源設定的
+前後身分或雜湊；異動則拒絕輸出。這些檢查不是寫入者互斥鎖，不能
+單憑它們證明期間絕無其他寫入者。此次外部檢查服務及 timer 均為
+inactive，前後資料庫、空 WAL 和狀態檔未變。[排序程式](../scripts/plan_news_sources.py)
+的輸出契約更新為 11：分開記錄清點時間與 owner 快照時間；因為排序
+本身不觀測服務狀態，`running_collectors_stopped` 為未知，而不再錯誤
+寫成 false。這些程式與報表不會自行啟動、停止服務或重新下載已完成
+正文。
+
+相關[清點測試](../test/test_news_selected_source_inventory.py)、
+[端點測試](../test/test_news_endpoint_inventory.py)、
+[順序測試](../test/test_news_implementation_order.py)與
+[原始網址工作測試](../test/test_news_metadata_link_plan.py)共 **120 項通過**。
+另有來源路由、有限範圍、舊路徑及快取的[共用邊界回歸](../artifacts/operations/agent-workflow/runs/news-offline-inventory-regressio-20261028T185423-8d090c23/run.log)
+**90 項通過**。
+第二次完整唯讀掃描量測約 33.8 秒牆鐘、33.8 秒程序 CPU；檔案快取
+狀態不同，不能據此與前一次比較或宣稱下載加速。目前沒有可依現有
+證據推算的全站完成時間；本輪沒有啟動或驗收正式下載 owner。
+
+## 10/29 維護期間：已完成範圍的可續跑巡檢
+
+共享頁收據必須與原來的頁面 ID 紀錄相符；觀測即使自帶正確雜湊，仍須
+核對來源、ID 摘要、返回與重複筆數。損壞收據會撤回完成狀態，僅把
+符合既有條件的原頁排入重查；429、錯誤次數與既有期限不會重設。
+面板將「原頁收據待核對」、「本機頁面證據損壞」和「範圍證明待修復」
+分開顯示，不能全部當作來源錯誤。
+
+原 owner 新增可續跑的本機清單中繼資料巡檢，以來源與授權契約隔離
+游標，記錄本輪範圍上界，掃描已記錄完成或待修復的範圍；本輪開始後
+新增或改動而已越過游標的範圍留到下一輪。每輪結束後一小時再檢查，
+這是本機巡檢週期，並非來源重試冷卻。既有待處理與修復工作先執行；
+巡檢每次採軟時間片，停機或交易失敗時回滾正在檢查的範圍及游標。
+異常前的 head、證明、缺口、無法解碼的 SQLite BLOB 與壞游標均保留。
+受影響父子範圍與兄弟證據先核對，再嘗試重建；既有來源缺口不會被
+本機掃描取消，舊來源／授權契約也不會被重新標成當前契約。
+範圍修復與游標在同一 SQLite 交易提交；本機寫入失敗會回滾本片
+已做的修復。只在該交易的穩定快照內重用子分區驗證，一旦修復改變
+任何 head 便清空快取；父層過期的證明參照不會使有效子層被誤判。
+面板的完成計數是最後一次核驗的記錄；本輪未巡檢的範圍不能保證
+目前仍然有效，巡檢數也不是全文或全歷史完成率。
+
+巡檢只核對資料庫的清單中繼資料，不發來源請求，不驗證原始檔或
+文章全文。一次失敗可能牽涉多個父子範圍，受影響計數可能重複，
+因此不能當作唯一缺失文章數。維護期間服務與 timer 均維持停止；
+本機實作及隔離測試不代表正式 owner 已載入新程式或完成正式巡檢。
+
+對 10/28 07:44:25 台北時間的停機快照另做
+[全範圍唯讀中繼資料檢查](../artifacts/operations/agent-workflow/runs/news-integrity-stopped-audit-20261028T183813-b2be8e28/run.log)：
+目前來源／授權契約下，3,720 個一般清單、86 個共用頁 ID 證據清單及
+1,116 個分區清單，共 **4,922／4,922** 個已記錄完成範圍通過上述
+檢查，未發現不一致。實測牆鐘約 90.9 秒、程序 CPU 約 66.8 秒；
+前後正式資料庫、空 WAL 與狀態檔的大小及修改時間相同。此結果不
+包含未完成範圍，也不涵蓋原始檔、正文或完整歷史；不會把唯讀結果
+寫入正式 owner 的游標。
+
+[離線 ABBA](../artifacts/operations/agent-workflow/runs/news-integrity-proof-abba-20261028T183426-e67094ae/run.log)
+將停機快照的一個 30 頁清單中繼資料複製到 tmpfs，驗證結果雜湊一致；
+不使用／使用摘要快取時，每次完整檢查中位數約為 10.7／6.9 毫秒，
+各兩組、每組八次，不能代表整條下載鏈路。另一次冷快取巡檢約
+17 毫秒，超過設定的 6.25 毫秒軟片：為避免大範圍永久飢餓，單個
+範圍仍可能超時；上述唯讀檢查的時間不能直接當作正式 owner 周期
+或來源下載吞吐量。
+
+[父子證明的離線 ABBA](../artifacts/operations/agent-workflow/runs/news-integrity-memo-abba-20261028T184144-534bb61c/run.log)
+使用停機快照 20 棵父樹、60 個範圍，未重用／交易內重用時的完整
+檢查中位數約 0.777／0.454 秒，驗證結果一致；各僅兩組。正式 owner
+的時間片可能只容納部分範圍，因此這不是全量週期或線上吞吐承諾。
+[交易、重啟與舊父層參照測試](../artifacts/operations/agent-workflow/runs/news-integrity-transaction-memo-20261028T184125-b6c7f18e/run.log)
+有 21 項通過，涵蓋寫入失敗回滾及安全快取邊界；此後的
+[owner、來源配額與面板回歸](../artifacts/operations/agent-workflow/runs/news-integrity-transaction-regre-20261028T184156-76675cdd/run.log)
+有 531 項通過。
+
+新聞佇列、來源排程、退避、收據恢復、鉅亨歷史及面板的
+[擴大隔離回歸](../artifacts/operations/agent-workflow/runs/news-periodic-integrity-final-20261028T183443-faa1fd6b/run.log)
+為 **1,463 項通過**；[重啟與共享收據的追加測試](../artifacts/operations/agent-workflow/runs/news-integrity-restart-reference-20261028T183619-3e508c66/run.log)
+為 3 項通過；[最終邊界](../artifacts/operations/agent-workflow/runs/news-integrity-last-boundaries-20261028T183837-3a9a6867/run.log)
+與[桌機／手機面板](../artifacts/operations/agent-workflow/runs/news-integrity-ui-final-20261028T183843-8bfd79f9/run.log)
+分別為 28 與 136 項通過。回歸結果不等於正式下載、網頁部署或全文完整性驗收。
+
+## 10/29 維護期間：損壞的頁面觀測與清單證明
+
+隔離測試發現，已保存的頁面觀測若損壞，同一範圍的新頁面進來時可能
+觸發例外，而既有完成狀態仍留在面板資料中；同一來源再次回傳相同
+內容時，也可能重用損壞的觀測。[失敗測試](../artifacts/operations/agent-workflow/runs/news-corrupt-observation-red-20261028T180419-6f9e0200/run.log)
+與[損壞的清單證明測試](../artifacts/operations/agent-workflow/runs/news-corrupt-proof-red-20261028T180638-383f3420/run.log)
+保留重現結果，不能據此推論正式資料庫已有同樣損壞。
+
+現在核對頁面觀測雜湊及必要身分欄位，發現損壞時將範圍標為
+`invalid_page_evidence`、撤回相關父分區的完成狀態，交由既有本機
+原件修復或原來源重查機制處理；429 與來源工作期限不被重設。
+同一頁再取得可驗證的來源內容時，先在交易內保存受損觀測的原始
+資料庫欄位及所有相關 head，再記錄新的來源觀測；共享頁面須重新
+核對各自原有的頁面 ID 收據。較舊的保留原件不能取代較新的 head。
+清單證明若自身內容與雜湊不符，也會在重建時保存受損的原始欄位。
+若交易失敗，受損原始紀錄與 head 會一併回滾；新聞全文和原始檔案
+不會因這項修復而被覆寫。
+
+另有[多層分區失敗重現](../artifacts/operations/agent-workflow/runs/news-nested-parent-corruption-re-20261028T180947-389ba101/run.log)：
+底層證據變壞時原本只撤回直接父層，較高的祖先仍顯示完成。現在會
+逐層傳遞狀態；重新取得有效證據後，也會逐層重新核對。針對雜湊
+核對開銷，只對最多 64 筆、每筆不超過 8,192 字元的完整觀測文字
+快取摘要；文字變動即重新計算，各次仍核對資料庫身分欄位。
+[隔離 ABBA 量測](../artifacts/operations/agent-workflow/runs/news-observation-cache-abba-20261028T181109-9fa422fa/run.log)
+使用停機快照的 30 頁中繼資料及相同證明流程，無快取與有快取的
+每次核對中位數約 14.9／8.1 毫秒，結果雜湊一致；每種只有兩組樣本，
+負載波動大，此數字不代表來源下載速度。
+
+受損觀測可能被多個頁面 head 引用。停機資料庫的
+[唯讀查詢計畫與樣本](../artifacts/operations/agent-workflow/runs/news-corrupt-head-lookup-readonl-20261028T181509-463e83a4/run.log)
+顯示目前反查觀測雜湊需要掃描 head 表；先取得完整受影響清單後，
+現在按主鍵刪除這些 head，避免再次全表掃描。測到的一次反查約
+0.13 秒；先前另一次約 3.5 秒，受磁碟快取及負載影響很大。這條
+罕見損壞修復仍有一次無索引掃描，不能宣稱已有固定上限。
+
+當時這些檢查只在範圍重新核對或收到新觀測時執行；後續已加入上述
+定期巡檢。正式 owner 尚未在維護後執行，不能說所有舊損壞都已發現
+或修復；本次沒有啟動正式 owner、下載來源或寫入正式新聞資料庫。
+
+新狀態原本不在面板投影白名單中，會使整組歷史清單進度變成未知；
+[隔離失敗測試](../artifacts/operations/agent-workflow/runs/news-invalid-evidence-ui-red-20261028T181414-dd4b6fd0/run.log)
+已重現。面板現在將「本機頁面證據損壞」與「來源清單矛盾」分開計數，
+未知狀態及無效數字仍不會被當成完成。舊版後端沒有提供新欄位時，
+網頁顯示未知，不自行補零；正式面板仍須待維護結束後驗收。
+
+共用新聞下載、歷史清單、來源配額、排程公平性及面板的
+[最終回歸](../artifacts/operations/agent-workflow/runs/news-evidence-dashboard-final-re-20261028T181540-f121d8d6/run.log)
+為 **1,434 項通過**；將計數標籤明確改成「範圍」後，另以
+[桌機與手機寬度的離線瀏覽器測試](../artifacts/operations/agent-workflow/runs/news-invalid-evidence-label-brow-20261028T181824-03bdb90c/run.log)
+通過兩項。這些是受影響部分的隔離回歸，非完整 repository 測試或
+正式下載、原件完整性與線上面板驗收。
+
+## 10/29 維護期間：待處理頁面借用分區證據的檢查
+
+一般 `pending`／`overflow_pending`／本機重試工作先前只要看到頁面 head，
+或範圍 head 標為完成，就可能直接改成 `forward_evidence_available`。
+隔離測試證實，頁面觀測、父證明、子證明、子頁面或成員清單損壞，
+以及子分區已不再完成時，這條捷徑仍可能接受；[原始失敗結果](../artifacts/operations/agent-workflow/runs/news-ordinary-pending-evidence-r-20261028T174819-1458ec90/run.log)
+保留以供重現。停機快照的工作狀態中沒有這些一般待處理工作，因此
+不能推稱正式佇列目前有同樣的誤判。
+
+現在工作必須與來源網址、實際頁碼及範圍一致。直接頁面按既有觀測
+驗證；跨範圍引用另核對原有頁面 ID 收據。父分區則核對目前的證明
+雜湊、來源／授權契約、子分區狀態與證明、葉節點觀測、成員與日期，
+確認覆蓋範圍及數量一致，才可借用；狀態轉換留下對應證據身分。
+驗證失敗時仍交給原本的候選原件處理，沒有重設來源 429 或期限。
+此檢查驗證的是本機資料庫中的清單中繼資料，不會重新讀取原始檔或
+驗證新聞全文。
+
+停機快照的 1,116 個已完成父分區中，證據樹最多 60 個葉頁；取最大
+的五棵樹各測三次，單次本機核對牆鐘介於約 34–111 毫秒，可能超過
+原 50 毫秒軟時間片。同一輪已選中的相同分區工作現在共用一次驗證；
+候選原件喚醒的舊失敗仍須遵守自己的證據要求，停止訊號也會中止。
+[隔離 owner 重播](../artifacts/operations/agent-workflow/runs/news-parent-batch-owner-abba-20261028T175849-358e0dce/run.log)
+以同一棵真實的 60 頁中繼資料樹和 30 筆合成工作，比較每輪選取 1 筆
+與 30 筆，ABBA 各兩次的牆鐘中位數約為 **0.867 秒與 0.045 秒**；
+工作、來源狀態及驗證事件的比較雜湊一致。這是選取批次不同的本機
+完整流程比較，不是舊版與新版的網路吞吐比較，不可推算網站完成時間。
+
+後續已增加上述事件驅動恢復及可續跑定期巡檢；正式資料尚未完成
+一次 owner 執行的全範圍巡檢。
+正式來源與面板仍需在維護解除後獨立驗收，不能把隔離測試當成線上已抓齊。
+
+## 10/29 維護期間：新清單證據與損壞原件分開記錄
+
+隔離重現發現，原件收據損壞後，即使同一請求取得不同雜湊的新清單，
+舊工作仍可能停在 `retained_invalid`；而已由新本機候選資料喚醒的舊
+失敗工作，另一條捷徑可能只看到頁面存在便標記已有證據，沒有核對
+觀測內容。前者的[失敗測試](../artifacts/operations/agent-workflow/runs/news-history-invalid-new-evidenc-20261028T173853-ae155865/run.log)
+和後者的[失敗測試](../artifacts/operations/agent-workflow/runs/news-pending-existing-evidence-r-20261028T174109-1f0bb580/run.log)
+均保留以供重現。
+
+現在新觀測須符合請求網址、頁面、觀測雜湊與目前來源和授權契約，
+才可另記為 `forward_evidence_available`。一般原件損壞需要直接頁面
+觀測；舊錯誤僅因請求網址不同時，仍可依原有嚴格頁面 ID 證據採用
+引用。狀態轉換保存舊錯誤、原回應雜湊與新觀測身分；不改寫舊原件，
+也不表示損壞的原件已修好。新版有界一次性掃描會處理已存在的同類
+舊狀態，不重設來源工作或 429。相符觀測若不存在或已損壞，仍須
+繼續驗證候選原件或等待來源，而不是憑頁面存在視為證明。
+停機快照中 88 筆 `retained_invalid` 均屬舊請求網址不同；這次一般
+收據損壞及候選工作邊界是在隔離佇列重現，不能說正式佇列目前有該錯誤。
+
+[隔離測試](../artifacts/operations/agent-workflow/runs/news-pending-existing-evidence-f-20261028T174138-295d9d94/run.log)
+涵蓋直接與共享證據、損壞雜湊、舊契約、本機候選及來源冷卻；尚未
+啟動正式 owner 或做來源連線驗收。
+
+## 10/29 維護期間：鉅亨本機清單掃描與重試喚醒
+
+下載 service 與 timer 仍依使用者指示停止；這次沒有呼叫新聞來源或
+寫入正式 queue。隔離測試重現兩個等待問題：舊錯誤、舊缺原件、空
+範圍和超限範圍的掃描已前進，但原排程可能在下一段固定等兩秒；
+沒有其他工作時，持久本機重試的期限也沒有傳到常駐 owner 的閒置
+喚醒，可能延遲到下一個一般排程。原始來源的 429、截止時間、
+授權與 HTTP 配額都不是由這兩個本機排程調整。
+
+現在各種掃描以自身實際前進的欄位決定是否立即續跑；非零範圍的舊
+防護清理有進展時也可續跑。有限的單段查詢若已花完時間片、但仍有
+資料且沒有停止訊號，先處理一筆再讓出控制權，避免緩慢索引查詢
+反覆消耗時間片、始終無法處理第一筆。時間片仍是軟目標：單筆磁碟
+或資料庫操作本身可能超時；零時間片與停止訊號不執行該步。常駐
+owner 在其他工作閒置時沿用上一段的本機重試期限，磁碟容量等待仍
+走原本的獨立排程，不更改來源重試或開新下載器。
+
+停機快照有 88 筆舊錯誤及 5,080 筆缺原件狀態的清單工作。從正式
+SQLite 在 WAL 為空時唯讀複製這些工作及相關頁面身分資料，在 tmpfs
+私人佇列以最後版本進行[有界完整重播](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-history-wake-isolated-20261029-v3.json)：
+共 5,168 筆轉為已有相容清單觀測，其中 3,552 筆直接觀測、1,616 筆
+經既有頁面 ID 引用核對；原請求、回應雜湊、來源時鐘和原錯誤的比較
+雜湊前後一致。此重播只檢查資料庫中的觀測身分、內容雜湊與來源契約，
+沒有重新驗證各檔案收據，也沒有取得或補入任何新聞全文。
+
+同一重播的 274 個分段實際運算為牆鐘約 2.71 秒、CPU 約 2.67 秒，
+不含排程等待。將新、舊喚醒規則分別套到這些相同分段結果上，累計
+應等待為 **0／546 秒**；這是依回傳結果計算的等待，不是兩次完整
+線上下載的實測。前一版[重播](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-history-wake-isolated-20261029-v2.json)
+為 328 個分段、0／654 秒；時間片分段數會受實際主機負載影響。更早的[量測](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-history-wake-isolated-20261029.json)
+暴露出耗時查詢後偶爾沒有處理第一筆，才增加上述續跑保證。以上重播均
+不包含 HTTP、正式磁碟寫入、來源排程或其他服務負載，不可推算全站
+抓取速度及完成時間。[量測腳本](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-history-wake-isolated-20261029-v3.py)
+保留輸入與程式雜湊；正式 queue、空 WAL 與狀態檔資訊在讀取前後不變。
+
+[修正前重現](../artifacts/operations/agent-workflow/runs/news-history-idle-wake-red-20261-20261028T172543-96e2c739/run.log)
+及[時間片邊界重現](../artifacts/operations/agent-workflow/runs/news-history-slow-seek-red-20261-20261028T173114-f90a1109/run.log)
+保留了失敗結果；修正後另以隔離常駐 owner 驗證檔案恢復後按期限
+重試、來源 429 不變且未發來源請求。正式 owner 尚未載入或線上驗收。
+[相關回歸](../artifacts/operations/agent-workflow/runs/news-history-evidence-final-life-20261028T174158-dbf52a16/run.log)
+涵蓋 34 個測試檔，**1,377 項通過**，包含來源冷卻、停止與零時間片、
+磁碟等待、其他來源公平派送及離線瀏覽器；不代表全部 repository 測試。
+
+## 10/29 維護期間：索引後缺檔恢復與批次讀取量測
+
+依維護指示，新聞 service 和 timer 保持停止；沒有向新聞來源發請求
+或寫入正式佇列。隔離測試發現：若已接受的批次完成本機索引後，
+資料檔或收據在驗證前才消失，原先會留下驗證失敗，卻不會安排這個
+檔案重新檢查。現在由原 owner 以已登錄的批次／收據身分建立持久
+缺檔重試，重試期限立即併入該輪喚醒時間。多個頁面引用同一批次時
+只建立一筆重試，不會因頁數重複增加退避次數；檔案恢復後仍須通過
+原請求、收據、雜湊、來源授權及頁面內容驗證。測試包含缺檔後重啟、
+收據缺失、三個頁面共用批次，以及原來源 429 和期限不變。這是隔離
+重現的缺口，沒有證據顯示停機前正式資料一定發生過相同故障。
+[新聞相關回歸](../artifacts/operations/agent-workflow/runs/news-indexed-missing-recovery-20-20261028T171738-7550d193/run.log)
+涵蓋 25 個測試檔，**1,124 項通過**；尚未以正式 owner 驗收。
+
+為判斷批次驗證是否有值得保留的快取，從停機資料庫的 223,582 個
+已接受批次按路徑取 20 個等距分層、每層三批；[唯讀比較](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-batch-row-lookup-benchmark-20261029.json)
+找到 42 個符合目前工作、舊頁面紀錄、收據及原始回應 SHA 的首列
+鉅亨候選。這是有限樣本，不代表全庫。量測只涵蓋收據、Parquet
+中繼資料、全檔 SHA 和單列讀取；前後正式 SQLite、空 WAL 及狀態檔
+大小與時間相同，沒有來源請求或正式佇列寫入。
+
+另以 40 個三十列合成批次，在 tmpfs 量測佇列啟動到所有清單頁證據
+完成的本機流程；[首列原件的固定工作量 ABBA](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-owner-replay-row-first-fixed-20261029.json)
+中，基線／首列捷徑的 CPU 中位數為 0.5321／0.5327 秒，六輪配對
+差異介於約 -23% 至 +23%；[末列原件](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-owner-replay-row-last-fixed-20261029.json)
+也有方向不一致的波動。各次來源內容、請求、發布時鐘及工作狀態的
+比較雜湊一致；每次新寫入的證據紀錄時鐘另驗為有時區後不列入該雜湊。
+此實驗沒有納入 HTTP、正文下載或冷磁碟。由於局部讀取改善沒有轉化成
+可穩定驗證的整段收益，且後段原件可能付出額外讀取，首列捷徑已撤回。
+量測腳本分別為[批次讀取比較](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-batch-row-lookup-benchmark-20261029.py)
+和[本機 owner 回放比較](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-owner-replay-row-benchmark-20261029.py)；
+另補上原件位於多個批次位置的正確性測試。
+
+## 10/29 維護期間：鉅亨原件批次的獨立 I/O 重試
+
+新聞 service 與 timer 按維護指示維持停止；本次沒有呼叫新聞來源、
+重排正式佇列或修改正文。隔離測試重現：單一已接受批次發生暫時性
+本機 I/O 錯誤時，原本的單一游標會停在該批次，後面的原件即使可讀
+也無法先索引。這是隔離測試證明的風險，不是已證明的停機前正式故障。
+
+原 owner 現在將暫時性 I/O 故障按來源契約及批次記入持久重試清單，
+保留故障與恢復結果，其他批次可繼續掃描；單筆重試以 1、2、4 秒等
+退避，最多 300 秒。前緣全數嘗試後，可先驗證其他已找到的原件，
+未知或暫時讀不到的原件尚未釐清時，不能提前安排對應來源重查。
+已確認缺少資料檔或收據的批次則單獨以相同退避持續重試，不堵住
+其他範圍或來源重查；只要仍有缺檔或 I/O 重試，面板不宣稱盤點完整。
+檔案與收據重新可讀只代表可以建立候選，仍要核對原請求、收據、
+內容與授權後才交還原有清單修復工作。首次盤點只對實際匹配候選
+檢查收據存在，避免對無關批次多做一次檔案查詢。記憶體不足仍暫停
+本輪以等待資源；來源既有的錯誤和重試期限不因本機重試而重設。
+如果缺檔在同一範圍的首次盤點前恢復，先由該範圍原有的全頁盤點
+接手，避免較早插入的單頁工作使其他頁面被跳過。
+
+新游標的「後面是否還有批次」使用既有 `accepted_batches` 路徑索引。
+在停機資料庫唯讀、WAL 為空的條件下，重複相同查詢 100 次的熱快取
+中位數為 0.0026 毫秒、95 百分位為 0.0034 毫秒；前後資料庫、WAL
+與狀態檔的大小及修改時間不變。此量測不含冷磁碟、實際檔案驗證、
+重試清單或整體管線，不能用來推估下載時間或宣稱全流程加速比例。
+
+面板資料現在區分嘗試盤點的批次、暫時讀取失敗及缺檔待重試批次；舊快照沒有此
+欄位時不顯示待重試數，也不認作零。只提供本機重試數，不把候選或清單證據
+當成已取得全文、也不推測全歷史完成時間。停機快照中的 3,693,925
+個鉅亨已知網址與 7,022 個未存正文仍是舊快照，不是全網總篇數。
+正式 owner 未重啟，正式頁面是否載入本次變更尚未驗收。
+
+擴大瀏覽器回歸亦重現展開來源細節後立即搜尋，原生 `toggle` 事件
+尚未送達、舊卡片即被重繪而遺失展開狀態。頁面現在在重繪前同步
+讀取目前卡片的展開狀態，不在目前篩選結果的來源仍保留先前狀態；
+不增加來源請求。測試包含同一瀏覽器事件迴圈內連續展開與搜尋。
+[首次擴大回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-batch-io-isolation-20-20261028T163736-d0e8c99f/run.log)
+有 1,109 項通過、1 項瀏覽器篩選失敗；修正後[相同範圍重跑](../artifacts/operations/agent-workflow/runs/news-cnyes-io-ui-final-20261029-20261028T164350-f0ceeda3/run.log)
+共 **1,110 項通過**，包含六個不同尺寸／新舊快照的瀏覽器情境、
+本機故障重啟恢復、收據與來源期限；這次回歸早於缺檔重試的補充修改，
+不代表全部 repository 測試，
+也不代表停機服務已部署或來源已恢復。
+
+補上缺檔、缺收據與首次盤點順序修復後，[同範圍最終回歸](../artifacts/operations/agent-workflow/runs/news-cnyes-missing-retry-final-2-20261028T165712-7cd89ce6/run.log)
+涵蓋 25 個測試檔，**1,116 項通過**。其中以隔離資料驗證：缺檔不
+阻塞其他候選；檔案及收據分別恢復後仍須驗證；429 原狀與重試期限
+不變；批次在首次盤點前恢復時不跳過其他頁面。測試不會變更正式
+佇列，也不證明正式服務已載入變更或實際網站資料已補齊。
+
 ## 10/29 維護期間：無本機原件的非零範圍與修復掃描
 
 依使用者維護指示，新聞 service 和 timer 仍停止；沒有發送來源請求、
@@ -7,9 +6593,11 @@
 不到本機原件，原盤點流程會走完該範圍卻不建立待驗證狀態，成功工作
 可能維持原本較遠的追查期限。現在盤點完整範圍、確認可用的本機候選
 後，即使沒有候選也會交給既有清單證據修復；不建立不存在的頁面觀測，
-保留 429、既有來源錯誤、分流與重試條件。正常 owner 先完成批次索引
-再盤點非零範圍，該範圍的本機候選處理完才重查；工作本身仍由原
-owner 的來源與公平性閘門管理。
+保留 429、既有來源錯誤、分流與重試條件。正常 owner 先嘗試完成批次
+索引前緣再盤點非零範圍，該範圍的本機候選處理完才重查；工作本身仍由原
+owner 的來源與公平性閘門管理；如批次前緣已掃完但部分原件仍待
+本機 I/O 重試，先處理已找到的其他候選，來源重查仍受完整盤點閘門
+保護。
 
 未完成範圍的修復游標現在會在分段之間接續，而不因掃描尚未結束便
 等待五分鐘；如果前一段耗盡時間片，會以有界索引查詢確認是否仍有
@@ -510,8 +7098,8 @@ owner 執行，網站後端是否載入也尚未驗收；維護結束後必須�
 顯示仍待驗證的頁數及已知最晚重試期限，暫停該階段完成時刻並說明其他
 頁可繼續排程；舊快照缺少新見證時不推定恢復，也不公開來源請求網址。
 這些見證只涵蓋已記錄的單頁錯誤，不能證明其餘所有頁都能成功；頁數及
-完成時刻仍不代表正文或全歷史。掃描最多 128 筆逐頁見證，更多或異常資料
-時保守顯示未知，不阻塞下載派工；之後仍可改進大規模歷史見證的估時。
+完成時刻仍不代表正文或全歷史。當時掃描最多 128 筆逐頁見證，更多或異常資料
+時保守顯示未知，不阻塞下載派工；後續改善見本文件「鉅亨清單缺頁的估時與有限掃描」。
 
 [停機 queue 的局部量測](../artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cnyes-partial-gate-local-benchmark-20261028.json)
 使用模擬的未完成階段及空 scope，實際目前指紋下有 1 個逐頁見證；7 組

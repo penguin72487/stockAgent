@@ -23,6 +23,13 @@ def test_vendor_identity_normalization_and_positive_volume():
     assert set(vendor_keys(vendor, positive=True).iter_rows()) == {('TXO', '202610W1', 20000., 'C')}
 
 
+def test_vendor_monthly_decimal_label_only_normalizes_exact_month():
+    vendor = pl.DataFrame({'option_id': ['TXO'] * 4,
+                           'contract_date': ['202006.0', '202006W1.0', '202006.1', '202013.0'],
+                           'strike_price': [100.] * 4, 'call_put': ['C'] * 4, 'volume': [1] * 4})
+    assert set(vendor_keys(vendor).iter_rows()) == {('TXO', '202006', 100., 'C')}
+
+
 def test_audit_distinguishes_missing_contract_and_zero_volume(tmp_path):
     path = tmp_path / 'parquet/TaiwanOptionDaily/all/2011-01-03/rows.parquet'
     path.parent.mkdir(parents=True)

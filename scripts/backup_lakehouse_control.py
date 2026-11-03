@@ -14,7 +14,7 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from stockagent.control.lakehouse import configuration, guard, sql_text, notify_transport
-from stockagent.control.backup import logical_database_state
+from stockagent.control.backup import logical_database_state, control_backup_capacity
 from stockagent.data_sync.backup_auxiliary import CONTROL
 from stockagent.data_sync.immutable_replication import digest
 from stockagent.runtime_identity import identity_sha256
@@ -58,8 +58,26 @@ with (state / 'control-backup-owner.lock').open('a') as owner:
              'independent_restore_verified', 'all_files_sha256_verified')}
         atomic_write_json(previous_path, previous)
     physical = Path('/srv/stockagent-d-volume/stockagent-backup-ingress-lab203')
-    if not physical.samefile(Path(backup_config['transport_root'])) or shutil.disk_usage(physical).free < 64*1024**3:
-        raise ValueError('traditional SQL backup needs its enrolled D transport reserve')
+    if not physical.samefile(Path(backup_config['transport_root'])):
+        raise ValueError('traditional SQL backup needs its enrolled D transport volume')
+    database_sizes = json.loads(subprocess.check_output(['runuser', '-u', 'postgres', '--',
+        'psql', '--no-psqlrc', '--tuples-only', '--no-align', '--command',
+        "SELECT json_object_agg(datname,pg_database_size(oid)) FROM pg_database "
+        "WHERE datname IN ('stockagent_ducklake','stockagent_temporal','stockagent_temporal_visibility')"],
+        text=True, timeout=30))
+    if (set(database_sizes) != {'stockagent_ducklake', 'stockagent_temporal', 'stockagent_temporal_visibility'}
+            or any(type(value) is not int or value < 0 for value in database_sizes.values())):
+        raise ValueError('control database size inventory differs')
+    capacity = control_backup_capacity(free_bytes=shutil.disk_usage(physical).free,
+        required_growth_bytes=sum(database_sizes.values()) * 2 + 16 * 1024**2,
+        configuration=backup_config)
+    capacity.update(observed_at_utc=datetime.now(timezone.utc).isoformat(), database_bytes=database_sizes)
+    atomic_write_json(state/'control-backup-capacity.json', capacity)
+    if capacity['state'] != 'admitted':
+        # Capacity is an expected wait, not a failed SQL dump. Preserve the
+        # previous fixed delivery/ACK and let this same timer re-admit it.
+        print(json.dumps(capacity))
+        raise SystemExit(0)
     staging = physical / '.staging' / ('lifecycle-controls-' + uuid.uuid4().hex)
     staging.mkdir(parents=True)
     # PostgreSQL OS account has loopback peer access; exported snapshots and
@@ -74,6 +92,19 @@ with (state / 'control-backup-owner.lock').open('a') as owner:
             dump=subprocess.run(['runuser','-u','postgres','--','pg_dump','-Fc','--no-owner','--no-privileges','--snapshot',snapshot,db],capture_output=True,timeout=180)
             if dump.returncode:raise RuntimeError('dedicated lifecycle SQL backup failed')
         root=staging / db
+        write_capacity = control_backup_capacity(free_bytes=shutil.disk_usage(physical).free,
+            required_growth_bytes=len(dump.stdout) + len(json.dumps(logical).encode()) + 2 * 1024**2,
+            configuration=backup_config)
+        if write_capacity['state'] != 'admitted':
+            write_capacity['observed_at_utc'] = datetime.now(timezone.utc).isoformat()
+            # A concurrent writer can consume headroom after initial admission.
+            # Keep any completed dumps explicitly accounted for; this is not a
+            # published envelope and must not be presented as NAS acceptance.
+            write_capacity['preserved_staging_root'] = str(staging)
+            write_capacity['databases_completed'] = [p.name for p in staging.iterdir() if p.is_dir()]
+            atomic_write_json(state/'control-backup-capacity.json', write_capacity)
+            print(json.dumps(write_capacity))
+            raise SystemExit(0)
         root.mkdir()
         (root/'archive.backup').write_bytes(dump.stdout)
         atomic_write_json(root/'logical-state.json',logical)

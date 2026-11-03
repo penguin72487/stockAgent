@@ -256,7 +256,10 @@ def _finish(queue, source, task, result, *, stop=None):
     # crashes before/after it leave the original or changed head recoverable.
     if stop and stop.is_set():
         return 0, 0
-    count = queue.accept([repaired])
+    count, adopted = queue.accept([repaired], return_adopted=True)
+    if article_id not in adopted:
+        _defer(queue, task, 'metadata_acceptance_not_adopted')
+        return 1, 0
     _checkpoint_batch(queue, fp, [(article_id, 'verified_repair', None)])
     _clear(queue, task, clear_batch=True)
     return 1, count

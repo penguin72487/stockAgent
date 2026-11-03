@@ -21,10 +21,13 @@ NOW = datetime(2026, 10, 28, 9, 1, tzinfo=ZoneInfo("Asia/Taipei"))
 def source(tmp_path, monkeypatch):
     published._read_market.cache_clear()
     configs = {}
+    monkeypatch.setattr(published, "dashboard_session_clock", lambda observed: {
+        "display_session_date": observed.astimezone(published._TAIPEI).date().isoformat(),
+    })
     monkeypatch.setattr(published, "load_market_configs", lambda _: configs)
     monkeypatch.setattr(published, "resolved_live_output_dir", lambda cfg: cfg.live_output_dir)
 
-    def add(market="m", *, session=DAY, rows=None, revision=0):
+    def add(market="m", *, session=DAY, rows=None, revision=0, price_source="tw_mis"):
         root = tmp_path / "signals" / market
         signal_id = f"{market}-signal"
         directory = root / f"{session}T09:00:00+08:00" / signal_id
@@ -33,7 +36,8 @@ def source(tmp_path, monkeypatch):
         stamp = f"{session}T09:00:02+08:00"
         summary = {"market": market, "signal_id": signal_id, "asof_date": session,
                    "execution_mode": "tw_day_trade", "day_trade_model_observation": "session_open",
-                   "signal_ready_at": ready, "opening_signal_revision": {"index": revision}}
+                   "signal_ready_at": ready, "opening_signal_revision": {"index": revision},
+                   "price_source": price_source}
         payload = {"schema_version": 1, "market": market, "signal_id": signal_id,
                    "rows": rows if rows is not None else [
                        {"symbol": "2330", "name": "台積電", "target_weight": 0.2,
@@ -63,12 +67,22 @@ def test_published_targets_are_independent_of_paper_ledger_and_exclude_prices_an
     assert result["simulation_only"] is True and result["production_order_possible"] is False
     assert result["modes"][0]["status"] == "published"
     assert result["modes"][0]["revision_index"] == 3
+    assert result["modes"][0]["completed_session_calculation"] is False
     assert [row["symbol"] for row in result["rows"]] == ["1101", "2330"]
     assert [row["side"] for row in result["rows"]] == ["short", "long"]
     body = json.dumps(result)
     assert all(secret not in body for secret in ("open_price", "current_price", "filled_shares", "signal_id", str(tmp_path)))
     assert len(result["rows"][0]["public_signal_key"]) == 32
     assert not (tmp_path / "artifacts/live/tw_day_trade_simulation").exists()
+
+
+def test_completed_session_calculation_is_not_labelled_as_an_opening_signal(tmp_path, source):
+    add, _ = source
+    add(price_source="panel_close")
+    result = published.build_published_signal_snapshot(repo_root=tmp_path, observed_at=NOW)
+    assert result["modes"][0]["completed_session_calculation"] is True
+    assert result["modes"][0]["signal_ready_at"] == f"{DAY}T09:00:01+08:00"
+    assert len(result["rows"]) == 2
 
 
 @pytest.mark.parametrize("corruption", ["market", "signal_id", "date", "observation", "payload_id", "escape", "duplicate", "nan", "future"])
@@ -121,6 +135,33 @@ def test_previous_session_is_not_shown_as_todays_signal(tmp_path, source):
     add(session="2026-10-27")
     result = published.build_published_signal_snapshot(repo_root=tmp_path, observed_at=NOW)
     assert result["modes"][0]["status"] == "unavailable"
+    assert result["rows"] == []
+
+
+@pytest.mark.parametrize("hour", [0, 8, 12, 23])
+def test_nontrading_day_keeps_verified_previous_session_targets(tmp_path, source, monkeypatch, hour):
+    add, _ = source
+    add(session="2026-10-30")
+    monkeypatch.setattr(published, "dashboard_session_clock", lambda observed: {
+        "display_session_date": "2026-10-30",
+    })
+    result = published.build_published_signal_snapshot(
+        repo_root=tmp_path, observed_at=datetime(2026, 10, 31, hour, tzinfo=published._TAIPEI),
+    )
+    assert result["session_date"] == "2026-10-30"
+    assert result["modes"][0]["status"] == "published"
+    assert len(result["rows"]) == 2
+
+
+def test_unknown_calendar_cannot_select_an_arbitrary_artifact_session(tmp_path, source, monkeypatch):
+    add, _ = source
+    add()
+    monkeypatch.setattr(published, "dashboard_session_clock", lambda observed: {
+        "display_session_date": None,
+    })
+    result = published.build_published_signal_snapshot(repo_root=tmp_path, observed_at=NOW)
+    assert result["session_date"] is None
+    assert result["modes"][0]["status"] == "calendar_unverified"
     assert result["rows"] == []
 
 

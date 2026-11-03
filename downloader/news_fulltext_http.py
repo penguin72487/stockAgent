@@ -90,6 +90,23 @@ class NewsHTTP:
                  limiter_factory: Callable = SharedRateLimiter,
                  metrics: NewsMetrics | None = None,
                  access_observer: Callable[[str, Response], None] | None = None):
+        # A traceback can retain a partially constructed instance. Never rely
+        # on its garbage collection to release the exclusive HTTP owner.
+        self.http_owner_lock = None
+        try:
+            self._initialize_transport(registry, config, root, session_factory=session_factory,
+                address_check=address_check, limiter_factory=limiter_factory, metrics=metrics,
+                access_observer=access_observer)
+        except BaseException as startup_error:
+            try:
+                self._release_http_owner()
+            except BaseException as cleanup_error:
+                startup_error.add_note(f'news HTTP initialization lock cleanup failed: {type(cleanup_error).__name__}')
+            raise
+
+    def _initialize_transport(self, registry: PolicyRegistry, config: dict, root: Path, *,
+                              session_factory: Callable, address_check: Callable, limiter_factory: Callable,
+                              metrics: NewsMetrics | None, access_observer: Callable[[str, Response], None] | None):
         self.registry, self.config, self.root = registry, config, root
         self.metrics = metrics or NewsMetrics()
         # Opt-in, bounded diagnostics use the very same request path. Normal
@@ -269,6 +286,33 @@ class NewsHTTP:
                     deadlines[provider] = max(deadlines.get(provider, 0), deadline)
             return deadlines
 
+    def scheduling_cooldown_snapshot(self):
+        """Include short local pacing only for dispatch and the owner's wake.
+
+        A known send gap should not occupy a shared worker.  It is not a
+        publisher refusal or a long capacity pause, so the status-facing
+        cooldown and adaptive-controller inputs remain unchanged.  The send
+        reservation is still the authority for races and shared rate state.
+        """
+        with self.lock:
+            deadlines = self.cooldown_snapshot()
+            now = time.time()
+            for provider in self.limiters:
+                remaining = self._local_pacing_remaining(provider)
+                if remaining > 0:
+                    deadlines[provider] = max(deadlines.get(provider, 0), now + remaining)
+            return deadlines
+
+    def may_prefetch_short_local_pacing(self, provider, lead_seconds):
+        """May lease shortly before a known local gap, without advancing a source gate."""
+        with self.lock:
+            if (self.provider_not_before.get(provider, 0) > time.time()
+                    or self.pacing_not_before.get(provider, 0) > time.monotonic()
+                    or self.effective_interval(provider) > self.config['response_deadline_seconds']):
+                return False
+            remaining = self._local_pacing_remaining(provider)
+            return 0 < remaining <= lead_seconds
+
     def _refresh_pacing_deadline(self, provider):
         # Read at startup, source deferral, slow grants or cancelled waits, not
         # on every scheduler round/request for normally paced publishers.
@@ -339,14 +383,40 @@ class NewsHTTP:
                 self._sessions.append(self.local.session)
         return self.local.session
 
+    def _release_http_owner(self):
+        lock = self.http_owner_lock
+        if lock is None:
+            return
+        self.http_owner_lock = None
+        try:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+        finally:
+            # Closing the file descriptor also releases flock if unlock fails.
+            lock.close()
+
     def close(self):
-        self.stop.set()
+        # A single broken session must not strand later sessions or the owner
+        # lock. Preserve the first failure after attempting every cleanup.
+        cleanup_errors = []
+        try:
+            self.stop.set()
+        except BaseException as error:
+            cleanup_errors.append(('stop', error))
         for session in self._sessions:
-            session.close()
-        if self.http_owner_lock is not None:
-            fcntl.flock(self.http_owner_lock, fcntl.LOCK_UN)
-            self.http_owner_lock.close()
-            self.http_owner_lock = None
+            try:
+                session.close()
+            except BaseException as error:
+                cleanup_errors.append(('session close', error))
+        try:
+            self._release_http_owner()
+        except BaseException as error:
+            cleanup_errors.append(('owner lock', error))
+        if cleanup_errors:
+            primary = cleanup_errors[0][1]
+            for step, error in cleanup_errors[1:]:
+                if error is not primary:
+                    primary.add_note(f'news HTTP {step} failed: {type(error).__name__}')
+            raise primary
 
     def _reset_failed_connection(self, provider, url):
         session = getattr(self.local, "session", None)

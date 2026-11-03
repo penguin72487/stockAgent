@@ -812,6 +812,10 @@ def parse_args() -> argparse.Namespace:
         help="Seconds to cache the account-wide traffic-usage check.",
     )
     parser.add_argument("--timeout-ms", type=int, default=30_000)
+    parser.add_argument(
+        "--login-receive-window-ms", type=int, default=30_000,
+        help="Signed login validity window, not the KBar request timeout. No additional login retry loop.",
+    )
     parser.add_argument("--retries", type=int, default=3)
     parser.add_argument("--retry-backoff", type=float, default=3.0)
     parser.add_argument(
@@ -2216,6 +2220,39 @@ def _download_symbol(
         )
 
 
+def _initialize_minute_worker(api, *, api_key, secret_key, worker_index, receive_window_ms):
+    """Time authentication separately from contracts, with no secret logging.
+
+    Let the existing owner release the session and retry a failed run. Do not
+    add concurrent logins or treat a larger signature window as a data receipt.
+    """
+    if type(receive_window_ms) is not int or receive_window_ms <= 0:
+        raise ValueError("login receive window must be a positive integer in milliseconds")
+    started = time.monotonic()
+    try:
+        api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False,
+                  receive_window=receive_window_ms)
+    except Exception as exc:
+        kind = "signature_timeout" if "Sign data is timeout" in str(exc) else "login_failed"
+        _emit_worker_log(
+            f"[shioaji-minute] worker={worker_index} phase=login status=failed "
+            f"elapsed_ms={(time.monotonic() - started) * 1000:.3f} "
+            f"receive_window_ms={receive_window_ms} failure_kind={kind} error_type={type(exc).__name__}"
+        )
+        raise
+    _emit_worker_log(
+        f"[shioaji-minute] worker={worker_index} phase=login status=ok "
+        f"elapsed_ms={(time.monotonic() - started) * 1000:.3f} receive_window_ms={receive_window_ms}"
+    )
+    started = time.monotonic()
+    contracts = stock_contract_map(api)
+    _emit_worker_log(
+        f"[shioaji-minute] worker={worker_index} phase=contracts status=ok "
+        f"elapsed_ms={(time.monotonic() - started) * 1000:.3f} stock_contracts={len(contracts)}"
+    )
+    return contracts
+
+
 def _parallel_download_worker(
     worker_index: int,
     args: argparse.Namespace,
@@ -2252,8 +2289,10 @@ def _parallel_download_worker(
             secret_key = os.environ.get("SHIOAJI_SECRET_KEY", "").strip()
             api = sj.Shioaji(simulation=bool(args.simulation))
             api.set_event_callback(lambda _code, _event_code, _info, _event: None)
-            api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=False)
-            contracts_by_code = stock_contract_map(api)
+            contracts_by_code = _initialize_minute_worker(
+                api, api_key=api_key, secret_key=secret_key, worker_index=worker_index,
+                receive_window_ms=getattr(args, "login_receive_window_ms", 30_000),
+            )
             _emit_worker_log(
                 f"[shioaji-minute] worker={worker_index} login=ok "
                 f"stock_contracts={len(contracts_by_code)}"

@@ -205,10 +205,15 @@ def test_native_pack_private_scope_does_not_enroll_other_directories(root):
         packed._check_native_pack_read_authority(Path(root))
 
 
-def test_native_private_pack_permission_does_not_enable_native_blob_reads():
-    with pytest.raises(SnapshotError, match='restricted to canonical D authority'):
+@pytest.mark.parametrize('pack_reads', [False, True])
+def test_native_blob_reads_keep_original_private_owner_gate(monkeypatch, pack_reads):
+    from stockagent.data_sync import dataset_migration as migration
+    def reject(*_args, **_options):
+        raise SnapshotError('original private owner/permissions/marker differs')
+    monkeypatch.setattr(migration, 'private_history_root', reject)
+    with pytest.raises(SnapshotError, match='original private owner/permissions/marker differs'):
         packed.verify_packed_snapshot(Path('/srv/stockagent-packed/.local-state/private-history'), None,
-                                      d_primary_native_pack_reads=True, d_primary_native_blob_reads=True)
+                                      d_primary_native_pack_reads=pack_reads, d_primary_native_blob_reads=True)
 
 
 def test_default_pack_reader_keeps_existing_file_path(tmp_path):

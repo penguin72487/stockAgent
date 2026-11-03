@@ -26,6 +26,20 @@ def test_contract_comparison_does_not_merge_right_expiry_or_strike():
     ]
 
 
+def test_monthly_decimal_label_is_normalized_without_merging_weeks_or_other_decimals():
+    official = pl.DataFrame({'product': ['TXO'] * 6,
+                             'series': ['202006', '202006W1', '202007', '202008', '202009', '202010'],
+                             'strike': [100.] * 6, 'right': ['C'] * 6},
+                            schema_overrides={'strike': pl.Float32})
+    vendor = pl.DataFrame({'option_id': ['TXO'] * 6,
+                           'contract_date': ['202006.0', '202006W1.0', '202007.1',
+                                             '202008.00', '202009/202010', '202010W1'],
+                           'ExercisePrice': [100.] * 6, 'PutCall': ['C'] * 6})
+    missing = compare_contracts(official, vendor)
+    assert set(missing['series']) == {'202006W1', '202007', '202008', '202009', '202010'}
+    assert vendor['contract_date'][0] == '202006.0'
+
+
 def test_ordinary_open_source_and_receipt_verified_without_fabricating_fills(tmp_path):
     archive = tmp_path / '2022_opt.zip'
     csv_data = ('交易日期,契約,到期月份(週別),履約價,買賣權,開盤價,成交量,交易時段\n'

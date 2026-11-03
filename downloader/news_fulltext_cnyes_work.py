@@ -22,10 +22,12 @@ from downloader.news_fulltext_publishers import cnyes_supported_native_alias_vie
 
 CONTRACT_VERSION = 4
 LOOKUP_DISCOVERY_VERSION = 1
+LOOKUP_RECHECK_VERSION = 1
 PROGRESS_VERSION = 1
 REQUEST_SCOPE_PROGRESS_VERSION = 1
 PENDING_SOURCE_RECHECKS_VERSION = 1
 MAX_REQUEST_SCOPE_URLS = 2048
+MAX_LOOKUP_RECHECKS_SAMPLED = 2049
 STATES = ('pending', 'retry', 'retry_cooldown')
 ACTIVE_STATES = (*STATES, 'inflight')
 CURSOR = 'cnyes_body_candidate_cursor_v1'
@@ -44,12 +46,15 @@ def native_lookup_url(url):
 
 
 def canonical_candidate_id(url):
-    lookup = native_lookup_url(url)
-    if lookup is not None:
-        return hashlib.sha256(lookup.encode()).digest()
     parts = urlsplit(url)
     match = re.fullmatch(r'/news/id/([0-9]+)', parts.path)
-    if not match or not cnyes_supported_native_alias_view(parts):
+    if not match:
+        return None
+    # AMP lookup admits only positive, unpadded IDs. Other aliases retain
+    # their existing URL restrictions; a scheduling hint is not identity proof.
+    amp_lookup = (parts.scheme == 'https' and parts.netloc == 'amp-news.cnyes.com'
+                  and match[1][0] != '0' and not parts.query and not parts.fragment)
+    if not amp_lookup and not cnyes_supported_native_alias_view(parts):
         return None
     return hashlib.sha256(('https://news.cnyes.com/news/id/' + match[1]).encode()).digest()
 
@@ -67,6 +72,25 @@ def initialize(queue):
             discovered_at_utc TEXT NOT NULL, data_fingerprint TEXT NOT NULL,
             authorization_fingerprint TEXT NOT NULL, discovery_contract_version INTEGER NOT NULL,
             basis TEXT NOT NULL CHECK(basis='unverified_same_id_public_lookup_not_alias'));
+        CREATE TABLE IF NOT EXISTS cnyes_native_lookup_rechecks(
+            seq INTEGER PRIMARY KEY, parent_article_id BLOB NOT NULL UNIQUE);
+        CREATE TRIGGER IF NOT EXISTS cnyes_native_lookup_recheck_update_v1
+        AFTER UPDATE OF id,url,host,provider,state,error_code,body_sha256 ON articles
+        WHEN NEW.provider='cnyes' AND NEW.host='amp-news.cnyes.com'
+            AND substr(NEW.url,1,35)='https://amp-news.cnyes.com/news/id/'
+            AND NEW.state IN ('pending','retry','retry_cooldown') AND NEW.body_sha256 IS NULL
+            AND (NEW.error_code IS NULL OR NEW.error_code IN
+                ('http_502','http_504','host_gateway_cooldown','transport_error'))
+            AND (OLD.id IS NOT NEW.id OR OLD.url IS NOT NEW.url OR OLD.host IS NOT NEW.host
+                OR OLD.provider IS NOT NEW.provider OR OLD.state IS NOT NEW.state
+                OR OLD.error_code IS NOT NEW.error_code OR OLD.body_sha256 IS NOT NEW.body_sha256)
+            AND NOT EXISTS (SELECT 1 FROM cnyes_native_lookup_candidates c WHERE c.parent_article_id=NEW.id)
+        BEGIN
+            INSERT OR IGNORE INTO cnyes_native_lookup_rechecks(parent_article_id) VALUES (NEW.id);
+        END;
+        CREATE TRIGGER IF NOT EXISTS cnyes_native_lookup_recheck_delete_v1 AFTER DELETE ON articles BEGIN
+            DELETE FROM cnyes_native_lookup_rechecks WHERE parent_article_id=OLD.id;
+        END;
         CREATE INDEX IF NOT EXISTS cnyes_candidate_target ON articles(cnyes_canonical_candidate_id)
             WHERE cnyes_canonical_candidate_id IS NOT NULL;
         CREATE INDEX IF NOT EXISTS dispatch_cnyes_body_value ON articles(
@@ -76,6 +100,13 @@ def initialize(queue):
         WHEN NEW.provider='cnyes' AND (OLD.body_sha256 IS NULL)!=(NEW.body_sha256 IS NULL) BEGIN
             UPDATE articles SET cnyes_known_body_candidate=(NEW.body_sha256 IS NOT NULL)
             WHERE cnyes_canonical_candidate_id=NEW.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS cnyes_candidate_body_provider_update AFTER UPDATE OF provider ON articles
+        WHEN (OLD.provider='cnyes' AND OLD.body_sha256 IS NOT NULL)
+           !=(NEW.provider='cnyes' AND NEW.body_sha256 IS NOT NULL) BEGIN
+            UPDATE articles SET cnyes_known_body_candidate=(NEW.provider='cnyes' AND NEW.body_sha256 IS NOT NULL)
+            WHERE cnyes_canonical_candidate_id=NEW.id
+              AND cnyes_known_body_candidate!=(NEW.provider='cnyes' AND NEW.body_sha256 IS NOT NULL);
         END;
         CREATE TRIGGER IF NOT EXISTS cnyes_candidate_body_delete AFTER DELETE ON articles
         WHEN OLD.provider='cnyes' AND OLD.body_sha256 IS NOT NULL BEGIN
@@ -87,6 +118,13 @@ def initialize(queue):
                          (str(CONTRACT_VERSION),))
         queue.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('cnyes_native_lookup_discovery_contract',?)",
                          (str(LOOKUP_DISCOVERY_VERSION),))
+        marker = queue.db.execute("SELECT value FROM queue_settings WHERE key='cnyes_native_lookup_recheck_contract'").fetchone()
+        if not marker or marker[0] != str(LOOKUP_RECHECK_VERSION):
+            # A legacy scan may already have passed an eligible parent. One
+            # bounded indexed replay repairs that pre-journal interval.
+            queue.db.execute('DELETE FROM queue_settings WHERE key=?', (AMP_CURSOR,))
+            queue.db.execute("INSERT OR REPLACE INTO queue_settings VALUES ('cnyes_native_lookup_recheck_contract',?)",
+                             (str(LOOKUP_RECHECK_VERSION),))
     initialize_progress(queue)
 
 
@@ -155,6 +193,15 @@ def progress(db):
             'states': rows, 'candidate_views_accepted_by_hint': False,
             'candidate_body_equivalence_verified': False,
             'scope': 'active missing-body URL heads; no-known-primary includes unclassified views, not unique stories'}
+
+
+def lookup_recheck_progress(db):
+    """Read a bounded journal prefix; this does not classify or fetch anything."""
+    count = db.execute('SELECT count(*) FROM (SELECT 1 FROM cnyes_native_lookup_rechecks LIMIT ?)',
+                       (MAX_LOOKUP_RECHECKS_SAMPLED,)).fetchone()[0]
+    return {'contract_version': 1, 'pending_records_lower_bound': count,
+            'count_exact': count < MAX_LOOKUP_RECHECKS_SAMPLED,
+            'records_are_article_completion': False, 'source_lookup_performed': False}
 
 
 def request_scope_progress(db, work, control, *, now_epoch):
@@ -274,8 +321,14 @@ def admit_native_lookup(queue, row):
     target = native_lookup_url(row['url']) if row['provider'] == 'cnyes' else None
     if target is None:
         return False
-    parent = queue.db.execute('SELECT state,error_code,body_sha256 FROM articles WHERE id=?', (row['id'],)).fetchone()
-    if (not parent or parent['state'] not in STATES or parent['body_sha256']
+    # Import metadata is resolved against the current registry before the
+    # article upsert, which deliberately does not rewrite an existing head's
+    # provider. A background slice can also hold an older row snapshot. Only
+    # the currently stored, exact parent can authorize this scheduling hint.
+    parent = queue.db.execute("SELECT state,error_code,body_sha256 FROM articles "
+                              "WHERE id=? AND provider='cnyes' AND url=?",
+                              (row['id'], row['url'])).fetchone()
+    if (not parent or parent['state'] not in STATES or parent['body_sha256'] is not None
             or parent['error_code'] not in {None, 'http_502', 'http_504', 'host_gateway_cooldown', 'transport_error'}):
         return False
     try:
@@ -304,22 +357,60 @@ def admit_native_lookup(queue, row):
     return True
 
 
-def classify(queue, row):
+def classify(queue, row, *, current_fields_trusted=False, signal_stale=False):
+    """Return whether the primary body is known; optionally signal a stale row.
+
+    With trusted current fields and signal_stale, None tells the dispatcher
+    that it repaired the supplied snapshot and must select a fresh row before
+    handing it to an owner. Other callers retain the original boolean result.
+    """
     if row['provider'] != 'cnyes':
         return False
     target = canonical_candidate_id(row['url'])
     if target is None:
-        return False
+        # A legacy or corrupt hint for an unsupported URL is not evidence of
+        # a primary body. Only scheduling fields are cleared, never the URL,
+        # receipt, due time, attempt, lease or source observation.
+        stale = (current_fields_trusted and (row['cnyes_canonical_candidate_id'] is not None
+                 or row['cnyes_known_body_candidate']))
+        if stale:
+            queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=NULL,cnyes_known_body_candidate=0 '
+                             "WHERE id=? AND provider='cnyes' AND url=? "
+                             'AND (cnyes_canonical_candidate_id IS NOT NULL OR cnyes_known_body_candidate!=0)',
+                             (row['id'], row['url']))
+        return None if signal_stale and stale else False
     other = queue.db.execute('SELECT body_sha256 FROM articles WHERE id=? AND provider=\'cnyes\'',
                              (target,)).fetchone()
     known = bool(other and other[0])
     # Reobserving an unchanged metadata partition must not rewrite its candidate
     # indexes. The primary body may have arrived since the last observation, so
     # still compare both fields against the current source state in this update.
-    queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=?,cnyes_known_body_candidate=? '
-                     'WHERE id=? AND (cnyes_canonical_candidate_id IS NOT ? OR cnyes_known_body_candidate!=?)',
-                     (target, known, row['id'], target, known))
-    return known
+    stale = (current_fields_trusted and (row['cnyes_canonical_candidate_id'] != target
+             or row['cnyes_known_body_candidate'] != known))
+    if not current_fields_trusted or stale:
+        queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=?,cnyes_known_body_candidate=? '
+                         "WHERE id=? AND provider='cnyes' AND url=? "
+                         'AND (cnyes_canonical_candidate_id IS NOT ? OR cnyes_known_body_candidate!=?)',
+                         (target, known, row['id'], row['url'], target, known))
+    return None if signal_stale and stale else known
+
+
+def fresh_dispatch_row(queue, row):
+    """Recheck a generic fairness-lane row without changing its eligibility.
+
+    The dedicated Cnyes priority lane already reselects stale rows. Retry,
+    undated and stored-body lanes use generic SQL and need the same protection.
+    If any non-hint field changed while repairing, let the owner select again
+    on its next cycle rather than claim an old eligibility snapshot.
+    """
+    if classify(queue, row, current_fields_trusted=True, signal_stale=True) is not None:
+        return row
+    fresh = queue.db.execute('SELECT * FROM articles WHERE id=?', (row['id'],)).fetchone()
+    hint_fields = {'cnyes_canonical_candidate_id', 'cnyes_known_body_candidate'}
+    if (fresh is None or any(fresh[key] != row[key] for key in row.keys() if key not in hint_fields)
+            or classify(queue, fresh, current_fields_trusted=True, signal_stale=True) is None):
+        return None
+    return fresh
 
 
 def _valid_cursors(value):
@@ -332,44 +423,109 @@ def backfill(queue, *, limit=256, max_seconds=0.04, stop=None):
         raise ValueError('bounded_cnyes_candidate_slice_required')
     from downloader.news_fulltext_urls import _read_checkpoint
     started = time.monotonic()
-    checked = known = added = 0
-    with queue.metrics.measure('cnyes_body_candidate_backfill'), queue.db:
+    checked = known = added = rechecked = 0
+    slots = tuple((host, checkpoint, state)
         for host, checkpoint in (('amp-news.cnyes.com', AMP_CURSOR), ('m.cnyes.com', CURSOR),
-                                 ('news.cnyes.com', DESKTOP_CURSOR)):
-            cursors = _read_checkpoint(queue, checkpoint, {state: 0 for state in STATES}, _valid_cursors)
-            scanned = 0
-            for state in STATES:
-                if checked >= limit or time.monotonic() - started >= max_seconds or stop and stop.is_set():
+                                 ('news.cnyes.com', DESKTOP_CURSOR)) for state in STATES)
+    # This is only a scheduling hint; the per-state rowid checkpoints below
+    # remain the durable authority after restart. Advance even over empty
+    # states so a slow first seek cannot indefinitely starve later states.
+    start_slot = getattr(queue, '_cnyes_candidate_seek_turn', 0)
+    if type(start_slot) is not int or not 0 <= start_slot < len(slots):
+        start_slot = 0
+    empty_seeks = getattr(queue, '_cnyes_candidate_empty_seeks', 0)
+    if type(empty_seeks) is not int or not 0 <= empty_seeks < len(slots):
+        empty_seeks = 0
+    visited, cursors, changed = 0, {}, set()
+    # Alternate two finite lanes so a stream of changed heads cannot starve
+    # the historical scan, or vice versa. The journal itself is durable FIFO.
+    rechecks_first = getattr(queue, '_cnyes_lookup_rechecks_first', False)
+
+    def recheck_slice():
+        nonlocal checked, known, added, rechecked
+        if checked >= limit or stop is not None and stop.is_set():
+            return
+        rows = queue.db.execute('SELECT r.seq,a.id,a.url,a.provider FROM cnyes_native_lookup_rechecks r '
+                                'LEFT JOIN articles a ON a.id=r.parent_article_id ORDER BY r.seq LIMIT ?',
+                                (limit - checked,)).fetchall()
+        for row in rows:
+            if stop is not None and stop.is_set() or checked and time.monotonic() - started >= max_seconds:
+                break
+            if row['id'] is not None:
+                known += classify(queue, row)
+                added += admit_native_lookup(queue, row)
+            queue.db.execute('DELETE FROM cnyes_native_lookup_rechecks WHERE seq=?', (row['seq'],))
+            checked += 1
+            rechecked += 1
+
+    with queue.metrics.measure('cnyes_body_candidate_backfill'), queue.db:
+        if rechecks_first:
+            recheck_slice()
+        for offset in range(len(slots)):
+            if (checked >= limit or stop is not None and stop.is_set()
+                    or visited and time.monotonic() - started >= max_seconds):
+                break
+            host, checkpoint, state = slots[(start_slot + offset) % len(slots)]
+            if checkpoint not in cursors:
+                cursors[checkpoint] = _read_checkpoint(queue, checkpoint,
+                    {value: 0 for value in STATES}, _valid_cursors)
+            if stop is not None and stop.is_set():
+                break
+            rows = queue.db.execute('SELECT rowid AS candidate_rowid,id,url,provider FROM articles INDEXED BY host_state '
+                'WHERE host=? AND state=? AND rowid>? '
+                + ("AND substr(url,-6)='?exp=a' " if host == 'news.cnyes.com' else '')
+                + 'ORDER BY rowid LIMIT ?',
+                (host, state, cursors[checkpoint][state], limit - checked)).fetchall()
+            visited += 1
+            for row in rows:
+                # Positive slices get one candidate even when the seek was
+                # slow. Stop always wins and the remaining rows stay behind
+                # the same durable cursor for a subsequent slice.
+                if stop is not None and stop.is_set() or checked and time.monotonic() - started >= max_seconds:
                     break
-                rows = queue.db.execute('SELECT rowid AS candidate_rowid,id,url,provider FROM articles INDEXED BY host_state '
-                    'WHERE host=? AND state=? AND rowid>? '
-                    + ("AND substr(url,-6)='?exp=a' " if host == 'news.cnyes.com' else '')
-                    + 'ORDER BY rowid LIMIT ?',
-                    (host, state, cursors[state], limit - checked)).fetchall()
-                for row in rows:
-                    if time.monotonic() - started >= max_seconds or stop and stop.is_set():
-                        break
-                    known += classify(queue, row)
-                    if host == 'amp-news.cnyes.com':
-                        added += admit_native_lookup(queue, row)
-                    checked += 1
-                    scanned += 1
-                    cursors[state] = row['candidate_rowid']
-            if scanned:
-                queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)', (checkpoint, json.dumps(cursors)))
+                known += classify(queue, row)
+                if host == 'amp-news.cnyes.com':
+                    added += admit_native_lookup(queue, row)
+                    # A scan and a state-change notification may cover the
+                    # same head. Consume both atomically without double work.
+                    queue.db.execute('DELETE FROM cnyes_native_lookup_rechecks WHERE parent_article_id=?', (row['id'],))
+                checked += 1
+                cursors[checkpoint][state] = row['candidate_rowid']
+                changed.add(checkpoint)
+        if not rechecks_first:
+            recheck_slice()
+        for checkpoint in changed:
+            queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
+                             (checkpoint, json.dumps(cursors[checkpoint])))
         if checked:
             queue.counter('cnyes_candidate_heads_classified', checked)
             queue.counter('cnyes_existing_body_candidates_observed', known)
-    return {'checked_heads': checked, 'existing_body_candidates': known,
+    queue._cnyes_lookup_rechecks_first = not rechecks_first
+    seek_continuation = False
+    if visited:
+        queue._cnyes_candidate_seek_turn = (start_slot + visited) % len(slots)
+        empty_seeks = 0 if checked else empty_seeks + visited
+        if empty_seeks >= len(slots):
+            empty_seeks = 0
+        else:
+            seek_continuation = not checked
+        queue._cnyes_candidate_empty_seeks = empty_seeks
+    return {'checked_heads': checked, 'rechecked_heads': rechecked, 'existing_body_candidates': known,
             'native_lookup_candidates_added': added, 'publisher_requests': 0,
-            'source_observations_merged': False, 'candidate_body_equivalence_verified': False}
+            'source_observations_merged': False, 'candidate_body_equivalence_verified': False,
+            'seek_continuation': seek_continuation}
 
 
 def maintenance_delay(result):
     # Imports classify immediately and claims lazily classify older state
     # transitions. An idle background seek cannot delay actual HTTP dispatch.
     # A new owner always seeks immediately from its durable cursor.
-    return 0.25 if result['checked_heads'] else 5.0
+    return 0.25 if result['checked_heads'] or result.get('seek_continuation') else 5.0
+
+
+def has_lookup_rechecks(queue):
+    """A cheap durable owner wake, independent of provider HTTP cooldowns."""
+    return queue.db.execute('SELECT 1 FROM cnyes_native_lookup_rechecks LIMIT 1').fetchone() is not None
 
 
 def statement(*, exclude_parser_repairs=False):
@@ -393,7 +549,11 @@ def candidate(queue, state, now, prefer_known, *, exclude_parser_repairs=False, 
             row = queue.db.execute(query, parameters).fetchone()
             if row is None:
                 break
-            if not known and row['cnyes_canonical_candidate_id'] is None and classify(queue, row):
+            # Also heal hints created before the provider-change trigger was
+            # installed. Recheck only the indexed head about to be considered;
+            # if it moved lanes, seek again within this fixed work budget.
+            current = classify(queue, row, current_fields_trusted=True, signal_stale=True)
+            if current is None or current != bool(known):
                 continue
             return row
     return None

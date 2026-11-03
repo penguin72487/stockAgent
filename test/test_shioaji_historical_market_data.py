@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from contextlib import nullcontext
 
 import polars as pl
+import pytest
 
 from downloader.download_shioaji_historical_market_data import (
     RECEIPT_SCHEMA_VERSION,
@@ -19,6 +20,7 @@ from downloader.download_shioaji_historical_market_data import (
     _valid_receipt,
     _write_inventory,
     build_tasks,
+    discover_contracts,
     load_inventory,
     observed_tick_dates,
     select_latest_option_infos,
@@ -89,6 +91,97 @@ def test_select_latest_weekly_and_monthly_keeps_every_strike_and_right() -> None
 
     assert {item.dict()["code"] for item in weekly} == {"W1C", "W1P"}
     assert {item.dict()["code"] for item in monthly} == {"M1C", "M1P"}
+
+
+def test_all_option_catalog_covers_roots_series_and_preserves_source_identity(tmp_path: Path) -> None:
+    from downloader.download_shioaji_historical_market_data import ALL_OPTION_SCOPE
+
+    def info(code, root, expiry, underlying, kind, ccy, strike, right):
+        values = {
+            "code": code, "root": root, "security_type": "OPT", "exchange": "TAIFEX",
+            "begin_date": date(2026, 8, 1), "delivery_date": expiry,
+            "last_trading_date": expiry, "delivery_month": expiry.strftime("%Y%m"),
+            "underlying_code": underlying, "underlying_kind": kind,
+            "quote_ccy": ccy, "spec_kind": "source-option-kind",
+            "strike_price": strike, "option_right": right,
+        }
+        return SimpleNamespace(dict=lambda: values)
+
+    chains = {
+        "TX1": [info("W1C", "TX1", date(2026, 9, 9), "IX0001", "I", "TWD", 100, "C")],
+        "TXO": [info("M1C", "TXO", date(2026, 9, 16), "IX0001", "I", "TWD", 100, "C"),
+                info("M2P", "TXO", date(2026, 10, 21), "IX0001", "I", "TWD", 110, "P")],
+        "TEO": [info("TEOC", "TEO", date(2026, 9, 16), "IX0028", "I", "TWD", 200, "C")],
+        "ETF": [info("ETFP", "ETF", date(2026, 9, 16), "0050", "S", "TWD", 50, "P")],
+        "GOLD": [info("GOLDC", "GOLD", date(2026, 9, 16), "GOLD", "C", "USD", 300, "C")],
+    }
+    calls = []
+    def options(root):
+        calls.append(root)
+        return chains[root]
+    contracts = SimpleNamespace(option_roots=lambda: [(root, root) for root in chains],
+                                options=options, futures_roots=lambda: [], list=lambda _: [])
+    api = SimpleNamespace(contracts=contracts)
+    completed = date(2026, 9, 8)
+
+    legacy = discover_contracts(api, completed_session=completed)
+    assert {row.code for row in legacy} == {"W1C", "M1C"}
+    assert set(calls) == {"TX1", "TXO"}
+    calls.clear()
+    expanded = discover_contracts(api, completed_session=completed, option_scope=ALL_OPTION_SCOPE)
+    assert set(calls) == set(chains)
+    assert {row.code for row in expanded} == {"W1C", "M1C", "M2P", "TEOC", "ETFP", "GOLDC"}
+    assert {row.collection for row in expanded} == {"all_options"}
+    manifest = _write_inventory(tmp_path, expanded, completed_session=completed, option_scope=ALL_OPTION_SCOPE)
+    assert manifest["by_collection"]["all_options"] == 6
+    assert len(manifest["option_scope_fingerprint"]) == 64
+    rows = {row.code: row for row in load_inventory(tmp_path)}
+    assert (rows["ETFP"].underlying_code, rows["ETFP"].underlying_kind, rows["ETFP"].quote_ccy) == ("0050", "S", "TWD")
+    assert (rows["GOLDC"].underlying_kind, rows["GOLDC"].quote_ccy, rows["GOLDC"].strike_price) == ("C", "USD", 300)
+    assert rows["M2P"].option_right == "P"
+
+
+def test_option_inventory_scopes_cannot_be_silently_mixed(tmp_path: Path, monkeypatch) -> None:
+    import sys
+    import downloader.download_shioaji_historical_market_data as collector
+
+    row = _row(collection="latest_monthly_option", priority=1, code="OLD")
+    manifest = _write_inventory(tmp_path, [row], completed_session=date(2026, 8, 28))
+    original = (tmp_path / "inventory/contracts.parquet").read_bytes()
+    with pytest.raises(ValueError, match="incompatible"):
+        _write_inventory(tmp_path, [row], completed_session=date(2026, 8, 28), option_scope="all_available")
+    monkeypatch.setattr(sys, "argv", ["collector", "--dry-run", "--option-scope", "all_available",
+                                      "--output-dir", str(tmp_path)])
+    with pytest.raises(ValueError, match="incompatible"):
+        collector.main()
+    assert (tmp_path / "inventory/contracts.parquet").read_bytes() == original
+    # Historical manifests without a scope marker mean the original TXO-only ABI.
+    for key in ("option_scope", "option_scope_version", "option_scope_fingerprint"):
+        manifest.pop(key)
+    _atomic_write_json(tmp_path / "inventory/manifest.json", manifest)
+    collector._validate_inventory_scope(tmp_path, "latest_txo")
+    with pytest.raises(ValueError, match="incompatible"):
+        collector._validate_inventory_scope(tmp_path, "all_available")
+
+
+def test_all_option_query_bound_does_not_apply_futures_history_floor() -> None:
+    values = {"code": "OLDOPT", "root": "ABC", "security_type": "OPT",
+              "begin_date": date(2012, 4, 1), "last_trading_date": date(2012, 5, 16),
+              "delivery_date": date(2012, 5, 16), "strike_price": 100, "option_right": "C"}
+    row = _history_contract(SimpleNamespace(dict=lambda: values), collection="all_options",
+                            completed_session=date(2012, 5, 15))
+    assert row is not None
+    assert (row.begin_date, row.end_date) == (date(2012, 4, 1), date(2012, 5, 15))
+
+
+def test_all_option_catalog_failure_does_not_rewrite_inventory(tmp_path: Path) -> None:
+    contracts = SimpleNamespace(option_roots=lambda: ["TXO", "TEO"],
+                                options=lambda root: [] if root == "TXO" else (_ for _ in ()).throw(OSError("bad root")),
+                                futures_roots=lambda: [], list=lambda _: [])
+    with pytest.raises(RuntimeError, match="inventory preserved"):
+        discover_contracts(SimpleNamespace(contracts=contracts), completed_session=date(2026, 9, 8),
+                           option_scope="all_available")
+    assert not (tmp_path / "inventory/contracts.parquet").exists()
 
 
 def test_native_last_trade_date_is_not_clipped_to_completed_session_or_delivery(tmp_path: Path) -> None:

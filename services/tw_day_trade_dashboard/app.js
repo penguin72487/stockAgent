@@ -39,6 +39,7 @@ let hiddenEquitySeries = new Set();
 let chartHistoryCache = new Map();
 let historyInFlight = false;
 let historyRequestKeyInFlight = "";
+let historyRequestScopeInFlight = "";
 let historyRequestSequence = 0;
 let historyAbortController = null;
 let historyLoadError = "";
@@ -67,6 +68,7 @@ let signalLoadError = "";
 let signalLoadNotice = "";
 let signalRequestSequence = 0;
 let signalRequestRevisionInFlight = "";
+let signalRequestScopeInFlight = "";
 let signalFeatureDrivers = {};
 let featurePanelSignalKey = "";
 let featurePanelScopeText = "";
@@ -78,6 +80,8 @@ let sessionRolloverTimer = null;
 let sessionRolloverDeadline = "";
 let sessionRolloverDue = Infinity;
 let signalAbortController = null;
+let signalFallbackActive = false;
+let signalFallbackVisible = SIGNAL_PAGE_SIZE;
 let eventRows = [];
 let eventTotal = 0;
 let eventOrderTotal = 0;
@@ -90,6 +94,7 @@ let eventLoadError = "";
 let eventLoadNotice = "";
 let eventRequestSequence = 0;
 let eventRequestRevisionInFlight = "";
+let eventRequestScopeInFlight = "";
 let eventAbortController = null;
 let eventViewActivated = false;
 let positionRows = [];
@@ -101,7 +106,10 @@ let positionRequestSequence = 0;
 let positionDataRevision = null;
 let positionSelectionKey = null;
 let positionRequestRevisionInFlight = "";
+let positionRequestScopeInFlight = "";
 let positionAbortController = null;
+let positionFallbackActive = false;
+let positionFallbackVisible = POSITION_PAGE_SIZE;
 const EMPTY_SOURCE_ROWS = Object.freeze([]);
 let priceSourceInputs = [];
 let availableDetailDates = [];
@@ -546,10 +554,17 @@ function detailDataRevision(kind) {
   const history = snapshot?.historical_replay || {};
   return JSON.stringify([
     detailSelectionKey(kind),
+    service.engine_generation ?? null,
     service.content_revision ?? null,
     history.generated_at || null,
     history.end_date || null,
   ]);
+}
+function detailReadScopeKey(kind) {
+  return JSON.stringify([detailSelectionKey(kind), snapshot?.service_sync?.engine_generation ?? null]);
+}
+function chartReadScopeKey() {
+  return JSON.stringify([detailRangeKey(), snapshot?.service_sync?.engine_generation ?? null]);
 }
 function chartWindowLabel() {
   const start = selectedDetailStartDate();
@@ -565,6 +580,7 @@ function chartRequestKey() {
   const sourceRevision = service.history_revision || null;
   return JSON.stringify([
     detailRangeKey(),
+    service.engine_generation ?? null,
     sourceRevision || service.revision_token || service.content_revision || null,
     sourceRevision ? null : (history.generated_at || null),
     sourceRevision ? null : (history.end_date || null),
@@ -945,13 +961,16 @@ function clearDateScopedViews() {
   ++signalRequestSequence; ++eventRequestSequence; ++positionRequestSequence; ++historyRequestSequence;
   signalLoading = eventLoading = positionLoading = historyInFlight = false;
   historyRequestKeyInFlight = "";
+  historyRequestScopeInFlight = "";
   signalRows = []; eventRows = []; positionRows = [];
   signalDirectionSummary = {}; signalOpeningExecutionAudit = {}; signalFeatureDrivers = {};
   signalTotal = eventTotal = eventOrderTotal = eventFillTotal = positionTotal = 0;
   signalHasMore = eventHasMore = positionHasMore = false;
+  signalFallbackVisible = SIGNAL_PAGE_SIZE; positionFallbackVisible = POSITION_PAGE_SIZE;
   signalDataRevision = positionDataRevision = eventRecordRevision = lastRenderedRevision = null;
   signalSelectionKey = positionSelectionKey = eventSelectionKey = null;
   signalRequestRevisionInFlight = positionRequestRevisionInFlight = eventRequestRevisionInFlight = "";
+  signalRequestScopeInFlight = positionRequestScopeInFlight = eventRequestScopeInFlight = "";
   featurePanelScopeText = featurePanelSignalKey = "";
   signalLoadError = signalLoadNotice = eventLoadError = eventLoadNotice = positionLoadError = historyLoadError = "";
   chartHistory = null;
@@ -1307,7 +1326,8 @@ function renderOperations(data) {
   const latencyValue = (value) => value == null ? "—" : `${number(value, 1)} ms`;
   const noLatency = !Number(latency.sample_count || 0);
   const noOpeningLatency = !Number(openingLatency.observed_mode_count || 0);
-  const latencyEmptyLabel = "所選日尚無開盤樣本";
+  const openingPartial = openingLatency.integrity?.state === "partial_corrupt";
+  const latencyEmptyLabel = openingPartial ? "測速紀錄不完整" : "所選日尚無開盤樣本";
   const latestBottleneck = latencyStageLabels[latency.latest_bottleneck_stage] || latency.latest_bottleneck_stage || "—";
   const serviceSync = data.service_sync || {};
   const discordSync = serviceSync.discord || {};
@@ -1358,14 +1378,14 @@ function renderOperations(data) {
     ? `${latencyStageLabels[slowestOpeningMode.bottleneck_stage] || slowestOpeningMode.bottleneck_stage} · ${latencyValue(slowestOpeningMode.bottleneck_ms)}`
     : noLatency ? "—" : `${latestBottleneck} · ${latencyValue(latency.latest_bottleneck_ms)}`;
   setHtml("latency-kpis", [
-    ["09:00 → 首個訊號", noOpeningLatency ? latencyEmptyLabel : latencyValue(openingLatency.first_ready_ms), firstOpeningMode ? `${strategyLabel(firstOpeningMode)} · 目標 ≤ ${number(openingGoalMs)} ms · ${openingLatency.first_signal_goal_met ? "達標" : "未達標"}` : "等待實測"],
+    [openingPartial ? "09:00 → 可讀樣本最快" : "09:00 → 首個訊號", noOpeningLatency ? latencyEmptyLabel : latencyValue(openingLatency.first_ready_ms), openingPartial ? "原始測速紀錄有損壞，不能認定最早時間或達標" : firstOpeningMode ? `${strategyLabel(firstOpeningMode)} · 目標 ≤ ${number(openingGoalMs)} ms · ${openingLatency.first_signal_goal_met ? "達標" : "未達標"}` : "等待實測"],
     ["09:00 → 行情覆蓋", Number.isFinite(sourceReadyMs) ? latencyValue(sourceReadyMs) : "—", Number.isFinite(sourceReadyMs) ? "本機收到足夠 callback；不是交易所 RTT" : "舊樣本未記錄逐筆到達時間"],
     ["行情就緒 → 訊號", Number.isFinite(controllableP50Ms) ? `${latencyValue(controllableP50Ms)} / ${latencyValue(controllableMaxMs)}` : "—", "逐模式 P50 / 最慢；這是主要可控區段"],
-    ["09:00 → 全部模式", noOpeningLatency ? "—" : latencyValue(openingLatency.final_ready_ms), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式有測速紀錄${openingLatency.all_modes_goal_met ? "，全數達標" : openingLatency.complete ? "，完成但未達 1 秒" : openingLatency.replay_without_live_measurement?.length ? `；${number(openingLatency.replay_without_live_measurement.length)} 個回補模式無當時即時測速` : "；仍缺測速紀錄"}`],
+    [openingPartial ? "09:00 → 可讀模式樣本" : "09:00 → 全部模式", noOpeningLatency ? "—" : latencyValue(openingLatency.final_ready_ms), `${number(openingLatency.observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式有可讀測速紀錄${openingPartial ? "；來源不完整，不能驗收" : openingLatency.all_modes_goal_met ? "，全數達標" : openingLatency.complete ? "，完成但未達 1 秒" : openingLatency.replay_without_live_measurement?.length ? `；${number(openingLatency.replay_without_live_measurement.length)} 個回補模式無當時即時測速` : "；仍缺測速紀錄"}`],
     ["相較前次開盤", openingChange, openingLatency.previous_session_date ? `${openingLatency.previous_session_date} 最後訊號 ${duration(Number(openingLatency.previous_final_ready_ms) / 1000)}` : "只比較 09:00 自動樣本"],
     ["09:00 → 全模式帳本落盤", openingLatency.final_ledger_ms == null ? "尚未完整觀測" : latencyValue(openingLatency.final_ledger_ms), `${number(openingLatency.ledger_observed_mode_count || 0)}/${number(openingLatency.expected_mode_count || 0)} 模式；含等待／回補，不是券商成交。輸入至帳本 P50/P95：${latencyValue(latency.p50_ms)} / ${latencyValue(latency.p95_ms)}`],
     ["開盤最大階段", openingBottleneck, slowestOpeningMode ? strategyLabel(slowestOpeningMode) : noLatency ? "等待實測" : "來自執行帳本樣本"],
-    ["失敗嘗試", number(openingLatency.failure_count || 0), openingLatency.failure_count ? "錯誤類型已寫入測速帳本" : "所選日沒有測速失敗紀錄"],
+    ["失敗嘗試", `${openingPartial ? "至少 " : ""}${number(openingLatency.failure_count || 0)}`, openingPartial ? "僅計可讀紀錄，損壞行可能包含其他失敗" : openingLatency.failure_count ? "錯誤類型已寫入測速帳本" : "所選日沒有測速失敗紀錄"],
   ].map(([label, value, note]) => `<div class="latency-kpi"><span>${esc(label)}</span><strong>${esc(value)}</strong><small>${esc(note)}</small></div>`).join(""));
   const officialUniverse = officialUniverseDescription(data.current_trading_universe);
   setHtml("operation-kpis", [
@@ -1447,7 +1467,9 @@ function renderOperations(data) {
     const resolved = Number(coverage.opens || 0) + Number(coverage.no_prints || 0);
     return `<div class="progress-row opening-latency-row"><div class="progress-title"><strong>${esc(strategyLabel(row))}</strong>${badge("等待資料・自動重試", "warn")}</div>${required > 0 ? progress(Math.min(100, resolved / required * 100), "warn") : ""}<small>${esc(openingWaitDescription(row))} · ${esc(shortTime(row.recorded_at))}</small></div>`;
   }).join("");
-  setHtml("opening-stage-progress", openingStageHtml || `<div class="empty-inline">所選日尚無 09:00 自動訊號測速；不以手動或回放資料冒充。</div>`);
+  setHtml("opening-stage-progress", openingStageHtml || (openingPartial
+    ? `<div class="empty-inline">測速紀錄有損壞，無法判定是否存在其他開盤樣本；原始紀錄已保留。</div>`
+    : `<div class="empty-inline">所選日尚無 09:00 自動訊號測速；不以手動或回放資料冒充。</div>`));
 
   const openingTrendRows = (openingLatency.trend || []).slice(-7).reverse();
   setHtml("opening-latency-trend", openingTrendRows.map((row) => {
@@ -1455,7 +1477,7 @@ function renderOperations(data) {
     const source = row.first_source_ready_ms == null ? "—" : latencyValue(row.first_source_ready_ms);
     const controllable = row.source_ready_to_signal_p50_ms == null ? "—" : latencyValue(row.source_ready_to_signal_p50_ms);
     const kind = row.all_modes_goal_met ? "good" : row.complete ? "bad" : "warn";
-    const state = row.all_modes_goal_met ? "≤1 秒" : row.complete ? "未達標" : "不完整";
+    const state = openingPartial ? "來源不完整" : row.all_modes_goal_met ? "≤1 秒" : row.complete ? "未達標" : "不完整";
     return `<div class="progress-row latency-trend-row">
       <div class="progress-title"><strong>${esc(row.session_date || "—")}</strong>${badge(state, kind)}</div>
       <small>${esc(`全部模式 ${total} · 行情覆蓋 ${source} · 可控 P50 ${controllable} · ${number(row.observed_mode_count || 0)}/${number(row.expected_mode_count || 0)} 模式 · 失敗 ${number(row.failure_count || 0)}`)}</small>
@@ -1749,6 +1771,7 @@ async function loadChartHistory({preferCache = false} = {}) {
   const requestedStart = selectedDetailStartDate();
   const requestedEnd = selectedDetailEndDate();
   const requestedKey = chartRequestKey();
+  const requestedScope = chartReadScopeKey();
   const cached = chartHistoryCache.get(requestedKey);
   if (preferCache) {
     if (cached && (chartHistory !== cached.payload || chartHistoryKey !== requestedKey)) {
@@ -1767,13 +1790,17 @@ async function loadChartHistory({preferCache = false} = {}) {
     // key is immutable; a time-to-live only retransfers the same large curve.
     if (cached) return;
   }
-  if (historyInFlight && historyRequestKeyInFlight === requestedKey && preferCache) return;
+  // New marks can arrive before a slow curve finishes. Coalesce that revision
+  // into the next request; only another selection/owner or force cancels it.
+  if (historyInFlight && historyRequestScopeInFlight === requestedScope && preferCache) return;
   if (historyAbortController) historyAbortController.abort();
   const controller = new AbortController();
   historyAbortController = controller;
   const sequence = ++historyRequestSequence;
   historyInFlight = true;
   historyRequestKeyInFlight = requestedKey;
+  historyRequestScopeInFlight = requestedScope;
+  let loaded = false;
   if (snapshot && !chartHistoryMatchesSelection()) renderChart(snapshot);
   try {
     const params = new URLSearchParams({range: requestedRange, resolution: "1m", encoding: "v2"});
@@ -1790,7 +1817,7 @@ async function loadChartHistory({preferCache = false} = {}) {
     if (!response.ok) { Dashboard.cancelResponse(response); throw new Error(`HTTP ${response.status}`); }
     const payload = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== historyRequestSequence) return;
-    if (requestedKey !== chartRequestKey()) return;
+    if (requestedScope !== chartReadScopeKey()) return;
     validateMinuteHistory(payload, {startDate: requestedStart, endDate: requestedEnd, unbounded: coversAllAvailableDates});
     if (!chartHistoryCache.has(requestedKey) && chartHistoryCache.size >= HISTORY_CLIENT_CACHE_MAX_ENTRIES) {
       chartHistoryCache.delete(chartHistoryCache.keys().next().value);
@@ -1803,9 +1830,13 @@ async function loadChartHistory({preferCache = false} = {}) {
       ? {...decodedPayload, start_date: requestedStart, end_date: requestedEnd}
       : decodedPayload;
     chartHistoryCache.set(requestedKey, {payload: decoded});
-    applyChartHistory(decoded, requestedKey);
+    if (requestedKey === chartRequestKey() || chartHistoryKey !== chartRequestKey()) {
+      applyChartHistory(decoded, requestedKey);
+    }
+    loaded = true;
   } catch (error) {
-    if (sequence !== historyRequestSequence || (error?.name === "AbortError" && controller.signal.aborted)) return;
+    if (sequence !== historyRequestSequence || requestedScope !== chartReadScopeKey()
+        || (error?.name === "AbortError" && controller.signal.aborted)) return;
     historyLoadError = `歷史載入失敗：${error}`;
     if (snapshot) renderChart(snapshot);
     scheduleStatusRecovery();
@@ -1814,7 +1845,8 @@ async function loadChartHistory({preferCache = false} = {}) {
       historyAbortController = null;
       historyInFlight = false;
       historyRequestKeyInFlight = "";
-      if (requestedKey !== chartRequestKey()) void loadChartHistory({preferCache: true});
+      historyRequestScopeInFlight = "";
+      if (loaded && requestedKey !== chartRequestKey()) void loadChartHistory({preferCache: true});
     }
   }
 }
@@ -1885,6 +1917,27 @@ function measureRevisionPaint(action, rows, rootId, stillCurrent = () => true) {
 
 function renderPositions() {
   const acceptedSelection = positionSelectionKey === detailSelectionKey("positions");
+  const shared = !IS_OVERNIGHT ? window.StockAgentTwLivePaper?.getSnapshot() : null;
+  const selection = {start: selectedDetailStartDate(), end: selectedDetailEndDate(),
+    mode: selectedMode(), symbol: textFilter(), status: $("status-filter").value || "all"};
+  const fallback = shared?.data && (!acceptedSelection || positionDataRevision !== detailDataRevision("positions"))
+    ? detailComponents.livePositionFallback(shared?.data, selection) : null;
+  positionFallbackActive = !!fallback;
+  if (fallback) {
+    const rows = fallback.rows.slice(0, positionFallbackVisible);
+    const age = Math.max(0, Math.floor((Date.now() - Date.parse(shared.data.as_of)) / 1000));
+    const freshness = `${shortTime(shared.data.as_of)} · 帳本版本 ${number(shared.data.state_revision)}`;
+    const warning = shared.error || (age > 120 ? `快照已 ${number(age)} 秒未更新` : "");
+    detailComponents.pagedTable({id: "position", rows, total: fallback.rows.length, loading: false,
+      hasMore: rows.length < fallback.rows.length, error: positionLoadError,
+      renderRow: detailComponents.positionRow,
+      emptyText: fallback.note,
+      countDetail: ` · ${fallback.note} · ${freshness}${warning ? ` · ${warning}` : ""}`});
+    // Keep scope and clock visible even when the full-history request failed.
+    $("position-count").textContent = `${number(rows.length)} / ${number(fallback.rows.length)} 筆 · ${fallback.note} · ${freshness}${warning ? ` · ${warning}` : ""}`;
+    renderPriceSources();
+    return;
+  }
   detailComponents.pagedTable({
     id: "position", rows: acceptedSelection ? positionRows : [],
     total: acceptedSelection ? positionTotal : 0,
@@ -1905,6 +1958,27 @@ function renderPositions() {
 function renderSignals() {
   syncFeaturePanelSelection();
   const acceptedSelection = signalSelectionKey === detailSelectionKey("signals");
+  const shared = !IS_OVERNIGHT ? window.StockAgentPublishedSignals?.getSnapshot() : null;
+  const selection = {start: selectedDetailStartDate(), end: selectedDetailEndDate(),
+    mode: selectedMode(), symbol: textFilter(), status: $("status-filter").value || "all"};
+  const ledgerReady = acceptedSelection && signalDataRevision === detailDataRevision("signals");
+  const publishedAhead = shared?.data && ledgerReady
+    && detailComponents.publishedSignalAhead(shared.data, selection, signalRows);
+  const fallback = shared?.data
+    ? detailComponents.publishedSignalFallback(shared.data, selection, {ledgerReady}) : null;
+  signalFallbackActive = !!fallback;
+  if (fallback) {
+    const rows = fallback.rows.slice(0, signalFallbackVisible);
+    const warning = shared.error ? ` · ${shared.error}` : "";
+    setHtml("signal-direction-summary", `<div><span>最新已發布訊號</span><strong>${esc(fallback.note)}${esc(warning)}</strong></div>`);
+    detailComponents.pagedTable({id: "signal", rows, total: fallback.rows.length, loading: false,
+      hasMore: rows.length < fallback.rows.length, error: signalLoadError,
+      renderRow: detailComponents.publishedSignalFallbackRow, emptyText: fallback.note,
+      countDetail: ` · ${fallback.note}${warning}`});
+    $("signal-count").textContent = `${number(rows.length)} / ${number(fallback.rows.length)} 筆 · ${fallback.note}${warning}`;
+    renderPriceSources();
+    return;
+  }
   const visibleRows = acceptedSelection ? signalRows : [];
   const visibleSummary = acceptedSelection ? signalDirectionSummary : {};
   const visibleAudit = acceptedSelection ? signalOpeningExecutionAudit : {};
@@ -1940,7 +2014,10 @@ function renderSignals() {
         : "待核對完整庫存差額";
       return `<div><span>${esc(strategyLabel(mode.market))} 即時再平衡</span><strong>版本 ${number(mode.opening_signal_revision.index)} · ${esc(shortTime(mode.signal_at))}</strong><small>${progress}。新開盤價優先；缺價沿用可追溯前次成交價。僅交易目標差額，原成交保留。</small></div>`;
     }).join("");
-  setHtml("signal-direction-summary", directionHtml + openingAuditHtml + revisionHtml);
+  const publishedNoticeHtml = publishedAhead
+    ? "<div><span>較新的模型預覽</span><strong>另列於上方最新訊號；此表保留已提交帳本版本，不把不同版本配成成交。</strong></div>"
+    : "";
+  setHtml("signal-direction-summary", directionHtml + openingAuditHtml + revisionHtml + publishedNoticeHtml);
   detailComponents.pagedTable({
     id: "signal", rows: visibleRows, total: acceptedSelection ? signalTotal : 0,
     loading: signalLoading || !acceptedSelection,
@@ -2087,6 +2164,7 @@ function revisionOf(data) {
     data.opening_signal_latency?.first_source_ready_ms,
     data.opening_signal_latency?.source_ready_to_signal_p50_ms,
     data.opening_signal_latency?.failure_count,
+    data.opening_signal_latency?.integrity,
     data.session_progress,
     data.preopen?.updated_at,
     data.unattended_guardian?.observed_at_taipei,
@@ -2128,10 +2206,11 @@ async function loadSignals({append = false, force = false} = {}) {
   if (!snapshot) return;
   const requestRevision = detailDataRevision("signals");
   const requestSelection = detailSelectionKey("signals");
+  const requestScope = detailReadScopeKey("signals");
   if (append && (signalSelectionKey !== requestSelection || signalDataRevision !== requestRevision)) append = false;
   if (!append && !force && (
     signalDataRevision === requestRevision
-    || (signalLoading && signalRequestRevisionInFlight === requestRevision)
+    || (signalLoading && signalRequestScopeInFlight === requestScope)
   )) return;
   if (signalAbortController) signalAbortController.abort();
   signalAbortController = new AbortController();
@@ -2139,6 +2218,8 @@ async function loadSignals({append = false, force = false} = {}) {
   const sequence = ++signalRequestSequence;
   const requestRange = detailRangeKey();
   signalRequestRevisionInFlight = requestRevision;
+  signalRequestScopeInFlight = requestScope;
+  let loaded = false;
   const requestOffset = append ? signalRows.length : 0;
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
@@ -2156,7 +2237,8 @@ async function loadSignals({append = false, force = false} = {}) {
     const response = await fetchWithTimeout(`api/signals?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== signalRequestSequence) return;
-    if (requestRange !== detailRangeKey() || requestRevision !== detailDataRevision("signals")) return;
+    if (requestRange !== detailRangeKey() || requestScope !== detailReadScopeKey("signals")) return;
+    if (append && requestRevision !== detailDataRevision("signals")) { loaded = true; return; }
     validateDetailPage(page, {kind: "訊號", offset: requestOffset, limit: SIGNAL_PAGE_SIZE,
       expectedTotal: append ? signalTotal : null});
     featurePanelScopeText = page.feature_drivers_scope
@@ -2178,8 +2260,9 @@ async function loadSignals({append = false, force = false} = {}) {
     signalFeatureDrivers = append
       ? {...signalFeatureDrivers, ...incomingDrivers}
       : incomingDrivers;
+    loaded = true;
   } catch (error) {
-    if (sequence !== signalRequestSequence || requestRevision !== detailDataRevision("signals")) return;
+    if (sequence !== signalRequestSequence || requestScope !== detailReadScopeKey("signals")) return;
     // Only our own superseded selection is intentionally silent. A timeout
     // while reading the body may also surface as AbortError in browsers.
     if (error?.name === "AbortError" && controller.signal.aborted) return;
@@ -2191,10 +2274,12 @@ async function loadSignals({append = false, force = false} = {}) {
     if (sequence === signalRequestSequence) {
       if (signalAbortController === controller) signalAbortController = null;
       signalRequestRevisionInFlight = "";
+      signalRequestScopeInFlight = "";
       signalLoading = false;
       syncFeaturePanelSelection();
       renderSignals();
       renderSignalFeaturePanel();
+      if (loaded && requestRevision !== detailDataRevision("signals")) void loadSignals();
     }
   }
 }
@@ -2203,10 +2288,11 @@ async function loadPositions({append = false, force = false} = {}) {
   if (!snapshot) return;
   const requestRevision = detailDataRevision("positions");
   const requestSelection = detailSelectionKey("positions");
+  const requestScope = detailReadScopeKey("positions");
   if (append && (positionSelectionKey !== requestSelection || positionDataRevision !== requestRevision)) append = false;
   if (!append && !force && (
     positionDataRevision === requestRevision
-    || (positionLoading && positionRequestRevisionInFlight === requestRevision)
+    || (positionLoading && positionRequestScopeInFlight === requestScope)
   )) return;
   if (positionAbortController) positionAbortController.abort();
   positionAbortController = new AbortController();
@@ -2214,6 +2300,8 @@ async function loadPositions({append = false, force = false} = {}) {
   const sequence = ++positionRequestSequence;
   const requestRange = detailRangeKey();
   positionRequestRevisionInFlight = requestRevision;
+  positionRequestScopeInFlight = requestScope;
+  let loaded = false;
   const requestOffset = append ? positionRows.length : 0;
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
@@ -2230,7 +2318,8 @@ async function loadPositions({append = false, force = false} = {}) {
     const response = await fetchWithTimeout(`api/positions?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== positionRequestSequence) return;
-    if (requestRange !== detailRangeKey() || requestRevision !== detailDataRevision("positions")) return;
+    if (requestRange !== detailRangeKey() || requestScope !== detailReadScopeKey("positions")) return;
+    if (append && requestRevision !== detailDataRevision("positions")) { loaded = true; return; }
     validateDetailPage(page, {kind: "持倉", offset: requestOffset, limit: POSITION_PAGE_SIZE,
       expectedTotal: append ? positionTotal : null});
     positionLoadError = "";
@@ -2239,8 +2328,9 @@ async function loadPositions({append = false, force = false} = {}) {
     positionHasMore = page.has_more;
     positionDataRevision = requestRevision;
     positionSelectionKey = requestSelection;
+    loaded = true;
   } catch (error) {
-    if (sequence !== positionRequestSequence || requestRevision !== detailDataRevision("positions")) return;
+    if (sequence !== positionRequestSequence || requestScope !== detailReadScopeKey("positions")) return;
     if (error?.name === "AbortError" && controller.signal.aborted) return;
     positionLoadError = `持倉明細暫時無法更新：${error}`;
     positionDataRevision = null;
@@ -2249,10 +2339,12 @@ async function loadPositions({append = false, force = false} = {}) {
     if (sequence === positionRequestSequence) {
       if (positionAbortController === controller) positionAbortController = null;
       positionRequestRevisionInFlight = "";
+      positionRequestScopeInFlight = "";
       positionLoading = false;
       renderPositions(snapshot);
       renderSignals();
       renderSignalFeaturePanel();
+      if (loaded && requestRevision !== detailDataRevision("positions")) void loadPositions();
     }
   }
 }
@@ -2261,10 +2353,11 @@ async function loadEvents({append = false, force = false} = {}) {
   if (!snapshot) return;
   const requestRevision = detailDataRevision("events");
   const requestSelection = detailSelectionKey("events");
+  const requestScope = detailReadScopeKey("events");
   if (append && (eventSelectionKey !== requestSelection || eventRecordRevision !== requestRevision)) append = false;
   if (!append && !force && (
     eventRecordRevision === requestRevision
-    || (eventLoading && eventRequestRevisionInFlight === requestRevision)
+    || (eventLoading && eventRequestScopeInFlight === requestScope)
   )) return;
   if (eventAbortController) eventAbortController.abort();
   eventAbortController = new AbortController();
@@ -2272,6 +2365,8 @@ async function loadEvents({append = false, force = false} = {}) {
   const sequence = ++eventRequestSequence;
   const requestRange = detailRangeKey();
   eventRequestRevisionInFlight = requestRevision;
+  eventRequestScopeInFlight = requestScope;
+  let loaded = false;
   const requestOffset = append ? eventRows.length : 0;
   const params = new URLSearchParams({
     start_date: selectedDetailStartDate(),
@@ -2287,7 +2382,8 @@ async function loadEvents({append = false, force = false} = {}) {
     const response = await fetchWithTimeout(`api/events?${params.toString()}`, {cache: "no-store", signal: controller.signal});
     const page = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
     if (sequence !== eventRequestSequence) return;
-    if (requestRange !== detailRangeKey() || requestRevision !== detailDataRevision("events")) return;
+    if (requestRange !== detailRangeKey() || requestScope !== detailReadScopeKey("events")) return;
+    if (append && requestRevision !== detailDataRevision("events")) { loaded = true; return; }
     validateDetailPage(page, {kind: "事件", offset: requestOffset, limit: EVENT_PAGE_SIZE,
       expectedTotal: append ? eventTotal : null});
     eventLoadError = "";
@@ -2300,8 +2396,9 @@ async function loadEvents({append = false, force = false} = {}) {
       ? `僅統計最近每種帳本最多 ${number(page.scan_limit)} 筆，較早紀錄未計入` : "";
     eventRecordRevision = requestRevision;
     eventSelectionKey = requestSelection;
+    loaded = true;
   } catch (error) {
-    if (sequence !== eventRequestSequence || requestRevision !== detailDataRevision("events")) return;
+    if (sequence !== eventRequestSequence || requestScope !== detailReadScopeKey("events")) return;
     if (error?.name === "AbortError" && controller.signal.aborted) return;
     eventLoadError = `事件明細暫時無法更新：${error}`;
     eventRecordRevision = null;
@@ -2310,8 +2407,10 @@ async function loadEvents({append = false, force = false} = {}) {
     if (sequence === eventRequestSequence) {
       if (eventAbortController === controller) eventAbortController = null;
       eventRequestRevisionInFlight = "";
+      eventRequestScopeInFlight = "";
       eventLoading = false;
       renderEvents();
+      if (loaded && requestRevision !== detailDataRevision("events")) void loadEvents();
     }
   }
 }
@@ -2531,6 +2630,7 @@ async function refreshServiceRevision() {
 }
 
 function filtersChanged({debounceSignals = false, includeChart = false, reloadEvents = true} = {}) {
+  signalFallbackVisible = SIGNAL_PAGE_SIZE; positionFallbackVisible = POSITION_PAGE_SIZE;
   featurePanelSignalKey = "";
   featurePanelScopeText = "";
   signalFeatureDrivers = {};
@@ -2577,6 +2677,8 @@ function detailDateChanged(event) {
   beginSilentTableUpdate("position-body", "load-more-positions", false);
   beginSilentTableUpdate("signal-body", "load-more-signals", false);
   beginSilentTableUpdate("event-body", "load-more-events", false);
+  renderPositions();
+  renderSignals();
   if (signalAbortController) signalAbortController.abort();
   if (eventAbortController) eventAbortController.abort();
   if (positionAbortController) positionAbortController.abort();
@@ -2618,9 +2720,23 @@ $("reset-filters").addEventListener("click", () => {
   $("status-filter").value = "all";
   filtersChanged({includeChart: true});
 });
-$("load-more-signals").addEventListener("click", () => loadSignals({append: true}));
+$("load-more-signals").addEventListener("click", () => {
+  if (signalFallbackActive) { signalFallbackVisible += SIGNAL_PAGE_SIZE; renderSignals(); }
+  else void loadSignals({append: true});
+});
 $("load-more-events").addEventListener("click", () => loadEvents({append: true}));
-$("load-more-positions").addEventListener("click", () => loadPositions({append: true}));
+$("load-more-positions").addEventListener("click", () => {
+  if (positionFallbackActive) { positionFallbackVisible += POSITION_PAGE_SIZE; renderPositions(); }
+  else void loadPositions({append: true});
+});
+if (!IS_OVERNIGHT) {
+  // Projections already validated and fetched by the independent panels. A
+  // failed full status or history request must not leave the tables blank.
+  window.addEventListener("stockagent:published-signals", () => renderSignals());
+  window.addEventListener("stockagent:live-paper", () => renderPositions());
+  if (window.StockAgentPublishedSignals?.getSnapshot().data) renderSignals();
+  if (window.StockAgentTwLivePaper?.getSnapshot().data) renderPositions();
+}
 $("signal-body").addEventListener("click", (event) => {
   const row = event.target.closest("tr[data-signal-key]");
   if (!row) return;

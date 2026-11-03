@@ -18,11 +18,26 @@ from scripts.backup_delivery_receipt import validate_ack
 from scripts.verify_backup_delivery import regular
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_bytes
 from stockagent.data_sync.materialized_cache import process_references_many
-from stockagent.data_sync.offhost_backup import _regular, private_json
+from stockagent.data_sync.offhost_backup import _regular
 from stockagent.data_sync.packed_backup import PinnedObjectSignatures, safe_path, signature, signature_from_stat
 from stockagent.runtime_identity import identity_sha256
 
 CONTRACT = "verified_reconstructible_cold_transport_cache_retirement_v1"
+
+
+def retirement_failure_reason(error: BaseException) -> str:
+    """A public enum only; detailed exceptions stay in the private owner log."""
+    if isinstance(error, FileNotFoundError):
+        return 'retirement_file_missing'
+    detail = str(error)
+    if 'original cold source changed' in detail or 'source changed' in detail:
+        return 'retirement_source_changed'
+    if 'active process' in detail:
+        return 'retirement_process_references'
+    if any(text in detail for text in ('transport member changed', 'transport changed', 'cold cache member changed',
+                                      'unknown or shared file', 'interrupted cold cache member changed')):
+        return 'retirement_transport_changed'
+    return 'retirement_validation'
 
 
 def source_scope(queue, delivery):
@@ -63,11 +78,19 @@ def same_ntfs_signature(current, recorded) -> bool:
     return len(recorded) == 5 and tuple(current)[1:] == tuple(recorded)[1:]
 
 
-def source_path(queue, row: dict, *, retain_head: bool = False, pinned=None) -> Path | None:
+def source_observation(queue, row: dict, *, retain_head: bool = False, pinned=None,
+                       revalidated=None) -> tuple[Path | None, tuple | None]:
+    """Return the path and the very signature checked in this proof pass.
+
+    Each later pre-rename/post-rename proof still observes its own fresh source
+    metadata. Do not issue a second DrvFs leaf lookup for the same observation.
+    """
     if pinned is not None and row["relative"].startswith("objects/"):
-        if not same_ntfs_signature(pinned.signature(row["relative"]),row["signature"]):
+        observed = pinned.signature(row["relative"])
+        if (not same_ntfs_signature(observed,row["signature"])
+                and (revalidated or {}).get(str(queue.cold / row['relative'])) != tuple(observed)):
             raise SnapshotError("original cold source changed; preserve its transport copy")
-        return queue.cold / row["relative"]  # Descriptor and every parent are pinned/rechecked above.
+        return queue.cold / row["relative"], observed  # Parents remain pinned/rechecked by the caller.
     path = safe_path(queue.cold, row["relative"])
     if row["relative"].startswith("heads/"):
         raw = row.get("captured_bytes_utf8")
@@ -78,11 +101,11 @@ def source_path(queue, row: dict, *, retain_head: bool = False, pinned=None) -> 
             parts = Path(row["relative"]).parts
             archived = queue.cold / "head-history" / Path(*parts).with_suffix("") / (row["sha256"] + ".json")
             if archived.exists() and hashlib.sha256(_regular(archived).read_bytes()).hexdigest() == row["sha256"]:
-                return archived
+                return archived, signature(archived)
             if path.exists() and hashlib.sha256(_regular(path).read_bytes()).hexdigest() == row["sha256"]:
-                return path
+                return path, signature(path)
             if not retain_head:
-                return None  # Original observed bytes remain in the private journal.
+                return None, None  # Original observed bytes remain in the private journal.
             # Preserve the small, genuinely observed head bytes from the journal.
             audit = queue.state / "retained-captured-heads" / (row["sha256"] + ".json")
             if audit.exists():
@@ -90,14 +113,64 @@ def source_path(queue, row: dict, *, retain_head: bool = False, pinned=None) -> 
                     raise SnapshotError("retained captured head differs")
             else:
                 atomic_write_bytes(audit, data, mode=0o600)
-            return audit
+            return audit, signature(audit)
     path = _regular(path)
-    if not same_ntfs_signature(signature(path), row["signature"]):
+    observed = signature(path)
+    if not same_ntfs_signature(observed, row["signature"]):
         raise SnapshotError("original cold source changed; preserve its transport copy")
-    return path
+    return path, observed
 
 
-def build_plan(queue, delivery: dict, *, root: Path | None = None, resume: bool = False) -> dict:
+def revalidate_source_ctimes(queue, delivery):
+    """Rehash only ctime-only drift, once within this retirement transaction.
+
+    Keep original receipts untouched. The enrolled volume, inode, size and
+    mtime still match; full content SHA must match as well. Every subsequent
+    plan pass must see the exact freshly hashed generation, including ctime.
+    """
+    source, rows, _ = source_scope(queue, delivery)
+    changed = {}
+    with PinnedObjectSignatures(source.cold) as pinned:
+        for row in rows:
+            if not row['relative'].startswith('objects/'):
+                continue
+            observed = tuple(pinned.signature(row['relative']))
+            recorded = row['signature']
+            if same_ntfs_signature(observed, recorded):
+                continue
+            if (len(recorded) != 5 or observed[1:4] != tuple(recorded[1:4])
+                    or observed[2] != row['bytes']):
+                raise SnapshotError('original cold source changed; preserve its transport copy')
+            changed[source.cold / row['relative']] = (observed, row['sha256'])
+        if changed:
+            from stockagent.data_sync.windows_cold_io import hash_many, windows_path, MAX_HASH_BATCH_MEMBERS
+            paths = list(changed)
+            digests = {}
+            if all(windows_path(path) is not None for path in paths):
+                for offset in range(0, len(paths), MAX_HASH_BATCH_MEMBERS):
+                    digests.update(hash_many(paths[offset:offset+MAX_HASH_BATCH_MEMBERS]))
+            else:
+                # Local semantic fixtures and non-NTFS enrolled authorities.
+                for path in paths:
+                    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+                    with os.fdopen(fd, 'rb') as stream:
+                        if signature_from_stat(os.fstat(stream.fileno())) != changed[path][0]:
+                            raise SnapshotError('original cold source changed during full SHA revalidation')
+                        digest = hashlib.sha256()
+                        for block in iter(lambda: stream.read(4*1024**2), b''):
+                            digest.update(block)
+                        if signature_from_stat(os.fstat(stream.fileno())) != changed[path][0]:
+                            raise SnapshotError('original cold source changed during full SHA revalidation')
+                    digests[path] = digest.hexdigest()
+            for path, (observed, expected_sha) in changed.items():
+                if digests[path] != expected_sha or tuple(pinned.signature(path.relative_to(source.cold).as_posix())) != observed:
+                    raise SnapshotError('original cold source changed during full SHA revalidation')
+        pinned.recheck()
+    return {str(path): observed for path, (observed, _) in changed.items()}
+
+
+def build_plan(queue, delivery: dict, *, root: Path | None = None, resume: bool = False,
+               revalidated=None) -> dict:
     dispatch = delivery["dispatch"]
     if not delivery.get("acceptance"):
         raise SnapshotError("only machine-ACKed cold-object copies are cache candidates")
@@ -126,14 +199,14 @@ def build_plan(queue, delivery: dict, *, root: Path | None = None, resume: bool 
             member = files[prefix + recorded["relative"]]
             if (member["sha256"], member["bytes"]) != (row["sha256"], row["bytes"]):
                 raise SnapshotError("cold cache member differs from its source journal")
-            original = source_path(source_queue,row,pinned=pinned)
-            observed = (pinned.signature(row["relative"]) if row["relative"].startswith("objects/")
-                        else signature(original) if original else None)
-            if observed is not None and not row["relative"].startswith("heads/") and not same_ntfs_signature(observed,row["signature"]):
+            original, observed = source_observation(source_queue,row,pinned=pinned, revalidated=revalidated)
+            fresh_sha = (revalidated or {}).get(str(source_queue.cold / row['relative'])) == tuple(observed or ())
+            if observed is not None and not row["relative"].startswith("heads/") and not same_ntfs_signature(observed,row["signature"]) and not fresh_sha:
                 raise SnapshotError("original cold source changed during its pinned proof")
             source_proofs.append({"relative":recorded["relative"],"sha256":row["sha256"],
                 "source_signature":list(observed) if observed is not None else None,
-                "captured_head_retained_in_journal":original is None})
+                "captured_head_retained_in_journal":original is None,
+                "fresh_full_sha256_revalidation": fresh_sha})
         pinned.recheck()
     expected = {*required, "backup-envelope.json", "READY"}
     observed = set()
@@ -204,19 +277,21 @@ def retire(queue, ledger: dict, key: str) -> dict:
     if not stage.exists() and not batch.exists() and prior.get("state") in {"prepared", "renamed"}:
         # Directory removal finished before the terminal journal write.
         delivery["cache_retirement"] = {**prior, "state": "retired"}
-        private_json(queue.ledger_path, ledger)
+        queue._save_ledger(ledger)
         return delivery["cache_retirement"]
-    plan = build_plan(queue, delivery, root=stage if stage.exists() else batch, resume=stage.exists())
+    revalidated = revalidate_source_ctimes(queue, delivery)
+    plan = build_plan(queue, delivery, root=stage if stage.exists() else batch, resume=stage.exists(),
+                      revalidated=revalidated)
     if not stage.exists():
         source_queue, source_rows, _prefix = source_scope(queue, delivery)
         with PinnedObjectSignatures(source_queue.cold) as pinned:
             for row in source_rows:
-                source_path(source_queue,row,retain_head=True,pinned=pinned)
+                source_observation(source_queue,row,retain_head=True,pinned=pinned, revalidated=revalidated)
             pinned.recheck()
         delivery["cache_retirement"] = {**plan, "state": "prepared"}
-        private_json(queue.ledger_path, ledger)
+        queue._save_ledger(ledger)
         # Recheck all sources and process references immediately before rename.
-        second = build_plan(queue, delivery)
+        second = build_plan(queue, delivery, revalidated=revalidated)
         if second["identity_sha256"] != plan["identity_sha256"]:
             raise SnapshotError("cold cache retirement plan changed")
         queue.storage_guard()
@@ -227,8 +302,9 @@ def retire(queue, ledger: dict, key: str) -> dict:
         finally:
             os.close(root_fd)
         delivery["cache_retirement"]["state"] = "renamed"
-        private_json(queue.ledger_path, ledger)
-    plan = build_plan(queue, delivery, root=stage, resume=prior.get("state") in {"prepared", "renamed"})
+        queue._save_ledger(ledger)
+    plan = build_plan(queue, delivery, root=stage, resume=prior.get("state") in {"prepared", "renamed"},
+                      revalidated=revalidated)
     # Exact files only. Unexpected contents survive and make rmdir fail closed.
     for relative in plan["files"]:
         path = stage / relative
@@ -241,5 +317,5 @@ def retire(queue, ledger: dict, key: str) -> dict:
     for path in sorted(directories, key=lambda p: len(p.parts), reverse=True):
         path.rmdir()
     delivery["cache_retirement"] = {**plan, "state": "retired"}
-    private_json(queue.ledger_path, ledger)
+    queue._save_ledger(ledger)
     return delivery["cache_retirement"]

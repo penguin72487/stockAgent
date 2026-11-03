@@ -18,17 +18,16 @@ import resource
 import signal
 import time
 
-import pyarrow.parquet as pq
-
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config, run_cycle
 from downloader.news_fulltext_http import NewsHTTP
 from downloader.news_fulltext_metrics import NewsMetrics
 from downloader.news_fulltext_policy import PolicyRegistry
-from downloader.news_fulltext_queue import NewsQueue, source_path, utc_now, verify_bodies
+from downloader.news_fulltext_queue import (BODY_BATCH_VERIFICATION_CONTRACT_VERSION, NewsQueue,
+    source_path, utc_now, verify_bodies, verify_immutable_body_batch)
 
 
-def verify_batches(queue, paths, *, head_ids=None, allow_superseded_heads=False):
+def verify_batches(queue, paths, *, head_ids=None, allow_superseded_heads=False, include_records=False):
     """Verify immutable envelopes; optionally pin only the selected current heads.
 
     A batch may also contain unrelated historical versions. Those still need
@@ -39,32 +38,46 @@ def verify_batches(queue, paths, *, head_ids=None, allow_superseded_heads=False)
     whose heads point inside their cohort, not unrelated queue article IDs.
     Heads outside that cohort must still exist and reference a committed batch;
     their bodies are outside this bounded audit, not silently called verified.
+    A single-batch caller can explicitly retain the already-verified private
+    records for in-process metadata inspection without reading Parquet twice.
+    That optional value includes raw bytes and must never be published.
     """
-    from downloader.news_fulltext_public_originals import verify_resolution_response
     if type(allow_superseded_heads) is not bool or allow_superseded_heads and head_ids is not None:
         raise ValueError('incompatible_batch_head_verification_scope')
     paths = tuple(paths)
     cohort_paths = set(paths)
+    if len(paths) != len(cohort_paths):
+        raise ValueError('duplicate_batch_paths')
+    if type(include_records) is not bool or include_records and len(paths) != 1:
+        raise ValueError('private_records_require_one_batch')
     versions, raw_bytes, hashes = 0, 0, []
+    source_responses_hashed = 0
     matched_heads, required_cohort_heads = set(), set()
     heads, committed_outside_paths = {}, set()
     superseded_versions = 0
     for path in paths:
-        receipt_path = queue.db.execute("SELECT receipt_path FROM accepted_batches WHERE path=?", (path,)).fetchone()[0]
+        committed = queue.db.execute("SELECT receipt_path FROM accepted_batches WHERE path=?", (path,)).fetchone()
+        if committed is None:
+            raise ValueError('benchmark_batch_not_committed')
+        receipt_path = committed[0]
         receipt = json.loads(source_path(queue.root, receipt_path).read_text())
-        target = source_path(queue.root, path)
-        if sha256_file(target) != receipt["sha256"]:
-            raise ValueError("benchmark_durable_receipt_mismatch")
-        rows = pq.read_table(target).to_pylist()
-        if len(rows) != receipt["rows"]:
-            raise ValueError("benchmark_durable_rows_mismatch")
-        envelopes = {r["article_id"]: r["raw_response_body"] for r in rows if r["raw_response_body"] is not None}
-        raw_bytes += sum(map(len, envelopes.values()))
+        try:
+            batch = verify_immutable_body_batch(queue.root, receipt, expected_parquet_path=path,
+                                                include_references=False)
+        except ValueError as error:
+            category = str(error).split(':', 1)[0]
+            legacy = {'parquet_digest_or_contract_mismatch': 'benchmark_durable_receipt_mismatch',
+                      'receipt_parquet_path_mismatch': 'benchmark_durable_receipt_mismatch',
+                      'parquet_row_count_mismatch': 'benchmark_durable_rows_mismatch',
+                      'body_digest_mismatch': 'benchmark_raw_or_body_hash_mismatch',
+                      'raw_response_digest_mismatch': 'benchmark_raw_or_body_hash_mismatch'}.get(category)
+            if legacy:
+                raise ValueError(legacy + ':' + str(error)) from error
+            raise
+        rows = batch['records']
+        raw_bytes += batch['raw_response_bytes']
+        source_responses_hashed += batch['distinct_source_responses_hashed']
         for row in rows:
-            raw_bytes += verify_resolution_response(row)
-            raw = envelopes[row["source_response_article_id"]]
-            if hashlib.sha256(raw).hexdigest() != row["response_sha256"] or hashlib.sha256(row["body"].encode()).hexdigest() != row["body_sha256"]:
-                raise ValueError("benchmark_raw_or_body_hash_mismatch")
             article_id = bytes.fromhex(row["article_id"])
             if allow_superseded_heads or head_ids is None or article_id in head_ids:
                 if article_id not in heads:
@@ -99,14 +112,17 @@ def verify_batches(queue, paths, *, head_ids=None, allow_superseded_heads=False)
         raise ValueError("selected_queue_heads_missing_from_batches")
     if allow_superseded_heads and matched_heads != required_cohort_heads:
         raise ValueError('recent_queue_head_mismatch')
-    return {"body_versions": versions, "private_raw_bytes": raw_bytes,
+    return {"body_batch_verification_contract_version": BODY_BATCH_VERIFICATION_CONTRACT_VERSION,
+            "body_versions": versions, "private_raw_bytes": raw_bytes,
+            "raw_response_hash_operations": source_responses_hashed,
             "current_heads_verified": len(matched_heads),
             **({'superseded_body_versions_verified': superseded_versions,
                 'current_heads_outside_cohort': len(heads) - len(required_cohort_heads),
                 'distinct_article_ids_checked': len(heads),
                 'head_verification_scope': 'all immutable versions and current-head witnesses for their observed article IDs pointing into this cohort; outside-cohort bodies and unrelated queue IDs not verified'}
                if allow_superseded_heads else {}),
-            "verified_ids_sha256": hashlib.sha256(json.dumps(sorted(hashes)).encode()).hexdigest(), "accepted": True}
+            "verified_ids_sha256": hashlib.sha256(json.dumps(sorted(hashes)).encode()).hexdigest(), "accepted": True,
+            **({'private_verified_records': rows} if include_records else {})}
 
 
 def main(argv=None):

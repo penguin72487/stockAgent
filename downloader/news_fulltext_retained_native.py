@@ -742,16 +742,19 @@ def materialize_reviewed_native(queue, urls, manifest_path, *, lease_seconds):
             skipped.append(url)
             continue
         witness = queue.db.execute('SELECT * FROM articles WHERE url=?', (url,)).fetchone()
+        from downloader.news_fulltext_queue import article_claim_witness
+        record['article_claim_witness_json'] = article_claim_witness(claimed)
         record.update(reviewed_native_approval_path=scope_relative, reviewed_native_scope_sha256=scope_sha,
             reviewed_native_observation_report_path=report_relative,
             reviewed_native_head_json=json.dumps({field: witness[field] for field in RETAINED_SUPPLEMENT_HEAD_FIELDS}, sort_keys=True))
         records.append(record)
-    queue.accept(records)
-    materialized = sum(queue.db.execute('SELECT body_sha256 FROM articles WHERE url=?',
-        (record['requested_url'],)).fetchone()[0] == record['body_sha256'] for record in records)
+    _, adopted = queue.accept(records, return_adopted=True)
+    materialized = len(adopted)
     queue.metrics.count(provider, 'reviewed_native_materialized_heads', materialized)
     return {'contract_version': version, 'selected_urls': len(urls),
-        'materialized_bodies': materialized, 'skipped_urls': skipped, 'publisher_requests_this_command': 0,
+        'materialized_bodies': materialized, 'skipped_urls': skipped,
+        'superseded_urls': [r['requested_url'] for r in records if bytes.fromhex(r['article_id']) not in adopted],
+        'publisher_requests_this_command': 0,
         'original_response_bytes': total_bytes, 'scope_sha256': scope_sha,
         'original_observation_clocks_preserved': True, 'wall_seconds': time.monotonic()-started,
         'all_publisher_history_complete': False, 'publish': False, 'remote_training_export': False}

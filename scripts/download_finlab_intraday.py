@@ -17,6 +17,7 @@ import json
 import os
 from pathlib import Path
 import re
+import socket
 import sys
 import tempfile
 import time
@@ -35,6 +36,7 @@ from scripts.check_acquisition_capacity import check_dispatch  # noqa: E402
 from stockagent.data.finlab_transport import (  # noqa: E402
     HTTP_COUNTERS, WorkerHTTPTransport, SignedMinutePrefetch, validate_prefetch_sdk,
 )
+from stockagent.data_sync.desync_snapshots import SnapshotError  # noqa: E402
 from scripts.finlab_columnar import (  # noqa: E402
     PROCESSING_CONTRACT_VERSION, PROCESSING_ENGINE, date_column, source_attrs,
     to_polars, write_parquet, timestamp_bounds,
@@ -43,6 +45,14 @@ from scripts.finlab_columnar import (  # noqa: E402
 
 DEFAULT_START = date(2026, 6, 1)  # FinLab's documented free sample, not earliest coverage.
 FAMILIES = ("tw_tick:2330",)
+
+
+class FuturesWorkspaceUnavailableBeforeSource(RuntimeError):
+    """The source was not called because its storage alias was unavailable."""
+
+
+class FuturesWorkspacePersistenceUnknown(RuntimeError):
+    """The source may have been called, but no reliable receipt was committed."""
 
 
 def _file_sha256(path: Path) -> str:
@@ -109,6 +119,25 @@ def _stored_receipt(path: Path, root: Path, key: str, day: date, *, verify_hash:
             return None
         if payload.get("status") in {"verified_closed_date", "verified_no_trade"}:
             return payload
+        if (payload.get("storage_contract") == "finlab_futures_workspace_objects_v1"
+                and socket.gethostname() == "penguin"
+                and root.resolve() == (REPO_ROOT / "data_finlab").resolve()):
+            # A missing mount is not a missing provider partition.  Failing
+            # here prevents the canonical owner from replacing an existing
+            # receipt or redownloading when this namespace cannot see E.
+            from stockagent.data_sync.workspace_volume import check_finlab_futures
+            try:
+                check_finlab_futures()
+            except SnapshotError:
+                raise
+            except Exception as error:
+                # The workspace check also reads enrollment/marker JSON and
+                # invokes findmnt.  A malformed marker, permission failure or
+                # subprocess error is a storage-identity failure, not an
+                # absent receipt.  In particular, do not let the broad
+                # malformed-receipt handler below turn ValueError/OSError
+                # from this check into a legacy-location re-download.
+                raise SnapshotError("FinLab futures workspace identity could not be verified") from error
         relative = Path(payload["parquet_path"])
         object_path = root / relative
         if (payload.get("status") == "downloaded_unverified_for_pit"
@@ -196,18 +225,41 @@ def _validate_frame(frame, key: str, day: date, *, attrs: dict | None = None) ->
     return "downloaded_unverified_for_pit"
 
 
+def _futures_workspace_objects(root: Path, key: str) -> Path:
+    from stockagent.data_sync.workspace_volume import FINLAB_FUTURES_ALIAS, check_finlab_futures
+
+    target = root / "intraday/objects/futures-workspace-v1"
+    if not key.startswith("tw_futures_minute:") or target != FINLAB_FUTURES_ALIAS:
+        raise ValueError("futures workspace requires the canonical futures source root")
+    check_finlab_futures()
+    return target
+
+
 def fetch_partition(root: Path, key: str, day: date, *, now: datetime,
-                    reference_root: Path | None = None, force_download: bool = True) -> dict:
+                    reference_root: Path | None = None, force_download: bool = True,
+                    futures_workspace: bool = False) -> dict:
     from finlab import data
 
+    if futures_workspace:
+        try:
+            _futures_workspace_objects(root, key)  # Fail before any provider request.
+        except (SnapshotError, OSError, ValueError) as exc:
+            raise FuturesWorkspaceUnavailableBeforeSource() from exc
     frame = data.get(key, start=day.isoformat(), end=day.isoformat(),
                      force_download=force_download, progress="silent",
                      **({"save_to_storage": False} if key.startswith("tw_tick:") else {}))
-    return persist_partition_frame(root, key, day, frame, reference_root=reference_root)
+    try:
+        return persist_partition_frame(root, key, day, frame, reference_root=reference_root,
+                                       futures_workspace=futures_workspace)
+    except (SnapshotError, OSError) as exc:
+        if futures_workspace:
+            raise FuturesWorkspacePersistenceUnknown() from exc
+        raise
 
 
 def persist_partition_frame(root: Path, key: str, day: date, frame, *,
-                            reference_root: Path | None = None, attrs: dict | None = None) -> dict:
+                            reference_root: Path | None = None, attrs: dict | None = None,
+                            futures_workspace: bool = False) -> dict:
     """One shared validation/unit/object/receipt path for single dates and ranges."""
     attrs = source_attrs(frame) if attrs is None else attrs
     frame = to_polars(frame)
@@ -244,14 +296,25 @@ def persist_partition_frame(root: Path, key: str, day: date, frame, *,
         from importlib.metadata import version
         payload.update(source_contract='finlab_futures_contract_month_minute_v1',
                        source_sdk_version=version('finlab'))
-    if status == "downloaded_unverified_for_pit":
+    if futures_workspace:
+        objects = _futures_workspace_objects(root, key)
+        payload["storage_contract"] = "finlab_futures_workspace_objects_v1"
+    else:
         objects = root / "intraday/objects"
-        objects.mkdir(parents=True, exist_ok=True)
-        with tempfile.NamedTemporaryFile(
-            dir=objects, prefix=".finlab-intraday-", suffix=".parquet.tmp", delete=False,
-        ) as handle:
-            temporary = Path(handle.name)
+    if status == "downloaded_unverified_for_pit":
+        if not futures_workspace:
+            objects.mkdir(parents=True, exist_ok=True)
+        # Keep an open reference to the verified mounted directory.  A lazy
+        # unmount cannot redirect this write to the empty authority directory.
+        directory_fd = (os.open(objects, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+                        if futures_workspace else None)
+        directory_handle = Path(f"/proc/self/fd/{directory_fd}") if directory_fd is not None else objects
+        temporary = None
         try:
+            with tempfile.NamedTemporaryFile(
+                dir=directory_handle, prefix=".finlab-intraday-", suffix=".parquet.tmp", delete=False,
+            ) as handle:
+                temporary = Path(handle.name)
             write_parquet(frame, temporary, attrs=attrs)
             digest = hashlib.sha256()
             with temporary.open("rb") as handle:
@@ -259,22 +322,28 @@ def persist_partition_frame(root: Path, key: str, day: date, frame, *,
                     digest.update(chunk)
             digest_text = digest.hexdigest()
             destination = objects / f"{safe_stem(key)}-{day.isoformat()}-{digest_text[:24]}.parquet"
-            if destination.exists():
+            anchored_destination = directory_handle / destination.name
+            if anchored_destination.exists():
                 existing = hashlib.sha256()
-                with destination.open("rb") as handle:
+                with anchored_destination.open("rb") as handle:
                     for chunk in iter(lambda: handle.read(8 * 1024 * 1024), b""):
                         existing.update(chunk)
                 if existing.hexdigest() != digest_text:
                     raise ValueError("intraday content-addressed object hash mismatch")
             else:
-                os.replace(temporary, destination)
+                os.replace(temporary, anchored_destination)
             payload.update({
                 "parquet_path": str(destination.relative_to(root)),
-                "parquet_size_bytes": destination.stat().st_size,
+                "parquet_size_bytes": anchored_destination.stat().st_size,
                 "sha256": digest_text,
             })
         finally:
-            temporary.unlink(missing_ok=True)
+            if temporary is not None:
+                temporary.unlink(missing_ok=True)
+            if directory_fd is not None:
+                os.close(directory_fd)
+    if futures_workspace:
+        _futures_workspace_objects(root, key)  # Do not publish a receipt for a vanished mount.
     _atomic_json(receipt_path, payload)
     return payload
 

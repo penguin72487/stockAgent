@@ -6,16 +6,38 @@
   "classification_timeout_seconds": 1800,
   "classification_depth": 3,
   "receipt_root": "/srv/stockagent-backup-receipts-lab203",
+  "operations": {
+    "workspace_relocation_state_root": "/var/lib/stockagent/workspace-volume/transport-relocation-v1",
+    "workspace_private_scratch_state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/c1fe0af6f2b34891429bc194",
+    "workspace_controls_candidates": [
+      {"batch_number": 1, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/5c3dcaf868ff5171b478326e", "controls_identity": "6cbcb45473dfe97ed2627f244af0406d89dcbe8809b71939b5b2c32f9b396618", "files": 47, "logical_bytes": 1992596286},
+      {"batch_number": 2, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/3e8c4f4eb26d2d9c57d63414", "controls_identity": "e03d7b26d3f07dd714db8087356c9098f0c2b6c8ce2fd3548fe18e0e24f32394", "files": 862, "logical_bytes": 1687007536},
+      {"batch_number": 3, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/9d30fe6d7e1b3d5d033d18ad", "controls_identity": "7c152fec673dbedadab34264dfc431b36765f4f17361118432f26c399d0eaf3d", "files": 36, "logical_bytes": 865661000}
+    ],
+    "bulk_return_state_root": "/var/lib/stockagent-vast-bulk-return",
+    "backup_state_root": "/var/lib/stockagent/backup-stream",
+    "migration_state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions",
+    "transport_gc_state_root": "/var/lib/stockagent/lakehouse-control",
+    "retirement_queue_config": "configs/data_sync/wsl_retirement_queue.json"
+  },
   "volumes": [
     {"id": "penguin-wsl", "path": "/", "filesystem": "ext4", "roots": [
       {"path": "{repo}", "label": "StockAgent 專案", "kind": "project"},
-      {"path": "/srv/stockagent-live", "label": "服務工作資料", "kind": "runtime"},
+      {"path": "{repo}/service_data", "label": "服務狀態、帳本與工作集", "kind": "runtime"},
       {"path": "/srv/stockagent-packed-materialized", "label": "冷庫本機還原", "kind": "materialized"},
       {"path": "/var/lib/stockagent", "label": "系統狀態與交付暫存", "kind": "control"},
       {"path": "/root/.cache", "label": "使用者套件／編譯快取", "kind": "cache"}
     ], "discover_worktrees": true, "discover_project_parents": [{"path": "/srv", "prefix": "stockagent"}]},
     {"id": "penguin-c", "path": "/mnt/c", "filesystem": "9p", "roots": []},
-    {"id": "penguin-d", "path": "/srv/stockagent-d-volume", "filesystem": "9p", "discover_prefix": "stockagent", "roots": []}
+    {"id": "penguin-d", "path": "/srv/stockagent-d-volume", "filesystem": "9p", "discover_prefix": "stockagent", "roots": []},
+    {"id": "penguin-e", "path": "/mnt/e", "filesystem": "9p", "roots": []},
+    {"id": "penguin-workspace", "path": "/srv/stockagent-workspace", "filesystem": "ext4", "roots": [
+      {"path": "/srv/stockagent-workspace/downloads", "label": "下載資料", "kind": "source"},
+      {"path": "/srv/stockagent-workspace/build", "label": "封裝工作區", "kind": "cache"},
+      {"path": "/srv/stockagent-workspace/verify", "label": "驗證工作區", "kind": "materialized"},
+      {"path": "/srv/stockagent-workspace/restore", "label": "按需還原", "kind": "materialized"},
+      {"path": "/srv/stockagent-workspace/transport", "label": "備份傳輸暫存", "kind": "runtime"}
+    ]}
   ],
   "remote": {
     "id": "vastai1T-disk",

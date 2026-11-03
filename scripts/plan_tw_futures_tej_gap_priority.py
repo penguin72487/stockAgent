@@ -19,7 +19,7 @@ import polars as pl
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file
 from downloader.tej_history import SOURCE_SCOPE_CONTRACT, company_code, normalize_period
 from downloader.tej_key_layout import KEY1_CONTRACT
-from downloader.tej_priority import CONTRACT, pack_gap_rectangles, query_keys, retained_request
+from downloader.tej_priority import CONTRACT, pack_gap_rectangles, query_axes, retained_request
 
 ATTRIBUTE = "1bea200ec21f8f1a39056861"
 ADJUSTMENT = "117392c87504f94e71a04d01"
@@ -27,6 +27,14 @@ DAILY = "21383689fde1be3aeaa90211"
 EX_RIGHT = "5908ef1a2f21c7f01139d1bb"
 SUSPENDED = "0be66e50ef36b4318ce84d78"
 OPERAND_CONTRACT = "futures_gap_actual_operand_inventory_v1"
+TABLE_REQUEST_FIELDS = {
+    ATTRIBUTE: frozenset({"own_physical_successor_and_last_day", "own_month_open_and_clearing_value",
+                          "contract_deliverable_and_conversion"}),
+    ADJUSTMENT: frozenset({"corporate_adjustment_reference", "contract_deliverable_and_conversion"}),
+    DAILY: frozenset({"own_month_open_and_clearing_value"}),
+    EX_RIGHT: frozenset({"equity_capital_reduction_event"}),
+    SUSPENDED: frozenset({"equity_halt_event"}),
+}
 
 
 def _positive(value):
@@ -469,12 +477,25 @@ def build_operand_inventory(root, replay, diagnosis, raw_source, terms_path, out
     return summary
 
 
+def relevant_covered_keys(request: dict, symbols: set[str]) -> set[tuple[str, str | None]]:
+    """Project prior rectangles before expansion, retaining every relevant control cell.
+
+    Every proposed rectangle is formed from worklist symbols, so prior cells for
+    other symbols cannot overlap it. Dates remain unfiltered: the rectangle
+    packer may include control dates needed by another requested symbol.
+    """
+    companies, periods = query_axes(request)
+    return {(company, period) for company in companies & symbols for period in periods}
+
+
 def plan_gaps(root: Path, worklist: Path, terms_path: Path, output: Path, *, query_expansion: float = 2.0) -> dict:
     if output.exists():
         raise ValueError("Preserve the existing source-bound plan")
     if not 1 <= query_expansion <= 4:
         raise ValueError("Sparse query expansion must be bounded by 1..4")
     work = pl.read_csv(worklist, schema_overrides={"contract": pl.String}).to_dicts()
+    work_symbols = {row["product"] + row["contract"] for row in work}
+    requested_fields = {row["requested_fields"] for row in work}
     terms = pl.read_parquet(terms_path)
     requests, diagnoses = [], {}
     with closing(sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)) as con:
@@ -487,6 +508,16 @@ def plan_gaps(root: Path, worklist: Path, terms_path: Path, output: Path, *, que
             table_ids += (SUSPENDED,)
         for tid in table_ids:
             definition = dict(con.execute("SELECT * FROM tables WHERE table_id=?", (tid,)).fetchone())
+            if not (requested_fields & TABLE_REQUEST_FIELDS[tid]):
+                # Expanding previous company-by-date rectangles for an
+                # irrelevant table can consume gigabytes. No proposed request
+                # can intersect that table; record that its history was not
+                # inventoried instead of claiming it has no prior tasks.
+                diagnoses[tid] = {"table": definition["name"], "prior_tasks": [],
+                                  "prior_inventory_skipped": "no_relevant_requested_fields",
+                                  "missing_native_axis": [], "unqueried_needed_keys": 0,
+                                  "planned_queries": 0, "requested_grid_rows": 0}
+                continue
             axes_path = root / definition["discovery_path"]
             axes = json.loads(axes_path.read_text())
             labels = {company_code(label): label for label in axes["company_labels"]}
@@ -504,7 +535,7 @@ def plan_gaps(root: Path, worklist: Path, terms_path: Path, output: Path, *, que
                     continue
                 if set(q["fields"]) != set(names):
                     raise ValueError("Partial previous field scope requires explicit partitioning")
-                covered.update(query_keys(q))
+                covered.update(relevant_covered_keys(q, work_symbols))
                 prior.append({"task_id": row["task_id"], "state": row["state"], "scope_contract": row["scope_contract"],
                               "receipt_path": row["receipt_path"], "source_observation_admitted": False})
             needed = defaultdict(set)

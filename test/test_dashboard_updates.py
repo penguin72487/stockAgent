@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from http.client import HTTPConnection
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from pathlib import Path
 import threading
@@ -336,8 +337,11 @@ def test_all_paper_views_reject_uncommitted_projection_without_caching(tmp_path,
 
 
 @pytest.mark.parametrize("advance", ["before", "during"])
-def test_paper_view_cache_rebinds_exact_source_and_discards_superseded_build(advance):
+def test_paper_view_cache_rebinds_exact_source_and_discards_superseded_build(advance, tmp_path):
     server = _test_server()
+    # Synthetic tokens must not depend on a live trading journal commit that
+    # can legitimately advance during this unrelated cache-coherency test.
+    server.repo_root = tmp_path
     token = {"value": "new" if advance == "before" else "old"}
     server.content_token = lambda *_args, **_kwargs: token["value"]
     calls = []
@@ -356,6 +360,109 @@ def test_paper_view_cache_rebinds_exact_source_and_discards_superseded_build(adv
         assert "tw-signals:query:old" not in server._cache
         assert "tw-signals:query:new" in server._cache
     finally:
+        server.server_close()
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_identical_cold_revision_callers_share_one_success_or_failure_and_can_retry(monkeypatch, fail):
+    from types import SimpleNamespace
+    from scripts import serve_public_dashboards as gateway
+
+    followers, follower_lock = [0], threading.Lock()
+    all_joined, entered, release = threading.Event(), threading.Event(), threading.Event()
+
+    class TrackingFuture(Future):
+        def result(self, *args, **kwargs):
+            with follower_lock:
+                followers[0] += 1
+                if followers[0] == 3:
+                    all_joined.set()
+            return super().result(*args, **kwargs)
+
+    monkeypatch.setattr(gateway, "Future", TrackingFuture)
+    server, calls = _test_server(), []
+    response = SimpleNamespace(body=b"verified")
+
+    def build():
+        calls.append(True)
+        entered.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("cold revision test was not released")
+        if fail:
+            raise OSError("uncommitted source")
+        return response
+
+    def request(builder=build):
+        return server._revision_stale_or_build(cache_prefix="tw-status:fixture:",
+            cache_key="tw-status:fixture:revision-1", revision_token="revision-1", builder=builder)
+
+    try:
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            leader = pool.submit(request)
+            try:
+                assert entered.wait(timeout=5)
+                waiting = [pool.submit(request) for _ in range(3)]
+                assert all_joined.wait(timeout=8)
+            finally:
+                release.set()
+            for future in [leader, *waiting]:
+                if fail:
+                    with pytest.raises(OSError, match="uncommitted source"):
+                        future.result(timeout=8)
+                else:
+                    assert future.result(timeout=8) is response
+        assert calls == [True]
+        assert not server._revision_cold
+        # A completed failure is not cached as a result or a retry barrier.
+        if fail:
+            assert request(lambda: response) is response
+    finally:
+        release.set()
+        server.server_close()
+
+
+def test_cold_revision_singleflight_never_shares_across_different_revision_keys(monkeypatch):
+    from types import SimpleNamespace
+    from scripts import serve_public_dashboards as gateway
+
+    created, registered, entered, release = [0], threading.Event(), threading.Event(), threading.Event()
+
+    class TrackingFuture(Future):
+        def __init__(self):
+            super().__init__()
+            created[0] += 1
+            if created[0] == 2:
+                registered.set()
+
+    monkeypatch.setattr(gateway, "Future", TrackingFuture)
+    server = _test_server()
+    first, second = SimpleNamespace(body=b"first"), SimpleNamespace(body=b"second")
+
+    def build_first():
+        entered.set()
+        if not release.wait(timeout=15):
+            raise TimeoutError("cold revision test was not released")
+        return first
+
+    def request(key, builder):
+        return server._revision_stale_or_build(cache_prefix="tw-status:fixture:",
+            cache_key="tw-status:fixture:" + key, revision_token=key, builder=builder)
+
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            slow = pool.submit(request, "one", build_first)
+            try:
+                assert entered.wait(timeout=5)
+                newer = pool.submit(request, "two", lambda: second)
+                assert registered.wait(timeout=8)
+                assert not newer.done()  # Different revisions still share only the query owner.
+            finally:
+                release.set()
+            assert slow.result(timeout=8) is first
+            assert newer.result(timeout=8) is second
+        assert not server._revision_cold
+    finally:
+        release.set()
         server.server_close()
 
 
@@ -425,9 +532,12 @@ def test_signals_are_requested_before_lossless_history_and_client_keys_include_r
     assert "const sourceRevision = service.history_revision || null;" in key
     assert "sourceRevision || service.revision_token || service.content_revision || null" in key
     assert "detailRangeKey()" in key
-    assert "signalLoading && signalRequestRevisionInFlight === requestRevision" in source
-    assert "positionLoading && positionRequestRevisionInFlight === requestRevision" in source
-    assert "eventLoading && eventRequestRevisionInFlight === requestRevision" in source
+    # A newer content revision must not cancel a same-selection request before
+    # it can finish. Mode/date/owner changes still fence the old response.
+    assert 'const requestScope = detailReadScopeKey("signals");' in source
+    assert "signalLoading && signalRequestScopeInFlight === requestScope" in source
+    assert "positionLoading && positionRequestScopeInFlight === requestScope" in source
+    assert "eventLoading && eventRequestScopeInFlight === requestScope" in source
 
 
 @pytest.mark.parametrize("method,path,headers,status", [

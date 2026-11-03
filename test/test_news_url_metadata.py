@@ -1,11 +1,14 @@
 """Resident URL registration keeps one writer and ordinary source admission."""
+from collections import Counter
 from datetime import UTC, datetime, timedelta
+import errno
 import hashlib
 import json
 from pathlib import Path
 import sqlite3
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -40,6 +43,102 @@ def head(queue, url=URL):
 
 def consume(queue, **kwargs):
     return intake.consume_urls(queue, max_seconds=.1, **kwargs)
+
+
+@pytest.mark.parametrize('slow_step', ['discovery', 'validation'])
+def test_slow_url_inbox_still_registers_one_per_slice(queue, monkeypatch, slow_step):
+    submit(queue, (URL, URL + '2'))
+    now = [0.0]
+    monkeypatch.setattr(intake, 'time', SimpleNamespace(monotonic=lambda: now[0], time=time.time))
+    name = '_pending' if slow_step == 'discovery' else '_load'
+    original = getattr(intake, name)
+
+    def delayed(*args):
+        result = original(*args)
+        now[0] += 1.0
+        return result
+
+    monkeypatch.setattr(intake, name, delayed)
+    for _ in range(2):
+        assert intake.consume_urls(queue, limit=1, max_seconds=.05)['outcomes'] == {'metadata_registered': 1}
+    assert head(queue, URL)['state'] == head(queue, URL + '2')['state'] == 'pending'
+
+
+def test_slow_url_requests_rotate_between_slices(queue, monkeypatch):
+    submissions = [submit(queue, tuple(f'{URL}-{group}-{i}' for i in range(2))) for group in ('a', 'b')]
+    now = [0.0]
+    monkeypatch.setattr(intake, 'time', SimpleNamespace(monotonic=lambda: now[0], time=time.time))
+    original = intake._load
+
+    def delayed(path):
+        request = original(path)
+        now[0] += 1.0
+        return request
+
+    monkeypatch.setattr(intake, '_load', delayed)
+    for _ in range(2):
+        assert intake.consume_urls(queue, limit=1, max_seconds=.05)['processed'] == 1
+    admitted = dict(queue.db.execute('SELECT request_id,count(*) FROM url_metadata_items GROUP BY request_id'))
+    assert admitted == {request['request_id']: 1 for request in submissions}
+
+
+def test_stop_during_url_validation_does_not_register(queue, monkeypatch):
+    submit(queue)
+    stop = threading.Event()
+    original = intake._load
+
+    def interrupted(path):
+        request = original(path)
+        stop.set()
+        return request
+
+    monkeypatch.setattr(intake, '_load', interrupted)
+    assert intake.consume_urls(queue, limit=1, stop=stop)['processed'] == 0
+    assert head(queue) is None
+    assert not queue.db.execute("SELECT 1 FROM sqlite_master WHERE name='url_metadata_jobs'").fetchone()
+
+
+def test_transient_url_request_read_failure_is_deferred_and_other_request_runs(queue, monkeypatch):
+    submitted = [submit(queue, (url,)) for url in (URL, URL + '2')]
+    paths = sorted(Path(item['pending_path']) for item in submitted)
+    original = intake._load
+    unavailable = [True]
+
+    def transient(path):
+        if path == paths[0] and unavailable[0]:
+            raise OSError(errno.EIO, 'temporary request read error')
+        return original(path)
+
+    monkeypatch.setattr(intake, '_load', transient)
+    assert intake.consume_urls(queue, limit=1, max_seconds=.1)['outcomes'] == {'request_io_deferred': 1}
+    assert paths[0].exists() and head(queue, URL) is None and head(queue, URL + '2') is None
+    assert intake.consume_urls(queue, limit=1, max_seconds=.1)['outcomes'] == {'metadata_registered': 1}
+    unavailable[0] = False
+    assert intake.consume_urls(queue, limit=1, max_seconds=.1)['outcomes'] == {'metadata_registered': 1}
+    assert head(queue, URL)['state'] == head(queue, URL + '2')['state'] == 'pending'
+
+
+def test_storage_failure_rolls_back_whole_url_slice_and_retries(queue, monkeypatch):
+    result = submit(queue, (URL, URL + '2'))
+    add = queue.add_articles
+    calls = [0]
+
+    def interrupted(rows):
+        add(rows)
+        calls[0] += 1
+        if calls[0] == 2:
+            raise OSError(errno.EIO, 'temporary write failure')
+
+    monkeypatch.setattr(queue, 'add_articles', interrupted)
+    monkeypatch.setattr(intake, 'time', SimpleNamespace(monotonic=lambda: 0.0, time=time.time))
+    first = intake.consume_urls(queue, limit=2, max_seconds=.1)
+    assert first['outcomes'] == {'url_metadata_storage_deferred': 1}
+    assert head(queue, URL) is None and head(queue, URL + '2') is None
+    assert not queue.db.execute('SELECT 1 FROM url_metadata_items').fetchone()
+    assert Path(result['pending_path']).exists()
+    monkeypatch.setattr(queue, 'add_articles', add)
+    assert intake.consume_urls(queue, limit=2, max_seconds=.1)['outcomes'] == {'metadata_registered': 2}
+    assert head(queue, URL)['state'] == head(queue, URL + '2')['state'] == 'pending'
 
 
 def rewrite(path, request=None, *, raw=None):
@@ -121,6 +220,86 @@ def test_resident_registration_is_durable_and_idempotent(queue):
     submit(queue)
     assert consume(queue)['outcomes'] == {'existing_head_preserved': 1}
     assert head(queue) == before
+
+
+@pytest.mark.parametrize('field,value', [
+    ('source_date', 'x' * (intake.MAX_SOURCE_DATE_CHARS + 1)),
+    ('source_date', '2026-01-01\x00hidden'),
+    ('source_date', None),
+    ('provider', 'other'),
+    ('allowed', False),
+])
+def test_cnyes_date_hint_rejects_invalid_scope_or_date(queue, field, value):
+    identity = intake._source_identity(queue.registry, URL)
+    identity['provider'] = 'cnyes'
+    target = {'url': URL, 'source': identity, 'source_date': '2026-01-01'}
+    if field in identity:
+        identity[field] = value
+    else:
+        target[field] = value
+    submitted = intake._submit(queue.root, {'contract_version': intake.LEGACY_FINLAB_CNYES_HINT_VERSION,
+        'kind': intake.FINLAB_CNYES_HINT_KIND, 'created_at_utc': intake.utc_now(), 'targets': [target]})
+    with pytest.raises(ValueError, match='invalid_finlab_cnyes_source_date_hint'):
+        intake._load(Path(submitted['pending_path']))
+    assert consume(queue)['outcomes'] == {'invalid_request': 1}
+    assert head(queue) is None
+
+
+@pytest.mark.parametrize('field,value', [
+    ('origin_id', 0), ('origin_id', True), ('sha256', 'x' * 64),
+    ('expected_rows', 0), ('expected_rows', True),
+    ('file_identity', [1, 2, 3, 4]), ('file_identity', [1, 2, 3, 4, True]),
+    ('source_row_index', -1), ('source_row_index', 2), ('source_row_index', True),
+])
+def test_bound_cnyes_hint_rejects_invalid_origin_and_row(queue, field, value):
+    identity = intake._source_identity(queue.registry, URL)
+    identity['provider'] = 'cnyes'
+    origin = {'origin_id': 1, 'sha256': 'a' * 64, 'expected_rows': 2, 'file_identity': [1, 2, 3, 4, 5]}
+    target = {'url': URL, 'source': identity, 'source_date': '2026-01-01', 'source_row_index': 1}
+    (target if field == 'source_row_index' else origin)[field] = value
+    submitted = intake._submit(queue.root, {'contract_version': intake.FINLAB_CNYES_HINT_VERSION,
+        'kind': intake.FINLAB_CNYES_HINT_KIND, 'created_at_utc': intake.utc_now(),
+        'source_origin': origin, 'priority_evidence': {'baseline_origin_id': 2, 'baseline_sha256': 'b' * 64,
+            'raw_unique_delta': 2, 'raw_hints_examined': 2}, 'targets': [target]})
+    with pytest.raises(ValueError, match='invalid_finlab_cnyes_source_(origin|row)'):
+        intake._load(Path(submitted['pending_path']))
+    assert consume(queue)['outcomes'] == {'invalid_request': 1}
+    assert head(queue) is None
+
+
+def test_bound_cnyes_hint_rejects_duplicate_source_rows(queue):
+    identity = intake._source_identity(queue.registry, URL)
+    identity['provider'] = 'cnyes'
+    targets = [{'url': URL, 'source': identity, 'source_date': '', 'source_row_index': 0},
+               {'url': URL + '/second', 'source': identity, 'source_date': '', 'source_row_index': 0}]
+    submitted = intake._submit(queue.root, {'contract_version': intake.FINLAB_CNYES_HINT_VERSION,
+        'kind': intake.FINLAB_CNYES_HINT_KIND, 'created_at_utc': intake.utc_now(),
+        'source_origin': {'origin_id': 1, 'sha256': 'a' * 64, 'expected_rows': 2,
+                          'file_identity': [1, 2, 3, 4, 5]},
+        'priority_evidence': {'baseline_origin_id': 2, 'baseline_sha256': 'b' * 64,
+                              'raw_unique_delta': 2, 'raw_hints_examined': 2}, 'targets': targets})
+    with pytest.raises(ValueError, match='invalid_finlab_cnyes_source_row'):
+        intake._load(Path(submitted['pending_path']))
+
+
+@pytest.mark.parametrize('field,value', [
+    ('baseline_origin_id', 0), ('baseline_origin_id', 1), ('baseline_origin_id', True),
+    ('baseline_sha256', 'invalid'), ('raw_unique_delta', 0), ('raw_unique_delta', True),
+    ('raw_hints_examined', 0), ('raw_hints_examined', True),
+])
+def test_bound_cnyes_hint_rejects_invalid_priority_evidence(queue, field, value):
+    identity = intake._source_identity(queue.registry, URL)
+    identity['provider'] = 'cnyes'
+    evidence = {'baseline_origin_id': 2, 'baseline_sha256': 'b' * 64,
+                'raw_unique_delta': 1, 'raw_hints_examined': 1}
+    evidence[field] = value
+    submitted = intake._submit(queue.root, {'contract_version': intake.FINLAB_CNYES_HINT_VERSION,
+        'kind': intake.FINLAB_CNYES_HINT_KIND, 'created_at_utc': intake.utc_now(),
+        'source_origin': {'origin_id': 1, 'sha256': 'a' * 64, 'expected_rows': 2,
+                          'file_identity': [1, 2, 3, 4, 5]}, 'priority_evidence': evidence,
+        'targets': [{'url': URL, 'source': identity, 'source_date': '', 'source_row_index': 0}]})
+    with pytest.raises(ValueError, match='invalid_finlab_cnyes_priority_evidence'):
+        intake._load(Path(submitted['pending_path']))
 
 
 @pytest.mark.parametrize('state', ['stored', 'retry', 'http_429', 'waiting_cohort', 'robots_disallowed'])
@@ -242,8 +421,14 @@ def test_invalid_input_is_retained_and_cannot_block_the_next_valid_request(queue
             request['body'] = 'Cannot inject article text'
         path = rewrite(path, request)
     submit(queue, ('https://publisher.test/story/2',))
-    outcome = consume(queue)
-    assert outcome['outcomes'] == {'invalid_request': 1, 'metadata_registered': 1}
+    outcomes = Counter()
+    # Durable quarantine can consume a slow I/O slice; a later owner turn
+    # must process the valid request without weakening the soft deadline.
+    for _ in range(8):
+        outcomes.update(consume(queue)['outcomes'])
+        if outcomes == {'invalid_request': 1, 'metadata_registered': 1}:
+            break
+    assert outcomes == {'invalid_request': 1, 'metadata_registered': 1}
     assert head(queue) is None and head(queue, 'https://publisher.test/story/2')['state'] == 'pending'
     assert not path.exists() and list((queue.root/'reviewed_repairs/rejected').glob('*.input'))
 

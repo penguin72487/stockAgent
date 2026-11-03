@@ -146,7 +146,8 @@ def last_traded_price(raw_root: Path, day: date, symbol: str, current):
     raise ValueError(f"no proven last trade within 366 days: {symbol}")
 
 
-def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=(), markets=()):
+def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=(), markets=(),
+              abort_unwritten_for=()):
     from stockagent.live.paper_mode_snapshot import read_paper_state
     state = read_paper_state(root / "state.json")
     if state.get("simulation_only") is not True or state.get("production_order_possible") is not False:
@@ -156,6 +157,11 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
     selected = set(markets) if markets else set(state["modes"])
     if not selected <= state["modes"].keys():
         raise ValueError("settlement scope includes unknown market")
+    abort_scope = set(abort_unwritten_for)
+    if not abort_scope <= selected:
+        raise ValueError("unwritten recovery must stay within the authorized settlement scope")
+    from stockagent.live.paper_signal_commit_recovery import build_unwritten_commit_proof
+    aborts = [build_unwritten_commit_proof(root, market, str(day)) for market in sorted(abort_scope)]
     open_symbols = {p["symbol"] for k, m in state["modes"].items() if k in selected
                     for p in m.get("positions", {}).values() if p.get("signed_shares")}
     if allowed - open_symbols:
@@ -172,7 +178,7 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
             continue
         if mode.get("session_date") != str(day):
             raise ValueError(f"scope must match current ledger session: {market}")
-        if mode.get("ledger_state_divergence"):
+        if mode.get("ledger_state_divergence") and market not in abort_scope:
             raise ValueError(f"ledger divergence: {market}")
         for pid, p in mode.get("positions", {}).items():
             if not int(p.get("signed_shares") or 0):
@@ -194,6 +200,7 @@ def make_plan(root: Path, raw_root: Path, day: date, *, last_traded_price_for=()
             "last_traded_price_for": sorted(allowed), "raw_root": str(raw_root.resolve()),
             "operation_id": f"{day}:{key}", "session_date": str(day),
             "simulation_only": True, "production_order_possible": False,
+            "unwritten_commit_aborts": aborts,
             "book_fingerprint": book_fingerprint(state), "sources": sources,
             "entries": entries, "blocked": blocked, "settle_count": len(entries),
             "blocked_count": len(blocked), "liquidity_assumption": "user_requested_full_residual_not_exchange_fill"}
@@ -210,6 +217,9 @@ def reconcile_candidate(root: Path, plan, *, recorded_at: datetime):
     engine = TwDayTradeSimulationEngine(root)
     if book_fingerprint(engine.state) != plan["book_fingerprint"]:
         raise ValueError("ledger changed after plan; replan required")
+    from stockagent.live.paper_signal_commit_recovery import abort_verified_unwritten
+    for proof in plan.get("unwritten_commit_aborts", []):
+        abort_verified_unwritten(engine, proof, recorded_at=recorded_at)
     effective_at = datetime.combine(day, time(13, 30), TAIPEI)
     rows, touched, reversal_total = [], set(), 0.
     for entry in plan["entries"]:
@@ -354,13 +364,46 @@ def apply_plan(live: Path, plan, *, recorded_at: datetime):
             if _sha256(Path(source["path"])) != source["sha256"]:
                 raise ValueError("official source changed")
         verified = make_plan(live, Path(plan["raw_root"]), date.fromisoformat(plan["session_date"]),
-                             last_traded_price_for=plan["last_traded_price_for"], markets=plan.get("markets", ()))
+                             last_traded_price_for=plan["last_traded_price_for"], markets=plan.get("markets", ()),
+                             abort_unwritten_for=[p["market"] for p in plan.get("unwritten_commit_aborts", [])])
         if verified != plan:
             raise ValueError("plan price or scope differs from the official source and current book")
+        capacity = {"state": "not-enrolled"}
+        if live == REPO_ROOT / "artifacts/live/tw_day_trade_simulation":
+            # This repairs the protected service ledger, not a new acquisition
+            # batch. Reuse the SAME filesystem leases/backing-volume proof and
+            # configured 25-GiB service floor; acquisition's extra research
+            # buffer is intentionally not borrowed as a ledger restriction.
+            from stockagent.data_sync.cache_capacity import (
+                _admit_backing_volume, _control_directory, load_capacity_policy,
+            )
+            from stockagent.data_sync.completed_forward_capacity import reserve_capacity
+            policy = load_capacity_policy()
+            growth = 1024**3 + (live / "marks.jsonl").stat().st_size
+            for member in live.rglob("*"):
+                if member.is_symlink():
+                    raise ValueError("redirected ledger member cannot enter a recovery clone")
+                if member.is_file():
+                    growth += member.stat().st_size
+            controls = _control_directory(f"filesystem-{live.stat().st_dev}")
+            if controls.stat().st_dev != live.stat().st_dev:
+                raise ValueError("recovery capacity controls are on another filesystem")
+            token = hashlib.sha256((str(live) + plan["operation_id"]).encode()).hexdigest()
+            reservation = stack.enter_context(reserve_capacity(controls, key=token,
+                maximum_growth_bytes=growth, capacity_bytes=2**63 - 1,
+                minimum_free_bytes=policy["minimum_free_bytes"]))
+            backing = _admit_backing_volume(live, growth + reservation["other_reserved_growth_bytes"]
+                + reservation["control_bytes"] + policy["minimum_free_bytes"])
+            capacity = {"state": "admitted", "contract": "paper_ledger_recovery_capacity_v1",
+                        "maximum_growth_bytes": growth, "reservation": reservation,
+                        "backing_volume": backing, "data_paths_removed": 0}
         staging = Path(tempfile.mkdtemp(prefix="official-close-settlement-", dir=live.parent))
         candidate = staging / "ledger"
-        before = {name: {"size": (live/name).stat().st_size, "sha256": _sha256(live/name)}
+        scanned = next(iter(plan.get("unwritten_commit_aborts", [])), {}).get("journals", {})
+        before = {name: {"size": (live/name).stat().st_size,
+                         "sha256": scanned[name]["sha256"] if name in scanned else _sha256(live/name)}
                   for name in LEDGERS if (live/name).exists()}
+        before_modes = read_paper_state(live / "state.json")["modes"]
         shutil.copytree(live, candidate, ignore=lambda directory,names: {
             name for name in names if Path(directory) == live and (name.startswith(".") or name.startswith("state.json.tmp.") or name == "quote_broker")})
         stack.enter_context(_acquire_engine_lock(candidate))
@@ -370,6 +413,10 @@ def apply_plan(live: Path, plan, *, recorded_at: datetime):
             if _prefix_hash(candidate/name, proof["size"]) != proof["sha256"]:
                 raise ValueError(f"original ledger prefix changed: {name}")
         after = read_paper_state(candidate / "state.json")
+        for market in set(before_modes) - set(plan.get("markets", before_modes)):
+            if book_fingerprint({"modes": {market: before_modes[market]}}) != book_fingerprint(
+                    {"modes": {market: after["modes"][market]}}):
+                raise ValueError(f"unrelated paper account changed: {market}")
         if result["remaining_count"] != len(plan["blocked"]):
             raise ValueError("unexpected residual count")
         for entry in plan["entries"]:
@@ -378,7 +425,8 @@ def apply_plan(live: Path, plan, *, recorded_at: datetime):
                 raise ValueError("settlement quantity/price mismatch")
         audit = {**plan, **result, "status": "applied_with_missing_closes" if plan["blocked"] else "applied",
                  "recorded_at": recorded_at.isoformat(), "rollback_directory": str(candidate),
-                 "original_ledger_prefixes": before, "strategy_changed": False}
+                 "original_ledger_prefixes": before, "strategy_changed": False,
+                 "capacity_admission": capacity}
         receipts = candidate / "settlement_receipts"
         previous = candidate / "official_close_settlement_receipt.json"
         if previous.exists():
@@ -413,6 +461,8 @@ def main():
     parser.add_argument("--confirm-counterfactual-settlement", action="store_true")
     parser.add_argument("--last-traded-price-for", action="append", default=[], metavar="SYMBOL",
                         help="Explicit fallback only for this residual symbol when today's official close is absent")
+    parser.add_argument("--abort-unwritten-for", action="append", default=[], metavar="MARKET",
+                        help="Explicitly reconcile a wholly unwritten interrupted paper commit before closing this account")
     args = parser.parse_args()
     if args.apply:
         if not args.confirm_counterfactual_settlement:
@@ -424,7 +474,8 @@ def main():
         print(json.dumps({k: result.get(k) for k in ("status", "settle_count", "remaining_count", "rollback_directory", "ending_equity_twd")}, ensure_ascii=False))
     else:
         plan = make_plan(args.state_dir.resolve(), args.raw_root, args.date,
-                         last_traded_price_for=args.last_traded_price_for, markets=args.only_market)
+                         last_traded_price_for=args.last_traded_price_for, markets=args.only_market,
+                         abort_unwritten_for=args.abort_unwritten_for)
         _atomic_json(args.plan, plan)
         print(json.dumps({"settle_count": plan["settle_count"], "blocked_count": plan["blocked_count"],
                           "blocked_symbols": sorted({e["symbol"] for e in plan["blocked"]}), "plan": str(args.plan)}, ensure_ascii=False))

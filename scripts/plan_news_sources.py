@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import csv
+from datetime import datetime, timedelta, timezone
 import io
 import json
 from pathlib import Path
@@ -73,6 +74,36 @@ def _literal_work(original_metadata, known, links):
             'unqueued_literal_link_work': pending}
 
 
+def _metadata_sort_day_quality(inventory, item, known):
+    # Counts describe scheduling hints, never verified publisher clocks. Old or
+    # ordinary inventories do not perform this scan, so absence means unknown.
+    fields = ('metadata_sort_days_present', 'metadata_sort_days_invalid',
+              'metadata_sort_days_pre_1900', 'metadata_sort_days_after_snapshot_utc')
+    requested = inventory.get('metadata_sort_day_quality_requested', False)
+    version = inventory.get('metadata_sort_day_quality_contract_version')
+    if type(requested) is not bool:
+        raise ValueError('invalid metadata sort-day quality selection')
+    if not requested:
+        if version is not None:
+            raise ValueError('invalid metadata sort-day quality contract')
+        return {key: None for key in fields}
+    if type(version) is not int or version != 1:
+        raise ValueError('unsupported metadata sort-day quality contract')
+    values = [item.get(key) for key in fields]
+    if any(type(value) is not int or not 0 <= value <= known for value in values):
+        raise ValueError('invalid metadata sort-day quality counts')
+    present, invalid, historical, future = values
+    if invalid > present or historical > present - invalid or future > present - invalid:
+        raise ValueError('inconsistent metadata sort-day quality counts')
+    # For a modern UTC observation, the two valid-date ranges are disjoint.
+    # Before 1900 a date may be both early and after the observation day.
+    observed = inventory.get('observed_at_utc')
+    if (isinstance(observed, str) and observed[:10] >= '1900-01-01'
+            and invalid + historical + future > present):
+        raise ValueError('inconsistent metadata sort-day quality counts')
+    return dict(zip(fields, values))
+
+
 def _has_literal_work(row):
     return bool(row['literal_metadata_links'] and row['unqueued_literal_link_work'] is not False)
 
@@ -125,7 +156,30 @@ ERROR_REPAIRS = {
 }
 
 
-def review_resume_plan(item, review):
+def _planning_clock(now):
+    now = datetime.now(timezone.utc) if now is None else now
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError('news planning clock requires a timezone')
+    return now.astimezone(timezone.utc)
+
+
+def _review_clock_state(review, now):
+    """A source annotation is not dated evidence without a valid clock."""
+    if not review:
+        return 'not_recorded'
+    value = review.get('reviewed_at_utc')
+    if not isinstance(value, str) or len(value) > 64:
+        return 'unverified'
+    try:
+        observed = datetime.fromisoformat(value.replace('Z', '+00:00'))
+        if observed.tzinfo is None or observed.utcoffset() is None:
+            return 'unverified'
+        return 'verified' if observed.astimezone(timezone.utc) <= now + timedelta(seconds=5) else 'unverified'
+    except (ValueError, OverflowError):
+        return 'unverified'
+
+
+def review_resume_plan(item, review, *, now=None):
     """Reuse completed review steps, without declaring missing bodies done.
 
     These are engineering handoff annotations only. A review is neither a
@@ -133,8 +187,12 @@ def review_resume_plan(item, review):
     An incomplete review resumes its unresolved question; permission-waiting
     sources stay inventoried but do not become fresh adapter/review work.
     """
+    clock_state = _review_clock_state(review, _planning_clock(now))
     decision = review.get("capture_decision")
-    if decision == "permission_required":
+    if clock_state == 'unverified':
+        state, completed, action = ('review_clock_unverified', False,
+            'verify_recorded_review_clock_before_reusing_review')
+    elif decision == "permission_required":
         state, completed, action = ("completed_waiting_permission", True,
             "obtain_source_permission_without_repeating_unchanged_review")
     elif decision == "authorized_api_configuration_required":
@@ -148,7 +206,7 @@ def review_resume_plan(item, review):
             "verify_remaining_adapter_and_body_work_within_recorded_scope")
     elif item.get("enabled"):
         state, completed, action = ("existing_runtime_policy_not_new_review", False,
-            "retain_existing_collector_and_verify_remaining_body_work")
+            "retain_existing_collector_and_review_source_scope")
     else:
         state, completed, action = ("not_started", False,
             "review_source_before_adapter_admission")
@@ -167,12 +225,14 @@ def review_resume_plan(item, review):
             "review_questions_are_exhaustive_body_work": False}
 
 
-def implementation_plan(item, provider, entry, review):
+def implementation_plan(item, provider, entry, review, *, now=None):
     """One blueprint for every key, not permission inferred from hostname.
 
     Endpoint URLs come only from existing declared configuration. Unknown
     sites use the same adapter family after review, not guessed API paths.
     """
+    now = _planning_clock(now)
+    review_clock_state = _review_clock_state(review, now)
     endpoints = {kind: list(entry.get(key, [])) for kind, key in (
         ("bulk_json", "cnyes_apis"), ("wordpress_json", "wordpress_apis"),
         ("fulltext_feed", "fulltext_feeds"), ("feed", "feeds"),
@@ -201,6 +261,9 @@ def implementation_plan(item, provider, entry, review):
         action = "verify_remaining_shared_adapter_within_recorded_scope"
     else:
         action = "review_then_extend_shared_source_adapter"
+    if (review_clock_state == 'unverified' and not item.get('enabled')
+            and review.get('capture_decision') != 'permission_required'):
+        action = 'verify_recorded_review_clock_before_adapter_admission'
     errors = sorted({error["error_code"] for error in item.get("errors", []) if error.get("error_code")})
     repairs = [ERROR_REPAIRS.get(error, "preserve source outcome; classify representation, schema and per-item failures")
                for error in errors]
@@ -221,7 +284,8 @@ def implementation_plan(item, provider, entry, review):
         "review_evidence_urls_json": json.dumps(review.get("evidence_urls", []), ensure_ascii=False),
         "source_policy_observation": review.get("observation", "No new access permission inferred"),
         "reviewed_at_utc": review.get("reviewed_at_utc"),
-        **review_resume_plan(item, review),
+        "source_review_clock_state": review_clock_state,
+        **review_resume_plan(item, review, now=now),
         "observed_error_codes_json": json.dumps(errors),
         "remediation_actions_json": json.dumps(list(dict.fromkeys(repairs)), ensure_ascii=False),
         "cpu_strategy": "one body parse; indexed URL dedup and dispatch; receipt-bounded batch writes; no completed finite rescan",
@@ -320,22 +384,40 @@ def apply_work_order(rows, policy):
             if row['implementation_state'] != 'waiting_source_permission'],
         'body_downloader_implementation_order': [row['provider'] for row in work if row['body_downloader_candidate']],
         'deferred_source_keys': sorted(row['provider'] for row in rows if row['provider'] in deferred),
-        'running_collectors_stopped': False, 'publisher_requests': 0, 'queue_writes': False,
+        # The planner does not inspect service state. In particular, not
+        # stopping a collector here does not prove an existing one is running.
+        'running_collectors_stopped': None, 'collector_service_state_observed': False,
+        'service_actions_performed': False, 'publisher_requests': 0, 'queue_writes': False,
         'work_order_grants_source_access': False,
     }
 
 
 def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, reviews=None,
-                 work_order=None) -> dict:
+                 work_order=None, now=None) -> dict:
     if type(small_threshold) is not int or not 1 <= small_threshold <= 10000:
         raise ValueError("small cohort threshold must be 1..10000")
+    now = _planning_clock(now)
     scope = _planning_scope(inventory)
+    offline = inventory.get('offline_snapshot')
+    if offline is not None and (not isinstance(offline, dict)
+            or type(offline.get('contract_version')) is not int or offline['contract_version'] != 2
+            or offline.get('wal_empty') is not True or offline.get('rollback_journal_empty') is not True
+            or offline.get('writer_exclusion_proven') is not False
+            or offline.get('quiescence_must_be_established_externally') is not True):
+        raise ValueError('invalid offline inventory snapshot contract')
+    status = inventory.get('status')
+    status_at = (status.get('updated_at_utc') if isinstance(status, dict)
+                 and inventory.get('status_owner_matches') is True else None)
     entries, reviews = entries or {}, reviews or {}
     rows = []
     for provider, item in inventory["providers"].items():
         known, stored = item.get("known_urls", 0), item.get("stored_bodies", 0)
         if type(known) is not int or type(stored) is not int or not 0 <= stored <= known:
             raise ValueError("invalid inventory URL/body counts")
+        queued_missing = item.get('missing_body_work')
+        if queued_missing is not None and (type(queued_missing) is not int
+                                           or not 0 <= queued_missing <= known - stored):
+            raise ValueError('invalid inventory missing-body work count')
         original_metadata = item.get("original_metadata", {})
         if not isinstance(original_metadata, dict):
             raise ValueError("invalid original metadata link counts")
@@ -343,6 +425,8 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         if type(literal_links) is not int or literal_links < 0:
             raise ValueError("invalid original metadata link counts")
         literal_work = _literal_work(original_metadata, known, literal_links)
+        review = reviews.get(provider, {})
+        review_clock_state = _review_clock_state(review, now)
         role = item["source_role"]
         # A .gov hostname proves neither monetary/economic relevance nor an
         # open license. Prioritize known monetary releases, then financial and
@@ -368,6 +452,12 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         elif item.get("enabled"):
             strategy, stage = "finite_existing_metadata" if item.get("acquisition_mode") == "finite" else "reuse_active_canonical_collector", 0
             gate = "preserve source/robots cooldowns and body acceptance receipts"
+        elif review_clock_state == 'unverified' and review.get('capture_decision') == 'permission_required':
+            strategy, stage = 'verify_recorded_review_clock_while_preserving_permission_gate', 5
+            gate = 'verify the local review clock while retaining the source access restriction'
+        elif review_clock_state == 'unverified':
+            strategy, stage = 'verify_recorded_review_clock_before_source_review', 1 if small or small_metadata else 2
+            gate = 'verify the local review clock; the annotation does not grant source access or prove completed review'
         elif reviews.get(provider, {}).get("capture_decision") == "authorized_api_configuration_required":
             strategy, stage = "authorized_api_configuration_and_capability_check", 1
             gate = "existing user authorization accepted; actual licensed API product/key, tool schema, history and quota need verification"
@@ -401,32 +491,58 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
             "small_metadata_link_candidate": small_metadata,
             "configured": item.get("configured", False), "enabled": item.get("enabled", False),
             "known_urls": known, "stored_bodies": stored, "missing_body_urls": known - stored,
+            "queued_or_inflight_missing_body_urls": queued_missing,
+            "other_missing_body_urls": None if queued_missing is None else known - stored - queued_missing,
+            "queued_or_inflight_missing_body_scope": (
+                'snapshot states pending, retry, retry_cooldown or inflight without a body; '
+                'not a readiness, permission, source request or completion guarantee'),
             "literal_metadata_links": literal_links,
             "literal_metadata_link_grain": "local original-resolution alias associations, not unique articles or queued heads",
             **literal_work,
             "first_metadata_day": item.get("earliest_metadata_day"),
             "last_metadata_day": item.get("latest_metadata_day"),
             "metadata_dates_are_publisher_clocks": False,
+            **_metadata_sort_day_quality(inventory, item, known),
             "source_evidence_url": item.get("authorization", {}).get("evidence_url"),
             "required_before_requests": gate,
-            "minimum_html_article_requests_if_no_bulk": None if known == 0 and literal_links else known - stored,
+            # URL heads with no body can be terminal, non-articles, aliases or
+            # recoverable from retained originals. A head count cannot prove
+            # a minimum number of network requests, even without bulk APIs.
+            "minimum_html_article_requests_if_no_bulk": None,
+            "request_count_estimate_basis": 'unknown; missing URL heads are not a proven request count',
             "bulk_request_reduction_verified": provider in {"cnyes", "globalvoices"},
             "finish_eta_utc": None,
             "eta_basis": "unknown until accepted-body throughput and source barriers are measured",
             "dedicated_refresh_service": False,
             "growth_action": "new metadata URLs visible; review cohort growth before adding refresh",
             "all_publisher_history_complete": False,
-            **implementation_plan(item, provider, entries.get(provider, {}), reviews.get(provider, {})),
+            **implementation_plan(item, provider, entries.get(provider, {}), review, now=now),
         })
     rows.sort(key=lambda r: (r["stage"], r["priority_tier"], r["known_urls"], r["provider"]))
     counts = Counter(row["strategy"] for row in rows)
     ordering = apply_work_order(rows, work_order) if work_order is not None else {}
+    unfinished_review_states = {'not_started', 'partially_completed',
+                                'existing_runtime_policy_not_new_review', 'review_clock_unverified'}
+    unfinished_review_keys = [row['provider'] for row in rows
+                              if row['source_review_work_state'] in unfinished_review_states
+                              or row['recorded_open_review_question_count'] > 0]
+    recorded_scope_reviewed = bool(rows) and not unfinished_review_keys and all(
+        row['recorded_review_stage_complete'] and row['source_review_clock_state'] == 'verified'
+        for row in rows)
+    full_scope_declared = (scope['all_known_source_keys_included']
+                           and not scope['input_scope_assumed_legacy_full_inventory'])
     return {
-        "contract_version": (10 if work_order is not None and work_order['contract_version'] == 2
-                             else 9 if work_order is not None else 8),
+        "contract_version": 14 if work_order is not None else 11,
         **scope, 'literal_target_work_contract_version': 2,
+        "metadata_sort_day_quality_contract_version": 1,
+        "metadata_sort_day_quality_basis": (
+            "optional calendar and range flags on sorting hints; missing means not checked; "
+            "a historical or future day alone does not prove an invalid publisher clock"),
         "news_outcome_classification_contract_version": NEWS_OUTCOME_CLASSIFICATION_VERSION,
         **ordering, "input_observed_at_utc": inventory["observed_at_utc"],
+        "input_status_observed_at_utc": status_at,
+        "input_snapshot_mode": 'offline_immutable' if offline is not None else 'read_only_or_unknown',
+        "input_offline_writer_exclusion_proven": (False if offline is not None else None),
         "queue_owner_id": inventory.get("queue_owner_id"),
         "small_threshold_urls": small_threshold,
         "threshold_basis": "planning heuristic only; not source quota, permission or history cap",
@@ -439,15 +555,27 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         "unknown_literal_target_coverage_source_keys": sum(row["unqueued_literal_link_work"] is None for row in rows),
         "plan_is_acquisition_acceptance": False, "all_history_complete": False,
         "source_policy_review_counts": dict(Counter(row["source_policy_review"] for row in rows)),
-        "review_resume_contract_version": 2,
+        "review_resume_contract_version": 3,
+        "source_review_clock_contract_version": 1,
+        "source_review_clock_reference_utc": now.isoformat(),
         "source_review_work_state_counts": dict(Counter(row["source_review_work_state"] for row in rows)),
         "completed_review_source_keys": [row['provider'] for row in rows
             if row['recorded_review_stage_complete']],
         "remaining_source_review_order": [row['provider'] for row in rows
-            if row['source_review_work_state'] in {'not_started', 'partially_completed'}
+            if row['source_review_work_state'] in unfinished_review_states
             and row['source_role'] not in {'redirector', 'aggregator', 'social_or_video'}
             and (row['missing_body_urls'] or _has_literal_work(row))
             and row.get('implementation_state') != 'deferred_by_user'],
+        # This full inventory also retains redirectors, empty scopes and user-
+        # deferred keys. It is review accounting, not permission or a runnable
+        # HTTP queue; the filtered body-oriented work order above stays intact.
+        "unfinished_source_review_keys": unfinished_review_keys,
+        "unfinished_source_review_count": len(unfinished_review_keys),
+        "unfinished_source_review_keys_include_deferred_and_nonpublishers": True,
+        "unfinished_source_review_keys_include_recorded_open_questions": True,
+        "all_input_recorded_scope_reviews_complete": recorded_scope_reviewed,
+        "all_recorded_scope_reviews_complete": full_scope_declared and recorded_scope_reviewed,
+        "review_record_is_independent_live_evidence": False,
         # A scope review can be complete while recorded follow-up questions
         # remain. Keep the existing review queue semantics, and expose these
         # separately without promoting them to runnable or exhaustive work.
@@ -468,9 +596,12 @@ def plan_sources(inventory: dict, *, small_threshold: int = 300, entries=None, r
         "completed_review_is_not_completed_body_history": True,
         "implementation_action_counts": dict(Counter(row["implementation_action"] for row in rows)),
         "all_input_source_keys_planned": len(rows) == len(inventory["providers"]),
-        "all_source_keys_planned": scope['all_known_source_keys_included'] and len(rows) == len(inventory["providers"]),
-        "all_input_sites_live_reviewed": all(row["source_policy_review"] != "not_reviewed" for row in rows),
-        "all_sites_live_reviewed": scope['all_known_source_keys_included'] and all(row["source_policy_review"] != "not_reviewed" for row in rows),
+        "all_source_keys_planned": full_scope_declared and len(rows) == len(inventory["providers"]),
+        # The planning ledger does not independently establish actual source
+        # visits. When its recorded stages are all complete, live review is
+        # still unknown instead of being promoted to true.
+        "all_input_sites_live_reviewed": None if recorded_scope_reviewed else False,
+        "all_sites_live_reviewed": (None if recorded_scope_reviewed else False) if full_scope_declared else False,
     }
 
 

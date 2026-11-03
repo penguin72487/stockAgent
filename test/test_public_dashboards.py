@@ -1134,6 +1134,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert "table.dashboard-responsive-table" in responsive
     assert "--dashboard-font-family" in responsive
     assert '"Microsoft JhengHei"' in responsive
+    assert "body details > summary {\n  min-block-size: 24px;\n}" in responsive
     pages = {
         "public_dashboards/index.html": "overview",
         "taifex_dashboard/index.html": "taifex",
@@ -1150,7 +1151,7 @@ def test_public_pages_share_visual_tokens() -> None:
         html = (root / relative).read_text(encoding="utf-8")
         core_version = 7 if "quote-display-notice" in html else 6
         assert f"dashboard-core.css?v={core_version}" in html
-        assert "dashboard-responsive.css?v=10" in html
+        assert "dashboard-responsive.css?v=11" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
         script_version = 19 if relative == "tw_day_trade_dashboard/index.html" else 15
         assert f'dashboard-core.js?v={script_version}" defer' in html
@@ -2251,6 +2252,32 @@ def test_data_monitor_summary_projection_falls_back_when_source_changes(
     try:
         summary = json.loads(server.data_monitor_summary().body)
         assert summary["health"] == "degraded"
+    finally:
+        server.server_close()
+
+
+def test_data_monitor_storage_operations_are_sanitized_background_receipts(tmp_path, monkeypatch):
+    from stockagent.data_sync import storage_progress as operations
+    server = _test_server()
+    server.repo_root = tmp_path
+    try:
+        def unexpected_work(*args, **kwargs):
+            raise AssertionError("HTTP must never collect receipts or run a scheduler")
+        monkeypatch.setattr(operations, "collect", unexpected_work)
+        from stockagent.service_layout import service_path
+        snapshot = service_path("data_monitor/storage_status.json", root=tmp_path)
+        snapshot.parent.mkdir(parents=True)
+        stamp = time.time()
+        row = operations.task("retirement", "enrolled", state="running", phase="decode-originals",
+            observed=stamp, done_bytes=100, total_bytes=1000)
+        row.update(error="/private/source secret", source="/private/data", label="private account")
+        snapshot.write_text(json.dumps({"contract": "stockagent.storage_monitor.v1",
+            "operations": {"contract": operations.CONTRACT, "observed_at_utc": operations.iso(stamp), "tasks": [row]}}))
+        payload = json.loads(server.data_monitor_storage().body)
+        assert len(payload["nodes"]) == 4
+        assert payload["operations"]["tasks"][0]["progress"]["completed_bytes"] == 100
+        assert "/private" not in json.dumps(payload) and "secret" not in json.dumps(payload)
+        assert payload["operations"]["read_only"] is True
     finally:
         server.server_close()
 
@@ -4076,3 +4103,92 @@ def test_public_route_and_request_errors_are_distinct_from_internal_failures() -
     with pytest.raises(InvalidPublicRequest):
         PublicDashboardHandler._history_range_query("range=unsupported")
     assert issubclass(PublicRouteNotFound, KeyError)
+
+
+def test_tw_browser_shares_validated_fallback_when_full_status_is_unavailable() -> None:
+    """The two lightweight views must reach the lower tables without invented fills."""
+    playwright = pytest.importorskip("playwright.sync_api")
+    from urllib.parse import urlsplit
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+
+    service_root = Path(__file__).resolve().parents[1] / "services"
+    key = "a" * 32
+    state = {
+        "signals": {"schema_version": 1, "simulation_only": True, "production_order_possible": False,
+                    "session_date": "2026-10-29", "modes": [{"market": "m", "label": "模型",
+                    "status": "published", "signal_ready_at": "2026-10-29T09:00:01+08:00",
+                    "revision_index": 1, "target_count": 101, "public_signal_key": key}],
+                    "rows": [{"market": "m", "symbol": str(1000 + index), "name": "測試",
+                              "target_weight": 0.1, "side": "long", "public_signal_key": key}
+                             for index in range(101)]},
+        "positions": {"schema_version": 1, "simulation_only": True, "production_order_possible": False,
+                      "scope": "committed_open_positions_only", "state_revision": 7,
+                      "as_of": "2026-10-29T10:45:00+08:00",
+                      "modes": [{"market": "m", "label": "模型", "open_position_count": 1}],
+                      "rows": [{"market": "m", "symbol": "1000", "session_date": "2026-10-29",
+                                "side": "long", "status": "open", "signed_shares": 1000,
+                                "target_weight": 0.1, "filled_shares": 1000}]},
+    }
+    baseline = json.loads(json.dumps(state))
+    with playwright.sync_playwright() as runtime:
+        browser = runtime.chromium.launch(**browser_profile_launch_options("cpu-2d"))
+        try:
+            for width in (1366, 390):
+                state = json.loads(json.dumps(baseline))
+                page = browser.new_page(viewport={"width": width, "height": 800})
+                errors: list[str] = []
+                page.on("pageerror", lambda error: errors.append(str(error)))
+
+                def serve(route) -> None:
+                    path = urlsplit(route.request.url).path
+                    if path == "/tw-day-trade/api/published-signals":
+                        route.fulfill(status=200, json=state["signals"])
+                    elif path == "/tw-day-trade/api/live-snapshot":
+                        route.fulfill(status=200, json=state["positions"])
+                    elif "/api/" in path:
+                        route.fulfill(status=503, content_type="application/json", body='{"error":"unavailable"}')
+                    else:
+                        relative = ("tw_day_trade_dashboard/index.html" if path == "/tw-day-trade/"
+                                    else "tw_day_trade_dashboard/" + path.removeprefix("/tw-day-trade/")
+                                    if path.startswith("/tw-day-trade/") else "public_dashboards/" + path.lstrip("/"))
+                        candidate = (service_root / relative).resolve()
+                        if candidate.is_relative_to(service_root) and candidate.is_file():
+                            route.fulfill(status=200, path=str(candidate))
+                        else:
+                            route.fulfill(status=404, body="not found")
+
+                page.route("**/*", serve)
+                page.goto("https://dashboard.test/tw-day-trade/", wait_until="domcontentloaded")
+                page.locator("#signal-count").get_by_text("非完整交易紀錄").wait_for(timeout=10000)
+                page.locator("#position-count").get_by_text("不含完整生命週期").wait_for(timeout=10000)
+                assert page.locator("#signal-body tr").count() == 100
+                assert "模擬委託及成交待核對" in page.locator("#signal-body").text_content()
+                assert "0 股紙上成交" not in page.locator("#signal-body").text_content()
+                page.locator("#load-more-signals").click()
+                assert page.locator("#signal-body tr").count() == 101
+                page.locator("#symbol-filter").fill("1000")
+                assert page.locator("#signal-body tr").count() == 1
+                assert page.locator("#position-body tr").count() == 1
+                page.locator("#status-filter").select_option("closed")
+                assert "無法套用" in page.locator("#signal-body").text_content()
+                assert "無法查詢已平倉" in page.locator("#position-body").text_content()
+                page.locator("#status-filter").select_option("all")
+                page.locator("#symbol-filter").fill("")
+                page.evaluate("window.fallbackTestMarker = {}")
+                key2 = "b" * 32
+                state["signals"]["modes"][0].update(revision_index=2, target_count=1, public_signal_key=key2)
+                state["signals"]["rows"] = [{"market": "m", "symbol": "2317", "name": "新版本",
+                                              "target_weight": -0.2, "side": "short", "public_signal_key": key2}]
+                state["positions"].update(state_revision=8)
+                state["positions"]["rows"][0].update(symbol="2317", signed_shares=-1000, side="short")
+                page.locator("#force-refresh").click()
+                page.locator("#signal-body").get_by_text("2317").wait_for(timeout=10000)
+                page.locator("#position-body").get_by_text("2317").wait_for(timeout=10000)
+                assert page.locator("#signal-body tr").count() == 1
+                assert page.locator("#signal-body tr").get_attribute("data-public-signal-key") == key2
+                assert page.evaluate("window.fallbackTestMarker != null && performance.getEntriesByType('navigation').length === 1")
+                assert page.evaluate("document.documentElement.scrollWidth <= window.innerWidth")
+                assert errors == []
+                page.close()
+        finally:
+            browser.close()

@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import numpy as np
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import matplotlib.ticker as mticker
 from matplotlib.patches import Patch
 
@@ -26,6 +27,13 @@ _MATPLOTLIB_TIGHT_LAYOUT_AXES_WARNING = (
 )
 _PLOT_ASPECT_RATIO = 17.0 / 6.0
 _DEFAULT_PLOT_HEIGHT = 6.0
+TRADING_SESSION_EQUITY_DISPLAY_CONTRACT = "observed_account_session_equity_v2"
+TX_ONE_CONTRACT_BENCHMARK_LABEL = (
+    "Benchmark (TX one-contract rolling margin account; deposits excluded)"
+)
+# Older frozen report consumers import this name. Its value identifies the
+# active report ABI, so they do not keep publishing the superseded calendar view.
+CALENDAR_EQUITY_DISPLAY_CONTRACT = TRADING_SESSION_EQUITY_DISPLAY_CONTRACT
 
 
 def _periods_per_year(result: BacktestResult) -> float:
@@ -117,9 +125,11 @@ def _save_current_figure(output_path: str | Path, **kwargs: object) -> None:
     _pad_saved_image_to_17_6(path)
 
 
-def _format_risk_metrics_text(result: BacktestResult) -> str:
+def _format_risk_metrics_text(
+    result: BacktestResult, *, futures_benchmark_replay: Mapping[str, Any] | None = None,
+) -> str:
     """Build a compact text block for on-chart risk metrics."""
-    met = compute_metrics(result)
+    met = compute_metrics(result, futures_benchmark_replay=futures_benchmark_replay)
     return (
         f"CAGR: {met['cagr']:.2%}\n"
         f"Sharpe: {met['sharpe']:.3f}\n"
@@ -225,6 +235,44 @@ def _plot_finite_line(ax: plt.Axes, x_values: np.ndarray, y_values: np.ndarray, 
     if x.size == 0 or y.size == 0:
         return
     ax.plot(x, y, *args, **kwargs)
+
+
+def _trading_session_equity_display(
+    dates: np.ndarray, values: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray] | None:
+    """Return actual account marks, including account-only valuation days.
+
+    Do not synthesize unobserved days: a gap can be a holiday or missing data,
+    and neither execution nor a flat account value can be inferred from it.
+    """
+    dates = np.asarray(dates)
+    values = np.asarray(values, dtype=np.float64)
+    if (dates.ndim != 1 or values.ndim != 1 or len(dates) != len(values)
+            or not len(dates) or not np.issubdtype(dates.dtype, np.datetime64)
+            or np.isnat(dates).any() or not np.isfinite(values).all()):
+        return None
+    days = dates.astype("datetime64[D]")
+    if (not np.array_equal(days.astype("datetime64[ns]"), dates.astype("datetime64[ns]"))
+            or np.any(days[1:] <= days[:-1])):
+        return None
+    return days, values
+
+
+def _plot_daily_equity_line(
+    ax: plt.Axes, dates: np.ndarray, values: np.ndarray, **kwargs: object,
+) -> None:
+    """Draw every actual account mark, irrespective of trading activity."""
+    display = _trading_session_equity_display(dates, values)
+    if display is None:
+        _plot_finite_line(ax, dates, values, **kwargs)
+        return
+    days, values = display
+    marker = "o" if len(days) <= 62 else None
+    ax.plot(days, values, marker=marker, markersize=3, **kwargs)
+    if 1 < len(days) <= 62:
+        ax.xaxis.set_major_locator(mticker.FixedLocator(mdates.date2num(days)))
+        ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y-%m-%d"))
+        ax.tick_params(axis="x", labelrotation=45, labelsize=7)
 
 
 def _configure_log_y_axis(ax: plt.Axes, *series: np.ndarray) -> None:
@@ -342,17 +390,49 @@ def _strategy_account_path(
 
 def _account_metric_rows(
     result: BacktestResult, dates: np.ndarray | None = None,
+    *, futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
     """Align risk metrics to actual account days without inventing TX trades.
 
-    The separately verified benchmark has no market session on an
-    account-only node. Its already observed value is carried across that node
-    (zero return), with no new price or execution inferred.
+    The legacy decision-only benchmark carries its value across account-only
+    nodes. An explicit TX replay instead supplies its own dated marks and can
+    have a nonzero return on such a node. This optional in-memory report input
+    does not establish source admission or change the persisted artifact ABI.
     """
     ledger = result.futures_account_ledger
     if ledger is None:
+        if futures_benchmark_replay is not None:
+            raise ValueError("a dated futures benchmark requires a dated strategy account ledger")
         return None
     account_dates, returns = _strategy_account_path(result, dates)
+    if futures_benchmark_replay is not None:
+        replay = futures_benchmark_replay
+        if (not isinstance(replay, Mapping)
+                or replay.get("account_replay_contract") != "tx_one_contract_account_calendar_replay_v1"
+                or replay.get("account_scope") not in {
+                    "continuous_from_first_supplied_event", "independent_window_reset"}
+                or replay.get("account_calendar_fingerprint") != ledger.calendar_fingerprint
+                or not np.array_equal(replay.get("dates"), account_dates)
+                or not np.array_equal(replay.get("decision_dates"), ledger.decision_dates)):
+            raise ValueError("dated TX benchmark replay and strategy calendar differ")
+        market = np.asarray(replay.get("market_session_mask"))
+        account_benchmark = np.asarray(replay.get("benchmark_log_returns"))
+        decisions = np.asarray(replay.get("decision_log_returns"))
+        if (market.dtype != np.bool_ or not np.array_equal(market, ~ledger.account_only_mask)
+                or account_benchmark.shape != account_dates.shape
+                or decisions.shape != ledger.decision_dates.shape
+                or not np.issubdtype(account_benchmark.dtype, np.floating)
+                or not np.issubdtype(decisions.dtype, np.floating)
+                or not np.isfinite(account_benchmark).all() or not np.isfinite(decisions).all()):
+            raise ValueError("dated TX benchmark replay has invalid account returns or sessions")
+        aggregated = np.zeros(len(ledger.decision_dates), dtype=np.float64)
+        owners = np.searchsorted(ledger.decision_dates, account_dates, side="left")
+        if np.any(owners >= len(aggregated)):
+            raise ValueError("dated TX benchmark replay has an unowned account event")
+        np.add.at(aggregated, owners, account_benchmark)
+        if not np.allclose(aggregated, decisions, rtol=1e-12, atol=1e-12):
+            raise ValueError("dated TX benchmark replay decision returns disagree with account events")
+        return account_dates, returns, account_benchmark.astype(np.float64, copy=False), _finite_values(ledger.turnovers)
     benchmark = _clean_log_returns(result.benchmark_returns).reshape(-1)
     if benchmark.shape != ledger.decision_dates.shape:
         raise ValueError("dated futures benchmark differs from its decision calendar")
@@ -361,7 +441,9 @@ def _account_metric_rows(
     return account_dates, returns, aligned_benchmark, _finite_values(ledger.turnovers)
 
 
-def compute_metrics(result: BacktestResult) -> dict[str, float]:
+def compute_metrics(
+    result: BacktestResult, *, futures_benchmark_replay: Mapping[str, Any] | None = None,
+) -> dict[str, float]:
     """Compute portfolio performance metrics from a BacktestResult.
 
     Returns a dict with:
@@ -371,7 +453,7 @@ def compute_metrics(result: BacktestResult) -> dict[str, float]:
     """
     from stockagent.backtest.futures_data_validity import reject_invalid_carry_artifact
     reject_invalid_carry_artifact(result)
-    account = _account_metric_rows(result)
+    account = _account_metric_rows(result, futures_benchmark_replay=futures_benchmark_replay)
     if account is None:
         r = _clean_log_returns(result.strategy_returns)
         b = _clean_log_returns(result.benchmark_returns)
@@ -453,10 +535,11 @@ def reporting_weight_history(result: BacktestResult) -> tuple[np.ndarray, str]:
 def _aligned_dated_backtest_rows(
     result: BacktestResult,
     dates: np.ndarray,
+    *, futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Return the common valid dated rows used by annual and total metrics."""
     date_values = np.asarray(dates, dtype="datetime64[D]").reshape(-1)
-    account = _account_metric_rows(result, date_values)
+    account = _account_metric_rows(result, date_values, futures_benchmark_replay=futures_benchmark_replay)
     if account is not None:
         return account
     strategy_returns = _clean_log_returns(result.strategy_returns).reshape(-1)
@@ -492,6 +575,7 @@ def compute_metrics_by_year(
     dates: np.ndarray,
     *,
     period_contract: Mapping[str, Any] | None = None,
+    futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> dict[int, dict[str, float]]:
     """Compute annual performance metrics.
 
@@ -501,7 +585,9 @@ def compute_metrics_by_year(
     Returns:
         dict mapping year -> annual metrics
     """
-    date_values, r, b, turnover = _aligned_dated_backtest_rows(result, dates)
+    date_values, r, b, turnover = _aligned_dated_backtest_rows(
+        result, dates, futures_benchmark_replay=futures_benchmark_replay,
+    )
     if date_values.size == 0:
         return {}
     years = (
@@ -563,6 +649,7 @@ def generate_annual_report(
     output_path: str | None = None,
     *,
     period_contract: Mapping[str, Any] | None = None,
+    futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> str:
     """Generate a text report of annual performance.
 
@@ -573,12 +660,18 @@ def generate_annual_report(
     Returns:
         formatted report string
     """
-    annual_metrics = compute_metrics_by_year(result, dates, period_contract=period_contract)
-    _, r_all, b_all, turnover_all = _aligned_dated_backtest_rows(result, dates)
+    annual_metrics = compute_metrics_by_year(
+        result, dates, period_contract=period_contract, futures_benchmark_replay=futures_benchmark_replay,
+    )
+    _, r_all, b_all, turnover_all = _aligned_dated_backtest_rows(
+        result, dates, futures_benchmark_replay=futures_benchmark_replay,
+    )
 
     # Column widths: Year(8) Strategy(12) Benchmark(12) Excess(12) Sharpe(10) BenchSharpe(11) MaxDD(10) Turnover(10)
     width = 109
     lines = ["Annual Performance Report", "=" * width]
+    if futures_benchmark_replay is not None:
+        lines.append(TX_ONE_CONTRACT_BENCHMARK_LABEL)
     if period_contract is not None and period_contract.get("mode") == "lookback_shifted":
         lines.append(
             f"Annual period: first trading session + {period_contract['offset_sessions']} sessions "
@@ -652,6 +745,7 @@ def plot_annual_performance(
     scope_label: str = "",
     benchmark_label: str = "Benchmark",
     period_contract: Mapping[str, Any] | None = None,
+    futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> None:
     """Plot annual performance comparison: strategy vs benchmark.
     
@@ -660,8 +754,12 @@ def plot_annual_performance(
         dates: datetime64 array [T]
         output_path: optional file path to save figure
     """
-    annual_metrics = compute_metrics_by_year(result, dates, period_contract=period_contract)
-    risk_text = _format_risk_metrics_text(result)
+    annual_metrics = compute_metrics_by_year(
+        result, dates, period_contract=period_contract, futures_benchmark_replay=futures_benchmark_replay,
+    )
+    if futures_benchmark_replay is not None:
+        benchmark_label = TX_ONE_CONTRACT_BENCHMARK_LABEL
+    risk_text = _format_risk_metrics_text(result, futures_benchmark_replay=futures_benchmark_replay)
     years = sorted(annual_metrics.keys())
     
     strategy_returns = _finite_values([annual_metrics[y]["cumulative_return"] for y in years])
@@ -721,6 +819,7 @@ def plot_equity_curve(
     *,
     scope_label: str = "",
     benchmark_label: str = "Benchmark",
+    futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> None:
     """Plot cumulative equity curve for strategy and benchmark.
 
@@ -730,7 +829,11 @@ def plot_equity_curve(
         output_path: optional file path to save figure
     """
     strategy_dates, r = _strategy_account_path(result, np.asarray(dates))
-    account = _account_metric_rows(result, np.asarray(dates))
+    account = _account_metric_rows(
+        result, np.asarray(dates), futures_benchmark_replay=futures_benchmark_replay,
+    )
+    if futures_benchmark_replay is not None:
+        benchmark_label = TX_ONE_CONTRACT_BENCHMARK_LABEL
     benchmark_dates = np.asarray(dates) if account is None else account[0]
     b = _clean_log_returns(result.benchmark_returns) if account is None else account[2]
 
@@ -738,8 +841,8 @@ def plot_equity_curve(
     benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(ax, np.asarray(strategy_dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
-    _plot_finite_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
+    _plot_daily_equity_line(ax, np.asarray(strategy_dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
+    _plot_daily_equity_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
     _annotate_max_drawdown_segment(ax, strategy_dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
@@ -750,7 +853,7 @@ def plot_equity_curve(
     )
     ax.legend()
     ax.grid(True, alpha=0.3)
-    _add_metrics_box(ax, _format_risk_metrics_text(result))
+    _add_metrics_box(ax, _format_risk_metrics_text(result, futures_benchmark_replay=futures_benchmark_replay))
 
     _safe_tight_layout()
 
@@ -767,6 +870,7 @@ def plot_equity_curve_log(
     *,
     scope_label: str = "",
     benchmark_label: str = "Benchmark",
+    futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> None:
     """Plot cumulative equity curve for strategy and benchmark (log scale Y-axis).
 
@@ -776,7 +880,11 @@ def plot_equity_curve_log(
         output_path: optional file path to save figure
     """
     strategy_dates, r = _strategy_account_path(result, np.asarray(dates))
-    account = _account_metric_rows(result, np.asarray(dates))
+    account = _account_metric_rows(
+        result, np.asarray(dates), futures_benchmark_replay=futures_benchmark_replay,
+    )
+    if futures_benchmark_replay is not None:
+        benchmark_label = TX_ONE_CONTRACT_BENCHMARK_LABEL
     benchmark_dates = np.asarray(dates) if account is None else account[0]
     b = _clean_log_returns(result.benchmark_returns) if account is None else account[2]
 
@@ -784,8 +892,8 @@ def plot_equity_curve_log(
     benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(ax, np.asarray(strategy_dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
-    _plot_finite_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
+    _plot_daily_equity_line(ax, np.asarray(strategy_dates), strategy_equity, label="Strategy", linewidth=2, alpha=0.8)
+    _plot_daily_equity_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=2, alpha=0.8)
     _annotate_max_drawdown_segment(ax, strategy_dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (log scale, starting at 1.0)")
@@ -797,7 +905,7 @@ def plot_equity_curve_log(
     )
     ax.legend()
     ax.grid(True, alpha=0.3, which="both")
-    _add_metrics_box(ax, _format_risk_metrics_text(result))
+    _add_metrics_box(ax, _format_risk_metrics_text(result, futures_benchmark_replay=futures_benchmark_replay))
     
     _safe_tight_layout()
     
@@ -862,10 +970,15 @@ def plot_configured_leverage_equity_curve(
     *,
     scope_label: str = "",
     benchmark_label: str = "Benchmark",
+    futures_benchmark_replay: Mapping[str, Any] | None = None,
 ) -> None:
     """Plot equity curve from strategy returns generated by the reporting leverage multiplier."""
     strategy_dates, r = _strategy_account_path(result, np.asarray(dates))
-    account = _account_metric_rows(result, np.asarray(dates))
+    account = _account_metric_rows(
+        result, np.asarray(dates), futures_benchmark_replay=futures_benchmark_replay,
+    )
+    if futures_benchmark_replay is not None:
+        benchmark_label = TX_ONE_CONTRACT_BENCHMARK_LABEL
     benchmark_dates = np.asarray(dates) if account is None else account[0]
     b = _clean_log_returns(result.benchmark_returns) if account is None else account[2]
 
@@ -873,7 +986,7 @@ def plot_configured_leverage_equity_curve(
     benchmark_equity = _safe_equity_for_plot(b)
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(
+    _plot_daily_equity_line(
         ax,
         np.asarray(strategy_dates),
         strategy_equity,
@@ -881,7 +994,7 @@ def plot_configured_leverage_equity_curve(
         linewidth=2.2,
         alpha=0.9,
     )
-    _plot_finite_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=1.8, alpha=0.8)
+    _plot_daily_equity_line(ax, benchmark_dates, benchmark_equity, label=benchmark_label, linewidth=1.8, alpha=0.8)
     _annotate_max_drawdown_segment(ax, strategy_dates, strategy_equity)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative Value (starting at 1.0)")
@@ -894,7 +1007,7 @@ def plot_configured_leverage_equity_curve(
     ax.grid(True, alpha=0.3)
 
     # These are the realised risk metrics from the configured-leverage run.
-    risk_text = _format_risk_metrics_text(result)
+    risk_text = _format_risk_metrics_text(result, futures_benchmark_replay=futures_benchmark_replay)
     info_text = f"{risk_text}\nLeverage: {float(leverage):.2f}x"
     _add_metrics_box(ax, info_text)
 
@@ -943,8 +1056,8 @@ def plot_fold_first_year_returns(
     date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(ax, date_values, strat_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, base_nav, label=benchmark_label, linewidth=2.2)
+    _plot_daily_equity_line(ax, date_values, strat_nav, label="Strategy", linewidth=2.2)
+    _plot_daily_equity_line(ax, date_values, base_nav, label=benchmark_label, linewidth=2.2)
     _annotate_max_drawdown_segment(ax, date_values, strat_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")
@@ -997,8 +1110,8 @@ def plot_fold_first_year_returns_log10(
     date_values = np.asarray(dates_sorted, dtype="datetime64[ns]")
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(ax, date_values, strat_log10_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, base_log10_nav, label=benchmark_label, linewidth=2.2)
+    _plot_daily_equity_line(ax, date_values, strat_log10_nav, label="Strategy", linewidth=2.2)
+    _plot_daily_equity_line(ax, date_values, base_log10_nav, label=benchmark_label, linewidth=2.2)
     ax.set_xlabel("Date")
     ax.set_ylabel("log10(Cumulative NAV), start=0")
     ax.set_title(f"{scope_label} Daily log10 Cumulative NAV (All Folds)")
@@ -1319,8 +1432,8 @@ def plot_first_test_year_only(
     result = _build_plot_result(strategy, baseline)
 
     fig, ax = plt.subplots(figsize=_figsize_17_6())
-    _plot_finite_line(ax, date_values, strategy_nav, label="Strategy", linewidth=2.2)
-    _plot_finite_line(ax, date_values, baseline_nav, label=benchmark_label, linewidth=2.2)
+    _plot_daily_equity_line(ax, date_values, strategy_nav, label="Strategy", linewidth=2.2)
+    _plot_daily_equity_line(ax, date_values, baseline_nav, label=benchmark_label, linewidth=2.2)
     _annotate_max_drawdown_segment(ax, date_values, strategy_nav)
     ax.set_xlabel("Date")
     ax.set_ylabel("Cumulative NAV (log scale, start=1)")

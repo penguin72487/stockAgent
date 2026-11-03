@@ -308,6 +308,8 @@ def main():
                         help='Compare full native SHA per process versus bounded batching; no copies')
     parser.add_argument('--hash-reference', choices=('individual', 'drvfs'), default='individual',
                         help='Reference for the read-only hash batch ABBA; defaults preserve prior trials')
+    parser.add_argument('--large-pack-sample', action='store_true',
+                        help='Hash-only ABBA of one real 64..512 MiB pack, including native process startup')
     parser.add_argument('--publication-workflow', action='store_true',
                         help='ABBA of complete generated D publication/recovery, including uncommitted retry')
     parser.add_argument('--native-recovery', action='store_true',
@@ -323,6 +325,8 @@ def main():
     args = parser.parse_args()
     if args.output.exists() or not 1 <= args.rounds <= 5:
         parser.error("fresh receipt and 1-5 rounds required")
+    if args.large_pack_sample and not args.hash_batch_only:
+        parser.error('large pack sampling requires the read-only hash comparison')
     os.umask(0o077)
     limits, owner = None, None
     if args.native_recovery and not args.publication_workflow:
@@ -404,18 +408,22 @@ def main():
     cold = Path("/srv/stockagent-packed")
     _check_d_primary_mount(cold)
     samples = []
-    for parent in sorted((cold / "objects/blobs").iterdir()):
+    kind = 'packs' if args.large_pack_sample else 'blobs'
+    suffix = '.zip' if args.large_pack_sample else '.blob'
+    low, high = ((64, 512) if args.large_pack_sample else (8, 32))
+    count = 1 if args.large_pack_sample else 8 if args.hash_batch_only else 3
+    for parent in sorted((cold / 'objects' / kind).iterdir()):
         for path in sorted(parent.iterdir()):
-            if path.is_symlink() or path.suffix != ".blob":
+            if path.is_symlink() or path.suffix != suffix:
                 continue
             info = path.stat()
-            if 8 * 1024**2 <= info.st_size <= 32 * 1024**2:
+            if low * 1024**2 <= info.st_size <= high * 1024**2:
                 samples.append({"path": path, "signature": signature(path), "sha256": path.stem})
-            if len(samples) == (8 if args.hash_batch_only else 3):
+            if len(samples) == count:
                 break
-        if len(samples) == (8 if args.hash_batch_only else 3):
+        if len(samples) == count:
             break
-    if len(samples) != (8 if args.hash_batch_only else 3):
+    if len(samples) != count:
         raise SnapshotError("bounded real cold objects were not found")
     total = sum(row["signature"][2] for row in samples)
     if args.hash_batch_only:

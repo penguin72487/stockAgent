@@ -34,6 +34,8 @@ const pages = requestedPages.size
   ? allPages.filter(([name]) => requestedPages.has(name))
   : allPages;
 const representativeControls = {
+  "tw-day-trade": {selector: "#mode-filter", selectAlternative: true, apiPath: "/tw-day-trade/api/signals"},
+  "tw-overnight": {selector: "#mode-filter", selectAlternative: true, apiPath: "/tw-overnight/api/signals"},
   taifex: {selector: "button[data-range='1h']", apiPath: "/taifex/api/history"},
   shioaji: {selector: "button[data-filter='historical']"},
   finlab: {selector: "button[data-pipeline-filter='historical']"},
@@ -632,17 +634,41 @@ for (const [name, suffix] of pages) {
         target.scrollIntoView({behavior:'instant',block:'center'});
         await new Promise(paint=>requestAnimationFrame(()=>requestAnimationFrame(paint)));
         const startedAt=Date.now(); const started=performance.now();
-        ${representative.value
+        const previousValue=target.value;
+        ${representative.selectAlternative
+          ? "const alternative=[...target.options].find(option=>option.value!=='all'); target.value=alternative?.value||'all'; target.dispatchEvent(new Event('change',{bubbles:true}));"
+          : representative.value
           ? `target.value=${JSON.stringify(representative.value)}; target.dispatchEvent(new Event('change',{bubbles:true}));`
           : "target.click();"}
         const check=()=>{
           const rows=StockAgentDashboard.performanceHistorySnapshot().filter(row=>row.observedAt>=startedAt-5);
           const interaction=rows.find(row=>row.kind==='interaction');
           const api=${representative.apiPath
-            ? `rows.find(row=>row.kind==='api'&&row.requestPath===${JSON.stringify(representative.apiPath)})`
+            ? `rows.find(row=>row.kind==='api'&&row.outcome==='ok'&&row.requestPath===${JSON.stringify(representative.apiPath)})`
             : "true"};
-          if(interaction&&api) resolve({milliseconds:performance.now()-started,interaction,api:${representative.apiPath ? "api" : "null"}});
-          else if(performance.now()-started>10000) resolve({error:'representative action deadline',rows});
+          const scoped=${["tw-day-trade", "tw-overnight"].includes(name) ? `{
+            signals:{rows:signalRows.length,total:signalTotal,loading:signalLoading,error:signalLoadError,
+              selectionMatches:signalSelectionKey===detailSelectionKey('signals'),
+              revisionMatches:signalDataRevision===detailDataRevision('signals')},
+            positions:{rows:positionRows.length,total:positionTotal,loading:positionLoading,error:positionLoadError,
+              selectionMatches:positionSelectionKey===detailSelectionKey('positions'),
+              revisionMatches:positionDataRevision===detailDataRevision('positions')},
+          }` : "null"};
+          const scopedReady=!scoped||Object.values(scoped).every(page=>!page.loading&&!page.error
+            &&page.selectionMatches&&page.revisionMatches&&Number.isSafeInteger(page.total)&&page.total>=page.rows);
+          // With no enabled overnight mode, selecting 'all' again correctly
+          // reuses its accepted empty page. Do not invent a mode-switch test or
+          // require a redundant request; still prove current scope/revision.
+          const unchangedSelection=${Boolean(representative.selectAlternative)}&&target.value===previousValue;
+          if(scoped&&Object.values(scoped).some(page=>page.error)) resolve({error:'representative scoped details failed',scoped,rows});
+          else if(interaction&&scopedReady&&(api||(unchangedSelection&&scoped))) resolve({
+            milliseconds:performance.now()-started,selectedValue:target.value||null,
+            selectionChanged:target.value!==previousValue,scoped,
+            navigationCount:performance.getEntriesByType('navigation').length,interaction,
+            api:${representative.apiPath ? "api||null" : "null"},
+            boundary:unchangedSelection?'Accepted unchanged scope; no alternative enabled mode tested':'Accepted selected scope',
+          });
+          else if(performance.now()-started>10000) resolve({error:'representative action deadline',scoped,rows});
           else setTimeout(check,20);
         }; check();
       })`,
@@ -651,6 +677,83 @@ for (const [name, suffix] of pages) {
     });
     representativeAction = tested.result?.value || {error:"representative action evaluation failed"};
     await waitUntilReady(send, pendingApi);
+  }
+  let detailPanels = null;
+  if (["tw-day-trade", "tw-overnight"].includes(name)) {
+    const tested = await send("Runtime.evaluate", {
+      expression: `new Promise(async resolve => {
+        const row=document.querySelector('#signal-body tr[data-signal-key]');
+        let feature;
+        if(row) {
+          const key=row.dataset.signalKey; row.click();
+          await new Promise(paint=>requestAnimationFrame(()=>requestAnimationFrame(paint)));
+          const scope=document.getElementById('signal-feature-scope')?.textContent||'';
+          const empty=document.getElementById('signal-feature-empty');
+          const message=empty&&!empty.classList.contains('hidden')?empty.textContent:'';
+          feature={selected:featurePanelSignalKey===key,scope,message,
+            rows:document.querySelectorAll('#signal-feature-body tbody tr').length};
+          if(!feature.selected||!scope||message.includes('尚未讀到 summary'))
+            feature.error='signal feature readback failed';
+        } else feature={status:'not_tested_no_signal_rows',acceptedEmpty:signalTotal===0&&!signalLoading&&!signalLoadError
+          &&signalSelectionKey===detailSelectionKey('signals')&&signalDataRevision===detailDataRevision('signals')};
+        const target=document.getElementById('tw-public-status');
+        if(!target) return resolve({error:'missing public source monitor',feature});
+        const started=performance.now(); target.scrollIntoView({behavior:'instant',block:'center'});
+        const check=()=>{
+          const sourceRows=twPublicMonitorData?twPublicRowsSource(twPublicMonitorData)
+            .filter(row=>row?.parent_id==='group:tw-public'):[];
+          const summary=document.getElementById('tw-public-monitor-summary')?.textContent||'';
+          const state=document.getElementById('tw-public-monitor-fetch-state')?.textContent||'';
+          if(sourceRows.length&&!twPublicMonitorRefreshInFlight) resolve({
+            feature,monitor:{milliseconds:performance.now()-started,sourceCount:sourceRows.length,
+              summary,state,updatedAt:twPublicMonitorLastUpdated},
+            navigationCount:performance.getEntriesByType('navigation').length,
+            ...(feature.error||feature.acceptedEmpty===false?{error:feature.error||'unaccepted empty signal page'}:{}),
+          });
+          else if(performance.now()-started>20000) resolve({error:'source monitor readback deadline',feature,summary,state});
+          else setTimeout(check,50);
+        }; check();
+      })`, awaitPromise:true, returnByValue:true,
+    });
+    detailPanels = tested.result?.value || {error:"detail panel evaluation failed"};
+  }
+  let modeSweep = null;
+  if (name === "tw-day-trade" && width >= 1024) {
+    const tested = await send("Runtime.evaluate", {
+      expression: `new Promise(async resolve => {
+        const select=document.getElementById('mode-filter');
+        if(!select) return resolve({error:'missing mode sweep control'});
+        const modes=[...select.options].map(option=>option.value).filter(value=>value!=='all');
+        const results=[];
+        for(const mode of modes) {
+          const started=performance.now(); select.value=mode;
+          select.dispatchEvent(new Event('change',{bubbles:true}));
+          const result=await new Promise(done=>{
+            const check=()=>{
+              const state={mode,signals:signalTotal,signalRows:signalRows.length,
+                positions:positionTotal,positionRows:positionRows.length,
+                signalError:signalLoadError,positionError:positionLoadError};
+              if(signalLoadError||positionLoadError) return done({...state,error:'mode sweep request failed'});
+              if(!signalLoading&&!positionLoading&&signalSelectionKey===detailSelectionKey('signals')
+                &&positionSelectionKey===detailSelectionKey('positions')
+                &&signalDataRevision===detailDataRevision('signals')&&positionDataRevision===detailDataRevision('positions')) {
+                if(signalRows.some(row=>row.market!==mode)||positionRows.some(row=>row.market!==mode))
+                  return done({...state,error:'mode sweep mixed market rows'});
+                return requestAnimationFrame(()=>requestAnimationFrame(()=>done({...state,
+                  milliseconds:performance.now()-started,acceptedCurrentScope:true})));
+              }
+              if(performance.now()-started>20000) return done({...state,error:'mode sweep deadline'});
+              setTimeout(check,25);
+            }; check();
+          });
+          results.push(result);
+          if(result.error) return resolve({error:result.error,results});
+        }
+        resolve({results,navigationCount:performance.getEntriesByType('navigation').length,
+          boundary:'Current-scope first pages for every enabled mode; not opening latency or broker execution'});
+      })`, awaitPromise:true, returnByValue:true,
+    });
+    modeSweep = tested.result?.value || {error:"mode sweep evaluation failed"};
   }
   const evaluated = await send("Runtime.evaluate", {
     expression,
@@ -666,7 +769,7 @@ for (const [name, suffix] of pages) {
   );
   results.push({...evaluated.result.value,
     initialApiResources:initialApiResources.result?.value || [],
-    interactionLatency, representativeAction, consoleErrors, failedApi,
+    interactionLatency, representativeAction, detailPanels, modeSweep, consoleErrors, failedApi,
     pendingApi:[...pendingApi.values()],
   });
   } catch(error) {
@@ -692,4 +795,5 @@ if(results.some(row=>row.auditError || row.horizontalOverflow || row.laptopTable
   || row.apiTimingErrors?.length || row.interactionLatency?.error
   || row.interactionLatency?.fullHistory?.error
   || (emulateMobile && row.touchTargetRisks?.length)
-  || row.interactionLatency?.eventActivation?.error || row.representativeAction?.error)) process.exitCode=1;
+  || row.interactionLatency?.eventActivation?.error || row.representativeAction?.error
+  || row.detailPanels?.error || row.modeSweep?.error)) process.exitCode=1;

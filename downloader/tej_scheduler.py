@@ -39,12 +39,14 @@ PROGRESS_STATES = frozenset({
     "prequery_failure_deferred",
     "api_scope_repartitioned",
     "selector_scope_repartitioned",
+    "finite_admission_rejected_before_query",
     "metadata_retry_scheduled",
 })
 # These transitions commit a smaller, exact pending scope before claiming any
 # desktop attempt. The preceding real query already paid its configured gap;
 # local queue work must not add another source-rate-limit sleep.
-LOCAL_PLANNING_STATES = frozenset({"api_scope_repartitioned", "selector_scope_repartitioned"})
+LOCAL_PLANNING_STATES = frozenset({"api_scope_repartitioned", "selector_scope_repartitioned",
+                                   "finite_admission_rejected_before_query"})
 SAFETY_STATES = frozenset({
     "desktop_interface_recovery_required", "inflight_requires_recovery",
     "unknown_outcome_no_auto_retry", "source_validation_failed", "local_storage_failed",
@@ -529,15 +531,17 @@ def queue_wait(root: Path, observed: datetime, fallback: float) -> float:
     Match _ready_task's isolation while reading only indexed live metadata.
     """
     from downloader.tej_planning import COMPANY_MEMBERSHIP_DEFERRED
+    from downloader.tej_finite_retry import retry_exception_sql
+    finite_retry = retry_exception_sql()
     with closing(connect(root)) as con:
         row = con.execute(
             "SELECT MIN(CASE WHEN retry.table_id IS NOT NULL AND "
-            "(retry.error_code<>? OR COALESCE(tasks.last_error_code,'')=?) "
+            "(retry.error_code<>? OR COALESCE(tasks.last_error_code,'')=?) AND NOT (" + finite_retry + ") "
             "THEN MAX(COALESCE(tasks.next_attempt_at_utc,?),retry.next_attempt_at_utc) "
             "ELSE COALESCE(tasks.next_attempt_at_utc,?) END) FROM tasks "
             "LEFT JOIN desktop_retry_windows AS retry ON retry.table_id=tasks.table_id "
             "WHERE tasks.state='pending' AND (retry.table_id IS NULL OR retry.error_code=? "
-            "OR retry.task_id=tasks.task_id) AND NOT EXISTS (SELECT 1 FROM tasks AS blocked "
+            "OR retry.task_id=tasks.task_id OR (" + finite_retry + ")) AND NOT EXISTS (SELECT 1 FROM tasks AS blocked "
             "WHERE blocked.table_id=tasks.table_id AND blocked.state='blocked' "
             "AND blocked.last_error_code='source_validation_failed_deferred')",
             (COMPANY_MEMBERSHIP_DEFERRED,COMPANY_MEMBERSHIP_DEFERRED,

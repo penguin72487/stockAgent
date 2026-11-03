@@ -103,7 +103,9 @@ def _compile_accounting(source, universe, *, output, end, slots, save, log,
                         rule_source=None, scope_products=None, portfolio_lifetimes=None,
                         information_halt_reviews=(), valuation_research_policy=None,
                         official_evidence_cache=None, official_spread_research_policy=None,
-                        holiday_account_dates_source=None):
+                        holiday_account_dates_source=None,
+                        holiday_valuation_source=None,
+                        allow_unobserved_catalog_products=False):
     """Canonical financial calculation, separately fingerprinted for reuse."""
     full_universe = universe
     products = universe["product"].to_list()
@@ -190,6 +192,10 @@ def _compile_accounting(source, universe, *, output, end, slots, save, log,
         save("research_valuation_rows", valuation_values)
         log("research_valuations_applied", rows=valuation_values.height)
     physical = carry_cash_only_accounting_marks(physical, account_calendar)
+    if holiday_valuation_source is not None:
+        from stockagent.data.tw_futures_holiday_c11 import apply_holiday_c11_marks
+        physical = apply_holiday_c11_marks(physical, holiday_valuation_source)
+        log("original_c11_holiday_marks_applied", source_fingerprint=holiday_valuation_source.fingerprint)
     save("physical_daily_marks", physical)
     parent_lives = None
     if scope_products is not None:
@@ -200,7 +206,8 @@ def _compile_accounting(source, universe, *, output, end, slots, save, log,
                                  own_lives], how="vertical")
         save("portfolio_slot_lifetimes", parent_lives)
     frame, _ = materialize_margin_market_rows(physical, raw, universe, slot_count=slots, market_dates=account_calendar,
-        portfolio_lifetimes=parent_lives, portfolio_universe=full_universe if parent_lives is not None else None)
+        portfolio_lifetimes=parent_lives, portfolio_universe=full_universe if parent_lives is not None else None,
+        allow_unobserved_catalog_products=allow_unobserved_catalog_products)
     del raw
     days = frame.select("date", "product", "contract").unique()
     units = bind_dated_corporate_terms(days.filter(pl.col("product").str.contains(r"\d$")),
@@ -1304,14 +1311,22 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
           official_evidence_cache: Path | None = None,
           official_spread_research_policy: Path | None = None,
           holiday_account_dates_source: Path | None = None,
-          holiday_account_workspace: Path | None = None) -> dict:
+          holiday_valuation_source: Path | None = None,
+          holiday_account_workspace: Path | None = None,
+          allow_unobserved_catalog_products: bool = False) -> dict:
     begun = time.monotonic()
     if accounting_only and prepare_only:
         raise ValueError('accounting-only and prepare-only are separate preparation boundaries')
-    if holiday_account_dates_source is not None and (not accounting_only or reuse_accounting
+    if type(allow_unobserved_catalog_products) is not bool:
+        raise ValueError('catalog-only admission requires an explicit Boolean')
+    if allow_unobserved_catalog_products and (reuse_accounting or previous_sources is not None
+            or replay_accounting is not None or parent_accounting is not None or diagnostic_products):
+        raise ValueError('catalog-only admission requires a fresh full-scope accounting build')
+    if (holiday_account_dates_source is not None or holiday_valuation_source is not None) and (not accounting_only or reuse_accounting
             or parent_accounting is not None or previous_sources is not None or replay_accounting is not None):
-        raise ValueError('holiday account dates require a fresh, unpublished accounting-only build')
-    if holiday_account_workspace is not None and holiday_account_dates_source is None:
+        raise ValueError('holiday sources require a fresh, unpublished accounting-only build')
+    if (holiday_account_workspace is not None and holiday_account_dates_source is None
+            and holiday_valuation_source is None):
         raise ValueError('holiday account workspace requires an explicit holiday account source')
     if official_evidence_cache is not None and (reuse_accounting or parent_accounting is not None
             or previous_sources is not None or replay_accounting is not None or diagnostic_products):
@@ -1339,6 +1354,13 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     if (output / "build_acceptance.json").exists():
         raise FileExistsError("completed releases are immutable; use the accepted build")
     holiday_source = None
+    holiday_marks = None
+    if holiday_valuation_source is not None:
+        from stockagent.data.tw_futures_holiday_c11 import load_holiday_c11
+        workspace = holiday_account_workspace if holiday_account_workspace is not None else Path.cwd()
+        holiday_marks = load_holiday_c11(holiday_valuation_source, workspace=workspace)
+        if holiday_marks.financial_daily_sha256 is not None:
+            raise ValueError('new accounting preparation needs an unbound C11 source; bound sources validate existing releases')
     if holiday_account_dates_source is not None:
         from stockagent.data.tw_futures_holiday_account_dates import load_holiday_account_dates
         # A frozen code release is not the mutable data workspace. Bind the
@@ -1398,12 +1420,22 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     products = universe["product"].to_list()
     inputs = dict(source_manifest_sha256=sha256_file(source / "source_manifest.json"),
         end=str(end), slots=slots, products=products, calculation=_calculation_identity())
+    if allow_unobserved_catalog_products:
+        inputs['catalog_history_admission'] = dict(
+            contract='unobserved_catalog_products_no_market_rows_v1',
+            absence_is_listing_proof=False, dropped_observations_permitted=False)
     if holiday_source is not None:
         from stockagent.data.tw_futures_holiday_account_dates import HOLIDAY_ACCOUNT_DATES_ABI
         inputs['holiday_account_dates_research'] = dict(contract=HOLIDAY_ACCOUNT_DATES_ABI,
             source_fingerprint=holiday_source.fingerprint,
             implementation_sha256=sha256_file(ROOT/'stockagent/data/tw_futures_holiday_account_dates.py'),
             valuation_complete=False, publication_allowed=False)
+    if holiday_marks is not None:
+        from stockagent.data.tw_futures_holiday_c11 import HOLIDAY_C11_ABI
+        inputs['holiday_c11_valuations'] = dict(contract=HOLIDAY_C11_ABI,
+            source_fingerprint=holiday_marks.fingerprint,
+            implementation_sha256=sha256_file(ROOT/'stockagent/data/tw_futures_holiday_c11.py'),
+            publication_allowed=False)
     if official_spread_research_policy is not None:
         from stockagent.data.tw_futures_spread_reconciliation import CONTRACT
         inputs['official_spread_research_reconciliation'] = dict(contract=CONTRACT,
@@ -1514,6 +1546,8 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
             information_halt_reviews=information_reviews, valuation_research_policy=valuation_policy,
             official_evidence_cache=official_evidence_cache,
             official_spread_research_policy=official_spread_research_policy,
+            **({'allow_unobserved_catalog_products': True} if allow_unobserved_catalog_products else {}),
+            **({'holiday_valuation_source': holiday_marks} if holiday_marks is not None else {}),
             **({'holiday_account_dates_source': holiday_source} if holiday_source is not None else {}))
         save("frame", frame); save("execution_dependencies", dependencies)
         if holiday_source is not None:
@@ -1521,14 +1555,20 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
             if inputs['holiday_account_dates_research']['implementation_sha256'] != sha256_file(
                     ROOT/'stockagent/data/tw_futures_holiday_account_dates.py'):
                 raise ValueError('holiday account date implementation changed during accounting build')
+        if holiday_marks is not None:
+            holiday_marks.verify()
+            if inputs['holiday_c11_valuations']['implementation_sha256'] != sha256_file(
+                    ROOT/'stockagent/data/tw_futures_holiday_c11.py'):
+                raise ValueError('holiday C11 implementation changed during accounting build')
         atomic_write_json(checkpoint, dict(inputs=inputs,
             outputs={name:sha256_file(output/name) for name in cache_files.values()}))
     if accounting_only:
-        result = dict(status=('holiday_account_dates_research_checkpoint_not_published' if holiday_source
+        result = dict(status=('holiday_original_c11_checkpoint_not_published' if holiday_marks else
+                              'holiday_account_dates_research_checkpoint_not_published' if holiday_source
                               else 'original_accounting_checkpoint_ready_not_published'),
             checkpoint_sha256=sha256_file(checkpoint), publication_asset_scope=publication_asset_scope,
             financial_release_accepted=False, elapsed_s=time.monotonic()-begun,
-            **(dict(holiday_valuation_complete=False, training_admitted=False) if holiday_source else {}))
+            **(dict(holiday_valuation_complete=False, training_admitted=False) if holiday_source or holiday_marks else {}))
         atomic_write_json(output/'accounting_stage.json', result)
         return result
     context_proof = None
@@ -1550,6 +1590,10 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
     active = flags.filter(~pl.col("is_warmup"))
     keys = ["date", "physical_contract"]
     log("complete_universe_accounting", rows=rules.height, blocked=int(active["has_blocker"].sum()))
+    catalog_only = sorted(set(products) - set(frame['product']))
+    if allow_unobserved_catalog_products:
+        universe.filter(pl.col('product').is_in(catalog_only)).write_csv(output / 'catalog_only_products.csv')
+        log('catalog_only_product_scope', products=len(catalog_only), absence_is_listing_proof=False)
     frame, rules, flags = _publication_asset_scope(
         frame, rules, flags, publication_asset_scope)
     selected, chosen, coverage = select_complete_margin_components(
@@ -1683,6 +1727,10 @@ def build(source: Path, output: Path, *, start: date, end: date, slots: int = 28
             if allow_component_history_before_start else 'complete_components_born_in_requested_horizon_v1'),
         publication_asset_scope=publication_asset_scope,
         requested_products=products, selected_products=chosen_products,
+        **({'catalog_history_admission': inputs['catalog_history_admission'],
+            'catalog_only_products': catalog_only,
+            'catalog_only_products_sha256': sha256_file(output / 'catalog_only_products.csv')}
+            if allow_unobserved_catalog_products else {}),
         lifetime_scope_sha256=sha256_file(output / "lifetime_scope.parquet"),
         source_evidence_sha256=sha256_file(source / "source_manifest.json"),
         full_history_training_ready=False, financial_values_inferred=valuation_proof is not None,
@@ -1759,6 +1807,8 @@ if __name__ == "__main__":
                         help='Stop after selected terms/materialization; publish in a fresh bounded process')
     parser.add_argument('--allow-component-history-before-start', action='store_true',
                         help='Retain fully verified ancestry for components intersecting the requested horizon')
+    parser.add_argument('--allow-unobserved-catalog-products', action='store_true',
+                        help='Retain catalog entries with no physical history as unverified catalog-only entries')
     parser.add_argument("--previous-sources", type=Path, help="Verified previous source for a margin-only incremental repair")
     parser.add_argument("--reuse-accounting", action="store_true")
     parser.add_argument('--reuse-parent-accounting', type=Path,
@@ -1769,6 +1819,8 @@ if __name__ == "__main__":
                         help='Explicit source-bound non-PIT duplicate-spread-label reconciliation')
     parser.add_argument('--holiday-account-dates-source', type=Path,
                         help='Source-bound date-only research candidate for a fresh accounting-only build')
+    parser.add_argument('--holiday-valuation-source', type=Path,
+                        help='Original C11/P08 marks for a fresh, unpublished accounting-only build')
     parser.add_argument('--holiday-account-workspace', type=Path,
                         help='Workspace containing pinned holiday inputs; defaults to the current directory')
     parser.add_argument('--recheck-corporate-requirements-from',type=Path,
@@ -1796,12 +1848,17 @@ if __name__ == "__main__":
     parser.add_argument('--empty-prefix-max-volume-participation', type=float,
                         help='Whole-contract prefix ABI; reject runtime participation above this explicit bound')
     args = parser.parse_args()
-    if args.holiday_account_workspace is not None and args.holiday_account_dates_source is None:
-        parser.error('--holiday-account-workspace requires --holiday-account-dates-source')
-    if args.holiday_account_dates_source is not None and (not args.accounting_only
+    if args.allow_unobserved_catalog_products and (args.rule_delta or args.publish_replay
+            or args.repair_release_metadata or args.reuse_accounting or args.reuse_parent_accounting
+            or args.previous_sources or args.diagnostic_product):
+        parser.error('catalog-only admission requires a fresh full-scope accounting build')
+    if (args.holiday_account_workspace is not None and args.holiday_account_dates_source is None
+            and args.holiday_valuation_source is None):
+        parser.error('--holiday-account-workspace requires a holiday date or valuation source')
+    if (args.holiday_account_dates_source is not None or args.holiday_valuation_source is not None) and (not args.accounting_only
             or args.reuse_accounting or args.reuse_parent_accounting or args.previous_sources
             or args.publish_replay or args.rule_delta or args.repair_release_metadata):
-        parser.error('holiday dates require a fresh, unpublished accounting-only build')
+        parser.error('holiday sources require a fresh, unpublished accounting-only build')
     if args.recheck_corporate_requirements_from is not None and (args.reuse_parent_accounting is None
             or not args.integrate_rule_delta or not args.accounting_only):
         parser.error('corporate recheck requires parent accounting, integrated rules and accounting-only phase')
@@ -1844,7 +1901,9 @@ if __name__ == "__main__":
             official_evidence_cache=args.reuse_official_evidence_cache,
             official_spread_research_policy=args.official_spread_research_policy,
             holiday_account_dates_source=args.holiday_account_dates_source,
-            holiday_account_workspace=args.holiday_account_workspace)
+            holiday_valuation_source=args.holiday_valuation_source,
+            holiday_account_workspace=args.holiday_account_workspace,
+            allow_unobserved_catalog_products=args.allow_unobserved_catalog_products)
     elif args.publish_replay:
         if (not args.rule_delta or not args.valuation_research_policy or not args.omit_empty_account_prefixes
                 or args.reuse_accounting or args.previous_sources or args.repair_release_metadata
@@ -1884,4 +1943,6 @@ if __name__ == "__main__":
               official_evidence_cache=args.reuse_official_evidence_cache,
               official_spread_research_policy=args.official_spread_research_policy,
               holiday_account_dates_source=args.holiday_account_dates_source,
-              holiday_account_workspace=args.holiday_account_workspace)
+              holiday_valuation_source=args.holiday_valuation_source,
+              holiday_account_workspace=args.holiday_account_workspace,
+              allow_unobserved_catalog_products=args.allow_unobserved_catalog_products)

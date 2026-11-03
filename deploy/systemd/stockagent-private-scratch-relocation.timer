@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the fixed private SQLite workspace handoff after interruption
+
+[Timer]
+OnBootSec=45
+OnUnitInactiveSec=60
+AccuracySec=1
+Unit=stockagent-private-scratch-relocation.service
+
+[Install]
+WantedBy=timers.target

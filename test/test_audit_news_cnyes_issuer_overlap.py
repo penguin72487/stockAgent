@@ -93,6 +93,20 @@ def test_new_comparison_reads_one_covering_source_and_preserves_distinct_provena
     assert audit.audit(news, finlab, registry, checked, changed)['counts']['novel_post_identities'] == 3
 
 
+def test_new_proof_contract_requires_complete_original_request_identity(cnyes_config, tmp_path):
+    news, finlab, db, part, receipt, registry, checked, prior, paths = _fixture(tmp_path, cnyes_config)
+    checked = {**checked, 'contract': 'cnyes_retained_missing_crosscheck_v2',
+               'unresolved_matching_observations': 0,
+               'target_outcomes': [{**item, 'original_request_identity_checked': True}
+                                   for item in checked['target_outcomes']]}
+    assert audit.audit(news, finlab, registry, checked, prior)['accepted']
+    for changed in ({**checked, 'unresolved_matching_observations': 1},
+                    {**checked, 'target_outcomes': [{**item, 'original_request_identity_checked': False}
+                                                    for item in checked['target_outcomes']]}):
+        with pytest.raises(ValueError, match='invalid_cnyes_proof_scope'):
+            audit.audit(news, finlab, registry, changed, prior)
+
+
 def test_failed_selected_original_uses_alternatives_but_failure_remains_visible(cnyes_config, tmp_path):
     news, finlab, db, part, receipt, registry, checked, prior, paths = _fixture(tmp_path, cnyes_config)
     broken = paths[1].with_suffix('.parquet.receipt.json')

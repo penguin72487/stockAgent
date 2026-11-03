@@ -6,6 +6,54 @@ from matplotlib.colors import to_rgba
 from stockagent.backtest import report
 
 
+def test_session_equity_display_keeps_actual_marks_without_weekend_rows():
+    # Tuesday's value changes even if there was no new trade: a carried
+    # futures position can still have marked P&L on an observed account day.
+    dates = np.array(["2026-01-02", "2026-01-05", "2026-01-06"], dtype="datetime64[D]")
+    equity = np.array([1.1, 1.2, 1.25])
+    days, shown = report._trading_session_equity_display(dates, equity)
+
+    np.testing.assert_array_equal(days, dates)
+    np.testing.assert_allclose(shown, [1.1, 1.2, 1.25])
+    np.testing.assert_allclose(equity, [1.1, 1.2, 1.25])
+
+
+def test_daily_equity_plot_includes_zero_trade_dates_and_preserves_metrics(monkeypatch):
+    dates = np.array(["2026-01-02", "2026-01-05", "2026-01-06"], dtype="datetime64[D]")
+    result = report.BacktestResult(
+        strategy_returns=np.log([1.1, 1.0, 1.05]),
+        benchmark_returns=np.log([1.0, 1.1, 1.0]),
+        turnovers=np.array([0.1, 0.0, 0.0]),
+        weights_history=np.ones((3, 1)),
+    )
+    before = report.compute_metrics(result)
+    original_close = report.plt.close
+    monkeypatch.setattr(report.plt, "close", lambda *args, **kwargs: None)
+    fig = None
+    try:
+        report.plot_equity_curve_log(result, dates)
+        fig = report.plt.gcf()
+        ax = fig.axes[0]
+        actual, benchmark = ax.lines[:2]
+        np.testing.assert_array_equal(actual.get_xdata(), dates)
+        np.testing.assert_allclose(actual.get_ydata(), [1.1, 1.1, 1.155])
+        assert actual.get_marker() == "o"
+        assert benchmark.get_marker() == "o"
+        assert len(ax.get_xticks()) == len(dates)
+        assert report.compute_metrics(result) == before
+    finally:
+        monkeypatch.setattr(report.plt, "close", original_close)
+        if fig is not None:
+            original_close(fig)
+
+
+def test_session_equity_display_rejects_intraday_or_ambiguous_axes():
+    intraday = np.array(["2026-01-02T08:45", "2026-01-02T09:00"], dtype="datetime64[m]")
+    duplicates = np.array(["2026-01-02", "2026-01-02"], dtype="datetime64[D]")
+    assert report._trading_session_equity_display(intraday, np.ones(2)) is None
+    assert report._trading_session_equity_display(duplicates, np.ones(2)) is None
+
+
 def test_first_year_fold_metric_bars_uses_log_return_scale(monkeypatch):
     original_close = report.plt.close
     monkeypatch.setattr(report.plt, "close", lambda *args, **kwargs: None)

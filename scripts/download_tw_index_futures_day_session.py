@@ -40,6 +40,7 @@ from stockagent.data.tw_customized_futures_daily import (  # noqa: E402
     iter_customized_daily_rows,
 )
 from downloader.dataset_lock import exclusive_dataset_lock  # noqa: E402
+from stockagent.data_sync.cache_capacity import acquisition_dispatch_status  # noqa: E402
 from scripts.taifex_daily_download_common import (  # noqa: E402
     atomic_write_json,
     download_taifex_attachment,
@@ -248,6 +249,67 @@ def _range_receipt_coverage(
     return dates, index_days, physical_rows
 
 
+def _priority_day_source(root: Path, day: date, *, attempts: int, request_interval: float) -> dict:
+    """Acquire one completed-day source without replacing the active panel.
+
+    The wrapper's normal writer lock and capacity gate remain authoritative.
+    A previously unreceipted or changed file is preserved and rejected.
+    """
+    if day >= datetime.now(TAIPEI).date():
+        raise ValueError("priority source requires a completed local calendar day")
+    target = root / "raw" / "priority_daily" / f"{day.isoformat()}_all.csv"
+    receipt = target.with_suffix(".receipt.json")
+    payload = {"down_type": "1", "queryStartDate": day.strftime("%Y/%m/%d"),
+               "queryEndDate": day.strftime("%Y/%m/%d"), "commodity_id": "all", "commodity_id2": ""}
+    with exclusive_dataset_lock(root / "state" / "all_futures_daily.lock",
+                                provider="taifex_futures_daily", timeout_seconds=0):
+        if target.is_symlink() or receipt.is_symlink():
+            raise ValueError("priority source cannot use symlinks")
+        if target.exists() != receipt.exists():
+            raise ValueError("unreceipted priority source must be reviewed without replacement")
+        if receipt.exists():
+            existing = json.loads(receipt.read_text(encoding="utf-8"))
+            if (existing.get("contract") != "taifex_futures_daily_priority_source_v1"
+                    or existing.get("source_url") != TAIFEX_DOWNLOAD_URL
+                    or existing.get("request") != payload
+                    or existing.get("sha256") != _sha256(target)
+                    or existing.get("bytes") != target.stat().st_size):
+                raise ValueError("priority source receipt or payload changed")
+            return existing
+        capacity = acquisition_dispatch_status(root)
+        if capacity.get("state") not in {"admitted", "not_enrolled"}:
+            raise RuntimeError(f"priority source capacity deferred: {capacity.get('reason')}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _download(payload, target, attempts=attempts, request_interval=request_interval)
+        _validate_receipt(target)
+        digest = _sha256(target)
+        rows = 0
+        keys: set[tuple[str, str, str]] = set()
+        with target.open("r", encoding="cp950", newline="") as stream:
+            reader = csv.DictReader(stream)
+            if reader.fieldnames is None or not {"交易日期", "契約", "到期月份(週別)", "交易時段"}.issubset(reader.fieldnames):
+                raise ValueError("priority source lacks required identity fields")
+            for number, row in enumerate(reader, 2):
+                observed_day = date.fromisoformat(str(row.get("交易日期") or "").strip().replace("/", "-"))
+                key = tuple(str(row.get(field) or "").strip() for field in ("契約", "到期月份(週別)", "交易時段"))
+                if observed_day != day or not all(key):
+                    raise ValueError(f"priority source has invalid identity at row {number}")
+                rows += 1
+                keys.add(key)
+        if _sha256(target) != digest:
+            raise ValueError("priority source changed during readback")
+        result = {"contract": "taifex_futures_daily_priority_source_v1",
+                  "observed_at_utc": datetime.now(ZoneInfo("UTC")).isoformat(),
+                  "source_url": TAIFEX_DOWNLOAD_URL, "request": payload,
+                  "path": str(target), "sha256": digest, "bytes": target.stat().st_size,
+                  "source_rows": rows, "source_product_count": len({key[0] for key in keys}),
+                  "source_contract_session_keys": len(keys),
+                  "state": "rows_observed" if rows else "header_only_observed",
+                  "scope": "raw source only; not executable, PIT or training admission"}
+        atomic_write_json(receipt, result)
+        return result
+
+
 def _retain_rejected_refresh(staged: Path, target: Path) -> Path:
     """Keep a rejected official reply separately for diagnosis."""
 
@@ -443,6 +505,8 @@ def main() -> int:
     )
     parser.add_argument("--request-interval", type=float, default=1.0)
     parser.add_argument("--attempts", type=int, default=3)
+    parser.add_argument("--priority-day", type=_parse_date,
+                        help="Collect one completed day as a separate immutable source; do not rebuild panels.")
     parser.add_argument("--customized-only", action="store_true",
                         help="Collect FLEX daily sources separately; do not change standard datasets.")
     parser.add_argument("--customized-start-date", type=_parse_date,
@@ -467,6 +531,16 @@ def main() -> int:
         parser.error("--attempts must be positive")
 
     output_dir = Path(args.output_dir).expanduser().resolve()
+    if args.priority_day:
+        if args.customized_only or args.rebuild_normalized_only:
+            parser.error("--priority-day cannot be combined with customized or rebuild mode")
+        try:
+            result = _priority_day_source(output_dir, args.priority_day, attempts=args.attempts,
+                                          request_interval=args.request_interval)
+        except (ValueError, RuntimeError) as exc:
+            parser.error(str(exc))
+        print(json.dumps(result, ensure_ascii=False), flush=True)
+        return 0
     if args.customized_only:
         if args.rebuild_normalized_only:
             parser.error("--customized-only cannot be combined with --rebuild-normalized-only")

@@ -309,15 +309,28 @@ def record_failure_observation(queue, task, error):
         return False  # Best-effort diagnostics cannot undo the source failure.
 
 
-def accept(queue, task, response, rows, records, errors):
+def accept(queue, task, response, rows, records, errors, *, _checkpoint_id=None, _checked=None):
     """Commit durable metadata before scheduling success; safe to replay a crash."""
+    from downloader.news_fulltext import (_article_links_started_after_heads, _discovery_head_fields,
+                                          _locked_discovery_head_matches, _missing_article_links)
     from downloader.news_fulltext_policy import NewsError
     from downloader.news_fulltext_queue import utc_now
+    from downloader.news_fulltext_metadata_checkpoint import MAX_BODY_BYTES, _MISSING_RECEIPT, _original
+    import pyarrow as pa
+
+    def verified_original(value, **options):
+        try:
+            return _original(queue, value, source, **options)
+        except FileNotFoundError as error:
+            raise NewsError('metadata_feed_receipt_mismatch', retry=True, delay=60) from error
+        except (ValueError, TypeError, KeyError, OverflowError, NewsError, pa.ArrowException) as error:
+            raise NewsError('metadata_feed_receipt_mismatch', retry=True, delay=60) from error
+
     source = require_request(queue.registry, task['url'], task['url'])
     if task['provider'] != source.provider or records or errors or response.url != task['url']:
         raise NewsError('metadata_feed_cannot_accept_article_bodies')
     fingerprint = source.metadata_feed_fingerprint
-    checked = utc_now()
+    checked = utc_now() if _checked is None else _checked
     previous = queue.db.execute('SELECT * FROM metadata_feed_heads WHERE provider=? AND feed_url=?',
                                  (source.provider, task['url'])).fetchone()
     if response.status == 304:
@@ -325,26 +338,44 @@ def accept(queue, task, response, rows, records, errors):
                 or previous['parser_fingerprint'] != task.get('parser_fingerprint')
                 or task.get('response_sha256') != previous['response_sha256']):
             raise NewsError('unverifiable_metadata_feed_not_modified', retry=True, delay=60)
-        receipt = json.loads((queue.root / previous['receipt_path']).read_bytes())
         fingerprint = previous['parser_fingerprint']  # Never relabel strict-v1 evidence on 304.
-        version = VERSION if fingerprint == source.metadata_feed_fingerprint else 1
-        if (sha256_file(queue.root / receipt['parquet_path']) != receipt['sha256']
-                or receipt['metadata_fingerprint'] != fingerprint or receipt['contract_version'] != version
-                or receipt['response_sha256'] != previous['response_sha256']
-                or receipt['feed_url'] != task['url'] or receipt['provider'] != source.provider
-                or receipt['article_bodies_accepted'] != 0 or receipt['publish'] is not False
-                or receipt['remote_training_export'] is not False):
-            raise NewsError('metadata_feed_receipt_mismatch')
+        digest = previous['response_sha256']
+        relative = (f"metadata_feeds/{fingerprint}/{hashlib.sha256(task['url'].encode()).hexdigest()}/"
+                    f'{digest}.parquet')
+        if (not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None
+                or previous['receipt_path'] != relative + '.receipt.json'
+                or type(previous['rows']) is not int or not 0 <= previous['rows'] <= 1000
+                or type(previous['response_bytes']) is not int
+                or not 0 <= previous['response_bytes'] <= MAX_BODY_BYTES):
+            raise NewsError('metadata_feed_receipt_mismatch', retry=True, delay=60)
+        witness = {'head': {'url': task['url']}, 'response_sha256': digest,
+                   'metadata_fingerprint': fingerprint, 'response_bytes': previous['response_bytes'],
+                   'headers': {'content-type': 'application/rss+xml'}}
+        _, _, retained_rows, receipt = verified_original(witness, legacy=True, details=True)
+        clocks = [datetime.fromisoformat(row['publication_aware']) for row in retained_rows if row['publication_aware']]
+        if (len(retained_rows) != previous['rows']
+                or (min(clocks).isoformat() if clocks else None) != previous['first_publication_aware']
+                or (max(clocks).isoformat() if clocks else None) != previous['last_publication_aware']):
+            raise NewsError('metadata_feed_receipt_mismatch', retry=True, delay=60)
     elif response.status == 200:
         if rows:
             raise NewsError('metadata_feed_cannot_accept_preparsed_or_invented_rows')
         rows, preservation = _parse(response, source, task['url'])  # One healthy XML parse, canonical writer.
+        if _checkpoint_id is None:
+            from downloader.news_fulltext_metadata_checkpoint import register
+            _checkpoint_id = register(queue, task, response, source, checked)
         digest = hashlib.sha256(response.body).hexdigest()
         feed_id = hashlib.sha256(task['url'].encode()).hexdigest()
         relative = f'metadata_feeds/{fingerprint}/{feed_id}/{digest}.parquet'
         target = queue.root / relative
         receipt_path = relative + '.receipt.json'
-        if not target.is_file():
+        receipt_file = queue.root / receipt_path
+        target_present = target.is_file()
+        if not target_present:
+            # Never replace orphan evidence or recreate an original underneath
+            # an existing receipt with a newly invented observation clock.
+            if target.exists() or target.is_symlink() or receipt_file.exists() or receipt_file.is_symlink():
+                raise NewsError('metadata_feed_receipt_mismatch', retry=True, delay=60)
             atomic_write_parquet(target, table_from_records([{
                 'feed_url': task['url'], 'provider': source.provider, 'raw_response_body': response.body,
                 'items_json': json.dumps(rows, ensure_ascii=False, sort_keys=True),
@@ -353,44 +384,80 @@ def accept(queue, task, response, rows, records, errors):
                 'observed_at_utc': checked, 'content_kind': 'rss_information_not_fulltext',
                 'article_bodies_accepted': 0, 'publish': False, 'remote_training_export': False,
             }]), compression='zstd', compression_level=9, durable=True)
-        if not (queue.root / receipt_path).is_file():
-            atomic_write_json(queue.root / receipt_path, {
+        witness = {'head': {'url': task['url']}, 'response_sha256': digest,
+                   'metadata_fingerprint': fingerprint, 'response_bytes': len(response.body),
+                   'headers': {'content-type': response.headers.get('content-type')}}
+        parsed = (response.body, rows, preservation)
+        # An orphan can be sealed only after validating the source bytes,
+        # identity, authorization, timestamps and parsed rows of the original.
+        receipt = _MISSING_RECEIPT
+        if target_present:
+            _, _, _, receipt = verified_original(witness, parsed=parsed, details=True)
+        if receipt is _MISSING_RECEIPT:
+            atomic_write_json(receipt_file, {
                 'contract_version': VERSION, 'parquet_path': relative, 'sha256': sha256_file(target),
                 'response_sha256': digest, 'feed_url': task['url'], 'provider': source.provider,
                 'metadata_fingerprint': fingerprint, 'rows': len(rows), 'response_bytes': len(response.body),
                 'xml_value_preservation': preservation,
                 'article_bodies_accepted': 0, 'publish': False, 'remote_training_export': False,
             }, durable=True)
+            # Read back both files after publishing the receipt, including the
+            # original's content, instead of trusting a partial write.
+            _, _, _, receipt = verified_original(witness, parsed=parsed, details=True)
         target.chmod(0o600)
-        (queue.root / receipt_path).chmod(0o600)
-        receipt = json.loads((queue.root / receipt_path).read_bytes())
-        if (receipt['sha256'] != sha256_file(target) or receipt['response_sha256'] != digest
-                or receipt['metadata_fingerprint'] != fingerprint or receipt['rows'] != len(rows)):
-            raise NewsError('metadata_feed_receipt_mismatch')
+        receipt_file.chmod(0o600)
         clocks = [datetime.fromisoformat(row['publication_aware']) for row in rows if row['publication_aware']]
-        with queue.db:
-            queue.add_articles([{'url': row['url'], 'title': row['title'], 'date': row['publication_raw']} for row in rows])
-            queue.db.execute('INSERT OR REPLACE INTO metadata_feed_heads VALUES (?,?,?,?,?,?,?,?,?,?)',
-                (source.provider, task['url'], fingerprint, digest, receipt_path, len(rows), len(response.body), checked,
-                 min(clocks).isoformat() if clocks else None, max(clocks).isoformat() if clocks else None))
-        queue.metrics.count(source.provider, 'durably_accepted_metadata_feed_pages')
-        queue.metrics.count(source.provider, 'metadata_feed_item_observations', len(rows))
     else:
         raise NewsError('metadata_feed_invalid_acceptance_status')
     with queue.db:
-        queue.db.execute('UPDATE metadata_feed_heads SET checked_at_utc=? WHERE provider=? AND feed_url=?',
-                         (checked, source.provider, task['url']))
+        if response.status == 200:
+            queue.db.execute('INSERT OR IGNORE INTO metadata_feed_observations VALUES (?,?,?,?,?,?,?)',
+                (source.provider, task['url'], fingerprint, digest, receipt_path, len(rows), checked))
+        if not _locked_discovery_head_matches(queue, task, _discovery_head_fields(task)):
+            # The raw page and its receipt remain indexed observations, but an
+            # older request cannot replace a later source/head outcome.
+            if response.status == 200:
+                links = [(row['url'], row['title'], row['publication_raw']) for row in rows]
+                links = _missing_article_links(queue, links)
+                queue.add_articles([{'url': url, 'title': title, 'date': date} for url, title, date in links])
+                from downloader.news_fulltext_metadata_checkpoint import finish
+                finish(queue, _checkpoint_id)
+            queue.metrics.count(source.provider, 'metadata_feed_stale_source_head')
+            return 0
+        if response.status == 200:
+            links = [(row['url'], row['title'], row['publication_raw']) for row in rows]
+            links = _article_links_started_after_heads(queue, links, task.get('_discovery_request_started_at_utc'))
+            queue.add_articles([{'url': url, 'title': title, 'date': date} for url, title, date in links])
+            queue.db.execute('INSERT OR REPLACE INTO metadata_feed_heads VALUES (?,?,?,?,?,?,?,?,?,?)',
+                (source.provider, task['url'], fingerprint, digest, receipt_path, len(rows), len(response.body), checked,
+                 min(clocks).isoformat() if clocks else None, max(clocks).isoformat() if clocks else None))
+        else:
+            queue.db.execute('UPDATE metadata_feed_heads SET checked_at_utc=? WHERE provider=? AND feed_url=?',
+                             (checked, source.provider, task['url']))
         queue.db.execute('UPDATE discovery SET due=?,etag=coalesce(?,etag),last_modified=coalesce(?,last_modified),'
             'response_sha256=?,parser_fingerprint=?,last_checked_at_utc=?,attempts=0,error_code=NULL WHERE url=?',
-            (time.time() + source.metadata_feed_interval_seconds, response.headers.get('etag'),
+            ((time.time() if _checked is None else datetime.fromisoformat(checked.replace('Z', '+00:00')).timestamp())
+             + source.metadata_feed_interval_seconds, response.headers.get('etag'),
              response.headers.get('last-modified'), receipt['response_sha256'], fingerprint, checked, task['url']))
+        if response.status == 200:
+            from downloader.news_fulltext_metadata_checkpoint import finish
+            finish(queue, _checkpoint_id)
+    if response.status == 200:
+        queue.metrics.count(source.provider, 'durably_accepted_metadata_feed_pages')
+        queue.metrics.count(source.provider, 'metadata_feed_item_observations', len(rows))
     return 0  # Never increment a body/version acceptance counter.
 
 
 def progress(db, source):
-    """At most the registered feed count; no article scan or publisher call."""
+    """Project feed heads and indexed recovery counts without publisher calls."""
+    from downloader.news_fulltext_metadata_legacy import progress as legacy_progress
     jobs, rows = [], []
     fingerprints = compatible_fingerprints(source)
+    placeholders = ','.join('?' for _ in source.metadata_feeds)
+    pending = {row['request_url']: (row['pending'], row['not_before']) for row in db.execute(
+        "SELECT request_url,count(*) AS pending,min(not_before) AS not_before "
+        "FROM metadata_feed_interrupted_checkpoints WHERE state='pending' AND request_url IN (" + placeholders + ") "
+        "GROUP BY request_url", source.metadata_feeds)} if source.metadata_feeds else {}
     for url in source.metadata_feeds:
         row = db.execute('SELECT * FROM metadata_feed_heads WHERE provider=? AND feed_url=?', (source.provider, url)).fetchone()
         job = db.execute('SELECT due,error_code,last_checked_at_utc FROM discovery WHERE url=? AND kind=?',
@@ -398,14 +465,21 @@ def progress(db, source):
         if row is not None and row['parser_fingerprint'] in fingerprints:
             rows.append(dict(row))
         if job is not None:
-            jobs.append(dict(job))
+            jobs.append((url, dict(job)))
+    eligible = [job for url, job in jobs if url not in pending]
+    next_recovery = min((value[1] for value in pending.values()), default=None)
     return {'contract_version': VERSION, 'failure_diagnostic_contract_version': FAILURE_DIAGNOSTIC_VERSION,
         'enabled': True, 'registered_feeds': len(source.metadata_feeds),
         'verified_feeds': len(rows), 'latest_feed_item_observations': sum(row['rows'] for row in rows),
         'latest_feed_response_bytes': sum(row['response_bytes'] for row in rows),
-        'feeds_with_errors': sum(bool(job['error_code']) for job in jobs),
+        'feeds_with_errors': sum(bool(job['error_code']) for _, job in jobs),
         'poll_interval_seconds': source.metadata_feed_interval_seconds,
-        'next_check_at_utc': datetime.fromtimestamp(min(job['due'] for job in jobs), timezone.utc).isoformat() if jobs else None,
-        'last_check_at_utc': max((job['last_checked_at_utc'] for job in jobs if job['last_checked_at_utc']), default=None),
+        'next_check_at_utc': datetime.fromtimestamp(min(job['due'] for job in eligible), timezone.utc).isoformat() if eligible else None,
+        'last_check_at_utc': max((job['last_checked_at_utc'] for _, job in jobs if job['last_checked_at_utc']), default=None),
+        'checkpoint_contract_version': 1, 'pending_recovery_feeds': len(pending),
+        'pending_recovery_originals': sum(value[0] for value in pending.values()),
+        'local_recovery_ready': next_recovery is not None and next_recovery <= time.time(),
+        'next_local_recovery_at_utc': datetime.fromtimestamp(next_recovery, timezone.utc).isoformat() if next_recovery is not None else None,
+        'legacy_original_index': legacy_progress(db, source),
         'article_bodies_accepted': 0, 'overlapping_feed_items_not_unique_articles': True,
         'all_history_complete': False, 'finish_eta_utc': None}

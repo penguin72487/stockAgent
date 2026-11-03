@@ -172,7 +172,12 @@ def _target_progress_commit(
                 or timestamp is None or timestamp.tzinfo is None
                 or not opening <= timestamp <= observed):
             continue
-        quantities = execution_quantities(row)
+        try:
+            quantities = execution_quantities(row)
+        except (KeyError, TypeError, ValueError):
+            # An incomplete/corrupt journal row is not evidence of a fill;
+            # keep checking other rows instead of crashing the whole gate.
+            continue
         if (not quantities["quantity_contract_valid"]
                 or quantities["ledger_state_divergence"]
                 or not quantities["live_execution_eligible"]

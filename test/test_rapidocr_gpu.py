@@ -7,17 +7,108 @@ import pytest
 
 from stockagent.ocr.rapidocr import (
     ExecutionBudget, RapidOCRRunner, rapidocr_runtime, require_provider, summarize_profile,
+    _configure_native_thread_environment, _cuda_provider_options,
 )
+from stockagent.ocr.fastpath import Optimizations
 
 
 @pytest.mark.parametrize("values", [
     {"device": "auto"}, {"cpu_threads": 0}, {"cpu_threads": True},
     {"cpu_cores": 0}, {"nice": -5}, {"gpu_memory_mb": 0}, {"device_id": -1},
     {"model_memory_mb": {'Wrong':2048}}, {"model_memory_mb": {'Det':True}},
+    {"shared_thread_pool": True}, {"shared_thread_pool": 'yes'},
 ])
 def test_invalid_budget_does_not_reach_optional_runtime(values):
     with pytest.raises(ValueError):
         ExecutionBudget(**values)
+
+
+def test_unrestricted_profile_removes_inherited_thread_limits_and_gpu_arena_cap(monkeypatch):
+    for name in ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'OMP_THREAD_LIMIT'):
+        monkeypatch.setenv(name, '1')
+    budget = ExecutionBudget(cpu_threads=None, cpu_cores=None, nice=None,
+                             gpu_memory_mb=None, min_free_gpu_mb=None,
+                             disable_thp=False, exclusive_gpu_owner=False)
+    _configure_native_thread_environment(budget)
+    import os
+    assert all(name not in os.environ for name in
+               ('OMP_NUM_THREADS', 'OPENBLAS_NUM_THREADS', 'OMP_THREAD_LIMIT'))
+    assert 'gpu_mem_limit' not in _cuda_provider_options(budget, Optimizations(), 'Rec')
+    bounded = _cuda_provider_options(ExecutionBudget(model_memory_mb={'Rec': 512}),
+                                     Optimizations(), 'Rec')
+    assert bounded['gpu_mem_limit'] == 512 * 1024**2
+
+
+def test_unrestricted_runner_does_not_apply_process_or_ort_caps(monkeypatch):
+    import sys
+    import stockagent.ocr.rapidocr as module
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('unrestricted profile attempted to impose a resource limit')
+
+    monkeypatch.setattr(module.os, 'sched_setaffinity', forbidden)
+    monkeypatch.setattr(module.os, 'setpriority', forbidden)
+    sessions = []
+
+    class Options:
+        def __init__(self):
+            self.intra_op_num_threads = 0
+            self.inter_op_num_threads = 0
+            self.use_per_session_threads = True
+            self.config = {}
+        def add_session_config_entry(self, key, value):
+            self.config[key] = value
+
+    class Session:
+        def __init__(self, path, sess_options, providers):
+            self.options, self.providers, self.fallback_disabled = sess_options, providers, False
+            sessions.append(self)
+        def get_providers(self):
+            return ['CUDAExecutionProvider', 'CPUExecutionProvider']
+        def disable_fallback(self):
+            self.fallback_disabled = True
+        def get_modelmeta(self):
+            return SimpleNamespace(custom_metadata_map={'character': 'abc'})
+        def get_inputs(self):
+            return [SimpleNamespace(name='input')]
+        def get_outputs(self):
+            return [SimpleNamespace(name='output')]
+
+    shared_pools = []
+    fake_ort = SimpleNamespace(SessionOptions=Options, InferenceSession=Session,
+        set_global_thread_pool_sizes=lambda: shared_pools.append(True),
+        get_available_providers=lambda: ['CUDAExecutionProvider'])
+    fake_cv2 = SimpleNamespace(setNumThreads=forbidden, getNumThreads=lambda: 8)
+    fake_torch = SimpleNamespace(set_num_threads=forbidden, __version__='test',
+        version=SimpleNamespace(cuda='test'), backends=SimpleNamespace(cudnn=SimpleNamespace(version=lambda: 1)),
+        cuda=SimpleNamespace(is_available=lambda: True, device_count=lambda: 1,
+                             mem_get_info=lambda device: (0, 1), get_device_name=lambda device: 'test'))
+    monkeypatch.setitem(sys.modules, 'torch', fake_torch)
+    monkeypatch.setattr(module, 'import_module', lambda name: {'onnxruntime': fake_ort, 'cv2': fake_cv2}[name])
+    monkeypatch.setattr(module, '_parameters', lambda config: {})
+
+    class FakeOCR:
+        def __init__(self, params):
+            for attr in ('text_det', 'text_cls', 'text_rec'):
+                setattr(self, attr, SimpleNamespace(get_preprocess=lambda: None))
+            for attr in ('load_img', 'preprocess_img', 'crop_text_regions', 'build_final_output'):
+                setattr(self, attr, lambda *args: None)
+
+    monkeypatch.setitem(sys.modules, 'rapidocr', SimpleNamespace(RapidOCR=FakeOCR))
+    monkeypatch.setitem(sys.modules, 'omegaconf', SimpleNamespace(flag_override=lambda *a: None))
+    runner = RapidOCRRunner.__new__(RapidOCRRunner)
+    runner.budget = ExecutionBudget(cpu_threads=None, cpu_cores=None, nice=None,
+        gpu_memory_mb=None, min_free_gpu_mb=None, disable_thp=False, exclusive_gpu_owner=False,
+        shared_thread_pool=True)
+    runner.optimizations = Optimizations()
+    runner.lock, runner.profile_dir, runner.sessions, runner.events, runner.runtime = None, None, {}, [], {}
+    runner._initialize({'models': {name: {'path': name} for name in ('Det', 'Rec', 'Cls')}})
+    assert runner.lock is None
+    assert len(sessions) == 3 and shared_pools == [True]
+    assert all(s.fallback_disabled and s.options.intra_op_num_threads == 0 and
+               s.options.inter_op_num_threads == 0 and not s.options.config and
+               not s.options.use_per_session_threads and
+               'gpu_mem_limit' not in s.providers[0][1] for s in sessions)
 
 
 def test_cuda_advertised_but_cpu_session_is_rejected():

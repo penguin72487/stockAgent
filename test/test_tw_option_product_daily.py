@@ -41,6 +41,22 @@ def test_source_rows_preserve_values_dates_sessions_and_duplicate_provenance(tmp
     assert frame['source_record_ordinal'].to_list() == [1, 2, 3, 4, 5]
     assert set(frame['source_sha256']) == {sha}
     assert set(frame['source_member']) == {'options.zip:member.csv'}
+    assert set(frame['source_contract']) == {'taifex_all_option_product_daily_source_v2'}
+    assert frame['contract_expiry_raw'].null_count() == frame.height
+
+
+def test_source_view_preserves_native_expiry_text_without_backfilling_or_inference(tmp_path):
+    path = tmp_path / 'newer.csv'
+    path.write_bytes((
+        '交易日期,契約,到期月份(週別),履約價,買賣權,開盤價,收盤價,結算價,成交量,契約到期日\n'
+        '2026/10/27,TXO,202610F4,41600,賣權,2,3,4,5,20261027\n'
+        '2026/10/27,TXO,202610W4,41600,買權,2,3,4,5,\n'
+        '2026/10/27,CAO,202611,300,買權,2,3,4,5,unverified\n'
+    ).encode('cp950'))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    frame = pl.concat(list(iter_option_product_daily_batches(path, expected_sha256=digest)))
+    assert frame['contract_expiry_raw'].to_list() == ['20261027', '', 'unverified']
+    assert 'expiry_date' not in frame.columns and 'available_at' not in frame.columns
 
 
 def test_scope_filters_without_promoting_to_execution(tmp_path):

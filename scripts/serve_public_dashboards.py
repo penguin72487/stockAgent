@@ -6,7 +6,7 @@ from __future__ import annotations
 import argparse
 from bisect import bisect_left
 from collections import deque
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime
 import gzip
@@ -44,6 +44,7 @@ from stockagent.live.public_dashboards import (  # noqa: E402
     sanitize_tw_signals,
     sanitize_tw_status,
 )
+from stockagent.service_layout import service_path
 from stockagent.live.dashboard_updates import (
     DashboardUpdateHub,
     json_snapshot_metrics,
@@ -124,6 +125,7 @@ from stockagent.live.tw_day_trade_service_sync import (  # noqa: E402
     SERVICE_SYNC_DURABLE_ACK_FILENAME,
     age_seconds,
     committed_paper_read_guard,
+    committed_paper_history_read_guard,
     load_service_sync,
 )
 from stockagent.live.tw_day_trade_published_signals import (  # noqa: E402
@@ -1733,6 +1735,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         # than starting a history/snapshot scan for every intermediate key.
         self._revision_active: dict[str, str] = {}
         self._revision_pending: dict[str, RevisionBuildJob] = {}
+        self._revision_cold: dict[tuple[str, str], Future[PreparedResponse]] = {}
         self._revision_scope_locks: WeakValueDictionary[str, threading.Lock] = WeakValueDictionary()
         self._static_cache: dict[Path, StaticCacheEntry] = {}
         self._static_cache_lock = threading.Lock()
@@ -2135,7 +2138,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         )
 
     def cached_paper_json(
-        self, topic: str, *, source_token: str, builder: Callable[[], Mapping[str, Any]],
+        self, topic: str, *, source_token: str, builder: Callable[..., Mapping[str, Any]],
         history_only: bool = False, **cache_options,
     ) -> PreparedResponse:
         """One source/commit fence for every paper detail and history DTO."""
@@ -2151,10 +2154,11 @@ class PublicDashboardServer(ThreadingHTTPServer):
             observed_token = self.content_token(topic, history_only=history_only)
 
             def checked(expected=observed_token):
-                with committed_paper_read_guard(self.repo_root / "artifacts/live" / directory):
+                read_guard = committed_paper_history_read_guard if history_only else committed_paper_read_guard
+                with read_guard(self.repo_root / "artifacts/live" / directory) as history_state:
                     if self.content_token(topic, history_only=history_only) != expected:
                         raise DashboardSnapshotChanged("paper query was superseded before admission")
-                    payload = builder()
+                    payload = builder(history_state) if history_only else builder()
                     if self.content_token(topic, history_only=history_only) != expected:
                         raise DashboardSnapshotChanged("paper query source changed during construction")
                     return payload
@@ -2235,6 +2239,9 @@ class PublicDashboardServer(ThreadingHTTPServer):
         coalesced = False
         first_job: RevisionBuildJob | None = None
         fallback: PreparedResponse | None = None
+        cold_future: Future[PreparedResponse] | None = None
+        cold_leader = False
+        cold_key = (cache_prefix, cache_key)
         with self._cache_lock:
             observed = time.monotonic()
             cached = self._cache.get(cache_key)
@@ -2266,12 +2273,35 @@ class PublicDashboardServer(ThreadingHTTPServer):
                             pending.first_requested_at if pending else observed, observed,
                             pending.superseded_pending_requests + 1 if pending else 0)
                     coalesced = True
+            else:
+                cold_future = self._revision_cold.get(cold_key)
+                if cold_future is None:
+                    cold_future = Future()
+                    self._revision_cold[cold_key] = cold_future
+                    cold_leader = True
         if fallback is None:
             # Cold/expired views may not use a stale body. They still share
             # the same query lock with the background consumer; different
             # dates/routes remain independent (no global concurrency limit).
-            with scope_lock:
-                return builder()
+            # Identical concurrent callers also share the same success OR
+            # failure; a failed scan must not be repeated serially by every
+            # waiting HTTP thread. A later request remains free to retry.
+            assert cold_future is not None
+            if not cold_leader:
+                self._cache_observation("revision_cold_coalesced")
+                return cold_future.result()
+            try:
+                with scope_lock:
+                    response = builder()
+                cold_future.set_result(response)
+                return response
+            except BaseException as error:
+                cold_future.set_exception(error)
+                raise
+            finally:
+                with self._cache_lock:
+                    if self._revision_cold.get(cold_key) is cold_future:
+                        self._revision_cold.pop(cold_key, None)
 
         self._cache_observation("revision_stale_hit")
         if coalesced:
@@ -2501,7 +2531,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 / "artifacts/discord_bot/service_status.json",
             )
             history_revision = hashlib.sha256(
-                repr(signature[5:]).encode("utf-8")
+                repr((signature[5:], payload.get("engine_generation"), payload.get("enabled_markets"))).encode("utf-8")
             ).hexdigest()[:16]
             payload["history_revision"] = history_revision
             payload["engine_revision_token"] = payload.get("revision_token") or "missing"
@@ -2541,7 +2571,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 ttl_seconds=55.0,
                 cache_control="no-cache",
                 stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
-                builder=lambda: sanitize_tw_history(
+                builder=lambda history_state=None: sanitize_tw_history(
                     build_dashboard_history_snapshot(
                         state_dir=self.repo_root
                         / "artifacts/live/tw_day_trade_simulation",
@@ -2554,6 +2584,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                         # response. Keeping the decoded graph too doubles the
                         # largest dashboard allocation without reducing latency.
                         use_memory_cache=False,
+                        _committed_history_state=history_state,
                     ), private_prices=self.is_owner,
                 ),
             )
@@ -2583,7 +2614,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 discord_engine_revision_field="overnight_engine_state_revision",
             )
             history_revision = hashlib.sha256(
-                repr(signature[5:]).encode("utf-8")
+                repr((signature[5:], payload.get("engine_generation"), payload.get("enabled_markets"))).encode("utf-8")
             ).hexdigest()[:16]
             payload["history_revision"] = history_revision
             payload["engine_revision_token"] = payload.get("revision_token") or "missing"
@@ -2709,7 +2740,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
             ttl_seconds=55.0,
             cache_control="no-cache",
             stale_grace_seconds=HISTORY_STALE_GRACE_SECONDS,
-            builder=lambda: sanitize_tw_history(
+            builder=lambda history_state=None: sanitize_tw_history(
                 build_dashboard_history_snapshot(
                     state_dir=self.repo_root / "artifacts/live/tw_overnight_simulation",
                     range_key=range_key,
@@ -2718,6 +2749,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     resolution=resolution,
                     history_encoding=history_encoding,
                     use_memory_cache=False,
+                    _committed_history_state=history_state,
                 ), private_prices=self.is_owner,
             ),
         )
@@ -2910,11 +2942,15 @@ class PublicDashboardServer(ThreadingHTTPServer):
         """Read a small observer-owned projection; no disk walk or remote calls."""
         def build() -> Mapping[str, Any]:
             try:
-                snapshot = read_storage_snapshot(self.repo_root / "artifacts/live/data_monitor/storage_status.json")
+                snapshot = read_storage_snapshot(service_path("data_monitor/storage_status.json", root=self.repo_root))
             except (OSError, ValueError):
                 snapshot = {}
             try:
-                snapshot["efficiency"] = read_storage_snapshot(self.repo_root / "artifacts/live/data_monitor/storage_efficiency.json")
+                snapshot["efficiency"] = read_storage_snapshot(service_path("data_monitor/storage_efficiency.json", root=self.repo_root))
+            except (OSError, ValueError):
+                pass
+            try:
+                snapshot["service_layout_generation"] = read_storage_snapshot(self.repo_root / "service_data/layout_generation.json")
             except (OSError, ValueError):
                 pass
             return storage_public_status(snapshot)

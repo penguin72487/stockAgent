@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import struct
+import subprocess
 import sys
 import threading
 import time
@@ -20,6 +21,26 @@ from stockagent.live import opening_price_acquisition as acquisition, quote_prov
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def test_acquisition_journal_serializes_independent_process_appends(tmp_path):
+    program = r'''
+import sys
+from pathlib import Path
+from stockagent.live import opening_price_acquisition as a, quote_provider as q
+root = Path(sys.argv[1])
+q._tw_mis_opening_receipt_path = lambda date: root / (date + ".json")
+for i in range(4):
+    if not a._record_source_event((str(root), "2026-10-29"), "fixture", "large",
+                                  {"sequence": i, "data": "x" * 200000}):
+        raise SystemExit(1)
+'''
+    processes = [subprocess.Popen([sys.executable, "-c", program, str(tmp_path)]) for _ in range(2)]
+    assert all(process.wait(timeout=30) == 0 for process in processes)
+    rows = [json.loads(line) for line in (tmp_path / "2026-10-29.acquisition.jsonl").read_bytes().splitlines()]
+    assert len(rows) == 8
+    assert all(len(row["data"]) == 200000 for row in rows)
+    assert sorted(row["sequence"] for row in rows) == [0, 0, 1, 1, 2, 2, 3, 3]
 
 
 @pytest.fixture
@@ -284,7 +305,10 @@ def test_provider_journal_compaction_preserves_dto_and_complete_failure_evidence
     metric = result.transport_timing["opening_providers"]["source"]
     assert metric["last_completed_job"]["transport_timing"]["mis_requests"][0]["error_type"] == "ReadTimeout"
     path = quotes._tw_mis_opening_receipt_path(acquisition.datetime.now(TAIPEI).date().isoformat())
-    events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_text().splitlines()]
+    # Another provider may be midway through an append after the quorum's
+    # durable line; inspect complete records without waiting on that provider.
+    events = [json.loads(line) for line in path.with_suffix(".acquisition.jsonl").read_bytes().splitlines(keepends=True)
+              if line.endswith(b"\n")]
     merged = [row for row in events if row["provider"] == "merged"][-1]
     summary = merged["providers"]["source"]
     finished = [row for row in events if row["event"] == "finished" and row["provider"] == "source"]

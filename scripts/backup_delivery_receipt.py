@@ -27,6 +27,12 @@ DISPATCH = "nas_backup_dispatch_v1"
 ACK = "nas_backup_delivery_acceptance_v1"
 READY = "nas_backup_relay_readiness_v1"
 CHECK_MODES = {"full_read_data", "structural_plus_fixed_snapshot_full_restore"}
+
+
+class RelayReadinessClockError(ValueError):
+    """A valid readiness record cannot currently admit a new write."""
+
+
 ACK_FIELDS = {
     "contract", "producer_device_id", "receiver_device_id", "envelope_identity_sha256",
     "envelope_file_sha256", "dispatch_identity_sha256", "repository_id", "snapshot_id",
@@ -141,7 +147,7 @@ def validate_readiness(value: dict, configuration: dict, *, now: datetime | None
         raise ValueError("relay readiness needs a timezone")
     age = ((now or datetime.now(timezone.utc)) - observed).total_seconds()
     if age < -300 or (not admission_only and age > configuration["readiness_max_age_seconds"]):
-        raise ValueError("relay readiness is stale or in the future")
+        raise RelayReadinessClockError("relay readiness is stale or in the future")
 
 
 def atomic_public(path: Path, value: dict, *, replace: bool = False) -> None:

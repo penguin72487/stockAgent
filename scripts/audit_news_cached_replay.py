@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -13,17 +13,19 @@ import time
 import re
 from types import SimpleNamespace
 
+import pyarrow as pa
 import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config
 from downloader.news_fulltext_bulk import cnyes_pagination, cnyes_records, wordpress_base, _plain_text
-from downloader.news_fulltext_cnyes_history import digest as history_digest
+from downloader.news_fulltext_cnyes_history import _read_accepted_batch_original, digest as history_digest
 from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_metrics import bulk_body_page_classification
 from downloader.news_fulltext_policy import cnyes_bulk_fingerprint
 from downloader.news_fulltext_queue import source_path, utc_now
 from downloader.news_fulltext_replay import REPLAY_CHECKPOINT_CONTRACT_VERSION
+from downloader.parquet_integrity import signature
 
 
 def _checkpoint_progress(db, fingerprint):
@@ -83,38 +85,107 @@ def audit(root, registry, relative_paths, *, sample_legacy_pages=0):
             'all_history_complete': False, 'publish': False, 'training_injection_enabled': False}
 
 
-def _source_proof(root, registry, source, db, relative, fingerprint, *, target_hashes=None):
+def _check_history_envelope(relative, raw, receipt, response_sha):
+    """Bind a history envelope to its actual request, bytes and private receipt."""
+    key = history_digest((raw['request_url'], raw['authorization_fingerprint']))
+    expected_dir = f'discovery_responses/by_request/{key[:2]}/{key}/'
+    allowed = (relative == f'discovery_responses/{response_sha}.parquet'
+               or relative.startswith(expected_dir) and re.fullmatch(
+                   re.escape(response_sha) + r'(?:-\d{6,})?\.parquet', relative[len(expected_dir):]))
+    if not allowed:
+        raise ValueError('cached_history_envelope_path_invalid')
+    if (receipt.get('contract') != 'cnyes_history_source_envelope_v1'
+            or type(receipt.get('raw_response_bytes')) is not int
+            or receipt['raw_response_bytes'] != len(raw['raw_response_body'])
+            or receipt.get('article_bodies_accepted') is not False):
+        raise ValueError('cached_history_envelope_receipt_invalid')
+
+
+def _source_proof(root, registry, source, db, relative, fingerprint, *, target_hashes=None,
+                  target_hashes_by_request=None, artifact_kind='canonical_quarantine',
+                  receipt_relative=None, accepted_request_url=None, accepted_response_sha=None):
+    if target_hashes is not None and target_hashes_by_request is not None:
+        raise ValueError('ambiguous_cached_target_selection')
+    if artifact_kind not in {'canonical_quarantine', 'cnyes_history_source_envelope', 'accepted_body_batch'}:
+        raise ValueError('unsupported_cached_source_kind')
+    if artifact_kind == 'accepted_body_batch':
+        if not all(isinstance(value, str) for value in (receipt_relative, accepted_request_url, accepted_response_sha)):
+            raise ValueError('cached_accepted_batch_identity_missing')
+    else:
+        receipt_relative = relative + '.receipt.json'
     path = source_path(root, relative)
-    if path.stat().st_size > 16 << 20:
+    source_before = signature(path)
+    if artifact_kind != 'accepted_body_batch' and path.stat().st_size > 16 << 20:
         raise ValueError('cached_source_envelope_oversized')
-    receipt = json.loads(source_path(root, relative + '.receipt.json').read_text())
-    if receipt['parquet_path'] != relative or receipt['publish'] is not False or sha256_file(path) != receipt['sha256']:
-        raise ValueError('cached_source_receipt_invalid')
-    table = pq.read_table(path, use_threads=False)
-    if table.num_rows != 1:
-        raise ValueError('cached_source_grain_invalid')
-    raw = table.to_pylist()[0]
+    receipt_path = source_path(root, receipt_relative)
+    receipt_before = signature(receipt_path)
+    if receipt_path.stat().st_size > 65536:
+        raise ValueError('cached_source_receipt_oversized')
+    if artifact_kind == 'accepted_body_batch':
+        try:
+            loaded = _read_accepted_batch_original(SimpleNamespace(root=root, db=db),
+                {'parquet_path': relative, 'receipt_path': receipt_relative}, source,
+                accepted_request_url, accepted_response_sha)
+        except sqlite3.Error as error:
+            raise ValueError('cached_accepted_batch_catalog_unavailable') from error
+        if loaded is None:
+            raise ValueError('cached_accepted_batch_original_invalid')
+        raw, receipt, receipt_bytes = loaded['original'], loaded['receipt'], loaded['receipt_bytes']
+        if (tuple(loaded['source_file_signature']) != source_before
+                or tuple(loaded['source_receipt_signature']) != receipt_before):
+            raise ValueError('cached_source_changed_during_proof')
+        source_sha = receipt['sha256']
+    else:
+        receipt_bytes = receipt_path.read_bytes()
+        receipt = json.loads(receipt_bytes)
+        with path.open('rb') as handle:
+            source_bytes = handle.read((16 << 20) + 1)
+        if len(source_bytes) > 16 << 20:
+            raise ValueError('cached_source_envelope_oversized')
+        source_sha = hashlib.sha256(source_bytes).hexdigest()
+        if receipt['parquet_path'] != relative or receipt['publish'] is not False or source_sha != receipt['sha256']:
+            raise ValueError('cached_source_receipt_invalid')
+        # Decode the exact bytes whose receipt was checked.
+        table = pq.read_table(pa.BufferReader(source_bytes), use_threads=False)
+        if table.num_rows != 1:
+            raise ValueError('cached_source_grain_invalid')
+        raw = table.to_pylist()[0]
     if len(raw['raw_response_body']) > 16 << 20:
         raise ValueError('cached_source_raw_response_oversized')
     digest = hashlib.sha256(raw['raw_response_body']).hexdigest()
-    if raw['response_sha256'] != digest or receipt['response_sha256'] != digest or raw['publish'] is not False:
+    if (raw['response_sha256'] != digest or raw['publish'] is not False
+            or artifact_kind != 'accepted_body_batch' and receipt['response_sha256'] != digest):
         raise ValueError('cached_source_response_digest_invalid')
+    if artifact_kind == 'cnyes_history_source_envelope':
+        _check_history_envelope(relative, raw, receipt, digest)
     if registry.require(raw['request_url']).provider != 'cnyes' or wordpress_base(raw['request_url']) not in source.cnyes_apis:
         raise ValueError('cached_source_provider_invalid')
     if (raw['authorization_fingerprint'] != source.authorization_fingerprint
-            or json.loads(raw['authorization_json']) != source.authorization):
+            or artifact_kind != 'accepted_body_batch' and json.loads(raw['authorization_json']) != source.authorization):
         raise ValueError('cached_source_authorization_changed')
     captured = datetime.fromisoformat(raw['captured_at_utc'])
     if captured.tzinfo is None or captured > datetime.now(timezone.utc):
         raise ValueError('cached_source_observation_clock_invalid')
     response = Response(raw['request_url'], 200, {'content-type': 'application/json'}, raw['raw_response_body'])
     page, posts = cnyes_pagination(response)
-    if receipt['article_count'] != len(posts):
+    if artifact_kind == 'canonical_quarantine' and receipt['article_count'] != len(posts):
         raise ValueError('cached_source_row_count_invalid')
     if any(type(p.get('payment')) is not int or p['payment'] != 0 for p in posts):
         raise ValueError('cached_source_contains_restricted_rows')
+    other_request_targets = defaultdict(set)
+    if target_hashes_by_request is not None:
+        # Equal response bytes can have been captured for a different query.
+        # Select target observations only after the original request is read
+        # from the verified envelope; unrelated observations must not affect
+        # either the accepted post hashes or the attribution.
+        target_hashes = target_hashes_by_request.get(raw['request_url'], {})
+        for request_url, targets in target_hashes_by_request.items():
+            if request_url != raw['request_url']:
+                for news_id, post_hashes in targets.items():
+                    if news_id not in target_hashes:
+                        other_request_targets[news_id].update(post_hashes)
     records, item_errors = cnyes_records(response, SimpleNamespace(registry=registry), source)
-    target_outcomes = None
+    target_outcomes, source_only_outcomes = None, []
     if target_hashes is not None:
         # A page checkpoint alone cannot establish what it said about a
         # particular missing article. Bind each target to the exact saved
@@ -140,6 +211,27 @@ def _source_proof(root, registry, source, db, relative, fingerprint, *, target_h
                 'outcome': 'validated_source_body' if record else error,
                 'body_sha256': record['body_sha256'] if record else None,
                 'body_bytes': record['body_bytes'] if record else None})
+        # A mismatched observation is not valid page provenance. The raw
+        # response itself can nevertheless prove a post from its own actual
+        # request and clock, so record that separately without adopting the
+        # mismatched observation or copying publisher text.
+        for news_id, claimed_hashes in sorted(other_request_targets.items()):
+            post = posts_by_id.get(news_id)
+            if post is None:
+                source_only_outcomes.append({'news_id': news_id, 'source_post_sha256': None,
+                    'outcome': 'target_id_absent_from_raw_source', 'body_sha256': None,
+                    'body_bytes': None, 'matches_observed_post_hash': False})
+                continue
+            post_sha = history_digest(post)
+            url = f'https://news.cnyes.com/news/id/{news_id}'
+            record, error = records_by_url.get(url), errors_by_url.get(url)
+            if bool(record) == bool(error):
+                raise ValueError('cached_target_parser_outcome_ambiguous')
+            source_only_outcomes.append({'news_id': news_id, 'source_post_sha256': post_sha,
+                'outcome': 'validated_source_body' if record else error,
+                'body_sha256': record['body_sha256'] if record else None,
+                'body_bytes': record['body_bytes'] if record else None,
+                'matches_observed_post_hash': claimed_hashes == {post_sha}})
     counts = Counter(e['error'] for e in item_errors)
     item_outcomes = []
     for error in item_errors[:16]:
@@ -167,9 +259,13 @@ def _source_proof(root, registry, source, db, relative, fingerprint, *, target_h
         else:
             kind = 'ready_missing_body' if head else 'not_yet_registered_body'
         head_readiness[kind] += 1
-    checkpoint = db.execute('SELECT state,accepted_heads,checked_at_utc FROM cached_bulk_replays '
-                            'WHERE source_fingerprint=? AND response_sha256=?', (fingerprint, digest)).fetchone()
-    result = {'parquet_path': relative, 'parquet_sha256': receipt['sha256'],
+    # Replay checkpoints are keyed by content SHA for canonical quarantine;
+    # they do not prove this separately captured request was replayed.
+    checkpoint = (db.execute('SELECT state,accepted_heads,checked_at_utc FROM cached_bulk_replays '
+                  'WHERE source_fingerprint=? AND response_sha256=?', (fingerprint, digest)).fetchone()
+                  if artifact_kind == 'canonical_quarantine' else None)
+    result = {'parquet_path': relative, 'receipt_path': receipt_relative,
+        'source_artifact_kind': artifact_kind, 'parquet_sha256': receipt['sha256'],
         'response_sha256': digest, 'request_url': raw['request_url'], 'source_observed_at_utc': raw['captured_at_utc'],
         'pagination': page, 'validated_full_bodies': len(records), 'item_error_counts': dict(counts),
         'bounded_item_outcomes': item_outcomes,
@@ -180,6 +276,14 @@ def _source_proof(root, registry, source, db, relative, fingerprint, *, target_h
         'parser_or_metadata_verified': not (set(counts) - {'bulk_body_not_provided', 'bulk_exact_duplicate_row'})}
     if target_outcomes is not None:
         result['target_outcomes'] = target_outcomes
+    if target_hashes_by_request is not None:
+        result['source_only_target_outcomes'] = source_only_outcomes
+    if (source_path(root, relative) != path or source_path(root, receipt_relative) != receipt_path
+            or sha256_file(path) != source_sha or receipt_path.read_bytes() != receipt_bytes
+            or signature(path) != source_before or signature(receipt_path) != receipt_before):
+        raise ValueError('cached_source_changed_during_proof')
+    result['source_file_signature'] = list(source_before)
+    result['source_receipt_signature'] = list(receipt_before)
     return result
 
 

@@ -36,6 +36,7 @@ with Path('/var/lib/stockagent/backup-stream/handoff-publisher.lock').open('a') 
         'stockagent/__init__.py', 'stockagent/runtime_identity.py', 'stockagent/control/__init__.py',
         'stockagent/control/lakehouse.py', 'stockagent/control/backup.py', 'stockagent/control/recovery.py',
         'stockagent/data_sync/__init__.py', 'stockagent/data_sync/immutable_replication.py',
+        'stockagent/data_sync/work_progress.py',
         'stockagent/data_sync/nas_target.py', 'stockagent/data_sync/offhost_backup.py',
         'stockagent/data_sync/packed_backup.py', 'stockagent/data_sync/packed_snapshots.py',
         'stockagent/data_sync/desync_snapshots.py', 'stockagent/data_sync/backup_auxiliary.py',

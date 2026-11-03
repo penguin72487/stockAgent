@@ -1,6 +1,7 @@
 """Retained release extraction cannot escape or admit unrecorded source bytes."""
 import hashlib
 import json
+import os
 import zipfile
 
 import pytest
@@ -35,6 +36,15 @@ def test_release_extracts_only_recorded_regular_sources(tmp_path):
     destination = tmp_path / "isolated"
     extract_recorded_sources(receipt, destination)
     assert (destination / "stockagent/module.py").read_bytes() == b"value=1\n"
+
+
+def test_release_restores_only_reviewed_runner_execution(tmp_path):
+    receipt = _receipt(tmp_path, [("coda_runner.sh", b"#!/bin/sh\nexit 0\n"),
+                                  ("scripts/unreviewed.sh", b"#!/bin/sh\nexit 0\n")])
+    destination = tmp_path / "isolated"
+    extract_recorded_sources(receipt, destination)
+    assert os.access(destination / "coda_runner.sh", os.X_OK)
+    assert not os.access(destination / "scripts/unreviewed.sh", os.X_OK)
 
 
 def test_release_rejects_escape_before_writing_any_source(tmp_path):

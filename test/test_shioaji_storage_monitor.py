@@ -162,6 +162,33 @@ def test_storage_snapshot_writer_preserves_one_total_per_day(tmp_path: Path) -> 
     assert output.stat().st_mode & 0o077 == 0
 
 
+def test_storage_writer_uses_enrolled_service_alias_without_relaxing_cache_checks(tmp_path, monkeypatch):
+    from stockagent.live import shioaji_storage_monitor as monitor
+    destination = tmp_path/'service_data/live'
+    destination.mkdir(parents=True)
+    (tmp_path/'artifacts').mkdir()
+    (tmp_path/'artifacts/live').symlink_to(destination, target_is_directory=True)
+    monkeypatch.setattr(monitor, 'build_shioaji_storage_snapshot', lambda *a, **k: {'status': 'fixture'})
+    output = tmp_path/'artifacts/live/shioaji_storage/summary.json'
+    assert monitor.write_shioaji_storage_snapshot(tmp_path, output) == {'status': 'fixture'}
+    assert (destination/'shioaji_storage/summary.json').is_file()
+    cache = destination/'shioaji_storage/.inventory-epochs'
+    assert cache.stat().st_mode & 0o077 == 0
+    cache.chmod(0o755)
+    with pytest.raises(ValueError, match='private unredirected'):
+        monitor.write_shioaji_storage_snapshot(tmp_path, output)
+
+
+def test_storage_writer_rejects_an_unregistered_service_alias(tmp_path):
+    destination = tmp_path/'elsewhere'; destination.mkdir()
+    (tmp_path/'service_data/live').mkdir(parents=True)
+    (tmp_path/'artifacts').mkdir()
+    (tmp_path/'artifacts/live').symlink_to(destination, target_is_directory=True)
+    with pytest.raises(ValueError, match='unregistered service compatibility'):
+        write_shioaji_storage_snapshot(tmp_path, tmp_path/'artifacts/live/shioaji_storage/summary.json')
+    assert not (destination/'shioaji_storage').exists()
+
+
 def test_storage_capacity_uses_daily_net_growth_after_seven_complete_days(
     tmp_path: Path,
 ) -> None:

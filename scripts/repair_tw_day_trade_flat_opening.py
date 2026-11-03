@@ -33,7 +33,7 @@ from scripts.rebuild_tw_day_trade_open_price_replay import (
     _close_quotes, _entry_quotes, _historical_minute_valuation_quotes,
     _latest_valid_signal, _load_price_limits, _load_retained_historical_entry_books,
     _materialize_exact_session_rules, _minute_bar_rows,
-    _replay_historical_intraday, _sha256,
+    _official_open_map, _replay_historical_intraday, _sha256,
 )
 from scripts.run_tw_day_trade_simulation import _acquire_engine_lock, _mode_specs, _rule_data_dir
 from stockagent.live.quote_provider import (
@@ -45,7 +45,11 @@ from stockagent.live.paper_journal import journal_write_transaction, open_paper_
 from stockagent.live.tw_day_trade_simulation import (
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     SIMULATION_SCHEMA_VERSION, TwDayTradeSimulationEngine, _append_jsonl_many,
+    PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT,
     load_live_eligibility, whole_lot_target_shares,
+)
+from stockagent.live.opening_signal_revision import (
+    SIGNAL_UPDATE_PROGRESSIVE, revision_admission, revision_fields,
 )
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -53,6 +57,7 @@ SERVICE = "stockagent-tw-day-trade-simulation.service"
 CONTRACT = "never_filled_missing_open_append_only_minute_repair_v1"
 ORIGINAL_SIGNAL_CONTRACT = "never_filled_original_signal_append_only_minute_repair_v2"
 MISSING_SESSION_CONTRACT = "missing_completed_session_append_only_minute_repair_v1"
+PUBLISHED_SESSION_CONTRACT = "missing_session_published_revisions_append_only_minute_repair_v1"
 ECONOMIC_KEYS = (
     "initial_capital_twd", "cumulative_realized_net_pnl_twd",
     "cumulative_commission_rebate_accrued_twd", "total_equity_twd",
@@ -68,6 +73,32 @@ POSITION_ECONOMIC_KEYS = (
     "last_mark_price", "exit_at", "exit_price",
     "take_profit_price", "stop_trigger_price", "entry_fill_policy",
 )
+REPLAY_SUMMARY_FIELDS = frozenset("""
+    signal_id market execution_mode asof_date generated_at signal_started_at
+    signal_ready_at artifact_published_at execution_pointer_written_at
+    execution_pointer_observed_at checkpoint_fingerprint config_fingerprint
+    feature_cutoff_date symbol_count target_risk summary_path weights_path
+    positions_markdown_path day_trade_signal_update_policy
+    day_trade_signal_update_policy_fingerprint opening_signal_revision
+    day_trade_opening_reference_policy day_trade_opening_reference_policy_fingerprint
+    opening_coverage_gate_basis opening_input_required_count opening_input_resolved_count
+    opening_missing_symbols opening_model_inputs_ready opening_no_print_active_count
+    opening_price_active_count opening_price_active_symbol_count opening_price_required_count
+    opening_provisional_reference_active_count opening_source_complete
+    live_session_open_feature_applied live_session_open_reference_applied
+    opening_entry_clock_contract initial_opening_signal_id initial_opening_publication_proof
+    entry_fill_contract entry_liquidity_assumption historical_minute_valuation
+    replay_basis replay_open_evidence_contract replay_source simulation_only simulation_replay
+    production_order_possible published_revision_replay
+    missed_opening_original_policy_fingerprint missed_opening_original_signal_revision
+    missed_opening_original_signal_update_policy missed_opening_recovery
+""".split())
+
+
+def _compact_replay_summary(summary: dict) -> dict:
+    # Full originals stay byte-pinned. The executor does not consume the MB-sized
+    # diagnostics/panel inventories; do not retain 163 copies of them in RAM.
+    return {key: value for key, value in summary.items() if key in REPLAY_SUMMARY_FIELDS}
 
 
 def _object(path: Path) -> dict:
@@ -209,13 +240,165 @@ def _missing_session_proof(spec, day: date, summary_path: Path) -> dict:
             "generated_at": summary.get("generated_at"), "original_weights_preserved": False}
 
 
-def _spec(market: str, markets_dir: Path):
+def _spec(market: str, markets_dir: Path, published_revisions: bool = False):
     specs, configs, errors = _mode_specs(markets_dir)
     if errors:
         raise RuntimeError(f"mode configuration errors: {errors}")
     spec = next(value for value in specs if value.market == market)
     return replace(spec, entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
-                   entry_price_offset_ticks=0), configs[market]
+                   entry_price_offset_ticks=0,
+                   historical_progressive_revision_replay=published_revisions), configs[market]
+
+
+def _published_revision_inventory(spec, day: date) -> dict:
+    """Pin every intraday publication, including independently restarted roots.
+
+    Original roots are audited separately. The repair's new lineage is explicit
+    and never edits, relabels or claims registration of the source artifacts.
+    """
+    from stockagent.live.market_status import short_file_fingerprint
+    paths = sorted(spec.live_output_dir.glob(f"{day}*/**/summary.json"))
+    versions, excluded, seen, lineages = [], [], set(), {}
+    for path in paths:
+        before = _sha256(path)
+        summary = _object(path)
+        if _sha256(path) != before:
+            raise RuntimeError(f"source changed during scan: {path}")
+        revision = summary.get("opening_signal_revision")
+        if not revision:
+            # Completed-close caches are not intraday decisions. Do not quietly
+            # classify malformed opening artifacts as an off-hours cache.
+            if summary.get("live_session_open_reference_applied") or summary.get("live_session_open_feature_applied"):
+                raise RuntimeError(f"unclassified opening artifact: {path}")
+            excluded.append({"path": str(path.resolve()), "sha256": before})
+            continue
+        stamp = datetime.fromisoformat(str(summary["execution_pointer_written_at"]))
+        artifact = datetime.fromisoformat(str(summary["artifact_published_at"]))
+        generated = datetime.fromisoformat(str(summary["generated_at"]))
+        started = datetime.fromisoformat(str(summary["signal_started_at"]))
+        if (stamp.utcoffset() != timedelta(hours=8) or stamp.date() != day
+                or not time(9) <= stamp.time() < time(13, 20)
+                or generated > artifact
+                or started > artifact
+                or started >= generated + timedelta(seconds=1)):
+            raise RuntimeError(f"invalid publication clocks: {path}")
+        if (summary.get("market") != str(spec.signal_market or spec.market)
+                or summary.get("execution_mode") != "tw_day_trade"
+                or summary.get("asof_date", "")[:10] != str(day)
+                or summary.get("config_fingerprint") != short_file_fingerprint(Path(spec.config_path))
+                or summary.get("checkpoint_fingerprint") != short_file_fingerprint(Path(spec.checkpoint_path))):
+            raise RuntimeError(f"published strategy identity differs: {path}")
+        signal_id = str(summary["signal_id"])
+        weights = path.with_name("target_weights.parquet")
+        if signal_id in seen or not weights.is_file():
+            raise RuntimeError(f"duplicate/incomplete publication: {path}")
+        seen.add(signal_id)
+        versions.append({"signal_id": signal_id, "summary_path": str(path.resolve()),
+            "weights_path": str(weights.resolve()), "summary_sha256": before,
+            "weights_sha256": _sha256(weights), "publication_upper_bound": max(stamp, artifact).isoformat(),
+            "execution_pointer_written_at": stamp.isoformat(),
+            "publication_clock_anomalies": ["artifact_after_pointer"] if artifact > stamp else [],
+            "artifact_published_at": artifact.isoformat(), "signal_started_at": started.isoformat(),
+            "opening_signal_revision": revision,
+            **{key: summary[key] for key in ("config_fingerprint", "checkpoint_fingerprint",
+                "day_trade_signal_update_policy", "day_trade_signal_update_policy_fingerprint")}})
+    versions.sort(key=lambda row: (row["publication_upper_bound"], row["signal_id"]))
+    previous_root = None
+    for row in versions:
+        summary = row
+        root = row["opening_signal_revision"]["root_signal_id"]
+        old = lineages.get(root, {})
+        _, error = revision_admission(policy=SIGNAL_UPDATE_PROGRESSIVE, summary=summary,
+                                      mode=old, session_date=str(day))
+        revision = row["opening_signal_revision"]
+        prior = old.get("opening_signal_revision")
+        if (error or (not prior and revision["index"] != 0)
+                or (prior and (revision["index"] != prior["index"] + 1
+                    or revision["parent_signal_id"] != old["signal_id"]))
+                or root != previous_root and root in lineages):
+            raise RuntimeError(f"non-contiguous/interleaved original revision lineage: {row['signal_id']}: {error}")
+        lineages[root] = {"session_date": str(day), "entry_completed_at": row["publication_upper_bound"],
+            "signal_id": row["signal_id"], "opening_signal_revision": revision,
+            "day_trade_signal_update_policy": SIGNAL_UPDATE_PROGRESSIVE,
+            "config_fingerprint": summary["config_fingerprint"],
+            "checkpoint_fingerprint": summary["checkpoint_fingerprint"]}
+        previous_root = root
+    if not versions or versions[0]["opening_signal_revision"]["index"] != 0:
+        raise RuntimeError("no complete original published lineage")
+    after = sorted(spec.live_output_dir.glob(f"{day}*/**/summary.json"))
+    for changed in set(paths) ^ set(after):
+        if changed in paths or _object(changed).get("opening_signal_revision"):
+            raise RuntimeError("intraday source membership changed during scan")
+    # Admit only the latest decision visible before a full completed interval.
+    # Superseded versions remain inspectable; they are not fabricated fills.
+    selected = {versions[0]["signal_id"]: datetime.combine(day, time(9, 1), tzinfo=TAIPEI).isoformat()}
+    current, cursor = versions[0]["signal_id"], 0
+    for offset in range(2, 260):  # last entry minute 13:19, exit priority 13:20
+        end = datetime.combine(day, time(9), tzinfo=TAIPEI) + timedelta(minutes=offset)
+        while cursor + 1 < len(versions) and datetime.fromisoformat(
+                versions[cursor + 1]["publication_upper_bound"]) <= end - timedelta(minutes=1):
+            cursor += 1
+        if versions[cursor]["signal_id"] != current:
+            current = versions[cursor]["signal_id"]
+            selected[current] = end.isoformat()
+    for row in versions:
+        row["effective_entry_at"] = selected.get(row["signal_id"])
+        row["disposition"] = ("completed_minute_target_revision" if row["effective_entry_at"]
+                              else "retained_not_executed_superseded_or_exit_priority")
+    result = {"contract": PUBLISHED_SESSION_CONTRACT, "session_date": str(day),
+        "market": spec.market, "simulation_only": True, "production_order_possible": False,
+        "original_weights_preserved": True, "original_publication_clocks_preserved": True,
+        "first_entry_assumption": "explicit_counterfactual_09_01_not_intraminute_fill_evidence",
+        "later_entry_assumption": "latest_published_target_before_full_minute_start",
+        "publication_count": len(versions), "selected_revision_count": len(selected),
+        "source_lineage_count": len(lineages), "versions": versions, "excluded_close_caches": excluded}
+    result["plan_sha256"] = _digest({key: value for key, value in result.items() if key != "excluded_close_caches"})
+    return result
+
+
+def plan_published_revisions(args) -> dict:
+    """Source/price inventory only; no account/journal mutation or API calls."""
+    spec, _ = _spec(args.market, args.markets_dir, True)
+    day = datetime.now(TAIPEI).date()
+    mode = _object(args.live_dir / "state.json")["modes"][args.market]
+    _require_missing_session_target(mode, day)
+    if datetime.now(TAIPEI).time() < time(13, 31) or _has_live_fill(args.live_dir, args.market, str(day)):
+        raise RuntimeError("published revision repair requires an unfilled completed session")
+    plan = _published_revision_inventory(spec, day)
+    first = plan["versions"][0]
+    rows = pl.read_parquet(first["weights_path"]).to_dicts()
+    opens, counts, no_trade = _official_open_map([spec], {spec.market: (
+        datetime.fromisoformat(first["publication_upper_bound"]), Path(first["summary_path"]),
+        Path(first["weights_path"]), _object(Path(first["summary_path"])), rows)}, day,
+        twse_daily_ohlcv_path=DEFAULT_TWSE_DAILY_OHLCV_PATH,
+        tpex_daily_ohlcv_path=DEFAULT_TPEX_DAILY_OHLCV_PATH)
+    symbols, unavailable = set(), set()
+    for version in plan["versions"]:
+        for row in pl.read_parquet(version["weights_path"], columns=["symbol", "target_weight"]).to_dicts():
+            symbol, weight = str(row["symbol"]), float(row["target_weight"] or 0)
+            if not weight:
+                continue
+            if symbol not in opens:
+                unavailable.add(symbol)
+            elif whole_lot_target_shares(weight, float(mode["total_equity_twd"]), opens[symbol], spec.lot_size) > 0:
+                symbols.add(symbol)
+    roots = tuple((*getattr(args, "minute_data_root", []), *DEFAULT_MINUTE_DATA_ROOTS))
+    bars, proof = _minute_bar_rows(roots, trading_date=day, symbols=symbols)
+    missing = sorted(symbols - bars.keys())
+    inventory = {"plan_sha256": plan["plan_sha256"], "session_date": str(day),
+        "sizing_nav_twd": mode["total_equity_twd"], "official_open_source_counts": counts,
+        "official_open_unavailable_symbols": sorted(unavailable),
+        "official_no_trade_symbols": sorted(no_trade & unavailable), "minute_symbols": sorted(symbols),
+        "missing_minute_symbols": missing, "local_source_proof": proof,
+        "simulation_only": True, "production_order_possible": False, "ledger_modified": False}
+    args.operation_root.mkdir(parents=True, exist_ok=True)
+    _atomic_json(args.operation_root / "published_revision_plan.json", plan)
+    _atomic_json(args.operation_root / "source_inventory.json", inventory)
+    pl.DataFrame({"symbol": missing}, schema={"symbol": pl.String}).write_csv(args.operation_root / "missing_minute_symbols.csv")
+    return {"publication_count": plan["publication_count"], "selected_revision_count": plan["selected_revision_count"],
+        "source_lineage_count": plan["source_lineage_count"], "minute_symbols": len(symbols),
+        "missing_minute_symbols": len(missing), "official_open_unavailable_symbols": sorted(unavailable),
+        "plan_sha256": plan["plan_sha256"], "ledger_modified": False}
 
 
 def _source_block_proof(spec, day: date, signal_id: str, *, preserve_original_signal: bool = False) -> dict:
@@ -255,6 +438,7 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
     now = datetime.now(TAIPEI)
     preserve_original = manifest.get("preserve_original_signal") is True
     append_missing = manifest.get("append_missing_session") is True
+    published = manifest.get("published_revisions") is True
     for source in manifest["sessions"]:
         day = date.fromisoformat(source["session_date"])
         summary_path = Path(source["summary_path"])
@@ -262,6 +446,21 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
         summary = _object(summary_path)
         rows = pl.read_parquet(weights_path).to_dicts()
         original = source["original"]
+        revision_rows = []
+        if published:
+            plan = manifest["published_revision_plan"]
+            for version in plan["versions"]:
+                for key in ("summary", "weights"):
+                    path = Path(version[f"{key}_path"])
+                    if _sha256(path) != version[f"{key}_sha256"]:
+                        raise RuntimeError(f"original published artifact changed: {path}")
+                    pins.append({"path": str(path), "sha256": version[f"{key}_sha256"]})
+                if version["effective_entry_at"]:
+                    revision_rows.append((version, _compact_replay_summary(_object(Path(version["summary_path"]))),
+                        pl.read_parquet(version["weights_path"]).to_dicts()))
+            rows_for_prices = [row for _, _, version_rows in revision_rows for row in version_rows]
+        else:
+            rows_for_prices = rows
         if preserve_original:
             if _sha256(weights_path) != original["weights_sha256"] or _sha256(summary_path) != original["summary_sha256"]:
                 raise RuntimeError(f"{day}: original signal changed")
@@ -272,29 +471,42 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
         original_symbols = pl.read_parquet(original["weights_path"], columns=["symbol"])["symbol"].to_list()
         if [row["symbol"] for row in rows] != original_symbols:
             raise RuntimeError(f"{day}: repair changed model universe/order")
-        symbols = {str(row["symbol"]) for row in rows if abs(float(row.get("target_weight") or 0)) > 0}
+        symbols = {str(row["symbol"]) for row in rows_for_prices if abs(float(row.get("target_weight") or 0)) > 0}
         if not symbols:
             raise RuntimeError(f"{day}: regenerated signal still has no targets")
         if str(summary["signal_id"]) in set(manifest["anchor"].get("processed_signal_ids") or []):
             raise RuntimeError(f"{day}: replacement identity was already consumed")
         opens = {str(row["symbol"]): float(row["open_price"]) for row in rows
                  if row.get("open_price") is not None and float(row["open_price"]) > 0}
+        if published:
+            opens, open_counts, no_trade = _official_open_map([spec], {spec.market: (
+                datetime.fromisoformat(plan["versions"][0]["publication_upper_bound"]), summary_path,
+                weights_path, summary, rows)}, day,
+                twse_daily_ohlcv_path=DEFAULT_TWSE_DAILY_OHLCV_PATH,
+                tpex_daily_ohlcv_path=DEFAULT_TPEX_DAILY_OHLCV_PATH)
+            source["official_open_unavailable_symbols"] = sorted(symbols - opens.keys())
+            source["official_open_source_counts"] = open_counts
+            source["official_no_trade_symbols"] = sorted(no_trade & (symbols - opens.keys()))
+            symbols &= opens.keys()
+            for path in (DEFAULT_TWSE_DAILY_OHLCV_PATH, DEFAULT_TPEX_DAILY_OHLCV_PATH):
+                pins.append({"path": str(path.resolve()), "sha256": _sha256(path)})
         if not symbols <= opens.keys():
             raise RuntimeError(f"{day}: selected model opening prices still missing")
-        limit_path = ROOT / "artifacts/live/tw_price_limits" / f"{day}.parquet"
+        limit_path = Path(manifest.get("price_limit_dir", ROOT / "artifacts/live/tw_price_limits")) / f"{day}.parquet"
         limits = _load_price_limits(limit_path)
-        if not symbols <= limits.keys():
-            raise RuntimeError(f"{day}: selected model legal price limits missing")
         # Keep every original model row, but do not fetch prices for targets
         # which cannot buy even one lot at the frozen session NAV.
         if preserve_original or append_missing:
             nav = float(manifest["anchor"]["total_equity_twd"] if append_missing
                         else manifest["anchor"]["session_sizing_nav_twd"])
-            symbols = {str(row["symbol"]) for row in rows if abs(float(row.get("target_weight") or 0)) > 0 and whole_lot_target_shares(
+            symbols = {str(row["symbol"]) for row in rows_for_prices if str(row["symbol"]) in opens
+                       and abs(float(row.get("target_weight") or 0)) > 0 and whole_lot_target_shares(
                 float(row.get("target_weight") or 0), nav, opens[str(row["symbol"])], spec.lot_size
             ) > 0}
             if not symbols:
                 raise RuntimeError(f"{day}: original targets have no whole-lot orders")
+        if not symbols <= limits.keys():
+            raise RuntimeError(f"{day}: executable target legal price limits missing: {sorted(symbols - limits.keys())}")
         completed = source.get("completed_through")
         if completed:
             cutoff = datetime.fromisoformat(completed)
@@ -307,8 +519,9 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
         bars, bar_proof = _minute_bar_rows(roots, trading_date=day, symbols=symbols)
         first_key = datetime.combine(day, time(9, 1), tzinfo=TAIPEI).isoformat(timespec="minutes")
         last_key = cutoff.isoformat(timespec="minutes")
-        missing = {symbol for symbol in symbols if symbol not in books
-                   or first_key not in bars.get(symbol, {}) or last_key not in bars.get(symbol, {})}
+        missing = (symbols - bars.keys() if published else
+                   {symbol for symbol in symbols if symbol not in books
+                    or first_key not in bars.get(symbol, {}) or last_key not in bars.get(symbol, {})})
         if fetch_current:
             source["minute_source_before"] = {"requested_symbols": sorted(symbols), "missing_symbols": sorted(missing),
                                                "source_files": bar_proof.get("source_files", [])}
@@ -340,7 +553,7 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
                 "source_files": bar_proof.get("source_files", [])}
         if fetch_current:
             source["minute_source_after"] = {"resolved_symbols": sorted(bars), "source_files": bar_proof.get("source_files", [])}
-        if set(books) != symbols or set(bars) != symbols:
+        if (not published and set(books) != symbols) or set(bars) != symbols:
             raise RuntimeError(f"{day}: missing 09:01/minute path for {sorted(symbols-set(books))}")
         if preserve_original and any(first_key not in bars[symbol] or last_key not in bars[symbol] for symbol in symbols):
             raise RuntimeError(f"{day}: replay source does not cover both 09:01 and {cutoff:%H:%M}")
@@ -401,24 +614,55 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
                           "original_weights_preserved": preserve_original,
                           "repair_recorded_at": manifest["created_at"],
                           "simulation_only": True}
+        revisions = []
+        if published:
+            prior = None
+            for version, original_summary, version_rows in revision_rows:
+                repaired_id = f"{version['signal_id']}:published-minute-repair:{source['repair_token']}"
+                fields = revision_fields(policy=SIGNAL_UPDATE_PROGRESSIVE, signal_id=repaired_id,
+                    input_fingerprint=_digest({"source_signal_id": version["signal_id"],
+                        "original_input_fingerprint": version["opening_signal_revision"]["input_fingerprint"],
+                        "weights_sha256": version["weights_sha256"]}), previous=prior)
+                fields["opening_signal_revision"]["trigger"] = "source_pinned_published_target_minute_replay"
+                derived = {**original_summary, **fields, "signal_id": repaired_id,
+                    "summary_path": version["summary_path"], "weights_path": version["weights_path"],
+                    "simulation_replay": True, "historical_minute_valuation": True,
+                    "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+                    "replay_basis": PUBLISHED_SESSION_CONTRACT,
+                    "replay_source": "source_pinned_completed_minute_ohlcv",
+                    "replay_effective_signal_at": version["effective_entry_at"],
+                    "opening_repair_of_signal_id": version["signal_id"],
+                    "original_weights_preserved": True, "counterfactual_signal_regeneration": False,
+                    "repair_recorded_at": manifest["created_at"], "simulation_only": True,
+                    "production_order_possible": False,
+                    "published_revision_replay": {"contract": PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT,
+                        "plan_sha256": plan["plan_sha256"], "source_signal_id": version["signal_id"],
+                        "publication_upper_bound": version["publication_upper_bound"],
+                        "original_revision": version["opening_signal_revision"]}}
+                prior = derived
+                revisions.append({"summary": derived, "rows": _canonicalize_signal_rows_for_replay(version_rows, opens),
+                                  "observed": datetime.fromisoformat(version["effective_entry_at"])})
+            replay_summary, rows = revisions[0]["summary"], revisions[0]["rows"]
         for path in (summary_path, weights_path, limit_path,
                      Path(original["summary_path"]), Path(original["weights_path"])):
             pins.append({"path": str(path.resolve()), "sha256": _sha256(path)})
         for pin in bar_proof.get("source_files", []):
             pins.append({"path": pin["path"], "sha256": pin["sha256"]})
         result.append({"day": day, "observed": observed, "summary": replay_summary,
-                       "rows": rows if preserve_original else _canonicalize_signal_rows_for_replay(rows, opens),
+                       "rows": rows if (preserve_original or published) else _canonicalize_signal_rows_for_replay(rows, opens),
                        "quotes": quotes, "eligibility": eligibility, "coverage": coverage,
                        "bars": bars, "end_at": end_at, "book_proof": book_proof,
                        "bar_proof": bar_proof, "quote_proof": quote_proof,
                        "rule_data_dir": rule_source, "rule_proof": rule_proof})
+        if published:
+            result[-1]["revisions"] = revisions[1:]
     return result, pins
 
 
 def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, reason: str) -> list[dict]:
     market = spec.market
     completed_replay = reason == ORIGINAL_SIGNAL_CONTRACT and all(item["end_at"] == time(13, 30) for item in sessions)
-    if reason == MISSING_SESSION_CONTRACT:
+    if reason in {MISSING_SESSION_CONTRACT, PUBLISHED_SESSION_CONTRACT}:
         if len(sessions) != 1 or sessions[0]["end_at"] != time(13, 30):
             raise RuntimeError("missing-session append requires one completed session")
         _require_missing_session_target(engine.state["modes"][market], sessions[0]["day"])
@@ -462,10 +706,25 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
                 official_raw_root=item["rule_data_dir"] / "raw")
             item["closing_proof"] = proof
             return quotes
+        remaining_revisions = {revision["observed"]: revision for revision in item.get("revisions", [])}
+        consumed_revisions = []
+        def update_targets(observed):
+            revision = remaining_revisions.pop(observed, None)
+            if revision is None:
+                return
+            status = engine.register_signal(spec=spec, summary=revision["summary"],
+                signal_rows=revision["rows"], quotes={}, eligibility=item["eligibility"],
+                eligibility_coverage=item["coverage"], now=observed, counterfactual_open_replay=True)
+            if status != "registered":
+                raise RuntimeError(f"published revision {revision['summary']['signal_id']}: {status}")
+            consumed_revisions.append(revision["summary"]["published_revision_replay"]["source_signal_id"])
         _replay_historical_intraday(engine, markets=[market], bars=item["bars"],
             trading_date=item["day"], end_at=item["end_at"],
             terminal_close_quote_provider=closing if (item["day"] < datetime.now(TAIPEI).date()
-                or reason == MISSING_SESSION_CONTRACT) else None)
+                or reason in {MISSING_SESSION_CONTRACT, PUBLISHED_SESSION_CONTRACT}) else None,
+            **({"before_completed_minute": update_targets} if item.get("revisions") else {}))
+        if remaining_revisions:
+            raise RuntimeError("published revisions were not completely replayed")
         engine.flush_deferred_ledger_writes()
         engine._persist(datetime.combine(item["day"], item["end_at"], tzinfo=TAIPEI))
         mode = engine.state["modes"][market]
@@ -479,7 +738,9 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
                          "open_position_count": mode["open_position_count"],
                          "completed_through": item["end_at"].isoformat(),
                          "closing_proof": item.get("closing_proof"),
-                         "eligibility_source_proof": item.get("rule_proof")})
+                         "eligibility_source_proof": item.get("rule_proof"),
+                         **({"later_revisions_applied": len(consumed_revisions),
+                             "original_revision_signal_ids": consumed_revisions} if item.get("revisions") else {})})
     return accepted
 
 
@@ -511,13 +772,22 @@ def prepare(args) -> dict:
     manifest_path = root / "ledger_repair_manifest.json"
     if manifest_path.exists():
         raise FileExistsError("repair manifest exists; inspect/verify it before another operation")
-    spec, live = _spec(args.market, args.markets_dir)
+    published = getattr(args, "published_revisions", False)
+    spec, live = _spec(args.market, args.markets_dir, True) if published else _spec(args.market, args.markets_dir)
     mode = _object(args.live_dir / "state.json")["modes"][args.market]
     preserve_original = getattr(args, "preserve_original_signal", False)
-    append_missing = getattr(args, "append_missing_session", False)
+    append_missing = getattr(args, "append_missing_session", False) or published
     if append_missing and preserve_original:
         raise ValueError("missing-session append cannot rearm an original signal")
     paths = sorted(args.signal_summary, key=lambda path: _object(path)["asof_date"])
+    plan = None
+    if published:
+        if paths or preserve_original:
+            raise ValueError("published revision repair cannot collapse to a supplied single signal")
+        plan = _object(root / "published_revision_plan.json")
+        if plan["plan_sha256"] != _published_revision_inventory(spec, datetime.now(TAIPEI).date())["plan_sha256"]:
+            raise RuntimeError("published revision plan/source membership changed; re-inventory")
+        paths = [Path(plan["versions"][0]["summary_path"])]
     if append_missing:
         if (len(paths) != 1 or str(_object(paths[0])["asof_date"])[:10] != str(datetime.now(TAIPEI).date())
                 or datetime.now(TAIPEI).time() < time(13, 31)):
@@ -525,16 +795,20 @@ def prepare(args) -> dict:
         _require_missing_session_target(mode, datetime.now(TAIPEI).date())
     else:
         _require_empty_target(mode, preserve_original_signal=preserve_original)
-    contract = MISSING_SESSION_CONTRACT if append_missing else ORIGINAL_SIGNAL_CONTRACT if preserve_original else CONTRACT
+    contract = PUBLISHED_SESSION_CONTRACT if published else MISSING_SESSION_CONTRACT if append_missing else ORIGINAL_SIGNAL_CONTRACT if preserve_original else CONTRACT
     manifest = {"schema_version": 2 if preserve_original else 1, "contract": contract, "simulation_only": True,
                 "preserve_original_signal": preserve_original,
                 "append_missing_session": append_missing,
+                "published_revisions": published,
                 "spec_sha256": _spec_digest(spec),
                 "production_order_possible": False, "market": args.market,
                 "live_dir": str(args.live_dir.resolve()), "operation_root": str(root),
+                "price_limit_dir": str(getattr(args, "price_limit_dir", ROOT / "artifacts/live/tw_price_limits").resolve()),
                 "created_at": datetime.now(TAIPEI).isoformat(), "anchor": _anchor(mode),
                 "minute_roots": [str(path.resolve()) for path in
                                  (*getattr(args, "minute_data_root", []), *DEFAULT_MINUTE_DATA_ROOTS)], "sessions": []}
+    if published:
+        manifest["published_revision_plan"] = plan
     if preserve_original and (len(paths) != 1 or str(mode["session_date"]) != str(datetime.now(TAIPEI).date())
                               or datetime.now(TAIPEI).time() < time(13, 31)):
         raise RuntimeError("original-signal repair is scoped to one completed current-session replay")
@@ -543,7 +817,12 @@ def prepare(args) -> dict:
         day = date.fromisoformat(str(summary["asof_date"])[:10])
         if _has_live_fill(args.live_dir, args.market, str(day)):
             raise RuntimeError(f"{day}: live target has existing fills")
-        if append_missing:
+        if published:
+            first = plan["versions"][0]
+            original = {**first, "config_fingerprint": summary["config_fingerprint"],
+                "checkpoint_fingerprint": summary["checkpoint_fingerprint"], "generated_at": summary["generated_at"]}
+            original_id = original["signal_id"]
+        elif append_missing:
             original = _missing_session_proof(spec, day, path)
             original_id = original["signal_id"]
         elif day == datetime.now(TAIPEI).date():
@@ -554,9 +833,11 @@ def prepare(args) -> dict:
             original = _source_block_proof(spec, day, original_id, preserve_original_signal=preserve_original)
         if preserve_original and (day != datetime.now(TAIPEI).date() or path.resolve() != Path(original["summary_path"])):
             raise RuntimeError("original-signal repair must use the exact consumed original artifact")
+        token = uuid.uuid4().hex[:12]
         manifest["sessions"].append({"session_date": str(day), "summary_path": str(path.resolve()),
-                                     "repair_signal_id": f"{original_id}:minute-repair:{uuid.uuid4().hex[:12]}",
-                                     "original": original})
+                                     "repair_signal_id": (f"{original_id}:published-minute-repair:{token}" if published
+                                                          else f"{original_id}:minute-repair:{token}"),
+                                     "repair_token": token, "original": original})
     if not manifest["sessions"] or (not append_missing and manifest["sessions"][-1]["session_date"] != mode["session_date"]):
         raise ValueError("repair must end at the current empty session")
     if len({row["session_date"] for row in manifest["sessions"]}) != len(manifest["sessions"]):
@@ -572,6 +853,22 @@ def prepare(args) -> dict:
                               or accepted[0]["entry_filled_shares"] != accepted[0]["entry_requested_shares"]):
         raise RuntimeError("original-signal replay did not complete the same requested whole-lot target")
     curves = _curve_proof(candidate/"marks.jsonl", args.market, sessions)
+    if published:
+        from scripts.verify_tw_day_trade_scoped_repair import (
+            verify_published_fill_accounting, verify_minute_source_coverage,
+        )
+        with open_paper_journal(candidate / "fills.jsonl") as handle:
+            fills = [json.loads(line) for line in handle if line.endswith(b"\n")]
+        manifest["candidate_fill_accounting"] = verify_published_fill_accounting(
+            candidate_engine.state["modes"][args.market], fills, day=str(sessions[0]["day"]),
+            plan=plan, bars=sessions[0]["bars"],
+            prior_realized=float(manifest["anchor"]["cumulative_realized_net_pnl_twd"]),
+            terminal_close_sources=(accepted[0].get("closing_proof") or {}).get("terminal_close_sources", []))
+        with open_paper_journal(candidate / "marks.jsonl") as handle:
+            marks = [json.loads(line) for line in handle if line.endswith(b"\n")]
+        manifest["candidate_minute_source_coverage"] = verify_minute_source_coverage(
+            candidate_engine.state["modes"][args.market], marks, market=args.market,
+            day=str(sessions[0]["day"]), source_files=sessions[0]["bar_proof"]["source_files"])
     for item in accepted:
         for source in (item.get("closing_proof") or {}).get("terminal_close_sources", []):
             pins.append({"path": source["path"], "sha256": source["sha256"]})
@@ -579,7 +876,8 @@ def prepare(args) -> dict:
         pins.append({"path": str(source.resolve()), "sha256": _sha256(source)})
     if preserve_original or append_missing:
         for source in (Path(__file__), ROOT/"scripts/rebuild_tw_day_trade_open_price_replay.py",
-                       ROOT/"stockagent/live/tw_day_trade_simulation.py", Path(spec.checkpoint_path)):
+                       ROOT/"stockagent/live/tw_day_trade_simulation.py", Path(spec.checkpoint_path),
+                       *((ROOT/"scripts/verify_tw_day_trade_scoped_repair.py",) if published else ())):
             pins.append({"path": str(source.resolve()), "sha256": _sha256(source)})
     _assert_source_pins(pins)
     manifest.update({"candidate_dir": str(candidate.resolve()), "source_pins": pins,
@@ -602,7 +900,8 @@ def _apply_locked(args) -> dict:
         raise RuntimeError("only a newly validated candidate can be applied; inspect interrupted receipts")
     if manifest["market"] != args.market or manifest["live_dir"] != str(args.live_dir.resolve()):
         raise ValueError("repair target identity mismatch")
-    spec, live = _spec(args.market, args.markets_dir)
+    spec, live = (_spec(args.market, args.markets_dir, True) if manifest.get("published_revisions")
+                  else _spec(args.market, args.markets_dir))
     if manifest.get("spec_sha256") and _spec_digest(spec) != manifest["spec_sha256"]:
         raise RuntimeError("repair execution configuration changed after candidate preparation")
     _assert_source_pins(manifest["source_pins"])
@@ -612,7 +911,7 @@ def _apply_locked(args) -> dict:
     preserve_original = manifest.get("preserve_original_signal") is True
     append_missing = manifest.get("append_missing_session") is True
     completed_replay = (((preserve_original and manifest.get("contract") == ORIGINAL_SIGNAL_CONTRACT)
-                         or (append_missing and manifest.get("contract") == MISSING_SESSION_CONTRACT))
+                         or (append_missing and manifest.get("contract") in {MISSING_SESSION_CONTRACT, PUBLISHED_SESSION_CONTRACT}))
                         and len(sessions) == 1 and sessions[0]["day"] == datetime.now(TAIPEI).date()
                         and cutoff == datetime.combine(sessions[0]["day"], time(13, 30), tzinfo=TAIPEI)
                         and sessions[0]["end_at"] == time(13, 30))
@@ -706,7 +1005,8 @@ def recover_interrupted(args) -> dict:
             revisions.append({"path": str(source), "previous_sha256": pin["sha256"], "sha256": current})
             pin["sha256"] = current
     _assert_source_pins(revised["source_pins"])
-    spec, live = _spec(args.market, args.markets_dir)
+    spec, live = (_spec(args.market, args.markets_dir, True) if original.get("published_revisions")
+                  else _spec(args.market, args.markets_dir))
     if _spec_digest(spec) != original["spec_sha256"]:
         raise RuntimeError("interrupted recovery changed execution configuration")
     sessions, pins = _prepared_sessions(revised, spec, live, fetch_current=False)
@@ -754,7 +1054,7 @@ def recover_interrupted(args) -> dict:
                 elif history.exists():
                     history.unlink()  # Generated failed-transaction projection; live original remains retained.
             engine = TwDayTradeSimulationEngine(candidate, publication_clock=lambda: datetime.now(TAIPEI))
-            accepted = _execute(engine, spec, sessions, reason=MISSING_SESSION_CONTRACT)
+            accepted = _execute(engine, spec, sessions, reason=original.get("contract", MISSING_SESSION_CONTRACT))
             if _outcome(engine.state["modes"][args.market]) != original["candidate_final_outcome"]:
                 raise RuntimeError("recovery differs from the original validated financial candidate")
             for market, mode in engine.state["modes"].items():
@@ -849,7 +1149,7 @@ def bridge_marks(args) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("prepare", "apply", "recover-interrupted", "bridge-marks", "status"))
+    parser.add_argument("action", choices=("plan-published-revisions", "prepare", "apply", "recover-interrupted", "bridge-marks", "status"))
     parser.add_argument("--market", default="tw_day_trade_multi_basis_22")
     parser.add_argument("--live-dir", type=Path, default=ROOT/"artifacts/live/tw_day_trade_simulation")
     parser.add_argument("--markets-dir", type=Path, default=ROOT/"services/discord_bot/markets")
@@ -857,12 +1157,16 @@ def main() -> None:
     parser.add_argument("--signal-summary", type=Path, action="append", default=[])
     parser.add_argument("--minute-data-root", type=Path, action="append", default=[],
                         help="Additional canonical collector roots, checked before default local sources.")
+    parser.add_argument("--price-limit-dir", type=Path, default=ROOT / "artifacts/live/tw_price_limits",
+                        help="Receipt-backed exact-session static limits; original snapshots stay untouched.")
     parser.add_argument("--preserve-original-signal", action="store_true",
                         help="Repair a never-filled completed minute replay without model inference or weight changes.")
     parser.add_argument("--append-missing-session", action="store_true",
                         help="Append today's missing completed session after flat prior history; never replace existing fills.")
+    parser.add_argument("--published-revisions", action="store_true",
+                        help="Use a pinned all-lineage published-revision plan for the missing completed session.")
     args = parser.parse_args()
-    result = prepare(args) if args.action == "prepare" else apply(args) if args.action == "apply" else recover_interrupted(args) if args.action == "recover-interrupted" else bridge_marks(args) if args.action == "bridge-marks" else _object(
+    result = plan_published_revisions(args) if args.action == "plan-published-revisions" else prepare(args) if args.action == "prepare" else apply(args) if args.action == "apply" else recover_interrupted(args) if args.action == "recover-interrupted" else bridge_marks(args) if args.action == "bridge-marks" else _object(
         args.operation_root/"ledger_repair_manifest.json")
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
 

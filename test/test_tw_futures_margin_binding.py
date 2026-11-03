@@ -782,6 +782,44 @@ def test_fixed_rights_require_complete_prior_source_proof():
             corporate_subscription_rights_require_fixing(dict(fact,fixed_subscription_rights_evidence={**proof,**changes}))
 
 
+def test_notice_declared_zero_is_terminal_only_and_requires_complete_source_scope():
+    from stockagent.data.tw_futures_margin_preparation import (
+        bind_adjusted_terminal_values, corporate_subscription_rights_require_fixing, corporate_terms_intervals,
+    )
+    proof = dict(product='IA2', page=2, valuation_kind='notice_declared_out_of_money_zero_v1',
+        observation_date='2011-12-12', closing_price='9.34', subscription_price='10',
+        derived_value_twd='0', covers_all_subscription_components=True,
+        transcribed_formula='100年12月12日標的證券收盤價格為9.34元，低於現金增資認購價格10元，故不予計算。')
+    fact = dict(product='IA2', from_product='IA1', effective_date='2012-07-10',
+        contract_months=['201209'], published_date='2012-06-29', known_at='2012-06-29T23:59:59+08:00',
+        issue_date_bound=True, source_content_sha256='a'*64, source_url='synthetic_test',
+        contract_multiplier=2080., deliverable_security_quantity=2080., deliverable_cash_twd=0.,
+        deliverable_components_resolved=True, has_equity_credit_fields=False,
+        subscription_rights_at_final_settlement=True, fixed_subscription_rights_twd=0.,
+        fixed_subscription_rights_evidence=proof, visual_review_sha256='b'*64)
+    assert not corporate_subscription_rights_require_fixing(fact)
+    assert corporate_subscription_rights_require_fixing(dict(fact,
+        fixed_subscription_rights_evidence={**proof, 'covers_all_subscription_components': False}))
+    for changes in ({'observation_date': '2012-06-29'}, {'product': 'IA1'},
+                    {'closing_price': '10.01'}, {'derived_value_twd': '1'},
+                    {'covers_all_subscription_components': 'true'}):
+        with pytest.raises(ValueError, match='source-bound'):
+            corporate_subscription_rights_require_fixing(dict(fact,
+                fixed_subscription_rights_evidence={**proof, **changes}))
+    with pytest.raises(ValueError, match='source-bound'):
+        corporate_subscription_rights_require_fixing(dict(fact, fixed_subscription_rights_twd=1.))
+    rows, issues = corporate_terms_intervals([fact])
+    assert not issues and rows[0]['subscription_rights_at_final_settlement'] is False
+    assert rows[0]['deliverable_cash_twd'] == 0.
+    terms = pl.DataFrame(rows, schema_overrides={'valid_until_exclusive': pl.String})
+    final = pl.DataFrame(dict(date=[date(2012, 9, 19)], product=['IA2'], contract=['201209'],
+        final_settlement_price=[10.], final_settlement_value=[None]),
+        schema_overrides={'final_settlement_value': pl.Float64})
+    result = bind_adjusted_terminal_values(final, terms)
+    assert result['terminal_value_input_twd'][0] == 20800.
+    assert result['official_final_settlement_value'][0] is None
+
+
 def test_old_fixed_rights_do_not_resolve_a_new_pending_entitlement():
     from stockagent.data.tw_futures_margin_preparation import corporate_terms_intervals,bind_adjusted_terminal_values
     fact=dict(product='AA2',from_product='AA1',effective_date='2020-04-17',

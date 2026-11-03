@@ -4,7 +4,24 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from stockagent.ocr.fastpath import CompactCTC, ExactDetPreprocess, Optimizations
+from stockagent.ocr.fastpath import AvoidDetUpscale, CompactCTC, ExactDetPreprocess, Optimizations
+
+
+def test_detector_avoids_small_page_upscale_without_downscaling_large_pages():
+    from types import SimpleNamespace
+    native = SimpleNamespace(limit_type='min', limit_side_len=1536)
+    seen = []
+    preprocess = AvoidDetUpscale(lambda image: seen.append(native.limit_side_len), native)
+    preprocess(np.empty((160, 700, 3), dtype=np.uint8))
+    preprocess(np.empty((2151, 2977, 3), dtype=np.uint8))
+    preprocess(np.empty((10, 20, 3), dtype=np.uint8))
+    assert seen == [160, 1536, 32]
+    assert native.limit_side_len == 1536
+    def fail(image):
+        raise ValueError('resize failed')
+    with pytest.raises(ValueError, match='resize failed'):
+        AvoidDetUpscale(fail, native)(np.empty((10, 20, 3), dtype=np.uint8))
+    assert native.limit_side_len == 1536
 
 
 @pytest.mark.parametrize('mean,std', [([.5]*3,[.5]*3), ([.485,.456,.406],[.229,.224,.225])])

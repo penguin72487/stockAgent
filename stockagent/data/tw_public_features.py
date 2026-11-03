@@ -322,11 +322,12 @@ _INCREMENTAL_DATE_DATASETS = frozenset(
     }
 )
 
-# These five exact source files are read only by the market-row TAIFEX
-# builders below. They neither define stock features nor the verified equity
-# session calendar. Other market-looking sources may be shared with stock
-# builders or availability rules and remain on the full-rebuild path.
+# These exact sources are read only by their market-row builders below. They
+# neither define stock features nor the verified equity session calendar.
+# Other market-looking sources may be shared with stock builders or
+# availability rules and remain on the full-rebuild path.
 _MARKET_ONLY_SOURCE_NAMES = frozenset({
+    "cbc_money_aggregates.parquet",
     "taifex_daily_futures.parquet",
     "taifex_daily_options.parquet",
     "taifex_institutional_total.parquet",
@@ -375,7 +376,35 @@ def _source_content_receipts(input_dir: Path) -> list[dict[str, str | int]]:
         receipt = _file_content_receipt(supplemental)
         receipt["name"] = supplemental.relative_to(input_dir).as_posix()
         receipts.append(receipt)
+    calendar_receipt = input_dir / "twse_taiex_ohlc.summary.json"
+    if calendar_receipt.is_file():
+        receipts.append(_session_calendar_content_receipt(calendar_receipt))
     return receipts
+
+
+def _session_calendar_content_receipt(path: Path) -> dict[str, str | int]:
+    # An absent historical bar is accepted only with this exact calendar
+    # proof. Bind every verifier input, while excluding cosmetic timestamps.
+    from stockagent.live.market_status import tw_actual_session_receipt_inputs
+
+    try:
+        semantic = tw_actual_session_receipt_inputs(
+            json.loads(path.read_text(encoding="utf-8"))
+        )
+        payload = json.dumps(
+            semantic, ensure_ascii=False, sort_keys=True,
+            separators=(",", ":"), allow_nan=False,
+        ).encode("utf-8")
+    except (ValueError, TypeError, UnicodeError):
+        # Malformed proofs are still dependencies; never certify them by
+        # dropping the file from source identity.
+        return _file_content_receipt(path)
+    return {
+        "name": path.name,
+        "size": len(payload),
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "basis": "actual_session_receipt_semantics_v1",
+    }
 
 
 def _release_feature_content_receipt(path: Path) -> dict[str, str | int]:
@@ -594,10 +623,14 @@ def build_tw_public_training_features(
         # Identical source bytes do not certify outputs of another feature
         # implementation. Bootstrap/rebuild once, never relabel an old result.
         base_compatible = False
-    if auto_start is not None and not base_compatible:
+    proven_unchanged_sources_only = (
+        incremental_plan.get("mode") in {"non_feature_sources_only", "semantic_sources_unchanged"}
+    )
+    if (auto_start is not None or proven_unchanged_sources_only) and not base_compatible:
         changed_names = frozenset(incremental_plan["changed_sources"])
-        # The same exact output/universe/ABI fence remains mandatory. Only a
-        # complete per-session proof may admit changed dependency bytes.
+        # The same exact output/universe/ABI fence remains mandatory. Changed
+        # bytes must have a dated partition proof or an implementation-bound
+        # proof of unchanged feature input or a source not read by the producer.
         base_compatible = _incremental_base_is_compatible(
             output_path, resolved_summary_path, market_symbol=market_symbol,
             source_receipts=source_receipts, symbol_universe_receipt=symbol_universe_receipt,
@@ -606,15 +639,28 @@ def build_tw_public_training_features(
         )
         if not base_compatible:
             incremental_plan = {**incremental_plan, "mode": "full", "reason": "output_universe_or_abi_not_verified"}
+            proven_unchanged_sources_only = False
     if incremental_auto:
         incremental_start_date = auto_start if base_compatible else None
     market_only_summary: dict[str, object] = {}
     if (
-        not base_compatible
-        and (not incremental_auto or previous_summary.get("feature_implementation_sha256") == feature_identity)
+        (not incremental_auto or previous_summary.get("feature_implementation_sha256") == feature_identity)
         and output_path.is_file()
         and end_date is not None
-        and _incremental_base_is_compatible(
+    ):
+        changed_sources = set(incremental_plan.get("changed_sources", ()))
+        if (
+            base_compatible
+            and incremental_auto
+            and incremental_plan.get("mode") == "affected_tail"
+            and changed_sources
+            and changed_sources <= _MARKET_ONLY_SOURCE_NAMES
+        ):
+            # The auto planner already verified this exact output, universe,
+            # ABI and source set. Reuse that proof instead of hashing the base
+            # a second time just because the changed sources are dated.
+            market_only_summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
+        elif not base_compatible and _incremental_base_is_compatible(
             output_path,
             resolved_summary_path,
             market_symbol=market_symbol,
@@ -622,17 +668,19 @@ def build_tw_public_training_features(
             symbol_universe_receipt=symbol_universe_receipt,
             allow_daily_publication_lag=allow_daily_publication_lag,
             allowed_changed_source_names=_MARKET_ONLY_SOURCE_NAMES,
-        )
-    ):
-        market_only_summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
-        if market_only_summary.get("requested_end_date") != end_date.isoformat():
+        ):
+            market_only_summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
+        if market_only_summary and market_only_summary.get("requested_end_date") != end_date.isoformat():
             market_only_summary = {}
     use_market_only = bool(market_only_summary)
     source_proof_done = time.perf_counter()
     if base_compatible:
         summary = json.loads(resolved_summary_path.read_text(encoding="utf-8"))
-        if summary.get("source_receipts") == source_receipts and summary.get("requested_end_date") == (
-            end_date.isoformat() if end_date is not None else None
+        if (
+            (summary.get("source_receipts") == source_receipts or proven_unchanged_sources_only)
+            and summary.get("requested_end_date") == (
+                end_date.isoformat() if end_date is not None else None
+            )
         ):
             if source_receipts != _source_content_receipts(input_dir):
                 raise RuntimeError("TW public source parquet changed while verifying unchanged features")
@@ -651,7 +699,10 @@ def build_tw_public_training_features(
                 stock_rows=int(summary["stock_rows"]),
                 market_rows=int(summary["market_rows"]),
                 market_symbol=market_symbol,
-                source_files=list(summary["source_files"]),
+                source_files=(
+                    sorted(str(path) for path in input_dir.glob("*.parquet"))
+                    if proven_unchanged_sources_only else list(summary["source_files"])
+                ),
                 source_receipts=source_receipts,
                 output_receipt=dict(summary["output_receipt"]),
                 symbol_universe_receipt=symbol_universe_receipt,
@@ -668,12 +719,18 @@ def build_tw_public_training_features(
                 feature_implementation_sha256=feature_identity,
             )
             old_partitions = summary.get("input_partitions")
-            if incremental_auto and (not isinstance(old_partitions, dict) or old_partitions.get("implementation_sha256") != input_partitions.get("implementation_sha256")):
-                # One metadata-only bootstrap binds the already SHA-verified
-                # output to its exact source partitions; no payload rewrite.
+            if incremental_auto and (
+                proven_unchanged_sources_only
+                or not isinstance(old_partitions, dict)
+                or old_partitions.get("implementation_sha256") != input_partitions.get("implementation_sha256")
+            ):
+                # Bind the existing SHA-verified output to all current source
+                # receipts and partition proofs, without rewriting its payload.
                 _write_summary(resolved_summary_path, result)
             return result
-    use_incremental = incremental_start_date is not None and base_compatible
+    # Market-only publication must rebuild every market date: its output
+    # branch retains all stock rows, not the old market-date prefix.
+    use_incremental = incremental_start_date is not None and base_compatible and not use_market_only
     incremental_fallback_reason = (
         "base_contract_not_verified"
         if incremental_start_date is not None and not base_compatible and not use_market_only
@@ -714,7 +771,7 @@ def build_tw_public_training_features(
         exchange_sessions = _exchange_session_dates(input_dir)
         session_token = _BUILD_SESSION_DATES.set((input_dir.resolve(), exchange_sessions))
         if use_market_only:
-            # These TAIFEX sources cannot affect stock rows: each is consumed
+            # These sources cannot affect stock rows: each is consumed
             # exclusively by its corresponding market-row builder below.
             # The old table and every other source were hash-verified above.
             stock_features = pl.DataFrame()
@@ -766,6 +823,7 @@ def build_tw_public_training_features(
             feature_stage_seconds["stock_merge"] = round(
                 time.perf_counter() - stock_merge_started, 3
             )
+            stock_frames.clear()
             if symbols is not None and not stock_features.is_empty():
                 stock_features = stock_features.filter(
                     pl.col("symbol").is_in(sorted(symbols))
@@ -841,6 +899,7 @@ def build_tw_public_training_features(
         feature_stage_seconds["market_merge"] = round(
             time.perf_counter() - market_merge_started, 3
         )
+        market_frames.clear()
         market_build_done = time.perf_counter()
     finally:
         if session_token is not None:
@@ -851,8 +910,10 @@ def build_tw_public_training_features(
             _INCREMENTAL_CANONICAL_DATES.reset(canonical_token)
 
     frames = [frame for frame in (stock_features, market_features) if not frame.is_empty()]
+    del stock_features, market_features
     if frames:
         output = pl.concat(frames, how="diagonal_relaxed")
+        frames.clear()
         if end_date is not None:
             output = output.filter(pl.col("date") <= pl.lit(end_date))
         if use_incremental:
@@ -874,8 +935,11 @@ def build_tw_public_training_features(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_output = output_path.with_suffix(output_path.suffix + ".tmp")
     reused_rows = 0
+    output_symbols = output.get_column("symbol")
+    output_stock_rows = int((output_symbols != market_symbol).sum())
+    output_market_rows = int((output_symbols == market_symbol).sum())
     if use_market_only:
-        if not output.is_empty() and output.filter(pl.col("symbol") != market_symbol).height:
+        if output_stock_rows:
             raise RuntimeError("market-only feature rebuild produced stock rows")
         stock_base = pl.scan_parquet(output_path).filter(
             pl.col("symbol") != market_symbol
@@ -917,12 +981,8 @@ def build_tw_public_training_features(
             maintain_order=True,
             engine="streaming",
         )
-        stock_rows = int(prefix_counts["stock_rows"] or 0) + int(
-            output.filter(pl.col("symbol") != market_symbol).height
-        )
-        market_rows = int(prefix_counts["market_rows"] or 0) + int(
-            output.filter(pl.col("symbol") == market_symbol).height
-        )
+        stock_rows = int(prefix_counts["stock_rows"] or 0) + output_stock_rows
+        market_rows = int(prefix_counts["market_rows"] or 0) + output_market_rows
         rows = reused_rows + int(output.height)
     else:
         output.write_parquet(
@@ -932,16 +992,8 @@ def build_tw_public_training_features(
             row_group_size=64_000,
         )
         rows = int(output.height)
-        stock_rows = (
-            int(output.filter(pl.col("symbol") != market_symbol).height)
-            if not output.is_empty()
-            else 0
-        )
-        market_rows = (
-            int(output.filter(pl.col("symbol") == market_symbol).height)
-            if not output.is_empty()
-            else 0
-        )
+        stock_rows = output_stock_rows
+        market_rows = output_market_rows
     if source_receipts != _source_content_receipts(input_dir):
         temporary_output.unlink(missing_ok=True)
         raise RuntimeError("TW public source parquet changed while features were being built")
@@ -1269,10 +1321,9 @@ def _merge_feature_frames(
     if not cleaned:
         return pl.DataFrame()
     if cleaned[0].height >= 100_000 and len(cleaned) >= 3:
-        # A sequence of wide full joins rebuilds and coalesces the growing
-        # key relation at every step. Form its union once, then attach each
-        # unique-key feature relation with a cheaper left join. Both plans
-        # retain every key and the first frame's value for repeated columns.
+        # Join only keys and row indices. Rejoining an increasingly wide
+        # result copies earlier value columns once per later source. Gather
+        # each winning value column once instead, retaining the full key union.
         keys_at = time.perf_counter()
         merged = pl.concat(
             [frame.select(list(KEY_COLUMNS)) for frame in cleaned],
@@ -1282,8 +1333,37 @@ def _merge_feature_frames(
             stage_seconds[f"{stage_prefix}_keys"] = round(
                 time.perf_counter() - keys_at, 3
             )
-        join_frames = enumerate(cleaned)
-        join_how = "left"
+        key_relation = merged
+        columns = list(key_relation)
+        joined_names = set(KEY_COLUMNS)
+        for index, frame in enumerate(cleaned):
+            joined_at = time.perf_counter()
+            value_names = []
+            for name in frame.columns:
+                if name in KEY_COLUMNS:
+                    continue
+                result_name = f"{name}_right" if name in joined_names else name
+                if result_name in joined_names:
+                    # Preserve the ordinary join's duplicate-suffix rejection.
+                    raise pl.exceptions.DuplicateError(
+                        f"column with name '{result_name}' already exists"
+                    )
+                joined_names.add(result_name)
+                if result_name in OUTPUT_COLUMNS:
+                    value_names.append(name)
+            if value_names:
+                positions = key_relation.join(
+                    frame.select(list(KEY_COLUMNS)).with_row_index("_feature_row_index"),
+                    on=list(KEY_COLUMNS), how="left", maintain_order="left",
+                ).get_column("_feature_row_index")
+                columns.extend(
+                    frame.get_column(name).gather(positions) for name in value_names
+                )
+            if stage_seconds is not None:
+                stage_seconds[f"{stage_prefix}_{index}"] = round(
+                    time.perf_counter() - joined_at, 3
+                )
+        return pl.DataFrame(columns)
     else:
         merged = cleaned[0]
         join_frames = enumerate(cleaned[1:], start=1)
@@ -1334,14 +1414,19 @@ def _finalize_feature_frame(frame: pl.DataFrame) -> pl.DataFrame:
     )
     if frame.is_empty():
         return frame
-    if frame.height >= 100_000 and not frame.select(
-        pl.struct(list(KEY_COLUMNS)).is_duplicated().any()
-    ).item():
-        # The group-by below exists to collapse duplicate source keys. If a
-        # large frame has none, the same normalized rows are already final.
-        # On the real official OHLCV frame this checks 9.7M keys in ~0.6s;
-        # grouping every feature column is orders of magnitude costlier.
-        return frame
+    if frame.height >= 100_000:
+        duplicated = frame.select(
+            pl.struct(list(KEY_COLUMNS)).is_duplicated()
+        ).to_series()
+        if not duplicated.any():
+            return frame
+        if not duplicated.all():
+            # Only colliding keys require a last-nonnull reduction. Filtering
+            # retains source row order within each duplicate group.
+            reduced = frame.filter(duplicated).group_by(list(KEY_COLUMNS)).agg(
+                [pl.col(col).drop_nulls().last().alias(col) for col in output_cols]
+            )
+            return pl.concat([frame.filter(~duplicated), reduced])
     return frame.group_by(["date", "symbol"]).agg([pl.col(col).drop_nulls().last().alias(col) for col in output_cols])
 
 

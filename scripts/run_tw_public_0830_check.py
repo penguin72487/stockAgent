@@ -30,7 +30,10 @@ if str(REPO_ROOT) not in sys.path:
 
 from downloader.download_tw_public_data import DEFAULT_DATASETS  # noqa: E402
 from scripts.check_tw_day_trade_preopen_readiness import _session_contract  # noqa: E402
-from stockagent.data.tw_public_features import _release_feature_content_receipt  # noqa: E402
+from stockagent.data.tw_public_features import (  # noqa: E402
+    _release_feature_content_receipt,
+    _session_calendar_content_receipt,
+)
 from stockagent.data.tw_public_source_receipts import (  # noqa: E402
     DERIVED_INPUT_RECEIPTS,
 )
@@ -420,7 +423,11 @@ def _audit_revision_errors(
         errors.append("derived data changed or became stale after audit")
     audited = str(audited_dependency_state.get("sha256") or "")
     current = str(final_dependency_state.get("sha256") or "")
-    if not audited or not current or audited != current:
+    if not audited:
+        errors.append("audit dependency revision was not observed; acceptance remains unverified")
+    elif not current:
+        errors.append("current live-root dependency revision is unavailable")
+    elif audited != current:
         errors.append(
             "live-root dependency revision changed after audit; retry convergence"
         )
@@ -713,7 +720,11 @@ def _receipt_dependency_errors(
     if not summary:
         return [f"missing summary: {summary_path}"]
     errors: list[str] = []
-    checked: set[Path] = set()
+    # Deduplicate only identical claims, not merely the path. Two references
+    # to one file can carry different expected hashes, sizes, semantic bases,
+    # or key scopes; silently skipping the later claim would certify a
+    # contradictory or unauthorized receipt.
+    checked: set[tuple[Path, str, str, str, str]] = set()
     for key in keys:
         payload = summary.get(key)
         if isinstance(payload, Mapping):
@@ -732,30 +743,34 @@ def _receipt_dependency_errors(
             if not path.is_absolute():
                 path = live_root / path
             path = path.resolve(strict=False)
-            if path in checked:
+            basis = str(receipt.get("basis") or "")
+            claim = (path, key, basis, str(expected_size), expected_sha256)
+            if claim in checked:
                 continue
-            checked.add(path)
+            checked.add(claim)
             try:
                 actual_size = path.stat().st_size
             except OSError:
                 errors.append(f"{key}: missing dependency {path}")
                 continue
-            basis = str(receipt.get("basis") or "")
             if basis:
-                if (
-                    basis != "feature_semantics_v1"
-                    or key != "source_receipts"
-                    or path.parent != live_root.resolve(strict=False)
-                    or path.name not in {
+                if key != "source_receipts" or path.parent != live_root.resolve(strict=False):
+                    errors.append(f"{key}: unsupported receipt basis {basis}: {path.name}")
+                    continue
+                if basis == "feature_semantics_v1" and path.name in {
                         "dgbas_release_vintages.parquet",
                         "cbc_fx_reserve_release_vintages.parquet",
                         "cbc_money_release_vintages.parquet",
-                    }
-                ):
+                    }:
+                    semantic_receipt = _release_feature_content_receipt
+                elif (basis == "actual_session_receipt_semantics_v1"
+                      and path.name == "twse_taiex_ohlc.summary.json"):
+                    semantic_receipt = _session_calendar_content_receipt
+                else:
                     errors.append(f"{key}: unsupported receipt basis {basis}: {path.name}")
                     continue
                 try:
-                    actual_receipt = _release_feature_content_receipt(path)
+                    actual_receipt = semantic_receipt(path)
                 except Exception as exc:
                     errors.append(f"{key}: unreadable semantic dependency {path}: {exc}")
                     continue
@@ -1165,7 +1180,36 @@ def main() -> int:
     derived_status_after: dict[str, Any] = {}
     lock_path = live_root.parent / ".locks" / "tw-public-refresh.lock"
     lock_path.parent.mkdir(parents=True, exist_ok=True)
-    if not _derived_refresh_blockers(failures):
+    if _derived_refresh_blockers(failures):
+        # A failed probe blocks activation, not read-only evidence of the last
+        # accepted runtime. Otherwise an empty, skipped audit is misreported as
+        # source drift and masks a perfectly valid cached audit of this revision.
+        with lock_path.open("a+", encoding="utf-8") as lock_handle:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_SH)
+            derived_status_before = _derived_data_status(
+                live_root, expected_latest=expected_latest, session_date=session_date,
+            )
+            derived_status_after = derived_status_before
+            if derived_status_after.get("current") is True:
+                try:
+                    observed_dependency = _audit_dependency_state(config=config, live_root=live_root)
+                    reusable = _reusable_audit(
+                        _repo_path(args.audit_root) / "latest.json",
+                        expected_latest=expected_latest,
+                        dependency_sha256=str(observed_dependency["sha256"]),
+                    )
+                except OSError as exc:
+                    failures.append(f"runtime_evidence:{type(exc).__name__}: {exc}")
+                else:
+                    if reusable is not None:
+                        audit, audit_cache_receipt = reusable
+                        audit_dependency_state = observed_dependency
+            steps.append({
+                "step": "source_blocked_read_only_acceptance",
+                "status": "cached_runtime_verified" if audit.get("model_safe") is True else "unverified",
+                "mode": "shared", "source_failures_preserved": True,
+            })
+    else:
         with lock_path.open("a+", encoding="utf-8") as lock_handle:
             # Read-only acceptance must coexist with live inference. Escalate
             # only when a builder really needs to mutate canonical source data.

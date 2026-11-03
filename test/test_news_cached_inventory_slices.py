@@ -116,12 +116,15 @@ def test_existing_exact_jobs_need_no_stat_or_redundant_writes(cfg, tmp_path, mon
             def __iter__(self): return self
             def __next__(self): return next(self.entries)
             def close(self): pass
-        monkeypatch.setattr('downloader.news_fulltext_replay.os.scandir', lambda path: Scan())
-        statements = []
-        queue.db.set_trace_callback(statements.append)
-        _inventory(queue, source)
-        assert not any('INSERT OR IGNORE INTO cached_bulk_replays' in sql for sql in statements)
-        assert [tuple(row) for row in queue.db.execute('SELECT priority,state FROM cached_bulk_replays ORDER BY response_sha256')] == [(0.0, 'checked'), (-1.0, 'checked'), (-2.0, 'checked')]
+        # os is a shared module, so restore scandir before pytest and other
+        # cleanup code need the real context-manager-capable implementation.
+        with monkeypatch.context() as patch:
+            patch.setattr('downloader.news_fulltext_replay.os.scandir', lambda path: Scan())
+            statements = []
+            queue.db.set_trace_callback(statements.append)
+            _inventory(queue, source)
+            assert not any('INSERT OR IGNORE INTO cached_bulk_replays' in sql for sql in statements)
+            assert [tuple(row) for row in queue.db.execute('SELECT priority,state FROM cached_bulk_replays ORDER BY response_sha256')] == [(0.0, 'checked'), (-1.0, 'checked'), (-2.0, 'checked')]
     finally:
         queue.close()
 

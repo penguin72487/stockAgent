@@ -155,6 +155,20 @@ only retained rows in affected parts are rewritten for corrections/deletions.
 Complete typed row matching is a multiset, not semantic deduplication. Preserve
 original strings, null bodies, source clocks, provenance and use flags.
 
+The root manifest is the publication pointer; root README and verification
+files are convenience copies and can describe a candidate if a publication is
+interrupted before the pointer moves. Bind acceptance to the manifest's own
+`versions/<generation>/verification.json` and its manifest-content hash; only
+fall back to a matching root receipt when the generation receipt is absent for
+a legacy version. A present but invalid generation receipt must not fall back.
+The layout inventory rechecks the root manifest after the receipt read and
+reports pending if it changed. New READMEs link to their fixed generation and
+distinguish it from the moving root pointer; quality details are authoritative
+inside the bound verification receipt. New generation schemas are included in
+new fixed private-news backup plans when present; previously sealed plans stay
+valid. None of this revalidates source content or proves historical coverage.
+See the [interruption and readback evidence](../news_all_source_repair_2026-10-09.md).
+
 Readers must use `news_table_paths` / corpus iterators or a pinned manifest;
 support legacy ABI 1 and root-relative ABI 2 paths. Never glob all versions.
 Input projection chunks reconstruct exact SQLite bytes and SHA; only the new
@@ -166,10 +180,12 @@ enabled. Full source comparison and acceptance still run; physical delta storage
 does not imply delta-only CPU work. Other providers are not implicitly migrated.
 See [implementation and evidence](../news_incremental_storage_2026-10-16.md).
 
-The headline scope `cnyes_market_route_metadata_only_v1` keeps no-body CNYES
-`/twstock/` market-page references, including strictly decoded literal Google
-envelopes, as source observations rather than news headlines. It retains
-existing accepted bodies and does not equate a market page with an article.
+The headline scope `cnyes_market_and_cmnews_tag_metadata_only_v2` keeps no-body
+CNYES `/twstock/` references and CMNews `/tag/` references, including strictly
+decoded literal Google envelopes, as source observations rather than news
+headlines. The CMNews route is an unverified page hint, not proof of its
+content or absence. The scope retains existing accepted bodies and does not
+equate these routes with articles.
 This changes the corpus data scope: a new build must use a separate root and a
 new compatible input snapshot; old ABI 1/2 manifests remain readable and must
 not be silently rewritten. Corpus construction and DuckDB verification use
@@ -177,6 +193,87 @@ the news owner's sampled physical-backing check as well as filesystem free
 space; stale or unavailable samples defer work. This sampled 25 GiB guard is
 not an exact forecast or a reservation for a complete rebuild. See the
 [bounded readback and unresolved rebuild](../news_all_source_repair_2026-10-09.md).
+
+The body quality scope `owner_reviewed_exact_body_exclusions_v1` excludes a
+stored body from a new corpus only when a successful canonical owner review
+matches the article, provider, body hash, source batch and capture time and
+its sealed request and accepted source artifacts verify. Retain the exact
+request bytes in the input snapshot; an unavailable or inconsistent witness
+defers the build. A later body or capture, even with identical text, is not
+excluded by the old review. Preserve original source data and retain an
+eligible title as a headline. This scope change also requires a new corpus root
+and compatible snapshot; legacy manifests remain readable. The [quality audit
+and private end-to-end rehearsal](../news_all_source_repair_2026-10-09.md)
+do not imply that the production corpus has been rebuilt.
+
+The former metadata selection scope `explicit_current_origin_or_legacy_inference_v1`
+uses the news owner's verified current complete receipt version. Historical
+versions and unfinished cursors remain evidence; a reverted receipt must not
+select a later obsolete origin or count its unfinished version as active.
+Legacy entries without a recorded selection use the highest complete origin id
+as an inference, reported separately, rather than as observed current-source
+proof. Invalid explicit pointers defer the snapshot. This changes corpus scope:
+new builds require a separate root and a compatible input snapshot; old
+manifests remain readable. The [offline repair and evidence](../news_all_source_repair_2026-10-09.md)
+do not establish that a production receipt reverted or that a corpus was rebuilt.
+
+The successor `explicit_current_origin_or_legacy_inference_alias_census_v2`
+also records a logical receipt alias only after its target was verified. A
+detected retarget is durable before importing the new target, and stays pending
+through a restart, an incomplete receipt or an unavailable source catalog.
+Only a completed two-pass, catalog-membership-stable reference census may
+retire an old physical target from the current selection; any other active
+reference keeps it selected. Historical origins, associations and source files
+remain intact.
+Pending retargets make current metadata totals unknown and defer a training
+snapshot. The census yields between paths. New completed retarget events retain
+the compressed catalog membership, resolved references, pending changes and
+retirement candidates under a content hash in the canonical queue transaction;
+`read_alias_census_proof` independently checks integrity and internal membership
+and retirement consistency. The normal write path verifies the stored bytes;
+it does not re-run that full independent readback on every new proof. Older
+digest-only events remain readable but cannot reconstruct a changed catalog.
+Proofs are private queue evidence, not embedded in the current training snapshot,
+publisher attestations or proof that a historical catalog was globally complete.
+Filesystem and producer SQLite updates do not share an atomic transaction:
+later changes are detected on a subsequent inventory, not proved impossible. Unrelated task
+generation and receipt-mtime changes do not change reference membership; the
+normal ingestion path remains responsible for those receipt versions. Older
+physical origins without recorded logical aliases cannot be retroactively
+mapped by guessing. This scope needs a fresh input snapshot and separate corpus root;
+old manifests remain readable. Code and offline tests alone do not deploy a
+new owner or prove the production corpus changed.
+
+The publication-basis scope `globalvoices_exact_retained_meta_declaration_v1`
+allows a new corpus to annotate an old Global Voices HTML record whose entire
+source batch lacks `published_time_basis`. The frozen head, immutable batch and
+receipt must agree; the same requested and final publisher URL, source response
+digest, HTML extraction method and exactly one matching source
+`article:published_time` declaration are required. Noncandidates do not decode
+raw HTML; missing or conflicting evidence remains unknown. The annotation is a
+source declaration in a retained response, not evidence of historical first
+publication or availability. Preserve the original clock, capture time, rights,
+body and source batch. `available_at_utc` remains the actual capture time.
+This output-semantic change requires a new compatible input snapshot and a
+separate corpus root; old manifests remain readable. No existing corpus is
+rewritten merely by changing the builder. See the [offline readback](../news_all_source_repair_2026-10-09.md).
+
+The successor `globalvoices_and_cmnews_exact_retained_declarations_v2` also
+allows a new corpus to recover a CMNews publisher declaration from an older
+combined visible publication/update string. The frozen head, immutable batch,
+receipt, URL, capture, body digest and original response digest must agree. The
+canonical article parser must confirm the same article, title, authors, visible
+publication and update minutes, absence of the known login mask and an explicitly
+timezone-aware `NewsArticle` declaration. If any evidence is absent or
+contradictory, preserve the old uncertainty. Decode original HTML only for
+candidate records, one row at a time. The new nullable
+`retained_published_declaration_raw` and `retained_modified_declaration_raw`
+fields preserve the exact timezone-aware declarations separately from the old
+`published_at_raw` and `modified_at_raw`; capture availability and rights are
+unchanged. This is a retained source claim, not evidence that the captured body
+was available historically at publication. The changed scope and schema need
+a new snapshot and corpus root. Readers and verification still support the old
+article schema; do not silently refresh an old root with the new scope.
 
 ## Crypto Downloader Baseline
 

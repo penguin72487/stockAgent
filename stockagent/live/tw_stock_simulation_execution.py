@@ -16,12 +16,15 @@ from decimal import Decimal, InvalidOperation
 import fcntl
 import hashlib
 import json
+import os
 from pathlib import Path
 import queue
 import sqlite3
+import stat
 import threading
 import time as monotonic_time
 from typing import Any, Iterator, Mapping
+import uuid
 from zoneinfo import ZoneInfo
 
 from stockagent.backtest.tw_day_trade_contract import BOARD_LOT_SHARES
@@ -67,6 +70,14 @@ def _now() -> datetime:
     return datetime.now(TAIPEI)
 
 
+def _outside_protected_opening() -> None:
+    clock = _now().astimezone(TAIPEI).time().replace(tzinfo=None)
+    # Leave room for registry I/O and the five-second SDK timeout before the
+    # engine's 08:59:30 protected window. It is not a provider latency SLA.
+    if time(8, 59) <= clock < time(9, 1):
+        raise ExecutionEvidenceError("subscription and baseline queries are disabled during protected opening")
+
+
 def _source_price(value: Any, session: date, security_type: str) -> str:
     # Do not round invalid source evidence onto the price grid. Decimal keeps
     # money exact in the durable receipt; VWAPs are not passed to this function.
@@ -85,6 +96,92 @@ def account_fingerprint(broker_id: str, account_id: str) -> str:
     if not broker_id or not account_id:
         raise ValueError("broker and account identity are required")
     return hashlib.sha256(_json([str(broker_id), str(account_id)]).encode()).hexdigest()
+
+
+def existing_quote_simulation_stock_accounts() -> tuple[str, ...]:
+    """List only hashed signed stock identities on the existing simulation owner.
+
+    No caller-provided SDK client, login, order callback or source request is
+    accepted. A subsequent attach independently fences the current generation.
+    """
+    from stockagent.live import quote_provider
+
+    api, token = quote_provider._claim_existing_shioaji_simulation_order_owner()
+    try:
+        with quote_provider._guard_existing_shioaji_simulation_order_owner(api, token):
+            accounts = api.list_accounts()
+        identities = tuple(account_fingerprint(str(getattr(account, "broker_id", "")),
+                                               str(getattr(account, "account_id", "")))
+                           for account in accounts
+                           if _enum(getattr(account, "account_type", "")) == "S"
+                           and getattr(account, "signed", None) is True)
+        if len(set(identities)) != len(identities):
+            raise ExecutionEvidenceError("duplicate simulation stock account identity")
+        return identities
+    finally:
+        quote_provider._release_existing_shioaji_simulation_order_owner(api, token, clear_callback=False)
+
+
+def _acquire_account_writer(journal: StockSimulationJournal):
+    """Cooperating writers share one durable account-to-journal binding.
+
+    A file lock alone cannot stop a later restart from picking another journal
+    and reusing its order tags. The small durable index preserves that identity;
+    it does not prove that unrelated external clients obey this boundary.
+    """
+    key = journal.account_key
+    if len(key) != 64 or any(ch not in "0123456789abcdef" for ch in key):
+        raise ExecutionEvidenceError("simulation account fingerprint is invalid")
+    # Keep the 0700 owner registry below the journal tree: opening a journal
+    # first may create its parent using the process's ordinary umask.
+    default = Path(__file__).resolve().parents[2] / "artifacts/live/shioaji_stock_simulation/owner_registry"
+    root = Path(os.environ.get("STOCKAGENT_SHIOAJI_SIMULATION_OWNER_DIR", str(default))).absolute()
+    root.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = root.lstat()
+    if (root.resolve() != root or not stat.S_ISDIR(info.st_mode)
+            or info.st_uid != os.geteuid() or info.st_mode & 0o077):
+        raise ExecutionEvidenceError("simulation account registry must be a private owned directory")
+    lock_path = root / (key + ".writer.lock")
+    fd = os.open(lock_path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    lock = os.fdopen(fd, "a+")
+    try:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError as exc:
+        lock.close()
+        raise ExecutionEvidenceError("simulation account already has a writer") from exc
+    try:
+        index_path = root / "account-journals.sqlite"
+        if index_path.is_symlink() or (index_path.exists() and not index_path.is_file()):
+            raise ExecutionEvidenceError("simulation account registry is not a regular file")
+        db = sqlite3.connect(index_path, timeout=10, isolation_level=None)
+        try:
+            index_path.chmod(0o600)
+            db.execute("PRAGMA journal_mode=WAL")
+            db.execute("PRAGMA synchronous=FULL")
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("CREATE TABLE IF NOT EXISTS bindings "
+                       "(account_key TEXT PRIMARY KEY, journal_path TEXT NOT NULL, journal_id TEXT)")
+            if "journal_id" not in {row[1] for row in db.execute("PRAGMA table_info(bindings)")}:
+                # An older index cannot prove that a path still contains the
+                # original journal. Existing rows stay NULL and fail closed.
+                db.execute("ALTER TABLE bindings ADD COLUMN journal_id TEXT")
+            path = str(journal.path.resolve())
+            db.execute("INSERT OR IGNORE INTO bindings(account_key,journal_path,journal_id) VALUES (?,?,?)",
+                       (key, path, journal.journal_id))
+            bound = db.execute("SELECT journal_path,journal_id FROM bindings WHERE account_key=?", (key,)).fetchone()
+            if bound is None or bound[0] != path or bound[1] != journal.journal_id:
+                raise ExecutionEvidenceError("simulation account is bound to a different journal")
+            db.execute("COMMIT")
+        except BaseException:
+            if db.in_transaction:
+                db.execute("ROLLBACK")
+            raise
+        finally:
+            db.close()
+    except BaseException:
+        lock.close()
+        raise
+    return lock
 
 
 def legacy_inventory_cutover_gate(state: Mapping[str, Any], markets: list[str]) -> dict[str, Any]:
@@ -243,6 +340,7 @@ class StockSimulationJournal:
             cancelled_shares INTEGER NOT NULL DEFAULT 0);
           CREATE UNIQUE INDEX IF NOT EXISTS trade_identity ON intents(trade_id)
             WHERE trade_id IS NOT NULL;
+          CREATE INDEX IF NOT EXISTS intents_state ON intents(state);
           CREATE TABLE IF NOT EXISTS fills (
             sequence INTEGER PRIMARY KEY, receipt_id TEXT NOT NULL UNIQUE,
             intent_key TEXT NOT NULL, payload TEXT NOT NULL);
@@ -252,13 +350,19 @@ class StockSimulationJournal:
           CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY, state TEXT NOT NULL, payload TEXT NOT NULL,
             received_at TEXT NOT NULL, processed INTEGER NOT NULL DEFAULT 0);
+          CREATE INDEX IF NOT EXISTS events_unprocessed ON events(processed);
         """)
         with self._transaction():
             self.db.execute("INSERT OR IGNORE INTO meta VALUES ('schema', '1')")
             self.db.execute("INSERT OR IGNORE INTO meta VALUES ('account', ?)", (account_key,))
+            self.db.execute("INSERT OR IGNORE INTO meta VALUES ('journal_id', ?)", (uuid.uuid4().hex,))
             metadata = dict(self.db.execute("SELECT key,value FROM meta"))
             if metadata["account"] != account_key or metadata["schema"] != "1":
                 raise ExecutionEvidenceError("journal account/schema mismatch")
+            self.journal_id = metadata["journal_id"]
+            if (len(self.journal_id) != 32
+                    or any(ch not in "0123456789abcdef" for ch in self.journal_id)):
+                raise ExecutionEvidenceError("journal identity is invalid")
 
     @contextmanager
     def _transaction(self) -> Iterator[None]:
@@ -492,18 +596,33 @@ class StockSimulationJournal:
                     "pending_event_count": self.db.execute("SELECT COUNT(*) FROM events WHERE processed=0").fetchone()[0],
                     "problems": [dict(row) for row in self.db.execute("SELECT code,detail,blocks FROM problems")]}
 
+    def preflight_summary(self) -> dict[str, int]:
+        """One consistent indexed read, without materializing account history."""
+        with self._lock:
+            row = self.db.execute(
+                "SELECT (SELECT COUNT(*) FROM intents WHERE state IN "
+                "('submitting','submitted','partially_filled','unknown')), "
+                "(SELECT COUNT(*) FROM problems WHERE blocks=1), "
+                "(SELECT COUNT(*) FROM events WHERE processed=0)"
+            ).fetchone()
+            return {
+                "unresolved_order_count": row[0],
+                "blocking_problem_count": row[1],
+                "pending_durable_event_count": row[2],
+            }
+
 
 class ShioajiStockSimulationSession:
-    """One private simulation-only client, created here, never supplied by callers.
+    """One simulation-only client, never supplied by callers.
 
-    Explicitly call login once, send from the owner thread, and drain callbacks
-    promptly. No CA activation, production setting, automatic reconnect/resend,
-    or odd-lot order API exists on this boundary.
+    The ordinary constructor creates a private client and requires login.
+    ``from_existing_quote_owner`` attaches to the proven process-local quote
+    client without a new login. Neither accepts an arbitrary client, activates
+    a CA, reconnects/resends automatically, or submits odd-lot orders.
     """
 
-    def __init__(self, journal: StockSimulationJournal):
+    def _initialize(self, journal: StockSimulationJournal) -> None:
         import shioaji as sj
-
         self._owner_lock = journal.path.with_suffix(".writer.lock").open("a")
         try:
             fcntl.flock(self._owner_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -512,18 +631,142 @@ class ShioajiStockSimulationSession:
             raise ExecutionEvidenceError("simulation journal already has a session owner") from exc
         self._sj = sj
         try:
-            self._api = sj.Shioaji(simulation=True)
+            self._account_lock = _acquire_account_writer(journal)
         except BaseException:
             self._owner_lock.close()
             raise
         self._closed = False
+        self._shared_token: object | None = None
+        self._api: Any = None
+        self._private_logged_in = False
         self.journal = journal
         self._account: Any = None
         self._events: queue.SimpleQueue[tuple[str, dict[str, Any], datetime]] = queue.SimpleQueue()
         self._callback_failed = threading.Event()
         self._submit_deadlines: dict[str, float] = {}
-        self._api.set_order_callback(self._callback)
-        journal.require_restart_reconciliation()
+        try:
+            journal.require_restart_reconciliation()
+        except BaseException:
+            self._account_lock.close()
+            self._owner_lock.close()
+            raise
+
+    def __init__(self, journal: StockSimulationJournal):
+        self._initialize(journal)
+        try:
+            self._api = self._sj.Shioaji(simulation=True)
+        except BaseException:
+            self._account_lock.close()
+            self._owner_lock.close()
+            raise
+
+    @classmethod
+    def from_existing_quote_owner(cls, journal: StockSimulationJournal) -> ShioajiStockSimulationSession:
+        """Attach to the existing simulation quote owner, with no login/logout.
+
+        Subscribe outside the quote mutex: a slow subscription must not stall
+        stock snapshots. Check the generation again afterwards; an old client
+        can never acquire permission to submit on the new one.
+        """
+        from stockagent.live import quote_provider
+
+        _outside_protected_opening()
+        self = cls.__new__(cls)
+        # Claim the proven existing client before creating any durable account
+        # binding. A missing/replaced owner must leave the index untouched.
+        api, token = quote_provider._claim_existing_shioaji_simulation_order_owner()
+        callback_installed = False
+        initialized = False
+        try:
+            self._initialize(journal)
+            initialized = True
+            self._api, self._shared_token = api, token
+            with quote_provider._guard_existing_shioaji_simulation_order_owner(self._api, self._shared_token):
+                # Treat a setter exception as potentially installed. Cleanup
+                # must clear it or retain the exclusive lease on uncertainty.
+                callback_installed = True
+                self._api.set_order_callback(self._callback)
+            accounts = self._api.list_accounts()
+            candidates = [a for a in accounts if _enum(getattr(a, "account_type", "")) == "S"
+                          and account_fingerprint(str(getattr(a, "broker_id", "")),
+                                                  str(getattr(a, "account_id", ""))) == journal.account_key]
+            if len(candidates) != 1 or getattr(candidates[0], "signed", None) is not True:
+                raise ExecutionEvidenceError("exact signed stock simulation account not found")
+            account = candidates[0]
+            if self._api.subscribe_trade(account, timeout=5000) is not True:
+                raise ExecutionEvidenceError("simulation trade report subscription was not accepted")
+            with quote_provider._guard_existing_shioaji_simulation_order_owner(self._api, self._shared_token):
+                self._account = account
+            return self
+        except BaseException:
+            try:
+                quote_provider._release_existing_shioaji_simulation_order_owner(
+                    api, token, clear_callback=callback_installed,
+                )
+            except Exception:
+                # If callback release fails, its process lease stays held.
+                pass
+            if initialized:
+                self._account_lock.close()
+                self._owner_lock.close()
+            raise
+
+    @contextmanager
+    def _submission_generation(self) -> Iterator[None]:
+        if self._shared_token is None:
+            yield
+        else:
+            from stockagent.live import quote_provider
+            try:
+                with quote_provider._guard_existing_shioaji_simulation_order_owner(self._api, self._shared_token):
+                    yield
+            except RuntimeError as exc:
+                raise ExecutionEvidenceError("shared simulation session changed; reconcile before use") from exc
+
+    def shared_readiness(self) -> dict[str, Any]:
+        """Observe the same client's report-cache and durable journal gates.
+
+        A healthy cache is a prerequisite, not a real callback or fill proof.
+        This does not query, submit, log in, or modify the quote connection.
+        """
+        if self._closed or self._shared_token is None or self._account is None:
+            raise ExecutionEvidenceError("open shared simulation session required")
+        with self._submission_generation():
+            health = self._api.trade_cache_health(self._account)
+        cache_state = _enum(getattr(health, "state", "Unknown"))
+        reasons = [{"event_type": _enum(getattr(item, "event_type", "")),
+                    "reason": _enum(getattr(item, "reason", ""))}
+                   for item in (getattr(health, "reasons", None) or [])]
+        summary = self.journal.preflight_summary()
+        unresolved = summary["unresolved_order_count"]
+        blocking = summary["blocking_problem_count"]
+        callbacks_pending = not self._events.empty()
+        ready = (cache_state == "Healthy" and not reasons and not unresolved and not blocking
+                 and not summary["pending_durable_event_count"] and not callbacks_pending
+                 and not self._callback_failed.is_set())
+        return {"simulation_only": True, "shared_existing_quote_client": True,
+                "extra_login": False, "report_cache_state": cache_state,
+                "report_cache_reasons": reasons, "unresolved_order_count": unresolved,
+                "blocking_problem_count": blocking,
+                "pending_durable_event_count": summary["pending_durable_event_count"],
+                "callbacks_awaiting_drain": callbacks_pending,
+                "report_callback_failed": self._callback_failed.is_set(),
+                "preflight_ready": ready, "actual_callback_or_fill_verified": False}
+
+    def refresh_shared_report_baseline(self) -> dict[str, Any]:
+        """Reconcile the subscribed cache off the quote mutex, then recheck.
+
+        A caller must run this outside the protected opening window. This is a
+        status query, not an order or evidence that an unknown order was absent.
+        """
+        if self._closed or self._shared_token is None or self._account is None:
+            raise ExecutionEvidenceError("open shared simulation session required")
+        _outside_protected_opening()
+        with self._submission_generation():
+            pass
+        self._api.update_status(self._account, timeout=5000)
+        # A disconnected/replaced generation must never inherit this result.
+        return self.shared_readiness()
 
     def _callback(self, state: Any, message: Any) -> None:
         try:
@@ -540,16 +783,37 @@ class ShioajiStockSimulationSession:
     def login(self, *, api_key: str, secret_key: str) -> None:
         if self._closed:
             raise ExecutionEvidenceError("closed simulation session cannot be reused")
+        if self._shared_token is not None:
+            raise ExecutionEvidenceError("shared simulation session must never log in again")
         if self._account is not None:
             raise ExecutionEvidenceError("reuse the existing logged-in simulation session")
-        accounts = self._api.login(api_key=api_key, secret_key=secret_key, subscribe_trade=True)
-        candidates = [a for a in accounts if _enum(getattr(a, "account_type", "")) == "S"
-                      and account_fingerprint(str(getattr(a, "broker_id", "")),
-                                              str(getattr(a, "account_id", ""))) == self.journal.account_key]
-        if len(candidates) != 1 or getattr(candidates[0], "signed", None) is not True:
-            self._api.logout()
-            raise ExecutionEvidenceError("exact signed stock simulation account not found")
-        self._account = candidates[0]
+        if self._private_logged_in:
+            raise ExecutionEvidenceError("previous simulation login cleanup is unresolved")
+        try:
+            # SDK 1.7.9 rejects set_order_callback before login. Start with a
+            # fresh, unsubscribed token so no trade report can race the setter.
+            accounts = self._api.login(api_key=api_key, secret_key=secret_key,
+                                       subscribe_trade=False, force_refresh=True)
+            self._private_logged_in = True
+            candidates = [a for a in accounts if _enum(getattr(a, "account_type", "")) == "S"
+                          and account_fingerprint(str(getattr(a, "broker_id", "")),
+                                                  str(getattr(a, "account_id", ""))) == self.journal.account_key]
+            if len(candidates) != 1 or getattr(candidates[0], "signed", None) is not True:
+                raise ExecutionEvidenceError("exact signed stock simulation account not found")
+            self._api.set_order_callback(self._callback)
+            if self._api.subscribe_trade(candidates[0], timeout=5000) is not True:
+                raise ExecutionEvidenceError("simulation trade report subscription was not accepted")
+            self._account = candidates[0]
+        except Exception as exc:
+            if self._private_logged_in:
+                try:
+                    self._api.logout()
+                except Exception:
+                    self._callback_failed.set()
+                    raise ExecutionEvidenceError("simulation login cleanup is unresolved") from exc
+                else:
+                    self._private_logged_in = False
+            raise
 
     def submit(self, intent: StockSimulationIntent) -> None:
         # Do not accept a caller-supplied historical clock on a network writer.
@@ -558,6 +822,10 @@ class ShioajiStockSimulationSession:
         signal_at = datetime.fromisoformat(payload["signal_at"])
         if self._account is None:
             raise ExecutionEvidenceError("simulation login required")
+        # Fail before making an intent durable when the quote owner has already
+        # been replaced. A second fence immediately before send handles races.
+        with self._submission_generation():
+            pass
         if (signal_at.date() != observed.date() or signal_at > observed
                 or not time(9) <= observed.time() < time(13, 30)):
             raise ExecutionEvidenceError("live submission must belong to the current trading session")
@@ -566,6 +834,8 @@ class ShioajiStockSimulationSession:
         self.drain()
         if self._callback_failed.is_set():
             raise ExecutionEvidenceError("callback failure requires reconciliation")
+        if self._shared_token is not None and not self.shared_readiness()["preflight_ready"]:
+            raise ExecutionEvidenceError("shared simulation report/journal preflight is not ready")
         contract = self._api.contracts.get(intent.symbol)
         if (contract is None or str(getattr(contract, "code", "")) != intent.symbol
                 or _enum(getattr(contract, "security_type", "")) != "STK"
@@ -600,12 +870,24 @@ class ShioajiStockSimulationSession:
         except Exception:
             self.journal.reject_before_send(intent.key)
             raise ExecutionEvidenceError("SDK order validation failed before any submission") from None
-        self._submit_deadlines[intent.key] = monotonic_time.monotonic() + 5.0
+        invoked = False
         try:
             # A returned Trade (even Filled) is not consumed as a StockDeal.
             # Native callbacks, including ones racing this return, own fills.
-            self._api.place_order(contract, order, timeout=0)
-        except Exception:
+            with self._submission_generation():
+                if self._shared_token is not None:
+                    health = self._api.trade_cache_health(self._account)
+                    if (_enum(getattr(health, "state", "Unknown")) != "Healthy"
+                            or bool(getattr(health, "reasons", None))
+                            or self._callback_failed.is_set() or not self._events.empty()):
+                        raise ExecutionEvidenceError("shared report health changed before submission")
+                self._submit_deadlines[intent.key] = monotonic_time.monotonic() + 5.0
+                invoked = True
+                self._api.place_order(contract, order, timeout=0)
+        except Exception as exc:
+            if not invoked:
+                self.journal.reject_before_send(intent.key)
+                raise ExecutionEvidenceError("shared preflight or session changed before submission; nothing sent") from exc
             self.journal.unknown(intent.key)
             raise ExecutionEvidenceError("simulation submit outcome unknown; do not resend") from None
         finally:
@@ -672,14 +954,30 @@ class ShioajiStockSimulationSession:
     def logout(self) -> None:
         if self._closed:
             return
+        if self._shared_token is not None:
+            # Detaching an unresolved order would drop its later report. Keep
+            # the lease and locks until the owner explicitly reconciles it.
+            self.drain()
+            if self.journal.preflight_summary()["unresolved_order_count"]:
+                raise ExecutionEvidenceError("unresolved shared orders require reconciliation before detach")
+            from stockagent.live import quote_provider
+            quote_provider._release_existing_shioaji_simulation_order_owner(self._api, self._shared_token)
+            self._account = None
+            self._closed = True
+            self._account_lock.close()
+            self._owner_lock.close()
+            return
         try:
             try:
                 self.drain()
             finally:
-                self._api.logout()
+                if self._private_logged_in:
+                    self._api.logout()
         finally:
             self._account = None
+            self._private_logged_in = False
             self._closed = True
+            self._account_lock.close()
             self._owner_lock.close()
 
     def __enter__(self) -> ShioajiStockSimulationSession:

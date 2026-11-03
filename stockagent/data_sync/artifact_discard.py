@@ -17,8 +17,8 @@ import uuid
 
 from stockagent.data_sync.artifact_consumers import artifact_service_references
 from stockagent.data_sync.artifact_maintenance import artifact_process_references
-from stockagent.data_sync.desync_snapshots import SnapshotError, _safe_relative_path, atomic_write_json
-from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids, process_references
+from stockagent.data_sync.desync_snapshots import SnapshotError, _safe_relative_path, atomic_write_bytes
+from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids, process_references, process_references_many
 from stockagent.data_sync.remote_legacy_return import (
     active_configuration_references, identity, metadata_tree, real, signature,
     unlink_preserved_file_names,
@@ -27,8 +27,19 @@ from stockagent.data_sync.training_return import shared_inode_references
 
 from stockagent.data_sync.testing_disposition import (
     CONTRACT, DEFAULT_POLICY, load_policy, artifact_roots, discarded_root, manifest_discarded,
-    target_path,
+    target_path, LOCAL_TESTING_CONTRACT,
 )
+
+
+def write_discard_receipt(path: Path, value) -> None:
+    """Persist exact POSIX names, including undecodable test-fixture bytes.
+
+    JSON escapes preserve surrogate-escaped filenames through a readback.
+    This encoding is for mutable discard evidence only; packed/source manifest
+    serialization and the identities of existing plans remain unchanged.
+    """
+    content = (json.dumps(value, ensure_ascii=True, sort_keys=True, separators=(',', ':')) + '\n').encode('ascii')
+    atomic_write_bytes(path, content)
 
 
 def cold_discard_plan(cold_root: Path, policy: dict, *, materialized_root: Path) -> dict:
@@ -37,6 +48,8 @@ def cold_discard_plan(cold_root: Path, policy: dict, *, materialized_root: Path)
     Restricted publications and historical manifests count as references too.
     Current use/pins override the user's discard decision.
     """
+    if policy.get('contract') == LOCAL_TESTING_CONTRACT:
+        raise SnapshotError('local performance-copy disposal cannot discard cold objects')
     from stockagent.data_sync.packed_snapshots import _validate_manifest
     from stockagent.data_sync.packed_backup import object_descriptor
     cold_root = real(cold_root)
@@ -136,7 +149,7 @@ def apply_cold_discard(cold_root: Path, policy: dict, plan: dict, *, materialize
         _recheck_cold_graph(cold_root, plan, materialized_root=materialized_root)
     if plan["blockers"]:
         raise SnapshotError("cold testing-discard graph changed or live protection applies")
-    atomic_write_json(receipt, {"state": "prepared", "plan": plan, "deleted_objects": []})
+    write_discard_receipt(receipt, {"state": "prepared", "plan": plan, "deleted_objects": []})
     deleted = []
     for row in plan["objects"]:
         p = real(cold_root / row["relative"])
@@ -145,12 +158,12 @@ def apply_cold_discard(cold_root: Path, policy: dict, plan: dict, *, materialize
         # Final-link helper rechecks opened inode identity through unlink.
         reclaimed = unlink_preserved_file_names(p.parent, [{"path": p.name, "kind": "file", "signature": row["signature"]}])
         deleted.append({"relative": row["relative"], "sha256": row["sha256"], "reclaimed_allocated_bytes": reclaimed})
-        atomic_write_json(receipt, {"state": "deleting", "plan": plan, "deleted_objects": deleted})
+        write_discard_receipt(receipt, {"state": "deleting", "plan": plan, "deleted_objects": deleted})
     result = {"state": "testing-only-cold-payload-discarded", "policy_identity_sha256": policy["identity_sha256"],
               "deleted_objects": deleted, "reclaimed_allocated_bytes": sum(r["reclaimed_allocated_bytes"] for r in deleted),
               "retained_shared_objects": plan["retained_shared_objects"], "manifest_receipts_deleted": False,
               "nas_deletion_claimed": False, "recovery_claimed": False}
-    atomic_write_json(receipt, {"state": "discarded", "plan": plan, "result": result})
+    write_discard_receipt(receipt, {"state": "discarded", "plan": plan, "result": result})
     return result
 
 
@@ -191,35 +204,66 @@ def restore_unchanged_discard_quarantine(policy: dict, target: dict, *, state_ro
     with real(state_root / (key + ".lock")).open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         value = json.loads(journal.read_bytes())
-        if value.get("state") != "quarantined":
+        if value.get("state") not in {"prepared", "quarantined"}:
             return False
         plan = value["plan"]
         source = target_path(policy, target, repo_root=repo_root, engineering_root=engineering_root)
         q = real(Path(value["quarantine"]))
+        old_location = q.parent.parent == state_root and q.parent.name.startswith('quarantine-')
+        local_location = (policy['contract'] == LOCAL_TESTING_CONTRACT
+                          and q.parent.parent == source.parent
+                          and q.parent.name.startswith('.stockagent-testing-quarantine-'))
         if (plan["policy_identity_sha256"] != policy["identity_sha256"] or plan["target"] != target
-                or plan["source"] != str(source) or source.exists() or q.parent.parent != state_root
-                or not q.parent.name.startswith("quarantine-") or q.name != source.name):
+                or plan["source"] != str(source) or not (old_location or local_location)
+                or q.name != source.name):
             raise SnapshotError("testing quarantine/source identity changed")
+        if value['state'] == 'prepared' and source.exists() and not q.exists():
+            # EXDEV/pre-rename interruption left the source untouched. Only
+            # this exact unchanged generation and empty owned directory may
+            # roll back; never infer that a prepared source was deleted.
+            if (_observed(source, target['kind']) != plan['observed']
+                    or not q.parent.is_dir() or any(q.parent.iterdir())
+                    or q.parent.stat().st_uid != os.geteuid()
+                    or stat.S_IMODE(q.parent.stat().st_mode) != 0o700):
+                raise SnapshotError('prepared testing quarantine changed; retain source')
+            q.parent.rmdir()
+            write_discard_receipt(journal, {**value, 'state': 'rolled-back-for-fresh-discard',
+                                       'resumed_at_epoch': time.time()})
+            return True
+        if source.exists() or not q.exists():
+            raise SnapshotError('testing quarantine/source identity changed')
         current = _observed(q, target["kind"])
         old = plan["observed"]
         if (current["rows"] != old["rows"] or not _same_root_before_after_rename(
                 old["root_signature"], current["root_signature"], target["kind"])
-                or process_references(q) or _gates(source, current, repo_root, materialized_root, cold_root)):
+                or process_references(q) or _gates(source, current, repo_root, materialized_root, cold_root,
+                    **({'allow_opaque_symlinks': True} if policy['contract'] == LOCAL_TESTING_CONTRACT else {}))):
             raise SnapshotError("interrupted testing quarantine changed or became active")
         q.rename(source)
         q.parent.rmdir()
-        atomic_write_json(journal, {**value, "state": "rolled-back-for-fresh-discard", "resumed_at_epoch": time.time()})
+        write_discard_receipt(journal, {**value, "state": "rolled-back-for-fresh-discard", "resumed_at_epoch": time.time()})
         return True
 
 
-def _gates(source: Path, observed: dict, repo_root: Path, materialized_root: Path, cold_root: Path) -> list[str]:
+def _gates(source: Path, observed: dict, repo_root: Path, materialized_root: Path, cold_root: Path,
+           *, allow_opaque_symlinks: bool = False) -> list[str]:
     blockers = []
-    if any(r["kind"] == "unsupported" or r["cross_filesystem"] for r in observed["rows"]):
+    if any((r["kind"] == "unsupported" and not (
+                allow_opaque_symlinks and (stat.S_ISLNK(r['signature'][5])
+                                           or stat.S_ISFIFO(r['signature'][5]))))
+           or r["cross_filesystem"] for r in observed["rows"]):
         blockers.append("unsupported-or-cross-filesystem-entry")
     scope = repo_root / "artifacts" if source.is_relative_to(repo_root / "artifacts") else source.parent
     if (artifact_process_references(source, scope) or active_configuration_references(source, repo_root)
             or shared_inode_references(observed)):
         blockers.append("active-process-config-hold-or-shared-inode")
+    if allow_opaque_symlinks:
+        # Bind mounts have different names but the same inode, even at nlink=1.
+        # Include directories for cwd/dir-FD consumers and every file for mmap.
+        inodes = {tuple(row['signature'][:2]) for row in observed['rows']}
+        inodes.add(tuple(observed['root_signature'][:2]))
+        if process_references_many((), inode_keys=inodes):
+            blockers.append('active-inode-through-mount-alias')
     if artifact_service_references([source], repo_root).get(str(source)):
         blockers.append("service-dependency")
     pins = _pinned_snapshot_ids(materialized_root)
@@ -275,6 +319,44 @@ def _pinned_manifest_paths(cold_root: Path, pins):
                 yield path
 
 
+def _unlink_opaque_links(root: Path, rows: list[dict]) -> int:
+    """Unlink exact symlinks/FIFOs in disposable quarantine, without reading them.
+
+    A FIFO created by a finished test is a name, not an archived byte stream.
+    O_PATH inspects its inode without waiting for a reader/writer. The caller
+    still checks every inode consumer; devices and sockets remain unsupported.
+    """
+    reclaimed = 0
+    for row in rows:
+        if row['kind'] != 'unsupported' or not (
+                stat.S_ISLNK(row['signature'][5]) or stat.S_ISFIFO(row['signature'][5])):
+            continue
+        path = root / _safe_relative_path(row['path'], 'testing symlink')
+        parent = real(path.parent)
+        directory = os.open(parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+        try:
+            descriptor = os.open(path.name, os.O_PATH | os.O_NOFOLLOW | os.O_CLOEXEC,
+                                 dir_fd=directory)
+            try:
+                before = os.fstat(descriptor)
+                if (signature(before) != row['signature']
+                        or not (stat.S_ISLNK(before.st_mode) or stat.S_ISFIFO(before.st_mode))
+                        or before.st_nlink != 1
+                        or signature(os.stat(path.name, dir_fd=directory, follow_symlinks=False)) != row['signature']):
+                    raise SnapshotError('testing symlink changed before unlink; quarantine retained')
+                os.unlink(path.name, dir_fd=directory)
+                after = signature(os.fstat(descriptor))
+                original = row['signature']
+                if after[:4] != original[:4] or after[5] != original[5] or after[6] != 0:
+                    raise SnapshotError('testing symlink inode changed during unlink; remainder retained')
+                reclaimed += before.st_blocks * 512
+            finally:
+                os.close(descriptor)
+        finally:
+            os.close(directory)
+    return reclaimed
+
+
 def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_root: Path,
                    state_root: Path, materialized_root: Path, cold_root: Path,
                    apply: bool = False, expected_plan_identity: str | None = None) -> dict:
@@ -296,7 +378,8 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
             return {"state": "already-absent", "target": target, "deleted": False,
                     "reclaimed_allocated_bytes": 0}
         observed = _observed(source, target["kind"])
-        blockers = _gates(source, observed, repo_root, materialized_root, cold_root)
+        gate_options = {'allow_opaque_symlinks': True} if policy['contract'] == LOCAL_TESTING_CONTRACT else {}
+        blockers = _gates(source, observed, repo_root, materialized_root, cold_root, **gate_options)
         plan = {"contract": policy["contract"], "policy_identity_sha256": policy["identity_sha256"],
                 "target": target, "source": str(source), "observed": observed, "blockers": blockers}
         plan["identity_sha256"] = identity(plan)
@@ -305,23 +388,28 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
         if blockers or plan["identity_sha256"] != expected_plan_identity:
             raise SnapshotError("testing discard dry run changed or live protection applies: "
                                 + json.dumps({"blockers": blockers, "generation_changed": plan["identity_sha256"] != expected_plan_identity}))
-        if _observed(source, target["kind"]) != observed or _gates(source, observed, repo_root, materialized_root, cold_root):
+        if _observed(source, target["kind"]) != observed or _gates(source, observed, repo_root, materialized_root, cold_root, **gate_options):
             raise SnapshotError("testing discard changed before quarantine")
-        quarantine_parent = state_root / ("quarantine-" + uuid.uuid4().hex)
+        # Equal st_dev does not imply rename works across distinct bind
+        # mounts. A local work copy uses a private sibling on its own mount;
+        # its durable journal remains under the canonical service state.
+        quarantine_parent = (source.parent / ('.stockagent-testing-quarantine-' + uuid.uuid4().hex)
+                             if policy['contract'] == LOCAL_TESTING_CONTRACT else
+                             state_root / ("quarantine-" + uuid.uuid4().hex))
         quarantine_parent.mkdir(mode=0o700)
         if quarantine_parent.stat().st_dev != source.stat().st_dev:
             quarantine_parent.rmdir()
             raise SnapshotError("testing quarantine crosses filesystem")
         quarantine = quarantine_parent / source.name
-        atomic_write_json(journal, {"state": "prepared", "plan": plan, "quarantine": str(quarantine)})
+        write_discard_receipt(journal, {"state": "prepared", "plan": plan, "quarantine": str(quarantine)})
         source.rename(quarantine)
-        atomic_write_json(journal, {"state": "quarantined", "plan": plan, "quarantine": str(quarantine)})
+        write_discard_receipt(journal, {"state": "quarantined", "plan": plan, "quarantine": str(quarantine)})
         current = _observed(quarantine, target["kind"])
         # Rename may change the root inode's ctime, never file members/content.
         if (current["rows"] != observed["rows"] and target["kind"] == "directory"
                 or current["files"] != observed["files"] or current["logical_bytes"] != observed["logical_bytes"]
                 or not _same_root_before_after_rename(observed["root_signature"], current["root_signature"], target["kind"])
-                or process_references(quarantine) or _gates(source, current, repo_root, materialized_root, cold_root)):
+                or process_references(quarantine) or _gates(source, current, repo_root, materialized_root, cold_root, **gate_options)):
             raise SnapshotError("quarantined testing artifact changed or became active; retained")
         if target["kind"] == "file":
             old, new = observed["rows"][0]["signature"], current["rows"][0]["signature"]
@@ -329,6 +417,8 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
                 raise SnapshotError("testing file changed during quarantine")
         unlink_root = quarantine if target["kind"] == "directory" else quarantine_parent
         reclaimed = unlink_preserved_file_names(unlink_root, current["rows"])
+        if policy['contract'] == LOCAL_TESTING_CONTRACT:
+            reclaimed += _unlink_opaque_links(unlink_root, current['rows'])
         if target["kind"] == "directory":
             for r in sorted(current["rows"], key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):
                 if r["kind"] == "directory":
@@ -339,5 +429,5 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
                   "policy_identity_sha256": policy["identity_sha256"], "files": current["files"],
                   "logical_bytes": current["logical_bytes"], "reclaimed_allocated_bytes": reclaimed,
                   "recovery_claimed": False, "external_shared_names_deleted": False, "at_epoch": time.time()}
-        atomic_write_json(journal, {"state": "discarded", "plan": plan, "result": result})
+        write_discard_receipt(journal, {"state": "discarded", "plan": plan, "result": result})
         return result

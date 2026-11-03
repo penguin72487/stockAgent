@@ -11,10 +11,47 @@ import ctypes
 import math
 import os
 import selectors
+import sqlite3
 import struct
 import sys
 import threading
 import time
+
+
+_MAILBOX_RETRY_KINDS = ('candidate', 'repair')
+_MAILBOX_RETRY_INITIAL_SECONDS = .25
+_MAILBOX_RETRY_MAX_SECONDS = 5.0
+
+
+def defer_mailbox_scan_retry(queue, kind):
+    """Retain a local discovery failure without changing source deadlines."""
+    if kind not in _MAILBOX_RETRY_KINDS:
+        raise ValueError('invalid_mailbox_retry_kind')
+    state = getattr(queue, '_mailbox_scan_retries', None)
+    if state is None:
+        state = queue._mailbox_scan_retries = {}
+    attempts = state.get(kind, (0.0, 0))[1] + 1
+    delay = min(_MAILBOX_RETRY_MAX_SECONDS, _MAILBOX_RETRY_INITIAL_SECONDS * 2**min(attempts-1, 5))
+    state[kind] = (time.monotonic() + delay, attempts)
+
+
+def clear_mailbox_scan_retry(queue, kind):
+    getattr(queue, '_mailbox_scan_retries', {}).pop(kind, None)
+
+
+def mailbox_scan_retry_ready(queue, kind):
+    retry = getattr(queue, '_mailbox_scan_retries', {}).get(kind)
+    return retry is None or time.monotonic() >= retry[0]
+
+
+def mailbox_scan_retry_due(queue, kind):
+    retry = getattr(queue, '_mailbox_scan_retries', {}).get(kind)
+    return retry is not None and time.monotonic() >= retry[0]
+
+
+def mailbox_scan_retry_delay(queue, maximum):
+    retries = getattr(queue, '_mailbox_scan_retries', {})
+    return min(maximum, max(0.0, min(value[0] for value in retries.values()) - time.monotonic())) if retries else maximum
 
 
 class OwnerStopEvent(threading.Event):
@@ -112,13 +149,44 @@ class OwnerMailboxWake:
     def has_pending(self, *, include_repairs=False):
         from downloader.news_fulltext_candidate_diagnostics import has_unadmitted_candidates
         from downloader.news_fulltext_repairs import _directory, _pending
-        from downloader.news_fulltext_url_metadata import has_pending as has_url_metadata
+        from downloader.news_fulltext_url_metadata import (
+            LOCAL_RETRY_SECONDS, has_pending as has_url_metadata, local_retry_ready,
+        )
         try:
             # Repair files are edge hints only. A failed archive may leave one
             # present after its job is complete; that must not force an empty
             # cycle repeatedly. Candidate admission has its indexed job guard.
-            return (has_url_metadata(self.queue) or has_unadmitted_candidates(self.queue) or include_repairs
-                and bool(_pending(_directory(self.queue.root, 'pending'))))
+            url_pending = False
+            if local_retry_ready(self.queue):
+                try:
+                    url_pending = has_url_metadata(self.queue, strict=True)
+                except (OSError, ValueError, sqlite3.Error):
+                    # The event was already drained. Wake the owner once so it
+                    # schedules a bounded retry instead of losing the hint.
+                    self.queue._url_metadata_retry_at = time.monotonic() + LOCAL_RETRY_SECONDS
+                    self._count('owner_url_metadata_scan_deferred')
+                    return True
+            if url_pending:
+                return True
+            if mailbox_scan_retry_ready(self.queue, 'candidate'):
+                try:
+                    candidate_pending = has_unadmitted_candidates(self.queue, strict=True)
+                except (OSError, ValueError, sqlite3.Error):
+                    defer_mailbox_scan_retry(self.queue, 'candidate')
+                    self._count('owner_candidate_scan_deferred')
+                    return True
+                if candidate_pending:
+                    return True
+            if include_repairs and mailbox_scan_retry_ready(self.queue, 'repair'):
+                try:
+                    repair_pending = bool(_pending(_directory(self.queue.root, 'pending')))
+                except (OSError, ValueError):
+                    defer_mailbox_scan_retry(self.queue, 'repair')
+                    self._count('owner_repair_scan_deferred')
+                    return True
+                if repair_pending:
+                    return True
+            return False
         except (OSError, ValueError):
             return False  # The normal owner retains malformed-input handling.
 

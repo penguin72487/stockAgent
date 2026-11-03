@@ -28,7 +28,7 @@ from downloader.news_fulltext_policy import CONTRACT_VERSION, NewsError, extract
 from downloader.news_fulltext_queue import replay_source_path, utc_now
 
 
-METADATA_REPLAY_VERSION = 2
+METADATA_REPLAY_VERSION = 3
 METADATA_REPLAY_POLL_SECONDS = 10
 METADATA_REPLAY_MAX_BYTES = 32 << 20
 METADATA_INITIAL_COHORT_LIMIT = 100000
@@ -39,6 +39,11 @@ PRIOR_NEWSROOM_REVIEW_FINGERPRINT = '940494a29ae4940afe046da3b5cdfa715867e9ac5cc
 HEAD_FIELDS = ('state', 'parquet_path', 'body_sha256', 'captured_at_utc',
                'last_checked_at_utc', 'authorization_fingerprint', 'due',
                'attempts', 'error_code', 'lease_owner', 'lease_until')
+_PRIOR_ACCEPTANCE_WITNESSES = frozenset({
+    'article_claim_witness_json', 'unleased_article_head_witness_json',
+    'reviewed_native_head_json', 'retained_failure_head_json',
+    'retained_supplement_head_json', 'retained_metadata_head_json',
+})
 
 
 class _ResourceBudgetExceeded(Exception):
@@ -227,6 +232,23 @@ def _checkpoint_batch(queue, fingerprint, checkpoints, *, clear_retry_path=None,
         queue.metrics.count('cnyes', 'retained_metadata_checkpoint_transactions')
 
 
+def _defer_batch_locally(queue, fingerprint, relative, error, *, counter, amount=1):
+    """Back off a local problem without declaring a source or head complete."""
+    with queue.db:
+        previous = queue.db.execute('SELECT local_attempts FROM retained_metadata_local_retries '
+                                    'WHERE source_fingerprint=? AND original_path=?',
+                                    (fingerprint, relative)).fetchone()
+        attempts = (previous[0] if previous else 0) + 1
+        delay = min(METADATA_LOCAL_RETRY_MAX_SECONDS, 2 ** min(attempts - 1, 9))
+        queue.db.execute('''INSERT INTO retained_metadata_local_retries VALUES (?,?,?,?,?,?)
+            ON CONFLICT(source_fingerprint,original_path) DO UPDATE SET
+                not_before_epoch=max(retained_metadata_local_retries.not_before_epoch,excluded.not_before_epoch),
+                local_attempts=excluded.local_attempts,last_attempt_at_utc=excluded.last_attempt_at_utc,
+                last_error=excluded.last_error''',
+            (fingerprint, relative, time.time() + delay, attempts, utc_now(), error))
+        queue.counter(counter, amount)
+
+
 def retained_metadata_next_wake_delay(queue, maximum):
     """Bound an idle wake for local work without granting any HTTP request."""
     if type(maximum) not in (int, float) or not math.isfinite(maximum) or maximum < 0:
@@ -359,7 +381,11 @@ def _repair_record(old, payload, head, source, receipt_path, receipt_digest):
         raise ValueError('retained_metadata_publication_conflict')
     if json.loads(old.get('authors_json') or '[]') not in ([], json.loads(article['authors_json'])):
         raise ValueError('retained_metadata_author_conflict')
-    return {**old, **article,
+    # The source record's lease or earlier replay witness describes its own
+    # acceptance, not this derived metadata operation. Its immutable Parquet
+    # and receipt remain referenced below; only the current exact-head witness
+    # is authority to adopt this new version.
+    return {**{key: value for key, value in old.items() if key not in _PRIOR_ACCEPTANCE_WITNESSES}, **article,
             'body_bytes': len(article['body'].encode()), 'raw_response_body': payload,
             'source_response_article_id': old['article_id'],
             'data_fingerprint': source.data_fingerprint, 'parser_backend': source.html_parser,
@@ -482,7 +508,7 @@ def replay_retained_cnyes_metadata(queue, *, maximum_heads=32, maximum_wall_seco
         raise ValueError('invalid bounded retained metadata target IDs')
     started = time.monotonic()
     totals = Counter(heads_checked=0, repaired_versions=0, batches_read=0, raw_bytes_checked=0,
-                     local_io_deferrals=0)
+                     local_io_deferrals=0, local_acceptance_deferrals=0)
     with queue.metrics.measure('retained_metadata_replay', 'cnyes'):
         _ensure_cohort(queue, source)
         fp = source.data_fingerprint
@@ -647,18 +673,8 @@ def replay_retained_cnyes_metadata(queue, *, maximum_heads=32, maximum_wall_seco
                 # Persist one deadline per original batch, so its heads cannot
                 # monopolize the bounded pending selection after a restart.
                 local_io_deferred = True
-                with queue.db:
-                    previous = queue.db.execute('SELECT local_attempts FROM retained_metadata_local_retries '
-                                                'WHERE source_fingerprint=? AND original_path=?', (fp, relative)).fetchone()
-                    attempts = (previous[0] if previous else 0) + 1
-                    delay = min(METADATA_LOCAL_RETRY_MAX_SECONDS, 2 ** min(attempts - 1, 9))
-                    queue.db.execute('''INSERT INTO retained_metadata_local_retries VALUES (?,?,?,?,?,?)
-                        ON CONFLICT(source_fingerprint,original_path) DO UPDATE SET
-                            not_before_epoch=max(retained_metadata_local_retries.not_before_epoch,excluded.not_before_epoch),
-                            local_attempts=excluded.local_attempts,last_attempt_at_utc=excluded.last_attempt_at_utc,
-                            last_error=excluded.last_error''',
-                        (fp, relative, time.time() + delay, attempts, utc_now(), 'retained_metadata_local_io_unavailable'))
-                    queue.counter('retained_metadata_local_io_deferrals', 1)
+                _defer_batch_locally(queue, fp, relative, 'retained_metadata_local_io_unavailable',
+                                     counter='retained_metadata_local_io_deferrals')
                 totals['local_io_deferrals'] += 1
                 queue.metrics.count('cnyes', 'retained_metadata_local_io_deferrals')
                 continue
@@ -681,10 +697,19 @@ def replay_retained_cnyes_metadata(queue, *, maximum_heads=32, maximum_wall_seco
             if eligible:
                 # Storage/commit failures propagate, leaving the cohort pending.
                 # The canonical owner restart recovers durable receipts first.
-                repaired = queue.accept(eligible)
+                repaired, adopted = queue.accept(eligible, return_adopted=True)
                 _checkpoint_batch(queue, fp, [(bytes.fromhex(record['article_id']), 'verified_repair', None)
-                                              for record in eligible])
+                                              for record in eligible if bytes.fromhex(record['article_id']) in adopted])
                 totals['repaired_versions'] += repaired
+                not_adopted = len(eligible) - len(adopted)
+                if not_adopted:
+                    # A receipt can be durable while its current-head fence
+                    # rejects adoption. Retain it as evidence and retry the
+                    # unadopted work later; never mark it verified here.
+                    _defer_batch_locally(queue, fp, relative, 'retained_metadata_acceptance_not_adopted',
+                                         counter='retained_metadata_acceptance_deferrals', amount=not_adopted)
+                    queue.metrics.count('cnyes', 'retained_metadata_acceptance_deferrals', not_adopted)
+                    totals['local_acceptance_deferrals'] += not_adopted
         # A completed large proof may already have spent this slice on one
         # parent validation/commit. Leave another proof for the next cycle so
         # grouped results do not extend an expired slice a second time. When

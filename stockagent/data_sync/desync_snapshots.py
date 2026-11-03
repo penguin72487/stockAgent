@@ -342,6 +342,25 @@ def scan_tree(root: Path, *, progress: Callable[[dict[str, int]], None] | None =
     if type(file_workers) is not int or not 1 <= file_workers <= 4:
         raise ValueError("scan workers must be between 1 and 4")
     root = root.resolve()
+    root_text = os.fspath(root)
+    root_prefix = root_text if root_text.endswith(os.sep) else root_text + os.sep
+
+    # Private SSH control can transmit this function to an older checkout;
+    # keep the lexical observer local to the transmitted scan implementation.
+    def relative_from_root(path):
+        path_text = os.fspath(path)
+        if path_text == root_text:
+            relative = '.'
+        elif path_text.startswith(root_prefix):
+            relative = path_text[len(root_prefix):]
+            if relative.startswith(os.sep):
+                relative = path.relative_to(root).as_posix()
+        else:
+            relative = path.relative_to(root).as_posix()
+        if os.sep != '/':
+            relative = relative.replace(os.sep, '/')
+        return relative
+
     if not root.is_dir():
         raise SnapshotError(f"snapshot source is not a directory: {root}")
     portable = hashlib.sha256()
@@ -395,7 +414,7 @@ def scan_tree(root: Path, *, progress: Callable[[dict[str, int]], None] | None =
             file_names.sort()
             current_path = Path(current)
             for path, info in _iter_lstat_bounded((current_path / name for name in list(dir_names)), executor):
-                relative = path.relative_to(root).as_posix()
+                relative = relative_from_root(path)
                 if stat.S_ISLNK(info.st_mode):
                     dir_names.remove(path.name)
                     update_entry(relative, "L", info, os.readlink(path))
@@ -404,7 +423,7 @@ def scan_tree(root: Path, *, progress: Callable[[dict[str, int]], None] | None =
                 else:
                     raise SnapshotError(f"unsupported directory entry type: {path}")
             for path, info in _iter_lstat_bounded((current_path / name for name in file_names), executor):
-                relative = path.relative_to(root).as_posix()
+                relative = relative_from_root(path)
                 if stat.S_ISREG(info.st_mode):
                     update_entry(relative, "F", info, "")
                 elif stat.S_ISLNK(info.st_mode):

@@ -5,7 +5,9 @@ from scripts.plan_news_sources import plan_sources
 
 
 def inventory(*, known=0, stored=0, links=38, role='government_origin', enabled=False):
-    return {'observed_at_utc': '2026-10-11T21:13:12+00:00', 'providers': {
+    return {'observed_at_utc': '2026-10-11T21:13:12+00:00',
+            'inventory_scope_contract_version': 1, 'inventory_scope': 'all_known_source_keys',
+            'all_known_source_keys_included': True, 'selected_source_keys': None, 'providers': {
         'unregistered:official.test': {
             'source_role': role, 'known_urls': known, 'stored_bodies': stored,
             'original_metadata': {'literal_metadata_links': links}, 'enabled': enabled,
@@ -17,7 +19,7 @@ def inventory(*, known=0, stored=0, links=38, role='government_origin', enabled=
 def test_metadata_only_source_has_real_pending_review_not_zero_work(links, stage, small):
     result = plan_sources(inventory(links=links))
     row = result['sources'][0]
-    assert result['contract_version'] == 8 and result['all_source_keys_planned']
+    assert result['contract_version'] == 11 and result['all_source_keys_planned']
     assert row['strategy'] == 'review_then_route_existing_literal_original_links'
     assert row['stage'] == stage
     assert row['literal_metadata_links'] == links and row['unqueued_literal_link_work']
@@ -35,12 +37,88 @@ def test_literal_associations_do_not_inflate_existing_frontier_or_body_counts():
     row = result['sources'][0]
     assert row['strategy'] == 'reuse_active_canonical_collector'
     assert row['known_urls'] == 10 and row['stored_bodies'] == 3 and row['missing_body_urls'] == 7
-    assert row['minimum_html_article_requests_if_no_bulk'] == 7
+    assert row['minimum_html_article_requests_if_no_bulk'] is None
     assert row['unqueued_literal_link_work'] is None
     assert not row['literal_target_coverage_verified']
     assert result['unknown_literal_target_coverage_source_keys'] == 1
     assert result['literal_metadata_links'] == 20000
     assert result['known_urls'] == 10 and result['stored_bodies'] == 3
+
+
+def test_terminal_missing_bodies_are_not_promoted_to_required_http_requests():
+    value = inventory(known=7, stored=0, links=0, enabled=True)
+    item = value['providers']['unregistered:official.test']
+    item['missing_body_work'] = 0
+    item['states'] = {'pdf_image_only_or_body_not_found': 4, 'source_document_landing_page': 3}
+    row = plan_sources(value)['sources'][0]
+    assert row['missing_body_urls'] == 7
+    assert row['queued_or_inflight_missing_body_urls'] == 0
+    assert row['other_missing_body_urls'] == 7
+    assert row['minimum_html_article_requests_if_no_bulk'] is None
+    assert row['finish_eta_utc'] is None
+
+
+def test_queue_state_count_is_not_a_dispatchable_or_request_count():
+    value = inventory(known=10, stored=3, links=20000, enabled=True)
+    value['providers']['unregistered:official.test']['missing_body_work'] = 2
+    row = plan_sources(value)['sources'][0]
+    assert (row['missing_body_urls'], row['queued_or_inflight_missing_body_urls'],
+            row['other_missing_body_urls']) == (7, 2, 5)
+    assert row['minimum_html_article_requests_if_no_bulk'] is None
+    assert row['finish_eta_utc'] is None
+    assert row['queued_or_inflight_missing_body_scope'] == (
+        'snapshot states pending, retry, retry_cooldown or inflight without a body; '
+        'not a readiness, permission, source request or completion guarantee')
+
+
+def test_legacy_inventory_without_queue_state_count_keeps_partition_unknown():
+    row = plan_sources(inventory(known=10, stored=3, links=0))['sources'][0]
+    assert row['missing_body_urls'] == 7
+    assert row['queued_or_inflight_missing_body_urls'] is None
+    assert row['other_missing_body_urls'] is None
+    assert row['minimum_html_article_requests_if_no_bulk'] is None
+
+
+@pytest.mark.parametrize('field,value', [
+    ('metadata_sort_days_present', True), ('metadata_sort_days_present', 11),
+    ('metadata_sort_days_invalid', -1), ('metadata_sort_days_invalid', 6),
+    ('metadata_sort_days_pre_1900', 6), ('metadata_sort_days_after_snapshot_utc', '1'),
+])
+def test_invalid_sort_day_quality_counts_are_not_projected(field, value):
+    source = inventory(known=10, stored=3, links=0)
+    source.update(metadata_sort_day_quality_requested=True, metadata_sort_day_quality_contract_version=1)
+    item = source['providers']['unregistered:official.test']
+    item.update(metadata_sort_days_present=5, metadata_sort_days_invalid=1,
+                metadata_sort_days_pre_1900=1, metadata_sort_days_after_snapshot_utc=1)
+    item[field] = value
+    with pytest.raises(ValueError, match='metadata sort-day quality counts'):
+        plan_sources(source)
+
+
+def test_disjoint_sort_day_flags_cannot_exceed_present():
+    source = inventory(known=10, stored=3, links=0)
+    source.update(metadata_sort_day_quality_requested=True, metadata_sort_day_quality_contract_version=1)
+    item = source['providers']['unregistered:official.test']
+    item.update(metadata_sort_days_present=5, metadata_sort_days_invalid=1,
+                metadata_sort_days_pre_1900=3, metadata_sort_days_after_snapshot_utc=2)
+    with pytest.raises(ValueError, match='inconsistent metadata sort-day quality counts'):
+        plan_sources(source)
+
+
+@pytest.mark.parametrize('requested,version', [(True, None), (True, 2), (True, True), (False, 1), ('yes', 1)])
+def test_unrecognized_sort_day_quality_contract_is_rejected(requested, version):
+    source = inventory(known=10, stored=3, links=0)
+    source.update(metadata_sort_day_quality_requested=requested, metadata_sort_day_quality_contract_version=version)
+    with pytest.raises(ValueError, match='metadata sort-day quality'):
+        plan_sources(source)
+
+
+@pytest.mark.parametrize('count', [True, -1, 8, 1.5, '2'])
+def test_invalid_missing_body_queue_count_cannot_create_false_progress(count):
+    value = inventory(known=10, stored=3, links=0)
+    value['providers']['unregistered:official.test']['missing_body_work'] = count
+    with pytest.raises(ValueError, match='invalid inventory missing-body work count'):
+        plan_sources(value)
 
 
 @pytest.mark.parametrize('role,strategy', [

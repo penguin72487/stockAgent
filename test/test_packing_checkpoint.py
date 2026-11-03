@@ -11,8 +11,8 @@ from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.packing_checkpoint import SealedPackHints
 
 
-@pytest.fixture
-def fixture(tmp_path, monkeypatch):
+@pytest.fixture(params=['private', 'shared'])
+def fixture(tmp_path, monkeypatch, request):
     source, primary = tmp_path / 'source', tmp_path / 'cold'
     source.mkdir()
     for index in range(13):
@@ -20,14 +20,15 @@ def fixture(tmp_path, monkeypatch):
     packed.initialize_packed_layout(primary, node_id='test')
     policy = {'private_history': {'enabled': True, 'relative_root': '.local-state/private-history',
               'shared_export': False, 'nas_export': False, 'source_retirement': False}}
-    cold = migration.private_history_root(primary, policy)
+    private = request.param == 'private'
+    cold = migration.private_history_root(primary, policy) if private else primary
     root = tmp_path / 'journal/sealed-pack-checkpoints/example'
     monkeypatch.setattr(packed, 'MAX_PACK_MEMBERS', 4)
     def hints():
         return SealedPackHints(root, cold, source, 'example')
     def publish(index):
         return packed.publish_packed_snapshot(cold, 'example', source, node_id='test',
-            pack_buckets=1, file_chunk_bytes=1024, private_observation_cohort=True,
+            pack_buckets=1, file_chunk_bytes=1024, private_observation_cohort=private,
             sealed_pack_hints=index, batch_directory_fsync=True)
     return source, cold, root, hints, publish
 
@@ -139,12 +140,12 @@ def test_corrupt_cas_object_is_not_blessed_by_hint_or_current_source_hash(fixtur
     assert len(list(source.iterdir())) == 13
 
 
-def test_hint_cannot_be_enabled_for_public_or_other_source_authority(fixture, tmp_path):
+def test_hint_cannot_be_enabled_for_other_source_or_dataset_authority(fixture, tmp_path):
     source, cold, root, hints, publish = fixture
-    with pytest.raises(SnapshotError, match='original private source/authority'):
-        packed.publish_packed_snapshot(cold, 'example', source, sealed_pack_hints=hints())
+    with pytest.raises(SnapshotError, match='original source/authority'):
+        packed.publish_packed_snapshot(cold, 'different', source, sealed_pack_hints=hints())
     wrong = SealedPackHints(tmp_path / 'other-journal', cold, tmp_path / 'another-source', 'example')
-    with pytest.raises(SnapshotError, match='original private source/authority'):
+    with pytest.raises(SnapshotError, match='original source/authority'):
         publish(wrong)
 
 

@@ -83,9 +83,73 @@ def test_selected_inventory_is_exact_subset_and_never_mutates_or_scans_other_hea
     frontier = [s for s in statements if 'FROM articles' in s]
     assert frontier and all('provider IN (' in s for s in frontier)
     assert all('NOT INDEXED' not in s for s in frontier)
+    assert all('date(metadata_order_day' not in s for s in frontier)
     assert 'PRAGMA query_only=ON' in statements and 'BEGIN' in statements
     assert not result['publisher_requests'] and not result['production_queue_writes']
     assert list(q.db.iterdump()) == before
+
+
+def test_optional_sort_day_quality_distinguishes_unknown_and_observed_cases(populated):
+    q, path = populated
+    samples = {
+        'ordinary': '2020-02-29',
+        'historical': '1899-12-30',
+        'invalid': '2023-02-29',
+        'invalid_month': '2023-99-01',
+        'invalid_year': '0000-01-01',
+        'malformed': 'not-a-calendar-day',
+        'future': '9999-12-31',
+        'missing': '',
+    }
+    with q.db:
+        q.add_articles([{'url': f'https://publisher.test/{name}', 'date': 'source original'}
+                        for name in samples])
+        for name, day in samples.items():
+            q.db.execute('UPDATE articles SET metadata_order_day=? WHERE url=?',
+                         (day, f'https://publisher.test/{name}'))
+    before = list(q.db.iterdump())
+    default = audit.inventory(path, providers=['publisher'])
+    default_row = next(row for row in plan_sources(default)['sources'] if row['provider'] == 'publisher')
+    assert default_row['metadata_sort_days_present'] is None
+    checked = audit.inventory(path, providers=['publisher', 'empty'], sort_day_quality=True)
+    assert checked['metadata_sort_day_quality_contract_version'] == 1
+    assert checked['metadata_sort_day_quality_requested'] is True
+    item = checked['providers']['publisher']
+    assert {key: item[key] for key in ('metadata_sort_days_present', 'metadata_sort_days_invalid',
+                                       'metadata_sort_days_pre_1900', 'metadata_sort_days_after_snapshot_utc')} == {
+        'metadata_sort_days_present': 7, 'metadata_sort_days_invalid': 4,
+        'metadata_sort_days_pre_1900': 1, 'metadata_sort_days_after_snapshot_utc': 1}
+    row = next(row for row in plan_sources(checked)['sources'] if row['provider'] == 'publisher')
+    assert row['metadata_sort_days_invalid'] == 4 and row['metadata_sort_days_pre_1900'] == 1
+    assert row['metadata_sort_days_after_snapshot_utc'] == 1
+    assert checked['providers']['empty']['metadata_sort_days_present'] == 0
+    assert list(q.db.iterdump()) == before
+
+
+def test_full_inventory_cli_publishes_reusable_compact_sort_summary(populated, tmp_path):
+    import hashlib
+    from datetime import datetime, timezone
+    from scripts.publish_news_sort_day_status import publish
+    q, path = populated
+    before = list(q.db.iterdump())
+    output = tmp_path / 'artifacts/data_quality/fixture/inventory.json'
+    summary_path = output.with_name('sort.json')
+    assert audit.main(['--config', str(path), '--output', str(output), '--sort-day-quality',
+                       '--sort-day-summary', str(summary_path)]) == 0
+    full, summary = json.loads(output.read_text()), json.loads(summary_path.read_text())
+    assert summary['source_inventory_sha256'] == hashlib.sha256(output.read_bytes()).hexdigest()
+    assert summary['totals']['known_heads'] == full['inventory_totals']['known_urls']
+    assert summary['provider_keys_with_heads'] == sum(item['known_urls'] > 0 for item in full['providers'].values())
+    assert publish(tmp_path, summary_path, now=datetime.now(timezone.utc))['known_heads'] == summary['totals']['known_heads']
+    assert list(q.db.iterdump()) == before
+
+
+@pytest.mark.parametrize('extra', [[], ['--sort-day-quality', '--provider', 'publisher']])
+def test_compact_summary_requires_a_full_quality_scan(populated, tmp_path, extra):
+    _, path = populated
+    with pytest.raises(SystemExit):
+        audit.main(['--config', str(path), '--output', str(tmp_path / 'inventory.json'),
+                    '--sort-day-summary', str(tmp_path / 'sort.json'), *extra])
 
 
 def test_exact_targets_count_duplicate_links_and_real_heads_not_queued_hint(populated):
@@ -109,7 +173,7 @@ def test_exact_targets_count_duplicate_links_and_real_heads_not_queued_hint(popu
     planned = plan_sources(result)
     assert planned['all_input_source_keys_planned']
     assert not planned['all_source_keys_planned'] and not planned['all_sites_live_reviewed']
-    assert planned['contract_version'] == 8
+    assert planned['contract_version'] == 11
     row = next(r for r in planned['sources'] if r['provider'] == 'blocked')
     assert row['known_urls'] == row['stored_bodies'] == 1
     assert row['unqueued_literal_link_work'] and row['literal_target_coverage_verified']
@@ -141,13 +205,15 @@ def test_selected_cli_records_scope_and_exact_targets_in_json_and_csv(populated,
     _, path = populated
     output = tmp_path / 'output/selected.json'
     assert audit.main(['--config', str(path), '--output', str(output), '--provider', 'blocked',
-                       '--resolve-link-coverage']) == 0
+                       '--resolve-link-coverage', '--sort-day-quality']) == 0
     result = json.loads(output.read_bytes())
     assert set(result['providers']) == {'blocked'}
+    assert result['metadata_sort_day_quality_requested'] is True
     with output.with_suffix('.csv').open() as stream:
         rows = list(csv.DictReader(stream))
     assert len(rows) == 1 and rows[0]['inventory_scope'] == 'selected_source_keys'
     assert rows[0]['all_known_source_keys_included'] == 'False'
+    assert rows[0]['metadata_sort_days_present'] == rows[0]['metadata_sort_days_invalid'] == '0'
     assert json.loads(rows[0]['literal_target_coverage_json'])['unqueued_target_urls'] == 1
 
 
@@ -175,6 +241,83 @@ def test_unavailable_summary_is_not_silently_zero_target_work(populated):
         q.db.execute("DELETE FROM queue_settings WHERE key='original_source_inventory_v1'")
     with pytest.raises(ValueError, match='reconciled original-source summary'):
         audit.inventory(path, providers=['blocked'], resolve_link_coverage=True)
+
+
+def test_offline_immutable_inventory_matches_readonly_snapshot_without_writing(populated):
+    q, path = populated
+    q.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    normal = audit.inventory(path)
+    files = [q.root / 'queue.sqlite3', q.root / 'queue.sqlite3-wal', q.root / 'status.json']
+    before = [(p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in files]
+    result = audit.inventory(path, offline_immutable=True)
+    after = [(p.stat().st_size, p.stat().st_mtime_ns, p.stat().st_ctime_ns) for p in files]
+    assert result['providers'] == normal['providers']
+    assert result['inventory_totals'] == normal['inventory_totals']
+    assert result['offline_snapshot']['wal_empty']
+    assert result['offline_snapshot']['rollback_journal_empty']
+    assert str(path.resolve()) in result['offline_snapshot']['configuration_sha256']
+    assert result['offline_snapshot']['writer_exclusion_proven'] is False
+    assert before == after
+
+
+def test_offline_immutable_rejects_uncheckpointed_wal_and_publishes_nothing(populated, tmp_path):
+    q, path = populated
+    q.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    with q.db:
+        q.db.execute("INSERT INTO queue_settings(key,value) VALUES('fixture_uncheckpointed', '1')")
+    assert (q.root / 'queue.sqlite3-wal').stat().st_size > 0
+    output = tmp_path / 'output/unsafe.json'
+    with pytest.raises(ValueError, match='WAL'):
+        audit.main(['--config', str(path), '--output', str(output), '--offline-immutable'])
+    assert not output.exists() and not output.with_suffix('.csv').exists()
+
+
+def test_offline_immutable_rejects_nonempty_rollback_journal(populated, tmp_path):
+    q, path = populated
+    q.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    (q.root / 'queue.sqlite3-journal').write_bytes(b'unreplayed journal')
+    output = tmp_path / 'output/unsafe_journal.json'
+    with pytest.raises(ValueError, match='rollback journal'):
+        audit.main(['--config', str(path), '--output', str(output), '--offline-immutable'])
+    assert not output.exists() and not output.with_suffix('.csv').exists()
+
+
+def test_offline_immutable_discards_result_when_snapshot_changes(populated, tmp_path, monkeypatch):
+    q, path = populated
+    q.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    original = audit._offline_snapshot_signature
+    calls = []
+
+    def changed(root):
+        calls.append(1)
+        if len(calls) == 2:
+            (q.root / 'status.json').write_text('{}')
+        return original(root)
+
+    monkeypatch.setattr(audit, '_offline_snapshot_signature', changed)
+    output = tmp_path / 'output/changed.json'
+    with pytest.raises(ValueError, match='changed'):
+        audit.main(['--config', str(path), '--output', str(output), '--offline-immutable'])
+    assert not output.exists() and not output.with_suffix('.csv').exists()
+
+
+def test_offline_immutable_discards_result_if_configuration_changes(populated, tmp_path, monkeypatch):
+    q, path = populated
+    q.db.execute('PRAGMA wal_checkpoint(TRUNCATE)')
+    original = audit._offline_snapshot_signature
+    calls = []
+
+    def changed(root):
+        calls.append(1)
+        if len(calls) == 2:
+            path.write_text(path.read_text() + '\n')
+        return original(root)
+
+    monkeypatch.setattr(audit, '_offline_snapshot_signature', changed)
+    output = tmp_path / 'output/changed_config.json'
+    with pytest.raises(ValueError, match='configuration changed'):
+        audit.main(['--config', str(path), '--output', str(output), '--offline-immutable'])
+    assert not output.exists() and not output.with_suffix('.csv').exists()
 
 
 @pytest.mark.parametrize('change', [

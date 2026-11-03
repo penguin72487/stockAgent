@@ -27,6 +27,7 @@ from downloader.artifact_io import atomic_write_json, sha256_file
 from stockagent.data.partitioned_parquet import ParquetSource, write_partitioned_table
 from stockagent.data.tw_public_incremental import session_fingerprints
 from stockagent.data_sync.cache_capacity import GenerationWriteBudget, reserve_cache_write
+from stockagent.service_layout import canonical_service_path
 
 CONTRACT = "official_ohlcv_exact_session_merge_v1"
 MAX_CONTROL_BYTES = 16 * 1024**2
@@ -41,7 +42,7 @@ class OfficialMergeProjection:
     """One serialized build; only a fully committed manifest can be reused."""
 
     def __init__(self, root, implementation, *, capacity_policy=None):
-        self.root = Path(root).absolute()
+        self.root = canonical_service_path(root)
         if self.root.resolve() != self.root:
             raise ValueError("redirected official merge cache")
         self.implementation = implementation

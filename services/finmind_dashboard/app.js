@@ -432,7 +432,8 @@ function renderCapture(data) {
   const running = data.health === "updating";
   const labels = {running: "正在抓取", backfilling: "持續回補", current: "目前任務已查驗", current_queue: "待下一輪查新", batch_complete: "本批結束，準備下一批", waiting: "等待下一輪排程", stale: "觀測已過期", unavailable: "尚無觀測", degraded: "來源需注意", protected_opening: "開盤保護暫停", waiting_retry: "等待短期重試", waiting_history_retry: "等待前階段歷史重試", rate_limited: "來源節流", disk_guard: "磁碟保留量不足", invalid_token: "Token 無效", waiting_necessary_acquisition: "等待必要下載完成後校驗", incremental_reserve: "預留追新配額"};
   text("capture-state", `整體 ${labels[info.state] || info.state || "待核實"} · Free ${labels[info.free_state] || info.free_state || "待核實"} · 補充 ${labels[info.complement_state] || info.complement_state || "待核實"} · Sponsor ${labels[info.sponsor_state] || info.sponsor_state || "待核實"}`);
-  text("capture-freshness", `盤中 ${timeLabel(info.observed_at_utc)} · 補充 ${timeLabel(info.complement_observed_at_utc)} · Sponsor ${timeLabel(info.sponsor_observed_at_utc)}；最近觀測 ${ageLabel(data.status_age_seconds)}`);
+  const summaryLabel = info.complement_summary_state === "carried_previous_snapshot" ? "補充總覽沿用" : info.complement_summary_state === "unavailable" ? "補充總覽尚無觀測" : "補充總覽";
+  text("capture-freshness", `盤中 ${timeLabel(info.observed_at_utc)} · 補充工作 ${timeLabel(info.complement_observed_at_utc)} · ${summaryLabel} ${timeLabel(info.complement_summary_observed_at_utc)} · Sponsor ${timeLabel(info.sponsor_observed_at_utc)}；最近觀測 ${ageLabel(data.status_age_seconds)}`);
   const workers = Object.entries(info.workers || {}).filter(([, worker]) => worker.alive);
   if (workers.length) {
     const names = {free: "盤中", complement: "補充", sponsor: "Sponsor"};

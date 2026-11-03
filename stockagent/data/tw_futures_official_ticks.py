@@ -18,10 +18,13 @@ import polars as pl
 from downloader.artifact_io import sha256_file
 
 SOURCE = 'taifex_recent_original_all_product_futures_tick_v1'
+OPTION_SOURCE = 'taifex_recent_original_all_product_option_tick_v1'
 DATASET = 'taifex_recent_tx_txo_trade_by_trade'
 
 
-def pin_official_tick_inventory(manifest_path: Path, dates: list[date]) -> list[dict]:
+def _pin_official_tick_inventory(manifest_path: Path, dates: list[date], *, kind: str) -> list[dict]:
+    if kind not in {'futures', 'options'}:
+        raise ValueError('unsupported TAIFEX recent archive kind')
     manifest = Path(manifest_path).resolve()
     before = sha256_file(manifest)
     document = json.loads(manifest.read_bytes())
@@ -30,19 +33,22 @@ def pin_official_tick_inventory(manifest_path: Path, dates: list[date]) -> list[
     wanted = {str(day) for day in dates}
     objects = {}
     for record in document.get('raw_downloads', []):
-        if record.get('kind') != 'futures' or record.get('trading_date') not in wanted:
+        if record.get('kind') != kind or record.get('trading_date') not in wanted:
             continue
         day = date.fromisoformat(record['trading_date'])
-        name = f"Daily_{day.strftime('%Y_%m_%d')}.zip"
+        prefix = 'Daily' if kind == 'futures' else 'OptionsDaily'
+        directory = 'DailydownloadCSV' if kind == 'futures' else 'OptionsDailydownloadCSV'
+        source_kind = SOURCE if kind == 'futures' else OPTION_SOURCE
+        name = f"{prefix}_{day.strftime('%Y_%m_%d')}.zip"
         path = Path(record['path'])
-        url = 'https://www.taifex.com.tw/file/taifex/Dailydownload/DailydownloadCSV/' + name
+        url = 'https://www.taifex.com.tw/file/taifex/Dailydownload/' + directory + '/' + name
         if (str(day) in objects or path.name != name or not path.is_absolute()
                 or path.is_symlink() or record.get('url') != url
                 or not isinstance(record.get('sha256'), str)
                 or not re.fullmatch(r'[0-9a-f]{64}', record['sha256'])
                 or not isinstance(record.get('bytes'), int) or record['bytes'] <= 0):
             raise ValueError('TAIFEX archive identity, URL, or receipt differs')
-        objects[str(day)] = dict(date=str(day), source_kind=SOURCE, path=str(path.resolve()),
+        objects[str(day)] = dict(date=str(day), source_kind=source_kind, path=str(path.resolve()),
             sha256=record['sha256'], bytes=record['bytes'], receipt_path=str(manifest),
             receipt_sha256=before, url=url, historical_point_in_time=False,
             price_representation='native_decimal')
@@ -51,6 +57,16 @@ def pin_official_tick_inventory(manifest_path: Path, dates: list[date]) -> list[
     if sha256_file(manifest) != before:
         raise ValueError('TAIFEX archive receipt changed during pinning')
     return [objects[day] for day in sorted(objects)]
+
+
+def pin_official_tick_inventory(manifest_path: Path, dates: list[date]) -> list[dict]:
+    """Pin retained all-product futures originals without changing the existing ABI."""
+    return _pin_official_tick_inventory(manifest_path, dates, kind='futures')
+
+
+def pin_official_option_tick_inventory(manifest_path: Path, dates: list[date]) -> list[dict]:
+    """Pin retained all-product option originals using the same collector receipt."""
+    return _pin_official_tick_inventory(manifest_path, dates, kind='options')
 
 
 def read_official_tick_day(item: dict, expected: pl.DataFrame, *, asset_scope='all_twd'):

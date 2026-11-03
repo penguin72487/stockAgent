@@ -1,5 +1,6 @@
 """Offline correction preserves source evidence and HTTP scheduling semantics."""
 from contextlib import closing
+import errno
 import hashlib
 import json
 import sqlite3
@@ -346,6 +347,35 @@ def test_replay_source_path_distinguishes_missing_and_unsafe_paths(tmp_path):
         replay_source_path(tmp_path, '.')
 
 
+@pytest.mark.parametrize('relative', ['loop', 'loop/retained.parquet'])
+def test_replay_source_path_rejects_symlink_cycles(tmp_path, relative):
+    from downloader.news_fulltext_queue import replay_source_path
+
+    (tmp_path / 'loop').symlink_to('loop')
+    with pytest.raises(ValueError, match='invalid source artifact path'):
+        replay_source_path(tmp_path, relative)
+
+
+@pytest.mark.parametrize('resolver_name', ['source_path', 'replay_source_path'])
+@pytest.mark.parametrize('error_number', [errno.ELOOP, errno.EACCES])
+def test_source_path_preserves_other_io_errors(tmp_path, monkeypatch, resolver_name, error_number):
+    from downloader import news_fulltext_queue
+
+    path_type = type(tmp_path)
+    original_resolve = path_type.resolve
+    target = tmp_path / 'blocked'
+
+    def resolve(self, *args, **kwargs):
+        if self == target:
+            raise OSError(error_number, 'synthetic resolution failure')
+        return original_resolve(self, *args, **kwargs)
+
+    monkeypatch.setattr(path_type, 'resolve', resolve)
+    expected = ValueError if error_number == errno.ELOOP else PermissionError
+    with pytest.raises(expected):
+        getattr(news_fulltext_queue, resolver_name)(tmp_path, 'blocked')
+
+
 def test_deferred_metadata_wakes_only_when_head_is_eligible(cfg, tmp_path):
     from downloader.news_fulltext_metadata_replay import _ensure_cohort, retained_metadata_next_wake_delay
 
@@ -555,10 +585,10 @@ def test_changed_head_before_acceptance_is_rejected(cfg, tmp_path, monkeypatch):
     with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
         old = old_head(queue)
         accept = queue.accept
-        def changed(records):
+        def changed(records, **kwargs):
             with queue.db:
                 queue.db.execute("UPDATE articles SET state='inflight',lease_owner='actual_http_owner',lease_until=?", (time.time() + 300,))
-            return accept(records)
+            return accept(records, **kwargs)
         monkeypatch.setattr(queue, 'accept', changed)
         with pytest.raises(ValueError, match='head_changed_before_acceptance'):
             replay_retained_cnyes_metadata(queue, maximum_wall_seconds=1)

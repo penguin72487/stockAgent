@@ -242,6 +242,32 @@ def test_sparse_date_views_align_all_fields_and_parameter_adjoints(tmp_path, nor
                                        msg=lambda message: name + ': ' + message)
 
 
+@pytest.mark.parametrize('device', ['cpu', 'cuda'])
+def test_sparse_offset_attachment_matches_dense_forward_and_gradients(tmp_path, device):
+    if device == 'cuda' and not torch.cuda.is_available():
+        pytest.skip('requires CUDA')
+    original = source_fixture(tmp_path)
+    source = FactorizedPanelFeatures(tmp_path, original.manifest, original.base[1:8], date_offset=1)
+    rows = np.array([6, 0, 3, 1, 4, 3])
+    expected_raw = original[rows + 1]
+    np.testing.assert_array_equal(source[rows].view(np.uint32), expected_raw.view(np.uint32))
+    candle = CandleEncoder(num_features=28, d_model=8, dropout=0., norm_type='layernorm',
+        ffn_type='swiglu', sanitize_inputs=True, projection_fp32=True).to(device)
+    oracle = deepcopy(candle)
+    model = SimpleNamespace(candle_encoder=candle, factorized_sparse_cache_bytes=1024**2)
+    actual = project_factorized_sparse_rows(model, FactorizedPanelSlab(source, rows, device=device))
+    expected = oracle(torch.from_numpy(expected_raw).to(device))[0]
+    torch.testing.assert_close(actual, expected, rtol=3e-5, atol=3e-5)
+    coefficient = torch.randn_like(actual)
+    (actual * coefficient).sum().backward()
+    (expected * coefficient).sum().backward()
+    for (name, value), (_, reference) in zip(candle.named_parameters(), oracle.named_parameters(), strict=True):
+        assert (value.grad is None) == (reference.grad is None), name
+        if value.grad is not None:
+            torch.testing.assert_close(value.grad, reference.grad, rtol=7e-5, atol=7e-5,
+                                       msg=lambda message: name + ': ' + message)
+
+
 def test_centering_remains_stable_with_nearly_constant_full_rows(tmp_path):
     source=source_fixture(tmp_path,constant=True)
     candle=CandleEncoder(num_features=28,d_model=8,dropout=0.,norm_type='layernorm',

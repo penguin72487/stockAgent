@@ -220,7 +220,8 @@ def test_canonical_inference_closure_excludes_news_and_retains_financial_depende
     repo = Path(cache.__file__).resolve().parents[2]
     paths = {Path(row["path"]).relative_to(repo).as_posix()
              for row in cache.implementation_identity()}
-    assert not any("news" in path for path in paths)
+    unexpected_news = sorted(path for path in paths if "news" in path)
+    assert not unexpected_news, unexpected_news
     assert {"stockagent/live/signal_engine.py", "stockagent/config.py",
             "stockagent/models/factory.py", "stockagent/models/financial_transformer.py",
             "stockagent/data/panel.py", "stockagent/data/tw_price_rules.py",

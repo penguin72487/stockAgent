@@ -22,6 +22,7 @@ import time
 import polars as pl
 
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json, sha256_file
+from downloader.finmind_option_contract_keys import vendor_option_series
 from downloader.parquet_integrity import parquet_receipt_error, signature
 from scripts.audit_taifex_option_contract_presence import KEYS, official_year
 from scripts.taifex_daily_download_common import month_ranges
@@ -34,7 +35,7 @@ def vendor_keys(vendor: pl.DataFrame, *, positive: bool = False) -> pl.DataFrame
     cp = pl.col('call_put').str.strip_chars().str.to_uppercase()
     return vendor.select(
         pl.col('option_id').str.strip_chars().str.to_uppercase().alias('product'),
-        pl.col('contract_date').str.strip_chars().str.to_uppercase().alias('series'),
+        vendor_option_series(pl.col('contract_date')).alias('series'),
         pl.col('strike_price').cast(pl.Float32, strict=False).alias('strike'),
         pl.when(cp.is_in(['CALL', 'C'])).then(pl.lit('C'))
           .when(cp.is_in(['PUT', 'P'])).then(pl.lit('P'))
@@ -167,17 +168,19 @@ def audit(product_summary: Path, coverage_path: Path, years: list[int], workers:
             or inventory.read_bytes() != inventory_bytes):
         raise ValueError('source coverage evidence changed during audit')
     return results, missing, {
-        'contract': 'taifex_option_ordinary_open_vs_finmind_market_daily_contract_v1',
+        'contract': 'taifex_option_ordinary_open_vs_finmind_market_daily_contract_v2',
         'observed_at_utc': datetime.now(UTC).isoformat(), 'elapsed_seconds': time.monotonic() - started,
         'product_summary': str(product_summary.resolve()), 'product_summary_sha256': hashlib.sha256(product_bytes).hexdigest(),
         'official_coverage_sha256': hashlib.sha256(coverage_bytes).hexdigest(),
         'official_parser_sha256': sha256_file(Path('scripts/audit_taifex_option_contract_presence.py')),
+        'series_normalizer_sha256': sha256_file(Path('downloader/finmind_option_contract_keys.py')),
         'audit_script_sha256': sha256_file(Path(__file__)), 'workers': workers, 'by_year': year_stats,
         'limitations': [
             'Only official positive opening and volume for day or unreported session and supported outright month/week identities are compared.',
             'Unsupported official rows are counted, not included; unreported session is not automatically day session.',
             'Vendor natural-day records may combine sessions; presence is not an opening event or decision-clock fill.',
             'Strike identities use float32 precision; distinct original decimal strikes could collide.',
+            'Vendor monthly YYYYMM.0 is compared as YYYYMM; weekly series and other decimals are not converted.',
             'A source mismatch is not proof of its cause, completeness, PIT availability, or accounting eligibility.',
         ],
     }

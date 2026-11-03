@@ -24,7 +24,7 @@ def replacing_decoder(monkeypatch, path, replacements):
             else:atomic_write_json(path,next_value)
         return value
 
-    monkeypatch.setattr(dashboard_updates.json,'loads',decode)
+    monkeypatch.setattr(dashboard_updates,'_decode_snapshot_json',decode)
     return calls
 
 

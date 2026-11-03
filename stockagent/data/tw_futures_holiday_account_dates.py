@@ -35,6 +35,9 @@ class HolidayAccountDatesSource:
     """Immutable reviewed date identities and independently pinned inputs."""
 
     events: tuple[tuple[date, str], ...]
+    # Each tuple is (last market session, reopening session, account dates).
+    # It is derived from the reviewed original, not an inferred holiday rule.
+    periods: tuple[tuple[date, date, tuple[date, ...]], ...]
     fingerprint: str
     manifest_path: Path
     pinned_files: tuple[tuple[Path, str], ...]
@@ -45,6 +48,15 @@ class HolidayAccountDatesSource:
         for path, digest in self.pinned_files:
             if sha256_file(path) != digest:
                 raise ValueError("holiday account source input changed")
+        manifest = json.loads(self.manifest_path.read_text())
+        periods = tuple(sorted((date.fromisoformat(item["last_session"]),
+                                date.fromisoformat(item["reopening_session"]),
+                                tuple(date.fromisoformat(day) for day in item["account_dates"]))
+                               for item in manifest["periods"]))
+        events = tuple(sorted((date.fromisoformat(day), item["content_sha256"])
+                              for item in manifest["periods"] for day in item["account_dates"]))
+        if periods != self.periods or events != self.events:
+            raise ValueError("holiday account source identities changed")
 
 
 def load_holiday_account_dates(source_dir: Path, *, workspace: Path) -> HolidayAccountDatesSource:
@@ -75,6 +87,7 @@ def load_holiday_account_dates(source_dir: Path, *, workspace: Path) -> HolidayA
         raise ValueError("holiday account reviewed periods differ")
     pins = {stage: manifest["staging_script_sha256"]}
     events = []
+    periods = []
     seen_periods = set()
     for period in manifest.get("periods", []):
         item = reviewed.get(period["indexed_date"])
@@ -116,10 +129,12 @@ def load_holiday_account_dates(source_dir: Path, *, workspace: Path) -> HolidayA
             raise ValueError("invalid holiday account date provenance")
         pins[raw], pins[parsed] = period["raw_sha256"], period["parsed_sha256"]
         events.extend((day, period["content_sha256"]) for day in days)
+        periods.append((last, reopening, tuple(days)))
     if (not events or len(events) != manifest.get("account_date_count")
             or len({day for day, _ in events}) != len(events)):
         raise ValueError("holiday account dates are empty or duplicated")
-    source = HolidayAccountDatesSource(tuple(sorted(events)), sha256_file(path), path, tuple(sorted(pins.items())))
+    source = HolidayAccountDatesSource(
+        tuple(sorted(events)), tuple(sorted(periods)), sha256_file(path), path, tuple(sorted(pins.items())))
     source.verify()
     return source
 

@@ -1,0 +1,3 @@
+[Unit]
+Requires=stockagent-e-workspace-mount.service
+After=stockagent-e-workspace-mount.service

@@ -67,6 +67,72 @@ def test_hash_omits_only_file_pins_without_mutating_input():
     assert original == before
 
 
+@pytest.mark.parametrize("references", [
+    [],
+    ["x@h", "x@h", '字\n"\\@雜湊', "missing@sha"],
+    ("x@h", "x@h"),
+    ["x@h", 2, None],
+    None,
+])
+def test_release_reference_reuse_preserves_the_exact_canonical_identity(references, monkeypatch):
+    monkeypatch.setattr(module, "_CATALOG_REUSE_MIN_REFERENCES", 1)
+    original = {
+        "files": [{"relative": "x", "sha256": "h", "signature": [1, 2], "bytes": 42},
+                  {"relative": '字\n"\\', "sha256": "雜湊", "signature": [3, 4]}],
+        "missing_objects": [{"relative": "missing", "sha256": "sha"}],
+        "releases": [{"required_file_keys": references, "name": "非 ASCII", "flag": True,
+                      "other": {"signed_zero": -0.0, "large": 2**100}} for _ in range(3)],
+    }
+    expected = deepcopy(original)
+    expected["files"] = [{k: v for k, v in row.items() if k != "signature"}
+                         for row in expected["files"]]
+    assert module.catalog_identity(original) == identity_sha256(original)
+    assert module.catalog_identity(original, omit_file_signatures=True) == identity_sha256(expected)
+    assert original["files"][0]["signature"] == [1, 2]
+
+
+def test_release_reference_encoder_reuses_only_catalog_objects():
+    class CountingEncoder(json.JSONEncoder):
+        def __init__(self):
+            super().__init__(ensure_ascii=False, sort_keys=True,
+                             separators=(",", ":"), allow_nan=False)
+            self.seen = []
+
+        def encode(self, value):
+            self.seen.append(value)
+            return super().encode(value)
+
+    encoder = CountingEncoder()
+    release = {"required_file_keys": ["x@h", "x@h", "unlisted", "unlisted"]}
+    cached = {}
+    actual = module._catalog_release_bytes(encoder, release, {"x@h"}, cached)
+    expected = json.dumps(release, ensure_ascii=False, sort_keys=True,
+                          separators=(",", ":"), allow_nan=False).encode()
+    assert actual == expected
+    assert encoder.seen.count("x@h") == 1
+    assert encoder.seen.count("unlisted") == 2
+    assert list(cached) == ["x@h"]
+
+
+@pytest.mark.parametrize("content", [
+    {"files": [{"relative": "x", "sha256": "h"}],
+     "releases": [{"required_file_keys": ["x@h"]}]},
+    {"files": [], "releases": [{"required_file_keys": ["unlisted"]}] * 2},
+])
+def test_no_reusable_release_references_keep_the_original_encoder(content, monkeypatch):
+    monkeypatch.setattr(module, "_catalog_release_bytes",
+                        lambda *_: pytest.fail("no catalog reuse is available"))
+    assert module.catalog_identity(content) == identity_sha256(content)
+
+
+def test_release_reference_fast_path_keeps_nonfinite_rejection(monkeypatch):
+    monkeypatch.setattr(module, "_CATALOG_REUSE_MIN_REFERENCES", 1)
+    content = {"files": [{"relative": "x", "sha256": "h"}],
+               "releases": [{"required_file_keys": ["x@h"], "other": math.nan}] * 2}
+    with pytest.raises(ValueError):
+        module.catalog_identity(content)
+
+
 @pytest.mark.parametrize("value", [{"bad": [math.nan]}, {"bad": {"number": math.inf}}, {1: "bad key"}])
 def test_hash_retains_original_invalid_number_and_catalog_key_rejections(value):
     with pytest.raises(ValueError):

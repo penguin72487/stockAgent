@@ -497,3 +497,30 @@ def test_projection_write_failure_cannot_fail_a_valid_opening_read(tmp_path, mon
     monkeypatch.setattr(dashboard, "_atomic_private_bytes", lambda *_: (_ for _ in ()).throw(OSError("no space")))
     assert dashboard._tail(path, 4, row_decoder=dashboard._decode_opening_latency_row,
                            verified_append=True) == [{"source": "executor", "i": 1}]
+
+
+def test_dashboard_diagnostic_projection_keeps_corruption_visible_across_restart_and_append(tmp_path, monkeypatch):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    path = tmp_path / "opening_signal_latency.jsonl"
+    original = b'{"source":"executor","i":1}\n\x00\x00{"i":2}\n'
+    path.write_bytes(original)
+    args = dict(row_decoder=dashboard._decode_opening_latency_row_for_dashboard, verified_append=True)
+    expected = [{"source": "executor", "i": 1}, {dashboard._OPENING_CORRUPT_LINE: True}]
+    assert dashboard._tail(path, 4, **args) == expected
+    strict_path = dashboard._opening_tail_projection_path(path, 4)
+    partial_path = dashboard._opening_tail_projection_path(
+        path, 4, contract=dashboard._OPENING_DIAGNOSTIC_PROJECTION_CONTRACT,
+    )
+    assert partial_path.exists() and partial_path != strict_path
+    dashboard._TAIL_CACHE.clear()  # Simulate a fresh web process.
+    assert dashboard._tail(path, 4, **args) == expected
+    with path.open("ab") as stream:
+        stream.write(b'{"source":"executor","i":3}\n')
+    dashboard._TAIL_CACHE.clear()
+    assert dashboard._tail(path, 4, **args) == [*expected, {"source": "executor", "i": 3}]
+    assert path.read_bytes().startswith(original)
+    with pytest.raises(ValueError):
+        dashboard._tail(path, 4, row_decoder=dashboard._decode_opening_latency_row,
+                        verified_append=True)

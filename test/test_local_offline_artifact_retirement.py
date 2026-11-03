@@ -1,6 +1,7 @@
 from dataclasses import replace
 import json
 import os
+from pathlib import Path
 import time
 
 import pytest
@@ -1452,6 +1453,22 @@ def test_phase_status_reports_failure_without_a_retirement_claim(tmp_path):
     assert 'retired' not in result and not (tmp_path / 'acceptance.json').exists()
 
 
+def test_failed_retirement_records_error_location_without_frame_locals():
+    import errno
+    from scripts import retire_local_offline_artifacts as cleanup
+    def failing_stage():
+        local_secret = 'not part of the diagnostic'
+        raise FileNotFoundError(errno.ENOENT, 'missing', '/example/encoded.raw')
+    try:
+        failing_stage()
+    except FileNotFoundError as error:
+        diagnostic = cleanup._failure_diagnostics(error)
+    assert diagnostic['error_type'] == 'FileNotFoundError'
+    assert diagnostic['errno'] == errno.ENOENT
+    assert diagnostic['traceback_frames'][-1]['function'] == 'failing_stage'
+    assert 'local_secret' not in json.dumps(diagnostic)
+
+
 @pytest.mark.parametrize('current_service', [False, True])
 def test_previously_retired_root_recovered_for_service_is_retained(tmp_path, monkeypatch, current_service):
     import hashlib
@@ -1509,6 +1526,28 @@ def test_reuse_completed_publication_requires_fixed_identity_and_claims_no_recov
     assert source.is_dir()
 
 
+def test_preparation_progress_is_written_by_the_canonical_publication_owner(tmp_path, monkeypatch):
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync import legacy_artifact_archive as archives
+    root, source, row, catalog = example(tmp_path)
+    spec = load_legacy_specs(catalog)[row['dataset']]
+    packed, target = tmp_path / 'packed', tmp_path / 'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'publication.lock')
+    monkeypatch.setattr(cleanup, '_check_d_primary_mount', lambda path: None)
+    monkeypatch.setattr(archives, '_manual_capture_usage_gate', lambda *a, **kw: None)
+    monkeypatch.setattr(archives, 'artifact_process_references', lambda *a, **kw: [])
+    published = cleanup.prepare_or_resume_publication(spec, root, packed, target, repo_root=root.parent)
+    progress = json.loads((target / 'preparation-progress.json').read_bytes())
+    assert progress['contract'] == 'manual-retirement-preparation-progress-v1'
+    assert progress['stage'] == 'encode-and-check-receipts'
+    assert progress['files_completed'] == progress['files_total'] == 1
+    assert progress['source_bytes_completed'] == progress['source_bytes_total'] == (source / 'unique-result.bin').stat().st_size
+    assert progress['acceptance'] is False
+    assert verify_cold_archive(spec, packed)['snapshot_id'] == published['snapshot_id']
+    assert source.is_dir() and not (target / 'acceptance.json').exists()
+
+
 @pytest.mark.parametrize('defect', [None, 'source', 'encoding'])
 @pytest.mark.parametrize('d_primary', [False, True])
 def test_complete_uncommitted_encoding_resume_keeps_canonical_full_audits(tmp_path, monkeypatch, defect, d_primary):
@@ -1556,7 +1595,13 @@ def test_complete_uncommitted_encoding_resume_keeps_canonical_full_audits(tmp_pa
         assert json.loads((target/'publication.json').read_bytes()) == published
         progress = json.loads((target/'publication-progress.json').read_bytes())
         assert progress['contract'] == 'manual-retirement-publication-progress-v1'
-        assert progress['acceptance'] is False and progress['files_total'] > 0
+        # The final event is the post-publication complete tree readback,
+        # including directories. It must not masquerade as a file-only count.
+        assert progress['acceptance'] is False and progress['acceptance_proof'] is False
+        assert progress['stage'] == 'post-publication-verify-materialized-tree'
+        assert progress['item_scope'] == 'filesystem_entries_observed'
+        assert progress['completed_items'] == progress['total_items'] > 0
+        assert progress['fingerprint_matched'] is True
         proof = verify_cold_archive(spec, packed)
         assert proof['decoded_originals_verified'] and proof['snapshot_id'] == published['snapshot_id']
         pending = packed / '.local-state/scan-pending' / (spec.dataset + '.json')
@@ -1822,6 +1867,38 @@ def test_recovery_interrupt_keeps_partial_telemetry_and_never_accepts_retirement
     assert source.is_dir() and not (target / 'retirement.json').exists()
 
 
+@pytest.mark.parametrize('failure', [False, True])
+def test_quarantine_audit_progress_is_observation_only_and_preserves_failure(tmp_path, monkeypatch, failure):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    target = tmp_path / 'receipts'
+    target.mkdir()
+    spec = SimpleNamespace(dataset='exact-dataset')
+    prior = {'snapshot_id': 'fixed-snapshot', 'manifest_sha256': 'fixed-manifest'}
+
+    def audit(actual_spec, actual_prior, *, progress, **options):
+        assert actual_spec is spec and actual_prior is prior and options == {'guard': True}
+        progress({'audit_step': 'verify-encoded-and-quarantined-originals',
+                  'stage': 'decode-originals', 'completed_items': 5, 'total_items': 10})
+        if failure:
+            raise SnapshotError('retain quarantine')
+        return {'full_verification': {'original_files': 10}}
+
+    monkeypatch.setattr(cleanup, 'plan_legacy_quarantine_resume', audit)
+    if failure:
+        with pytest.raises(SnapshotError, match='retain quarantine'):
+            cleanup.audit_quarantine_resume(spec, prior, {'guard': True}, target, 2)
+    else:
+        assert cleanup.audit_quarantine_resume(spec, prior, {'guard': True}, target, 2)['full_verification']['original_files'] == 10
+    progress = json.loads((target / 'quarantine-audit-progress.json').read_bytes())
+    assert progress['state'] == ('failed' if failure else 'verified')
+    assert progress['attempt'] == 2 and progress['manifest_sha256'] == 'fixed-manifest'
+    assert progress['acceptance_proof'] is False
+    if failure:
+        assert progress['completed_items'] == 5 and progress['error_type'] == 'SnapshotError'
+    assert not (target / 'retirement.json').exists()
+
+
 def test_post_decode_corruption_persists_failure_without_retirement(tmp_path, monkeypatch):
     from types import SimpleNamespace
     from scripts import retire_local_offline_artifacts as cleanup
@@ -1970,6 +2047,163 @@ def test_renumbered_source_reuses_original_capture_only_with_complete_sha(tmp_pa
     assert manifest_path.read_bytes() == original_manifest
 
 
+@pytest.mark.parametrize('scenario,expected_timeouts', [
+    ('idle-only', [0]), ('healthy', [0]), ('peer-down', [0, 300]),
+    ('local-error', [0, 300]), ('normal-path', [300]),
+])
+def test_quarantine_options_overlap_only_healthy_scan(tmp_path, monkeypatch, scenario, expected_timeouts):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+
+    checks = {key: True for key in ('folder_idle', 'need_bytes_zero', 'need_items_zero',
+              'need_deletes_zero', 'errors_zero', 'pull_errors_zero', 'watch_error_empty',
+              'folder_errors_empty', 'system_errors_empty')}
+    checks['folder_idle'] = scenario in ('healthy', 'normal-path')
+    if scenario == 'local-error':
+        checks['errors_zero'] = False
+    peer = {'ok': scenario != 'peer-down'}
+    initial = {'ok': scenario in ('healthy', 'normal-path'), 'local_checks': checks,
+               'peers': [peer], 'checked_at': datetime.now(timezone.utc).isoformat()}
+    ready = {'ok': True, 'local_checks': {**checks, 'folder_idle': True, 'errors_zero': True},
+             'peers': [{'ok': True}], 'checked_at': initial['checked_at']}
+    calls = []
+    def wait(_cfg, timeout):
+        calls.append(timeout)
+        return initial if timeout == 0 else ready
+    cfg = SimpleNamespace(sync_root=tmp_path/'cold', materialized_root=tmp_path/'materialized',
+                          backup_config=tmp_path/'backup.json')
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', wait)
+    monkeypatch.setattr(cleanup, '_syncthing', lambda _cfg: ready)
+    monkeypatch.setattr(cleanup, '_bridge_inactive', lambda _path: True)
+    options = cleanup.retirement_options(cfg, tmp_path/'src', tmp_path/'hot', tmp_path/'state',
+        tmp_path/'activations', allow_audit_during_idle_scan=scenario != 'normal-path')
+    assert calls == expected_timeouts
+    assert options['peer_proof'] == (initial if calls == [0] else ready)
+    assert options['peer_probe']() == ready
+
+
+@pytest.mark.parametrize('outcome', ['expired-before', 'expired-during', 'changed-and-expired', 'consumer'])
+def test_quarantine_expiry_requests_full_reaudit_only_before_unlink(tmp_path, monkeypatch, outcome):
+    from scripts import retire_local_offline_artifacts as cleanup
+    import stockagent.data_sync.legacy_artifact_retirement as retirement
+    from test_legacy_artifact_retirement import _fixture
+
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    with pytest.raises(retirement.LegacyQuarantineAuditRequired):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+            owned_verified_plan=plan, defer_owned_post_rename_audit=True, **options)
+    resumed = retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+    state_path = retirement._state_path(options['state_root'], spec.dataset)
+    state_bytes = state_path.read_bytes()
+    quarantine = Path(json.loads(state_bytes)['quarantine'])
+    original = (quarantine/'source/checkpoint.pt').read_bytes()
+    verified_at = resumed['full_verification']['verified_at_epoch']
+    clock = {'now': verified_at}
+    monkeypatch.setattr(retirement.time, 'time', lambda: clock['now'])
+    if outcome == 'expired-before':
+        clock['now'] += 1501
+        with pytest.raises(retirement.LegacyQuarantineProofExpired):
+            retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                owned_verified_plan=resumed, defer_quarantine_transport=True, **options)
+    else:
+        target = tmp_path/'receipt'
+        target.mkdir()
+        monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path/'common.lock')
+        monkeypatch.setattr(cleanup, '_wait_for_convergence', lambda *a: {'ok': True})
+        real_gate = retirement._assert_legacy_unlink_gates
+        def gate(*args, **kwargs):
+            if outcome == 'consumer':
+                raise SnapshotError('new process reference; quarantine retained')
+            peer = real_gate(*args, **kwargs)
+            if outcome == 'changed-and-expired':
+                (quarantine/'source/checkpoint.pt').write_bytes(b'changed')
+            clock['now'] += 1501
+            return peer
+        monkeypatch.setattr(retirement, '_assert_legacy_unlink_gates', gate)
+        if outcome == 'expired-during':
+            assert cleanup.retire_after_convergence(spec, None, target, resumed, options) is None
+            receipts = list(target.glob('quarantine-audit-expired-*.json'))
+            assert len(receipts) == 1
+            receipt = json.loads(receipts[0].read_bytes())
+            assert receipt['proof_time_extended'] is False and receipt['unlink_started'] is False
+            assert receipt['original_verified_at_epoch'] == verified_at
+        else:
+            with pytest.raises(SnapshotError) as caught:
+                cleanup.retire_after_convergence(spec, None, target, resumed, options)
+            assert not isinstance(caught.value, retirement.LegacyQuarantineProofExpired)
+            assert not list(target.glob('quarantine-audit-expired-*.json'))
+    assert resumed['full_verification']['verified_at_epoch'] == verified_at
+    assert state_path.read_bytes() == state_bytes
+    assert (quarantine/'source/checkpoint.pt').exists() and (quarantine/'hot').is_dir()
+    if outcome != 'changed-and-expired':
+        assert (quarantine/'source/checkpoint.pt').read_bytes() == original
+
+
+def test_quarantine_audit_overlaps_scan_but_unlink_requires_convergence(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    import stockagent.data_sync.artifact_retirement as common
+    import stockagent.data_sync.legacy_artifact_archive as archive
+    import stockagent.data_sync.legacy_artifact_retirement as retirement
+    from test_legacy_artifact_retirement import _fixture
+
+    # This test's fixture lives only in tmpfs; production consumer checks are
+    # independently covered by the existing pin/process/FD gate regressions.
+    monkeypatch.setattr(archive, 'artifact_process_references', lambda *args: [])
+    monkeypatch.setattr(common, 'artifact_process_references', lambda *args: [])
+    monkeypatch.setattr(common, 'process_references', lambda *args: [])
+    spec, source, hot, old_options = _fixture(tmp_path, monkeypatch)
+    old_options['manual_immediate'] = True
+    original = (source/'checkpoint.pt').read_bytes()
+    plan = retirement.plan_legacy_retirement(spec, **old_options)
+    original_gate = retirement._assert_unlink_gates
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', lambda *a, **kw:
+                        (_ for _ in ()).throw(SnapshotError('controlled interruption')))
+    with pytest.raises(SnapshotError, match='controlled interruption'):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                          owned_verified_plan=plan, **old_options)
+    monkeypatch.setattr(retirement, '_assert_unlink_gates', original_gate)
+    state_path = retirement._state_path(old_options['state_root'], spec.dataset)
+    quarantine = Path(json.loads(state_path.read_bytes())['quarantine'])
+    checks = {key: True for key in ('need_bytes_zero', 'need_items_zero', 'need_deletes_zero',
+              'errors_zero', 'pull_errors_zero', 'watch_error_empty', 'folder_errors_empty',
+              'system_errors_empty')}
+    scanning = {'ok': False, 'checked_at': datetime.now(timezone.utc).isoformat(),
+                'local_checks': {**checks, 'folder_idle': False},
+                'peers': [{'name': 'vastai1T', 'ok': True}]}
+    healthy = {**scanning, 'ok': True, 'local_checks': {**checks, 'folder_idle': True}}
+    current = {'proof': scanning}
+    cfg = SimpleNamespace(sync_root=old_options['sync_root'],
+        materialized_root=old_options['materialized_root'], backup_config=old_options['backup_config'])
+    timeouts = []
+    def wait(_cfg, timeout):
+        timeouts.append(timeout)
+        return current['proof']
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', wait)
+    monkeypatch.setattr(cleanup, '_syncthing', lambda _cfg: current['proof'])
+    monkeypatch.setattr(cleanup, '_bridge_inactive', lambda _path: True)
+    options = cleanup.retirement_options(cfg, old_options['artifact_root'], old_options['hot_root'],
+        old_options['state_root'], old_options['activation_root'], allow_audit_during_idle_scan=True)
+    options.update(repo_root=old_options['repo_root'], manual_capture=False)
+    assert timeouts == [0]
+    resumed = retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+    assert 'cold-peer-not-converged' in resumed['blockers']
+    with pytest.raises(retirement.LegacyQuarantineTransportPending):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+            owned_verified_plan=resumed, defer_quarantine_transport=True, **options)
+    assert (quarantine/'source/checkpoint.pt').read_bytes() == original
+    assert json.loads(state_path.read_text())['state'] == 'retiring'
+    current['proof'] = healthy
+    result = retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+        owned_verified_plan=resumed, defer_quarantine_transport=True, **options)
+    assert result['deleted'] and result['resumed_quarantine']
+    assert not source.exists() and not hot.exists() and not quarantine.exists()
+
+
 @pytest.mark.parametrize('problem', [None, 'wait-failed', 'transport-changed',
                                    'expired-before', 'expired-during', 'consumer', 'source'])
 def test_scan_wait_keeps_original_full_audit_and_all_final_gates(tmp_path, monkeypatch, problem):
@@ -2023,6 +2257,115 @@ def test_scan_wait_keeps_original_full_audit_and_all_final_gates(tmp_path, monke
             assert result['deleted'] is True and not source.exists() and not hot.exists()
             assert plan['full_verification']['verified_at_epoch'] == verified_at
     assert bool(waits) is (problem not in ('consumer', 'expired-before'))
+
+
+@pytest.mark.parametrize('outcome', ['cleared', 'persistent', 'changed-source', 'other-blocker'])
+def test_transient_reader_wait_rechecks_full_owned_retirement_gates(tmp_path, monkeypatch, outcome):
+    import fcntl
+    from scripts import retire_local_offline_artifacts as cleanup
+    import stockagent.data_sync.legacy_artifact_retirement as retirement
+    from test_legacy_artifact_retirement import _fixture
+
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    plan['blockers'].append('artifact-has-process-references')
+    if outcome == 'other-blocker':
+        plan['blockers'].append('artifact-release-is-pinned')
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', lambda *args: {'ok': True})
+    waited = []
+
+    def wait(spec_arg, options_arg):
+        with cleanup.COMMON_OWNER.open('a') as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert spec_arg is spec and options_arg is options
+        waited.append(True)
+        if outcome == 'changed-source':
+            (source / 'checkpoint.pt').write_bytes(b'changed while the reader was leaving')
+        return outcome != 'persistent'
+
+    monkeypatch.setattr(cleanup, '_wait_for_artifact_process_references', wait)
+    if outcome == 'cleared':
+        result = cleanup.retire_after_convergence(spec, None, target, plan, options)
+        assert result['deleted'] and not source.exists() and not hot.exists()
+    else:
+        with pytest.raises(SnapshotError):
+            cleanup.retire_after_convergence(spec, None, target, plan, options)
+        assert source.exists() and hot.exists()
+    assert bool(waited) is (outcome != 'other-blocker')
+    if waited:
+        receipt = json.loads((target / 'retirement-process-wait.json').read_bytes())
+        assert receipt['references_cleared'] is (outcome != 'persistent')
+        assert receipt['proof_time_extended'] is False
+
+
+def test_process_reference_wait_checks_source_and_hot_and_is_bounded(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import retire_local_offline_artifacts as cleanup
+    root = tmp_path / 'artifacts'
+    source = root / 'markets/example'
+    source.mkdir(parents=True)
+    hot_root = tmp_path / 'hot'
+    hot = hot_root / 'markets/example'
+    hot.mkdir(parents=True)
+    clock = {'value': 0.0}
+    monkeypatch.setattr(cleanup.time, 'monotonic', lambda: clock['value'])
+    monkeypatch.setattr(cleanup.time, 'sleep', lambda seconds: clock.update(value=clock['value'] + seconds))
+    monkeypatch.setattr(cleanup, 'artifact_process_references', lambda src, scope: [])
+    monkeypatch.setattr(cleanup, 'process_references', lambda path: ['pid=7:fd'] if path == hot else [])
+    spec = SimpleNamespace(relative_root='markets/example', capture_contract=None)
+    options = {'artifact_root': root, 'hot_root': hot_root}
+    assert not cleanup._wait_for_artifact_process_references(spec, options, seconds=5)
+    assert clock['value'] == 5
+    monkeypatch.setattr(cleanup, 'process_references', lambda path: [])
+    assert cleanup._wait_for_artifact_process_references(spec, options, seconds=5)
+
+
+@pytest.mark.parametrize('combined', [False, True])
+def test_reader_appearing_in_final_preflight_retries_only_before_mutation(
+        tmp_path, monkeypatch, combined):
+    from types import SimpleNamespace
+    import fcntl
+    from scripts import retire_local_offline_artifacts as cleanup
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    verified_at = time.time()
+    plan = {'blockers': [], 'plan_fingerprint': 'a' * 64,
+            'full_verification': {'verified_at_epoch': verified_at}}
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', lambda *args: {'ok': True})
+    applies, waits = [], []
+
+    def apply(spec, **options):
+        applies.append(True)
+        if len(applies) == 1:
+            suffix = ', artifact-release-is-pinned' if combined else ''
+            raise SnapshotError('legacy retirement blocked: artifact-has-process-references' + suffix)
+        return {'deleted': True}
+
+    def wait(spec, options):
+        with cleanup.COMMON_OWNER.open('a') as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        waits.append(True)
+        return True
+
+    monkeypatch.setattr(cleanup, 'apply_legacy_retirement', apply)
+    monkeypatch.setattr(cleanup, '_wait_for_artifact_process_references', wait)
+    call = lambda: cleanup.retire_after_convergence(
+        SimpleNamespace(relative_root='markets/example'), None, target, plan, {})
+    if combined:
+        with pytest.raises(SnapshotError, match='artifact-release-is-pinned'):
+            call()
+        assert len(applies) == 1 and not waits
+    else:
+        assert call() == {'deleted': True}
+        assert len(applies) == 2 and waits == [True]
+        journal = list(target.glob('transport-preflight-retry-*.json'))
+        assert len(journal) == 1
+        assert json.loads(journal[0].read_bytes())['state'] == 'retry_process_preflight_without_mutation'
 
 
 @pytest.mark.parametrize('outcome', ['success', 'exhausted', 'expired', 'unlink', 'combined', 'source'])

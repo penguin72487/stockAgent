@@ -57,6 +57,7 @@ from stockagent.backtest.return_metrics import (
     clean_log_returns_torch,
 )
 from stockagent.backtest.report import (
+    TRADING_SESSION_EQUITY_DISPLAY_CONTRACT,
     _aligned_dated_backtest_rows,
     reporting_weight_history,
     compute_metrics,
@@ -3223,6 +3224,7 @@ def _mode_artifact_contract_for_config(
 
     mode = normalize_execution_mode(config.trading.execution_mode)
     payload = canonical_mode_artifact_contract(mode)
+    payload["equity_display_contract"] = TRADING_SESSION_EQUITY_DISPLAY_CONTRACT
     if mode == "tw_day_trade":
         payload["mode_details"] = _benchmark_reporting_details(config)
     if (mode == "tw_stock_context_futures_portfolio"
@@ -3265,6 +3267,7 @@ def _mode_artifact_contract_for_config(
             manifest_path = None if entry_path is None else Path(entry_path).with_name("manifest.json")
             clock = {"decision_time": decision_time}
             metadata_sha256 = None
+            entry_manifest = None
             if manifest_path is not None and manifest_path.is_file():
                 manifest_bytes = manifest_path.read_bytes()
                 manifest = json.loads(manifest_bytes)
@@ -3272,6 +3275,7 @@ def _mode_artifact_contract_for_config(
                     clock = clock_contract_from_manifest(manifest, decision_time)
                 except ValueError as exc:
                     raise ValueError("futures report entry clock manifest is incomplete or incompatible") from exc
+                entry_manifest = manifest
                 metadata_sha256 = hashlib.sha256(manifest_bytes).hexdigest()
                 minutes = clock.get("window_minutes", 1)
                 execution_clock = (f"post_decision_minute_vwap_label_{clock['window_end_minute']}"
@@ -3289,12 +3293,28 @@ def _mode_artifact_contract_for_config(
                 entry_clock_manifest_sha256=metadata_sha256,
                 risk_clock="entry_proxy_boundary_and_official_settlement_not_intraday_broker_replay")
             if config.trading.tw_futures_portfolio_opening_reference_path is not None:
-                from stockagent.data.tw_futures_decision_clock import opening_reference_contract
+                from downloader.artifact_io import sha256_file
+                from stockagent.data.tw_futures_decision_clock import opening_reference_contract_from_manifest
+                reference_path = Path(config.trading.tw_futures_portfolio_opening_reference_path)
+                reference_manifest_path = reference_path.with_name("opening_reference_manifest.json")
+                reference_details = {"source_path": str(reference_path), "source_metadata": "unavailable"}
+                if reference_manifest_path.is_file():
+                    reference_bytes = reference_manifest_path.read_bytes()
+                    reference_manifest = json.loads(reference_bytes)
+                    reference_contract = opening_reference_contract_from_manifest(reference_manifest, decision_time)
+                    pair = reference_manifest.get('pair_identity')
+                    daily = reference_manifest.get('source_daily_sha256')
+                    if (not isinstance(pair, str) or not pair or not isinstance(daily, str) or len(daily) != 64
+                            or not reference_path.is_file()
+                            or reference_manifest.get('data_sha256') != sha256_file(reference_path)
+                            or (entry_manifest is not None and (
+                                reference_manifest.get('pair_identity') != entry_manifest.get('pair_identity')
+                                or reference_manifest.get('source_daily_sha256') != entry_manifest.get('source_daily_sha256')))):
+                        raise ValueError('futures report opening reference differs from its paired source')
+                    reference_details = {**reference_contract, 'source_path': str(reference_path),
+                        'manifest_sha256': hashlib.sha256(reference_bytes).hexdigest()}
                 payload["decision_clock"] = f"{clock['decision_time']}_prior_features_and_causal_opening_reference"
-                payload["mode_details"]["opening_reference"] = {
-                    **opening_reference_contract(clock["decision_time"]),
-                    "source_path": config.trading.tw_futures_portfolio_opening_reference_path,
-                }
+                payload["mode_details"]["opening_reference"] = reference_details
         return payload
     if (mode == "tw_stock_context_futures_portfolio"
             and config.trading.tw_futures_portfolio_holding_policy == "intraday"):
@@ -3496,6 +3516,13 @@ def _mode_artifact_contract_for_config(
                 ),
                 "minute_execution_contract_version": DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION,
                 "regular_market_admission": regular_market_admission_contract(),
+                **({"short_limit_up_close_penalty": {
+                    "contract": "official_limit_up_close_source_residual_short_expense_v1",
+                    "rate": float(config.trading.tw_day_trade_short_limit_up_penalty_rate),
+                    "base": "uncovered_short_shares_times_official_close",
+                    "assessment": "after_source_capacity_before_synthetic_terminal_liquidation",
+                    "research_only": True,
+                }} if config.trading.tw_day_trade_short_limit_up_penalty_rate else {}),
                 "daily_policy_decisions_per_session": 1,
                 "daily_proxy_allowed": bool(
                     config.data.day_trade_minute_execution_allow_daily_proxy
@@ -6095,6 +6122,22 @@ def _store_training_transform_cache(
         temporary.unlink(missing_ok=True)
 
 
+def _training_feature_history(panel: PanelData | None, train_ds: CrossSectionalDataset):
+    """Bind account indices to the full causal feature axis, when present."""
+    offset = int(getattr(train_ds, "feature_row_offset", 0))
+    history = getattr(panel, "feature_history", None) if panel is not None else None
+    if offset:
+        from stockagent.data.futures_feature_history import FuturesFeatureHistory
+
+        if (not isinstance(history, FuturesFeatureHistory)
+                or history.prefix_rows != offset or panel is None):
+            raise ValueError("training transform requires the bound feature history")
+        history.verify(panel)
+    elif history is not None:
+        raise ValueError("training transform cannot ignore bound feature history")
+    return history, offset
+
+
 def _fit_group_temporal_basis(
     *,
     config: ExperimentConfig,
@@ -6178,6 +6221,7 @@ def _fit_group_temporal_basis(
         lookback, int(config.training.temporal_basis_covariance_lag_batch_size)
     )
     covariance_cpu_threads = config.training.temporal_basis_covariance_cpu_threads
+    feature_history, feature_row_offset = _training_feature_history(panel, train_ds)
 
     payload: dict[str, Any] | None = None
     cache_key = _training_transform_cache_key(
@@ -6196,6 +6240,8 @@ def _fit_group_temporal_basis(
             "lookback": int(lookback),
             "feature_lag": int(execution_feature_lag(train_ds.execution_mode)),
             "uses_pca": bool(uses_pca),
+            **({"feature_history": feature_history.fingerprint()}
+               if feature_history is not None else {}),
             **({"covariance_lag_batch_size": covariance_lag_batch_size}
                if uses_pca and covariance_lag_batch_size > 1 else {}),
             "train_years": [int(year) for year in train_years],
@@ -6232,7 +6278,7 @@ def _fit_group_temporal_basis(
                 )
                 pca_fit = fit_training_only_pca_klt(
                     train_ds.features_t,
-                    train_ds.valid_indices,
+                    np.asarray(train_ds.valid_indices, dtype=np.int64) + feature_row_offset,
                     lookback=lookback,
                     feature_lag=execution_feature_lag(train_ds.execution_mode),
                     components=int(
@@ -6426,11 +6472,21 @@ def _fit_group_causal_feature_rms(
     if valid_indices.size == 0:
         raise ValueError("causal feature RMS normalization requires training rows")
     feature_lag = int(execution_feature_lag(train_ds.execution_mode))
+    feature_history, feature_row_offset = _training_feature_history(panel, train_ds)
+    if feature_row_offset:
+        from stockagent.data.futures_feature_history import CONTRACT as FUTURES_FEATURE_HISTORY_CONTRACT
+        fit_features = feature_history.features
+        fit_alive_mask = feature_history.alive_mask
+        fit_dates = feature_history.dates
+        history_cache_contract = {"feature_history": feature_history.fingerprint()}
+    else:
+        fit_features, fit_alive_mask, fit_dates = panel.features, panel.alive_mask, panel.dates
+        history_cache_contract = {}
     row_start = max(
         0,
-        int(valid_indices.min()) - feature_lag - int(train_ds.lookback) + 1,
+        int(valid_indices.min()) + feature_row_offset - feature_lag - int(train_ds.lookback) + 1,
     )
-    row_end = int(valid_indices.max()) - feature_lag
+    row_end = int(valid_indices.max()) + feature_row_offset - feature_lag
     if row_end < row_start:
         raise ValueError("causal feature RMS training window is empty")
     feature_count = len(panel.feature_names)
@@ -6442,6 +6498,7 @@ def _fit_group_causal_feature_rms(
         contract={
             "schema_version": 2 if window_rms else 1,
             **({"window_rms": True} if window_rms else {}),
+            **history_cache_contract,
             "feature_row_start": int(row_start),
             "feature_row_end_inclusive": int(row_end),
             "feature_lag": int(feature_lag),
@@ -6471,7 +6528,7 @@ def _fit_group_causal_feature_rms(
             return
         started = time.perf_counter()
         scale, active, active_date_count, alive_cell_count = _fit_masked_training_feature_rms(
-            panel.features, panel.alive_mask,
+            fit_features, fit_alive_mask,
             np.arange(row_start, row_end + 1, dtype=np.int64),
             epsilon=epsilon, minimum_dates=minimum_dates, window_rms=window_rms,
         )
@@ -6507,10 +6564,10 @@ def _fit_group_causal_feature_rms(
             "feature_row_start": int(row_start),
             "feature_row_end_inclusive": int(row_end),
             "feature_date_start": str(
-                np.asarray(panel.dates[row_start], dtype="datetime64[D]")
+                np.asarray(fit_dates[row_start], dtype="datetime64[D]")
             ),
             "feature_date_end": str(
-                np.asarray(panel.dates[row_end], dtype="datetime64[D]")
+                np.asarray(fit_dates[row_end], dtype="datetime64[D]")
             ),
             "feature_lag": feature_lag,
             "lookback": int(train_ds.lookback),
@@ -6530,6 +6587,9 @@ def _fit_group_causal_feature_rms(
                 for index, name in enumerate(panel.feature_names)
             ],
         }
+        if feature_row_offset:
+            metadata["feature_history_contract"] = FUTURES_FEATURE_HISTORY_CONTRACT
+            metadata["feature_row_offset"] = feature_row_offset
         metadata["normalizer_fingerprint"] = _stable_fingerprint(metadata)
         payload = {
             "scale": scale.tolist(),
@@ -6614,6 +6674,10 @@ def _fit_group_feature_svd(
     from stockagent.models.feature_svd import CONTRACT, fit_training_feature_svd
 
     scale, active, rms_metadata = causal_feature_rms
+    feature_history, feature_row_offset = _training_feature_history(panel, train_ds)
+    fit_features = feature_history.features if feature_history is not None else panel.features
+    fit_alive_mask = feature_history.alive_mask if feature_history is not None else panel.alive_mask
+    fit_dates = feature_history.dates if feature_history is not None else panel.dates
     contract = {
         "contract": CONTRACT,
         "components": int(model_config.feature_svd_components),
@@ -6626,6 +6690,8 @@ def _fit_group_feature_svd(
         "fold_ids": [fold.fold_id for fold in group_folds],
         "lookback": int(train_ds.lookback),
         "feature_lag": int(execution_feature_lag(train_ds.execution_mode)),
+        **({"feature_history": feature_history.fingerprint()}
+           if feature_history is not None else {}),
     }
     cache_key = _training_transform_cache_key(kind="feature_svd", panel=panel,
         train_ds=train_ds, contract=contract, include_alive_mask=True)
@@ -6645,8 +6711,8 @@ def _fit_group_feature_svd(
     if payload is None:
         # Every rank owns a disjoint set of training input dates. Each operator
         # pass reduces only a small F x sketch-width buffer, not the raw panel.
-        fitted = fit_training_feature_svd(panel.features, panel.alive_mask,
-            train_ds.valid_indices, lookback=train_ds.lookback,
+        fitted = fit_training_feature_svd(fit_features, fit_alive_mask,
+            np.asarray(train_ds.valid_indices, dtype=np.int64) + feature_row_offset, lookback=train_ds.lookback,
             feature_lag=contract["feature_lag"], scale=scale, active_mask=active,
             components=contract["components"], analysis_components=contract["analysis_components"],
             oversampling=contract["oversampling"], power_iterations=contract["power_iterations"],
@@ -6654,8 +6720,8 @@ def _fit_group_feature_svd(
             progress=lambda value: print(f"[feature SVD] {json.dumps(value)}", flush=True))
         if _distributed_should_write():
             metadata = {**fitted.metadata, **contract,
-                "feature_date_start": str(np.asarray(panel.dates[fitted.metadata["training_source_min"]], dtype="datetime64[D]")),
-                "feature_date_end": str(np.asarray(panel.dates[fitted.metadata["training_source_max"]], dtype="datetime64[D]")),
+                "feature_date_start": str(np.asarray(fit_dates[fitted.metadata["training_source_min"]], dtype="datetime64[D]")),
+                "feature_date_end": str(np.asarray(fit_dates[fitted.metadata["training_source_max"]], dtype="datetime64[D]")),
                 "feature_names": [str(name) for name in panel.feature_names],
             }
             metadata["projection_fingerprint"] = _stable_fingerprint({
@@ -8695,6 +8761,7 @@ def _feature_slab_from_metadata(
     date_start = int(date_start_tensor.reshape(-1)[0].detach().cpu().item())
     feature_start = (
         date_start
+        + int(split.feature_row_offset)
         - execution_feature_lag(split.execution_mode)
         - int(split.lookback)
         + 1
@@ -11427,13 +11494,16 @@ def _save_stock_context_tx_rolling_benchmark_audit(
         raise ValueError("reported TX benchmark differs from verified front-month roll path")
     np.savez_compressed(
         output_path,
-        artifact_schema_version=np.asarray(1, dtype=np.int64),
+        artifact_schema_version=np.asarray(2, dtype=np.int64),
         benchmark_name=np.asarray("TX front-month rolling buy-and-hold", dtype="U64"),
         benchmark_contract=np.asarray(
             "1x_long_front_month_gross_roll_at_preceding_close_v1", dtype="U96"
         ),
         roll_gap_treatment=np.asarray("same_contract_close_to_close", dtype="U64"),
         cost_treatment=np.asarray("gross_no_fees_or_tax", dtype="U32"),
+        calendar_coverage_contract=np.asarray(
+            "panel_market_dates_match_tx_source_sessions_within_horizon_v1", dtype="U96"
+        ),
         reference_product=np.asarray("TX", dtype="U8"),
         **payload,
         benchmark_simple_returns=np.expm1(expected),
@@ -14134,7 +14204,9 @@ def _split_valid_indices(
         return indices
     context = normalize_lookback_context(lookback_context)
     history_origin = 0 if context == "panel_history" else int(indices[0])
-    min_valid_idx = history_origin + int(lookback) - 1 + execution_feature_lag(execution_mode)
+    history = getattr(panel, "feature_history", None)
+    history_offset = int(history.prefix_rows) if context == "panel_history" and history is not None else 0
+    min_valid_idx = history_origin + int(lookback) - 1 + execution_feature_lag(execution_mode) - history_offset
     valid_indices = indices[indices >= min_valid_idx]
     if valid_indices.size > 0 and normalize_execution_mode(execution_mode) == "naive":
         target_mask = panel.tradable_mask & np.isfinite(panel.returns_1d)
@@ -15375,6 +15447,8 @@ def _combine_datasets_to_windowed(
         split = dataset_to_windowed_tensors(dataset)
         if split.lookback != first.lookback:
             raise ValueError("all windowed datasets must use the same lookback")
+        if split.feature_row_offset != first.feature_row_offset:
+            raise ValueError("all windowed datasets must use the same feature history offset")
         if split.execution_mode != first.execution_mode:
             raise ValueError("all windowed datasets must use the same execution_mode")
         if split.futures_account_source_fingerprint != first.futures_account_source_fingerprint:
@@ -15395,6 +15469,7 @@ def _combine_datasets_to_windowed(
         can_sell_mask=first.can_sell_mask,
         benchmark=first.benchmark,
         lookback=first.lookback,
+        feature_row_offset=first.feature_row_offset,
         volume_notional=first.volume_notional,
         short_capacity_shares=first.short_capacity_shares,
         short_margin_rate=first.short_margin_rate,
@@ -15441,6 +15516,7 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
             can_sell_mask=split.can_sell_mask,
             benchmark=split.benchmark,
             lookback=split.lookback,
+            feature_row_offset=split.feature_row_offset,
             volume_notional=split.volume_notional,
             short_capacity_shares=split.short_capacity_shares,
             short_margin_rate=split.short_margin_rate,
@@ -15500,6 +15576,7 @@ def _pad_windowed_training_split(split: WindowedSplitTensors, batch_size: int) -
         can_sell_mask=split.can_sell_mask,
         benchmark=split.benchmark,
         lookback=split.lookback,
+        feature_row_offset=split.feature_row_offset,
         volume_notional=split.volume_notional,
         short_capacity_shares=split.short_capacity_shares,
         short_margin_rate=split.short_margin_rate,
@@ -15599,6 +15676,7 @@ def _densify_windowed_training_split_for_panel_slab(
         can_sell_mask=split.can_sell_mask,
         benchmark=split.benchmark,
         lookback=split.lookback,
+        feature_row_offset=split.feature_row_offset,
         volume_notional=split.volume_notional,
         short_capacity_shares=split.short_capacity_shares,
         short_margin_rate=split.short_margin_rate,
@@ -15893,6 +15971,7 @@ def _prepare_windowed_split(
             can_sell_mask=shared_base.can_sell_mask,
             benchmark=shared_base.benchmark,
             lookback=split.lookback,
+            feature_row_offset=split.feature_row_offset,
             volume_notional=shared_base.volume_notional,
             short_capacity_shares=shared_base.short_capacity_shares,
             short_margin_rate=shared_base.short_margin_rate,
@@ -15955,6 +16034,7 @@ def _prepare_windowed_split(
         can_sell_mask=_prepare_host_tensor(split.can_sell_mask, pin_memory),
         benchmark=_prepare_host_tensor(split.benchmark, pin_memory),
         lookback=split.lookback,
+        feature_row_offset=split.feature_row_offset,
         volume_notional=(
             None if split.volume_notional is None else _prepare_host_tensor(split.volume_notional, pin_memory)
         ),
@@ -16092,6 +16172,7 @@ def _with_windowed_base(
         benchmark=base_tensors[9],
         volume_notional=base_tensors[10],
         lookback=split.lookback,
+        feature_row_offset=split.feature_row_offset,
         sample_mask=split.sample_mask,
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
@@ -16136,6 +16217,7 @@ def _with_windowed_metadata(
         benchmark=split.benchmark,
         volume_notional=split.volume_notional,
         lookback=split.lookback,
+        feature_row_offset=split.feature_row_offset,
         sample_mask=None if split.sample_mask is None else metadata_tensors[1],
         symbol_indices=split.symbol_indices,
         execution_mode=split.execution_mode,
@@ -16243,7 +16325,8 @@ def _windowed_base_compatible(a: WindowedSplitTensors, b: WindowedSplitTensors) 
     a.assert_futures_execution_unmodified()
     b.assert_futures_execution_unmodified()
     if (a.futures_account_source_fingerprint != b.futures_account_source_fingerprint
-            or a.futures_execution_release_fingerprint != b.futures_execution_release_fingerprint):
+            or a.futures_execution_release_fingerprint != b.futures_execution_release_fingerprint
+            or a.feature_row_offset != b.feature_row_offset):
         return False
     attrs = (
         "features",
@@ -16340,6 +16423,7 @@ def _maybe_share_windowed_base_from_cached(
         benchmark=cached_base.benchmark,
         volume_notional=cached_base.volume_notional,
         lookback=split.lookback,
+        feature_row_offset=split.feature_row_offset,
         sample_mask=sample_mask,
         symbol_indices=cached_base.symbol_indices,
         execution_mode=split.execution_mode,
@@ -20275,6 +20359,7 @@ def _replay_taiwan_stitched_deployment(
     coverage = {
         "report_contract": ("contiguous_completed_fold_prefix_dated_futures_v1"
                             if dated_source is not None else "contiguous_completed_fold_prefix_v1"),
+        "equity_display_contract": TRADING_SESSION_EQUITY_DISPLAY_CONTRACT,
         "state": (
             "awaiting_intervening_folds" if deferred_fold_ids
             else "contiguous_available_folds"
@@ -28951,7 +29036,10 @@ def _run_training_impl(
         )
 
         early_stop_ratio = max(0.0, float(config.training.early_stopping_no_improve_ratio))
-        early_stop_patience = int(np.ceil(config.training.epochs * early_stop_ratio))
+        early_stop_patience = int(np.ceil(
+            (config.training.early_stopping_reference_epochs or config.training.epochs)
+            * early_stop_ratio
+        ))
         early_stop_min_delta = max(0.0, float(getattr(config.training, "early_stopping_min_delta", 0.0)))
         best_checkpoint_max_epoch = max(0, int(getattr(config.training, "best_checkpoint_max_epoch", 0)))
         val_interval = max(1, int(config.training.val_interval_epochs))

@@ -2,6 +2,9 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import subprocess
+import sys
+import threading
 from types import SimpleNamespace
 
 import pytest
@@ -152,11 +155,34 @@ def test_native_io_uses_binary_filestream_not_9p_copy():
     assert '[Math]::Min([long]$buffer.Length, [long]($offset - $total))' in code
 
 
-def test_only_enrolled_backup_transport_maps_to_windows(monkeypatch):
+def test_nested_batch_metadata_does_not_pass_through_windows_environment():
+    # A legitimate 160-extent original needs over 32,767 characters when its
+    # metadata is base64 encoded. Pass the parsed object into a fresh scope;
+    # command length stays fixed and no nested fields are serialized again.
+    chunks = [{'path': 'D:\\stockagent-cold-primary\\' + 'a' * 150,
+               'sha256': 'b' * 64, 'bytes': 1} for _ in range(160)]
+    configs = [{'path': chunks[0]['path'], 'mode': 'hash-chunks',
+                'expected_bytes': 160, 'chunks': chunks}]
+    import base64
+    assert len(base64.b64encode(json.dumps(configs[0]).encode())) > 32767
+    command = native._native_command(configs, batched=True)
+    assert command == native._native_command([], batched=True)
+    assert '& { param($stockagentBinaryBatchConfig)' in command
+    assert '$config = $stockagentBinaryBatchConfig' in command
+    assert '$env:STOCKAGENT_BINARY_IO_CONFIG =' not in command
+    assert 'ConvertTo-Json -Compress -Depth' not in command
+    standalone = native._native_command([{'path': 'D:\\stockagent-cold-primary\\one', 'mode': 'hash'}])
+    assert "$env:STOCKAGENT_BINARY_IO_CONFIG='" in standalone
+
+
+@pytest.mark.parametrize('on_e', [False, True])
+def test_only_enrolled_backup_transport_maps_to_windows(monkeypatch, on_e):
+    from stockagent.data_sync import transport_placement
     monkeypatch.setattr(Path, 'resolve', lambda self: self)
     monkeypatch.setattr(Path, 'is_symlink', lambda self: False)
-    assert native.windows_path(Path('/srv/stockagent-backup-ingress-lab203/.staging/fixed/member')) == (
-        'D:\\stockagent-backup-ingress-lab203\\.staging\\fixed\\member')
+    monkeypatch.setattr(transport_placement, 'on_e', lambda: on_e)
+    expected = None if on_e else 'D:\\stockagent-backup-ingress-lab203\\.staging\\fixed\\member'
+    assert native.windows_path(Path('/srv/stockagent-backup-ingress-lab203/.staging/fixed/member')) == expected
     assert native.windows_path(Path('/srv/unrelated-backup/member')) is None
 
 
@@ -205,7 +231,28 @@ def test_windows_stage_namespace_guard_also_requires_read_mode():
     assert "$completedStageRead = $config.mode -eq 'read' -and" in guard
     assert "D:\\stockagent-completed-benchmark-scratch\\" in guard
     assert "D:\\stockagent-completed-offline-scratch\\" in guard
-    assert '!$completedStageRead' in guard and '$path -ne [string]$config.path' in guard
+    assert "D:\\stockagent-legacy-archive-stage\\" in guard
+    assert '!$completedStageRead' in guard and '!$retiredEncodingHash' in guard
+    assert "$retiredEncodingHash = $config.mode -eq 'hash' -and" in guard
+    assert '$path -ne [string]$config.path' in guard
+
+
+@pytest.mark.parametrize('admitted', [False, True])
+@pytest.mark.parametrize('mode', ['read', 'write', 'hash'])
+def test_native_legacy_encoding_requires_reviewed_dataset_and_read_only_mode(monkeypatch, admitted, mode):
+    from stockagent.data_sync import cold_primary, packed_backup, legacy_artifact_archive as archive
+    path = Path('/srv/stockagent-d-volume/stockagent-legacy-archive-stage/fixed/archive/payload/test.gz')
+    monkeypatch.setattr(Path, 'resolve', lambda self: self)
+    monkeypatch.setattr(Path, 'is_symlink', lambda self: False)
+    monkeypatch.setattr(Path, 'stat', lambda self: SimpleNamespace(st_dev=7))
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda root: None)
+    monkeypatch.setattr(packed_backup, 'mounted_volume', lambda root: (None, None, 'D:'))
+    monkeypatch.setattr(archive, 'reviewed_retired_stage_path', lambda p: admitted)
+    if admitted and mode in {'read', 'hash'}:
+        assert native._configuration(path, mode=mode, expected_bytes=5)['mode'] == mode
+    else:
+        with pytest.raises(SnapshotError, match='read-only|exact reviewed'):
+            native._configuration(path, mode=mode, expected_bytes=5)
 
 
 @pytest.mark.parametrize('count',[1,2])
@@ -227,6 +274,38 @@ def test_measured_mid_size_copy_uses_native_batch_or_single_tail_without_changin
     assert calls==[('single',1)] if count==1 else calls==[('batch',2)]
     for p,d,s,n in members:
         assert p.read_bytes()==d.read_bytes()==data and hashlib.sha256(d.read_bytes()).hexdigest()==sha
+
+
+@pytest.mark.parametrize('reserve', [True, '34359738368', 0, 32*1024**3-1, 65*1024**3])
+def test_native_backup_copy_rejects_invalid_reserve_before_any_io(monkeypatch, reserve):
+    monkeypatch.setattr(native, '_batch', lambda *a, **k: pytest.fail('must not start native process'))
+    with pytest.raises(SnapshotError, match='32 GiB writer floor'):
+        native.copy_many([], reserve_bytes=reserve)
+    with pytest.raises(SnapshotError, match='32 GiB writer floor'):
+        native.copy_verified(Path('/missing'), Path('/target'), expected_sha256='a'*64,
+                             expected_bytes=1, reserve_bytes=reserve)
+
+
+@pytest.mark.parametrize('reserve', [None, 32*1024**3])
+def test_closed_private_export_forwards_exact_copy_reserve_without_changing_bytes(tmp_path, monkeypatch, reserve):
+    from stockagent.data_sync import offhost_backup
+    source, destination = tmp_path/'source', tmp_path/'target'
+    value = b'original cold bytes -3.5'
+    source.write_bytes(value)
+    sha = hashlib.sha256(value).hexdigest()
+    monkeypatch.setattr(native, 'windows_path', lambda p: 'D:\\stockagent-cold-primary\\fixed'
+        if p == source else 'D:\\stockagent-backup-ingress-lab203\\.staging\\fixed')
+    calls = []
+    def copy(members, **kwargs):
+        calls.append(kwargs)
+        for s, d, digest, count in members:
+            assert hashlib.sha256(s.read_bytes()).hexdigest() == digest and s.stat().st_size == count
+            d.write_bytes(s.read_bytes())
+    monkeypatch.setattr(native, 'copy_many', copy)
+    offhost_backup.copy_verified_many([(source, destination, sha, len(value))],
+        native_windows_io=True, **({} if reserve is None else {'native_reserve_bytes': reserve}))
+    assert calls == ([{}] if reserve is None else [{'reserve_bytes': reserve}])
+    assert source.read_bytes() == destination.read_bytes() == value
 
 
 @pytest.mark.parametrize('damage', ['changed_source', 'wrong_sha', 'copy_failure'])
@@ -311,6 +390,35 @@ def test_native_hash_batch_checks_authority_before_and_after_not_per_member(tmp_
         assert native.hash_many(paths) == {path: 'a'*64 for path in paths}
         assert events == ['guard']+['member']*16+['batch', 'guard']
     assert all(path.read_bytes() == b'exact immutable member' for path in paths)
+
+
+@pytest.mark.parametrize('reject_member', [False, True])
+def test_hash_metadata_can_overlap_but_every_path_must_join_before_payload(tmp_path, monkeypatch, reject_member):
+    import threading
+    from stockagent.data_sync import cold_primary
+    paths = [tmp_path / str(index) for index in range(3)]
+    for path in paths:
+        path.write_bytes(b'exact source')
+    barrier = threading.Barrier(3, timeout=5)
+    checked = []
+    def config(path, **options):
+        barrier.wait()
+        if reject_member and path == paths[1]:
+            raise SnapshotError('redirected original member')
+        checked.append(path)
+        return options
+    def batch(configs):
+        assert set(checked) == set(paths)
+        assert not reject_member
+        return [{'bytes': item['expected_bytes'], 'sha256': 'a' * 64} for item in configs]
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda *_: None)
+    monkeypatch.setattr(native, '_configuration_on_checked_mount', config)
+    monkeypatch.setattr(native, '_batch', batch)
+    if reject_member:
+        with pytest.raises(SnapshotError, match='redirected original member'):
+            native.hash_many(paths)
+    else:
+        assert native.hash_many(paths) == {path: 'a' * 64 for path in paths}
 
 
 @pytest.mark.parametrize('failure', [None, 'before', 'after', 'changed', 'short', 'excess',
@@ -411,6 +519,90 @@ def test_native_batch_requires_one_result_for_every_member(monkeypatch):
     monkeypatch.setattr(native, '_await_batch_ready', lambda *a, **k: None)
     with pytest.raises(SnapshotError, match='omitted'):
         native._batch([{'mode': 'hash', 'expected_bytes': 1}] * 2)
+
+
+@pytest.mark.parametrize('mode,count,total_excess,allowed', [
+    ('hash', 128, False, True), ('hash', 129, False, False),
+    ('copy', 17, False, False), ('copy', 16, False, True),
+    ('hash', 128, True, False),
+])
+def test_larger_read_only_batches_keep_write_and_total_byte_bounds(monkeypatch, mode, count, total_excess, allowed):
+    class ReachedProcess(Exception):
+        pass
+    def launch(*_args, **_kwargs):
+        raise ReachedProcess
+    monkeypatch.setattr(native, '_launch', launch)
+    configs = [{'mode': mode, 'expected_bytes': 1024**3 if total_excess else 1}] * count
+    with pytest.raises(ReachedProcess if allowed else SnapshotError):
+        native._batch(configs)
+
+
+def test_full_128_member_result_set_survives_exact_output_count_gate(monkeypatch):
+    row = {'bytes': 1, 'sha256': 'a' * 64, 'io': 'windows-filestream-v1'}
+    class Process:
+        def __init__(self):
+            self.stdout, self.stdin, self.returncode = io.BytesIO(), io.BytesIO(), 0
+        def communicate(self, payload, **_kwargs):
+            assert len(json.loads(payload)) == 128
+            return (json.dumps(row).encode() + b'\n') * 128, None
+        def poll(self):
+            return self.returncode
+    monkeypatch.setattr(native, '_launch', lambda *_args, **_kwargs: (Process(), io.BytesIO()))
+    monkeypatch.setattr(native, '_await_batch_ready', lambda *_args, **_kwargs: None)
+    assert native._batch([{'mode': 'hash', 'expected_bytes': 1}] * 128) == [row] * 128
+
+
+def test_read_only_native_batch_stops_when_failed_peer_cancels(monkeypatch):
+    cancel = threading.Event()
+    class Process:
+        def __init__(self):
+            self.stdout = io.BytesIO()
+            self.stdin = io.BytesIO()
+            self.returncode = None
+            self.terminated = False
+            self.inputs = []
+        def communicate(self, payload, *, timeout):
+            self.inputs.append(payload)
+            cancel.set()
+            raise subprocess.TimeoutExpired('hash-process', timeout)
+        def poll(self):
+            return self.returncode
+        def terminate(self):
+            self.terminated = True
+            self.returncode = -15
+        def wait(self, **kwargs):
+            return self.returncode
+    process = Process()
+    monkeypatch.setattr(native, '_launch', lambda *a, **k: (process, io.BytesIO()))
+    monkeypatch.setattr(native, '_await_batch_ready', lambda *a, **k: None)
+    with pytest.raises(SnapshotError, match='cancelled after peer'):
+        native._batch([{'mode': 'hash', 'expected_bytes': 1}], cancel_event=cancel)
+    assert process.terminated and len(process.inputs) == 1
+    assert process.stdin.closed and process.stdout.closed
+
+
+def test_cancellable_hash_retries_communicate_without_resending_input():
+    process = subprocess.Popen(
+        [sys.executable, '-c',
+         'import sys,time; data=sys.stdin.buffer.readline(); time.sleep(1.1); sys.stdout.buffer.write(data)'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    try:
+        output, _ = native._communicate_cancellable_hash(process, b'one payload\n', threading.Event())
+        assert output == b'one payload\n'
+        assert process.returncode == 0
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait()
+        process.stdin.close()
+        process.stdout.close()
+        process.stderr.close()
+
+
+def test_cancellation_is_never_applied_to_native_writes(monkeypatch):
+    monkeypatch.setattr(native, '_launch', lambda *a, **k: pytest.fail('write must not launch'))
+    with pytest.raises(SnapshotError, match='only for read-only'):
+        native._batch([{'mode': 'copy', 'expected_bytes': 1}], cancel_event=threading.Event())
 
 
 @pytest.mark.parametrize('failure',['startup-once','startup-exhausted','nonempty-failure','copy-startup','other-error'])

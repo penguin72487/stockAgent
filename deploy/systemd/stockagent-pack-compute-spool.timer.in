@@ -1,0 +1,11 @@
+[Unit]
+Description=Continue sealed-pack staging to Vast automatically
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=60s
+AccuracySec=5s
+Unit=stockagent-pack-compute-spool.service
+
+[Install]
+WantedBy=timers.target

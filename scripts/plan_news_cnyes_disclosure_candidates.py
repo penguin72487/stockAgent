@@ -35,10 +35,57 @@ def is_43_1_candidate(title):
     return bool(ARTICLE.search(normalized))
 
 
+def valid_request_scoped_provenance(observations, selected_sha, selected_path, *,
+                                    selected_receipt=None, selected_request=None, require_details=False):
+    """Keep independently captured equal response bytes and clocks distinct."""
+    if (not isinstance(observations, list) or not observations
+            or not isinstance(selected_sha, str) or not SHA256.fullmatch(selected_sha)
+            or not isinstance(selected_path, str)):
+        return False
+    detailed = require_details or selected_receipt is not None or selected_request is not None
+    if detailed and (not isinstance(selected_receipt, str) or not isinstance(selected_request, str)
+                     or not SHA256.fullmatch(selected_request)):
+        return False
+    keys = set()
+    for item in observations:
+        if not isinstance(item, dict):
+            return False
+        sha, path, kind, clock = (item.get('source_response_sha256'), item.get('source_artifact_path'),
+                                  item.get('source_artifact_kind'), item.get('source_observed_at_utc'))
+        receipt, request = item.get('source_receipt_path'), item.get('source_request_sha256')
+        if (not isinstance(sha, str) or not SHA256.fullmatch(sha) or not isinstance(path, str)
+                or Path(path).is_absolute() or '..' in Path(path).parts or not isinstance(clock, str)
+                or not (kind == 'canonical_quarantine' and path == f'quarantine/{sha}.parquet'
+                        or kind == 'cnyes_history_source_envelope'
+                        and path.startswith('discovery_responses/') and path.endswith('.parquet')
+                        or detailed and kind == 'accepted_body_batch'
+                        and path.startswith('bodies/') and path.endswith('.parquet'))):
+            return False
+        if detailed and (not isinstance(receipt, str) or Path(receipt).is_absolute()
+                or '..' in Path(receipt).parts or not isinstance(request, str) or not SHA256.fullmatch(request)
+                or kind == 'accepted_body_batch' and not (receipt.startswith('receipts/') and receipt.endswith('.json'))
+                or kind != 'accepted_body_batch' and receipt != path + '.receipt.json'):
+            return False
+        try:
+            if datetime.fromisoformat(clock).tzinfo is None:
+                return False
+        except ValueError:
+            return False
+        key = (sha, path, kind, receipt, request) if detailed else (sha, path, kind)
+        if key in keys:
+            return False
+        keys.add(key)
+    return any(key[0] == selected_sha and key[1] == selected_path
+               and (not detailed or key[3:] == (selected_receipt, selected_request)) for key in keys)
+
+
 def plan(report, prior):
     rows, counts = report.get('rows'), report.get('counts', {})
     inputs = report.get('input_audit_sha256')
-    if (report.get('contract') != 'cnyes_finlab_issuer_overlap_v1' or report.get('accepted') is not True
+    contract = report.get('contract')
+    if (contract not in {'cnyes_finlab_issuer_overlap_v1', 'cnyes_finlab_issuer_overlap_v2',
+                         'cnyes_finlab_issuer_overlap_v3'}
+            or report.get('accepted') is not True
             or report.get('source_failures') != [] or counts.get('source_envelopes_failed') != 0
             or counts.get('changed_head_pairs', 0) or counts.get('unverified_post_identities') != 0
             or not isinstance(rows, list) or len(rows) != counts.get('novel_post_identities')
@@ -66,11 +113,19 @@ def plan(report, prior):
         news_id, sha = row['news_id'], row.get('source_post_sha256')
         observations, selected = row.get('source_observations'), row.get('selected_response_sha256')
         epoch, day, symbol = row.get('source_publish_epoch'), row.get('publisher_day_taipei'), row.get('symbol_candidate')
+        if contract == 'cnyes_finlab_issuer_overlap_v1':
+            provenance_valid = (isinstance(observations, dict) and bool(observations)
+                and isinstance(selected, str) and selected in observations
+                and all(isinstance(k, str) and SHA256.fullmatch(k) and isinstance(v, str)
+                        for k, v in observations.items()))
+        else:
+            provenance_valid = valid_request_scoped_provenance(
+                observations, selected, row.get('selected_source_artifact_path'),
+                **({'selected_receipt': row.get('selected_source_receipt_path'),
+                    'selected_request': row.get('selected_source_request_sha256'), 'require_details': True}
+                   if contract == 'cnyes_finlab_issuer_overlap_v3' else {}))
         if (not isinstance(sha, str) or not SHA256.fullmatch(sha)
-                or not isinstance(observations, dict) or not observations
-                or not isinstance(selected, str) or selected not in observations
-                or any(not isinstance(k, str) or not SHA256.fullmatch(k) or not isinstance(v, str)
-                       for k, v in observations.items())
+                or not provenance_valid
                 or type(epoch) is not int or not isinstance(day, str) or not isinstance(symbol, str) or not symbol
                 or row.get('local_record_candidates') != []):
             raise ValueError('invalid_candidate_provenance')
@@ -83,15 +138,23 @@ def plan(report, prior):
         if news_id in old_ids:
             skipped_old += 1
             continue
-        groups[day].append({'cnyes_news_id': news_id, 'cnyes_url': f'https://news.cnyes.com/news/id/{news_id}',
+        candidate = {'cnyes_news_id': news_id, 'cnyes_url': f'https://news.cnyes.com/news/id/{news_id}',
             'issuer_symbol_candidate': symbol, 'cnyes_subject_literal': row['literal_subject'],
             'cnyes_published_epoch': epoch, 'source_post_sha256': sha, 'selected_response_sha256': selected,
             'source_observations': observations, 'official_record_identity_verified': False,
-            'official_release_clock_verified': False, 'body_found_in_audited_cnyes_bulk_post': False})
+            'official_release_clock_verified': False, 'body_found_in_audited_cnyes_bulk_post': False}
+        if contract in {'cnyes_finlab_issuer_overlap_v2', 'cnyes_finlab_issuer_overlap_v3'}:
+            candidate['selected_source_artifact_path'] = row['selected_source_artifact_path']
+        if contract == 'cnyes_finlab_issuer_overlap_v3':
+            candidate['selected_source_receipt_path'] = row['selected_source_receipt_path']
+            candidate['selected_source_request_sha256'] = row['selected_source_request_sha256']
+        groups[day].append(candidate)
     ordered = [{'cnyes_publication_day': day, 'candidates': sorted(items, key=lambda item: item['cnyes_news_id'])}
                for day, items in sorted(groups.items())]
     candidates = [item for group in ordered for item in group['candidates']]
-    return {'contract': 'cnyes_43_1_incremental_candidates_v1',
+    return {'contract': ('cnyes_43_1_incremental_candidates_v3' if contract == 'cnyes_finlab_issuer_overlap_v3'
+                         else 'cnyes_43_1_incremental_candidates_v2' if contract == 'cnyes_finlab_issuer_overlap_v2'
+                         else 'cnyes_43_1_incremental_candidates_v1'),
         'created_at_utc': datetime.now(timezone.utc).isoformat(),
         'scope': 'explicit 43-1 title variants among new exact-key no-local-match CNYES posts; not all missing news',
         'candidate_heads': len(candidates), 'candidate_days': len(ordered),

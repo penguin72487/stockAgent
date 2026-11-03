@@ -14,7 +14,8 @@ function harness({overnight = false, latestOnly = true} = {}) {
     return nodes.get(id);
   };
   const context = vm.createContext({
-    IS_OVERNIGHT: overnight, $, performance: {now: () => 0}, document: {hidden: false},
+    IS_OVERNIGHT: overnight, SIGNAL_PAGE_SIZE: 100, POSITION_PAGE_SIZE: 100,
+    $, performance: {now: () => 0}, document: {hidden: false},
     window: {setTimeout: (fn, ms) => { timers.set(++timerId, {fn, ms}); return timerId; }, clearTimeout: (id) => timers.delete(id)},
     setHtml: () => {}, esc: String, strategyLabel: (row) => row.label,
     renderPriceSources: () => {},

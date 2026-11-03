@@ -99,6 +99,57 @@ def test_finmind_page_rejects_partial_master_and_missing_status(tmp_path: Path) 
     assert result["acquisition"]["total_session_day_tasks"] is None
 
 
+def test_finmind_page_distinguishes_worker_heartbeat_from_carried_summary(tmp_path: Path) -> None:
+    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
+    root = tmp_path / 'data_finmind'
+    summary_at = (now - timedelta(hours=1)).isoformat()
+    _write(root / 'complement/status.json', {
+        'state': 'running', 'observed_at_utc': now.isoformat(),
+        'source_status_observed_at_utc': summary_at,
+        'status_aggregate_state': 'carried_previous_snapshot',
+        'series': {'TaiwanOptionTick': {'target': 4, 'complete': 1}},
+    })
+    result = build_finmind_public_status(tmp_path, now=now)
+    acquisition = result['acquisition']
+    assert acquisition['complement_observed_at_utc'] == now.isoformat()
+    assert acquisition['complement_summary_observed_at_utc'] == summary_at
+    assert acquisition['complement_summary_state'] == 'carried_previous_snapshot'
+    row = next(item for item in result['datasets'] if item['id'] == 'TaiwanOptionTick')
+    assert row['summary_observed_at_utc'] == summary_at
+    assert row['summary_state'] == 'carried_previous_snapshot'
+    assert row['complete_partitions'] == 1
+
+
+def test_finmind_ui_labels_carried_summary_separately_from_worker_heartbeat() -> None:
+    node = shutil.which('node')
+    if not node:
+        pytest.skip('Node runtime not installed')
+    path = Path(__file__).resolve().parents[1] / 'services/finmind_dashboard/app.js'
+    script = """
+const fs = require('fs'), vm = require('vm');
+const all = fs.readFileSync(process.argv[1], 'utf8');
+const body = all.split('function renderCapture(data) {')[1].split('function render(data) {')[0];
+const nodes = {};
+const context = {
+  nodes,
+  $: id => nodes[id] ||= {textContent: '', classList: {toggle() {}}},
+  text: (id, value) => { (nodes[id] ||= {textContent: '', classList: {toggle() {}}}).textContent = value; },
+  timeLabel: value => value || '—', ageLabel: () => 'age', count: () => '—',
+  freshWorkerStatus: () => false,
+};
+vm.createContext(context);
+vm.runInContext('function renderCapture(data) {' + body, context);
+context.renderCapture({health: 'updating', acquisition: {
+  complement_observed_at_utc: 'WORKER', complement_summary_observed_at_utc: 'SUMMARY',
+  complement_summary_state: 'carried_previous_snapshot',
+}});
+process.stdout.write(context.nodes['capture-freshness'].textContent);
+"""
+    result = subprocess.run([node, '-e', script, str(path)], capture_output=True, text=True, check=True, timeout=10)
+    assert '補充工作 WORKER' in result.stdout
+    assert '補充總覽沿用 SUMMARY' in result.stdout
+
+
 def test_session_grain_breakdown_preserves_all_historical_cadences(tmp_path: Path) -> None:
     now = datetime(2026, 9, 27, tzinfo=UTC)
     grains = {"1m": 1503, "15s": 764, "10s": 214, "5s": 2862}
@@ -219,7 +270,7 @@ def test_finmind_ui_does_not_consume_legacy_partition_based_eta() -> None:
     assert "分割數不等於請求數" in javascript + html
     assert 'unbatched_task_projection' not in javascript
     assert 'id="download-global-eta-basis"' in html
-    assert 'app.js?v=23' in html
+    assert 'app.js?v=24' in html
 
 
 def test_finmind_ui_legacy_numeric_values_still_render_unknown() -> None:

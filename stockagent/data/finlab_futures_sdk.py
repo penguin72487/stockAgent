@@ -58,7 +58,8 @@ class PartitionFailure(Exception):
         self.category = category
 
 
-def fetch_with_owner_session(root: Path, key: str, day: date, *, overlay: Path) -> dict:
+def fetch_with_owner_session(root: Path, key: str, day: date, *, overlay: Path,
+                             futures_workspace: bool = False) -> dict:
     """Copy the live owner's native session through a private stdin pipe only."""
     from finlab import get_token
     from finlab.auth import get_session
@@ -73,7 +74,8 @@ def fetch_with_owner_session(root: Path, key: str, day: date, *, overlay: Path) 
     env = dict(os.environ)
     env['PYTHONPATH'] = os.pathsep.join(filter(None, (str(overlay), str(repo), env.get('PYTHONPATH', ''))))
     env['PYTHONDONTWRITEBYTECODE'] = '1'
-    request = json.dumps({'root': str(root.resolve()), 'key': key, 'day': day.isoformat(), 'session': session})
+    request = json.dumps({'root': str(root.resolve()), 'key': key, 'day': day.isoformat(),
+                          'session': session, 'futures_workspace': futures_workspace})
     try:
         child = subprocess.run([sys.executable, '-B', '-m', 'scripts.finlab_futures_sdk_bridge'],
             input=request, text=True, capture_output=True, env=env, cwd=repo, timeout=170, check=False)

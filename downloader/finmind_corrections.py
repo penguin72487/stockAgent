@@ -23,6 +23,7 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 
 from downloader.finmind_scheduling import PRODUCT_HISTORY_STARTS, TAIPEI
+from downloader.finmind_option_contract_keys import vendor_option_series
 
 
 OWNERS = frozenset({'sponsor', 'complement', 'free'})
@@ -409,8 +410,12 @@ def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
             if prior_before.st_size > MAX_PROOF_BYTES or _sha(prior) != request['original_parquet_sha256']:
                 return None
             names = ['option_id', 'contract_date', 'strike_price', 'call_put', 'trading_session']
-            old = pl.scan_parquet(prior).select(names).unique().collect(engine='streaming')
-            new = pl.scan_parquet(path).select(names).unique().collect(engine='streaming')
+            def daily_contract_keys(source: Path):
+                return (pl.scan_parquet(source).select(
+                    *(vendor_option_series(pl.col(name)).alias(name) if name == 'contract_date' else pl.col(name)
+                      for name in names)).unique().collect(engine='streaming'))
+            old = daily_contract_keys(prior)
+            new = daily_contract_keys(path)
             after_prior = prior.stat()
             if (old.join(new, on=names, how='anti', nulls_equal=True).height
                     or prior_sig != (after_prior.st_dev, after_prior.st_ino, after_prior.st_size,
@@ -430,7 +435,7 @@ def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
             def distinct_keys(source: Path):
                 return (pl.scan_parquet(source).select(
                     pl.col('option_id').str.strip_chars().str.to_uppercase(),
-                    pl.col('contract_date').str.strip_chars().str.to_uppercase(),
+                    vendor_option_series(pl.col('contract_date')).alias('contract_date'),
                     pl.col('ExercisePrice').cast(pl.Float32),
                     pl.col('PutCall').str.strip_chars().str.to_uppercase(),
                 ).unique().collect(engine='streaming'))
@@ -455,6 +460,43 @@ def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
                 return None
             evidence.update(verified_expected_contract_keys=wanted.height,
                             verified_prior_contract_keys=prior_keys.height)
+        expected_futures = request.get('expected_source_futures_contracts')
+        if expected_futures is not None:
+            # Contract-day identity is necessary but does not prove complete
+            # prices, trading sessions, executable quotes, or training safety.
+            if (task['dataset'] != 'TaiwanFuturesTick' or not isinstance(expected_futures, list)
+                    or not 0 < len(expected_futures) <= 50000
+                    or any(not isinstance(key, list) or len(key) != 2
+                           or any(not isinstance(item, str) or not item for item in key)
+                           for key in expected_futures)):
+                return None
+            names = ['futures_id', 'contract_date']
+            def futures_keys(source: Path):
+                return (pl.scan_parquet(source).filter(pl.col('volume') > 0).select(
+                    pl.col('futures_id').cast(pl.String).str.strip_chars().str.to_uppercase(),
+                    pl.col('contract_date').cast(pl.String).str.strip_chars().str.to_uppercase(),
+                ).drop_nulls().unique().collect(engine='streaming'))
+            current_keys = futures_keys(path)
+            wanted = pl.DataFrame(expected_futures, schema={'futures_id': pl.String,
+                                                           'contract_date': pl.String}, orient='row').unique()
+            if wanted.join(current_keys, on=names, how='anti').height:
+                return None
+            evidence['verified_expected_futures_contract_keys'] = wanted.height
+            if request.get('original_parquet_path') is not None:
+                prior = _local_path(root, request['original_parquet_path'])
+                old_stat = prior.stat()
+                old_signature = (old_stat.st_dev, old_stat.st_ino, old_stat.st_size,
+                                 old_stat.st_mtime_ns, old_stat.st_ctime_ns)
+                if (old_stat.st_size > MAX_PROOF_BYTES
+                        or _sha(prior) != request.get('original_parquet_sha256')):
+                    return None
+                prior_keys = futures_keys(prior)
+                old_after = prior.stat()
+                if (prior_keys.join(current_keys, on=names, how='anti').height
+                        or old_signature != (old_after.st_dev, old_after.st_ino, old_after.st_size,
+                                             old_after.st_mtime_ns, old_after.st_ctime_ns)):
+                    return None
+                evidence['verified_prior_futures_contract_keys'] = prior_keys.height
         after = path.stat()
         if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
                 after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
@@ -505,7 +547,8 @@ def _matching_tasks(connection: sqlite3.Connection, request: dict[str, Any], now
     """
     exact = request.get('exact_source_conflict_key')
     if exact is not None:
-        expected_kind = {'TaiwanOptionTick': 'id_day', 'TaiwanOptionDaily': 'day'}.get(request['dataset'])
+        expected_kind = {'TaiwanOptionTick': 'id_day', 'TaiwanOptionDaily': 'day',
+                         'TaiwanFuturesTick': 'id_day'}.get(request['dataset'])
         if (not isinstance(exact, dict) or set(exact) != {'dataset', 'data_id', 'partition', 'kind'}
                 or exact != {'dataset': request['dataset'], 'data_id': '',
                              'partition': request['start_date'], 'kind': expected_kind}
@@ -557,6 +600,7 @@ def apply_worker_corrections(connection: sqlite3.Connection, root: Path, owner: 
             CONTRACT_BATCHES, PRODUCT_BATCHES, RECENT_BATCHES, load_option_conflicts,
             load_option_contract_conflicts, load_option_product_conflicts, load_recent_option_conflicts,
         )
+        from downloader.finmind_futures_tick_conflicts import BATCHES as FUTURES_BATCHES, load_futures_tick_conflicts
 
         try:
             conflicts = load_option_conflicts(root, now)
@@ -616,6 +660,23 @@ def apply_worker_corrections(connection: sqlite3.Connection, root: Path, owner: 
                     results.append({'state': 'rejected', 'reason': str(exc)[:256], 'batch': path.name})
             if results:
                 summary['source_recent_tick_conflicts'] = results
+        futures_paths = sorted((root / FUTURES_BATCHES).glob('*.json'))
+        if len(futures_paths) > 16:
+            summary['source_futures_tick_conflicts'] = [{'state': 'rejected', 'reason': 'too many batches'}]
+        else:
+            results = []
+            for path in futures_paths:
+                try:
+                    loaded = load_futures_tick_conflicts(root, now, sidecar=path)
+                    if loaded:
+                        futures_plan, futures_digest = loaded
+                        results.append(_apply_worker_plan(connection, root, owner, now,
+                                                          futures_plan, futures_digest, max_receipts=max_receipts))
+                except (OSError, ValueError, TypeError, KeyError, json.JSONDecodeError,
+                        pl.exceptions.PolarsError) as exc:
+                    results.append({'state': 'rejected', 'reason': str(exc)[:256], 'batch': path.name})
+            if results:
+                summary['source_futures_tick_conflicts'] = results
     return summary
 
 

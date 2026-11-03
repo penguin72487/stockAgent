@@ -52,6 +52,30 @@ def test_first_publication_pinned_separately_from_all_registered_revisions(tmp_p
     assert report["ledger_modified"] is False
 
 
+def test_native_daily_inventory_keeps_original_publication_and_evidence_errors(tmp_path, monkeypatch):
+    day, opening, state, spec, _source = _fixture(tmp_path)
+    payload = json.loads(opening.read_text())
+    payload["contract"] = "daily_native_opening_latency_audit_v1"
+    payload["opening_publication_slo"] = payload.pop("publication")
+    payload["opening_publication_slo"].update(
+        contract="all_enabled_mode_immutable_publication_stages_v1", expected_mode_count=1,
+    )
+    payload["evidence_errors"] = ["malformed_attempt_rows:1"]
+    opening.write_text(json.dumps(payload))
+    monkeypatch.setattr(audit, "load_local_stock_0901_vwaps", lambda *a, **k: ({}, {"error_counts": {}}))
+    report, missing = audit.inspect_sources(day=day, audit_path=opening, state_dir=state,
+                                            specs=[spec], minute_roots=())
+    assert missing == ["0051"]
+    assert report["modes"]["m"]["first_published_signal_id"] == "first"
+    assert report["opening_audit_contract"] == "daily_native_opening_latency_audit_v1"
+    assert report["opening_audit_evidence_errors"] == ["malformed_attempt_rows:1"]
+    assert report["ledger_modified"] is False
+    payload["opening_publication_slo"]["expected_mode_count"] = 2
+    opening.write_text(json.dumps(payload))
+    with pytest.raises(ValueError, match="publication contract or roster differs"):
+        audit.inspect_sources(day=day, audit_path=opening, state_dir=state, specs=[spec], minute_roots=())
+
+
 def test_first_publication_rejects_duplicate_symbol_or_wrong_roster(tmp_path):
     day, opening, state, spec, source = _fixture(tmp_path)
     pl.DataFrame({"symbol": ["0051", "0051"], "target_weight": [0.1, 0.2],

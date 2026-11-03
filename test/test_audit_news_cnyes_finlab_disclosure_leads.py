@@ -76,6 +76,38 @@ def test_all_history_leads_preserve_clock_ambiguity_and_do_not_read_body(tmp_pat
     assert not result["body_text_read"] and "私人公告內容" not in json.dumps(result, ensure_ascii=False)
 
 
+def test_request_scoped_incremental_worklist_validates_selected_original(tmp_path):
+    old, new, old_path, _ = _worklists(tmp_path)
+    sha = 'b' * 64
+    path = 'quarantine/' + sha + '.parquet'
+    new['contract'] = 'cnyes_43_1_incremental_candidates_v2'
+    row = new['groups'][0]['candidates'][0]
+    row.update(selected_response_sha256=sha, selected_source_artifact_path=path,
+        source_observations=[{'source_response_sha256': sha, 'source_artifact_path': path,
+            'source_artifact_kind': 'canonical_quarantine', 'source_observed_at_utc': '2026-10-01T00:00:00+00:00'}])
+    assert len(audit.candidates(old, new, sha256_file(old_path))) == 2
+    row['selected_source_artifact_path'] = 'quarantine/' + 'c' * 64 + '.parquet'
+    with pytest.raises(ValueError, match='invalid_candidate_provenance'):
+        audit.candidates(old, new, sha256_file(old_path))
+
+
+def test_accepted_batch_incremental_worklist_requires_selected_request_and_receipt(tmp_path):
+    old, new, old_path, _ = _worklists(tmp_path)
+    sha, request = 'b' * 64, 'c' * 64
+    path, receipt = 'bodies/fixture.parquet', 'receipts/fixture.json'
+    new['contract'] = 'cnyes_43_1_incremental_candidates_v3'
+    row = new['groups'][0]['candidates'][0]
+    row.update(selected_response_sha256=sha, selected_source_artifact_path=path,
+        selected_source_receipt_path=receipt, selected_source_request_sha256=request,
+        source_observations=[{'source_response_sha256': sha, 'source_artifact_path': path,
+            'source_artifact_kind': 'accepted_body_batch', 'source_receipt_path': receipt,
+            'source_request_sha256': request, 'source_observed_at_utc': '2026-10-01T00:00:00+00:00'}])
+    assert len(audit.candidates(old, new, sha256_file(old_path))) == 2
+    row['selected_source_request_sha256'] = 'd' * 64
+    with pytest.raises(ValueError, match='invalid_candidate_provenance'):
+        audit.candidates(old, new, sha256_file(old_path))
+
+
 @pytest.mark.parametrize("change", ["chain", "duplicate", "day", "count", "identity", "symbol", "scope"])
 def test_worklist_inconsistencies_fail_closed(tmp_path, change):
     old, new, old_path, _ = _worklists(tmp_path)

@@ -26,6 +26,7 @@ from stockagent.data_sync.acquisition_capacity_sampler import AcquisitionCapacit
 REPO = Path(__file__).resolve().parents[1]
 ROOT = REPO / 'data_finmind/complement'
 OWNER_FILES = (REPO / 'downloader/download_finmind_complement.py',
+               REPO / 'downloader/finmind_errors.py',
                REPO / 'downloader/finmind_product_query_verification.py',
                REPO / 'downloader/finmind_option_finite_priority.py',
                REPO / 'downloader/provider_priority.py',

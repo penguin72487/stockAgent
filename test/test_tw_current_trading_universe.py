@@ -263,6 +263,23 @@ def test_refresh_singleflight_and_runtime_never_performs_http(setup, monkeypatch
     assert len(list((universe.receipt_path(DAY).parent / "generations").glob("*.json"))) == 2
 
 
+def test_recorded_diagnostics_pin_original_generation_without_relaxing_live_admission(setup, monkeypatch):
+    first = setup.publish()
+    setup.clock[0] += timedelta(minutes=16)
+    second = setup.publish(max_age_seconds=900)
+    assert first["fingerprint"] != second["fingerprint"]
+    setup.clock[0] += timedelta(days=1)
+    monkeypatch.setattr(universe, "_fetch", lambda _: pytest.fail("archived diagnostics must not fetch"))
+    recorded = universe.load_recorded_universe(DAY, expected_fingerprint=first["fingerprint"])
+    assert recorded == first
+    with pytest.raises(universe.TWTradingUniversePending):
+        universe.load_current_universe(DAY)
+    with pytest.raises(universe.TWTradingUniversePending):
+        universe.load_recorded_universe(DAY, expected_fingerprint="f" * 64)
+    with pytest.raises(ValueError):
+        universe.load_recorded_universe(DAY, expected_fingerprint="")
+
+
 def test_failed_aggregate_retries_only_missing_transport_preserving_success_clocks(setup):
     calls = []
     broken = [True]

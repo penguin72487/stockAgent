@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "enabled": false,
+  "datasets": ["local-openbb", "cftc-legacy-pre2000"],
+  "local_workers": 2,
+  "remote_workers": 1,
+  "remote_spool": false,
+  "remote_spool_reserve_bytes": 34359738368,
+  "timeout_seconds": 300,
+  "initial_local_bytes_per_second": 26214400,
+  "initial_remote_bytes_per_second": 8388608,
+  "transport_policy": "/etc/stockagent/packed-rclone-transport.json",
+  "ssh_profile": "/etc/stockagent/agent-ssh.conf"
+}

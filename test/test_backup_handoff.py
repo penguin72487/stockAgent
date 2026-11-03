@@ -188,6 +188,33 @@ def test_original_runtime_supplement_handoff_is_closed_and_imports_without_mutat
     assert not proof['receiver_adapter_deployed'] and not handoff_queue.ledger_path.exists()
 
 
+@pytest.mark.parametrize('name,files', [
+    ('storage-source-evidence-20261029-v1',
+     ('artifacts/operations/storage-single-authority-20261025/lab203-source-evidence-20261029-v1.json',)),
+    ('storage-capsule-binding-20261029-v1',
+     ('artifacts/operations/storage-single-authority-20261025/lab203-training-capsule-binding-20261029-v1.json',)),
+    ('storage-retired-scan-20261029-v1',
+     ('artifacts/operations/storage-single-authority-20261025/source-retired-unscanned-20261029.private.json',)),
+])
+def test_source_evidence_handoff_is_bounded_immutable_and_does_not_modify_ledger(handoff_queue, tmp_path, name, files):
+    source = tmp_path / 'fixed-source'
+    evidence = source / files[0]
+    evidence.parent.mkdir(parents=True)
+    evidence.write_text('{"is_batch_or_recovery_ACK": false}\n')
+    with (handoff_queue.state / 'owner.lock').open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        proof = publish_handoff(handoff_queue, name, source_root=source,
+                                physical_transport_alias=handoff_queue.transport)
+    root = Path(proof['source_path'])
+    verify(root, proof['envelope_identity_sha256'])
+    assert (root / files[0]).read_bytes() == evidence.read_bytes()
+    assert proof['source_files'] == 1 and proof['publication_scope'] == 'immutable_control_namespace_only'
+    assert not proof['source_ledger_modified'] and not handoff_queue.ledger_path.exists()
+    with pytest.raises(ValueError, match='previously frozen'):
+        publish_handoff(handoff_queue, name, source_root=source,
+                        physical_transport_alias=handoff_queue.transport)
+
+
 def test_operator_can_wait_for_existing_owner_without_parallel_publication(handoff_queue):
     queue = handoff_queue
     with (queue.state / 'owner.lock').open('a') as owner:

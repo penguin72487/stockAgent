@@ -310,7 +310,8 @@ def transfer_statistics(connection: sqlite3.Connection) -> dict:
 
 
 def fetch(session, limiter, root: Path, task, token: str, *, heartbeat=None):
-    from downloader.download_finmind_complement import MIN_FREE_BYTES, SourceError, _response_rows
+    from downloader.download_finmind_complement import MIN_FREE_BYTES, _response_rows
+    from downloader.finmind_errors import SourceError
     from downloader.download_finmind_free import _record_request_start
     if task.dataset not in OBJECT_FIRST or task.data_id:
         raise ValueError('object_requires_registered_whole_market_day')

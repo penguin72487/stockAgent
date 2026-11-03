@@ -7,6 +7,7 @@ Non-D paths retain normal file I/O (including unit-test temporary directories).
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 import hashlib
 import json
@@ -44,16 +45,24 @@ ALIASES = (
     (Path('/srv/stockagent-d-volume/stockagent-immutable-lake'), 'stockagent-immutable-lake'),
     (Path('/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch'), 'stockagent-completed-benchmark-scratch'),
     (Path('/srv/stockagent-d-volume/stockagent-completed-offline-scratch'), 'stockagent-completed-offline-scratch'),
+    (Path('/srv/stockagent-d-volume/stockagent-legacy-archive-stage'), 'stockagent-legacy-archive-stage'),
 )
 READ_ONLY_STAGE_PREFIXES = (
     'D:\\stockagent-completed-benchmark-scratch\\',
     'D:\\stockagent-completed-offline-scratch\\',
+    'D:\\stockagent-legacy-archive-stage\\',
 )
 
 _INTEROP_DIRECTORY = Path('/run/WSL')
 _INTEROP_LOCK = threading.Lock()
 _INTEROP_CACHE = None
 _INTEROP_MARKER = b'stockagent-cold-interop-v1'
+# The admission executes an empty batch only. A busy Windows host can need
+# over 10 s to start an otherwise healthy bridge; do not classify that as a
+# failed endpoint before allowing a bounded startup interval.
+_INTEROP_PROBE_TIMEOUT_SECONDS = 15
+MAX_HASH_BATCH_MEMBERS = 128
+HASH_METADATA_WORKERS = 16
 
 
 def _interop_socket(path):
@@ -138,7 +147,7 @@ def _windows_process_environment():
                 try:
                     result = subprocess.run([POWERSHELL, '-NoLogo', '-NoProfile', '-NonInteractive',
                         '-EncodedCommand', encoded_probe], input=b'[]\n',
-                        env=env, capture_output=True, timeout=5)
+                        env=env, capture_output=True, timeout=_INTEROP_PROBE_TIMEOUT_SECONDS)
                 except subprocess.TimeoutExpired as error:
                     # No target path or payload has left Python. Only an
                     # empty-output admission timeout may retry; malformed
@@ -164,7 +173,8 @@ def admit_workspace(path: Path, required_bytes: int, *, windows_distribution: st
     Shared with the completed-return owner. The old public entrypoint delegates
     here so native byte readers do not import model/training lifecycle modules.
     """
-    path = path.absolute()
+    from stockagent.service_layout import canonical_service_path
+    path = canonical_service_path(path)
     if any(parent.is_symlink() for parent in (path, *path.parents)):
         raise SnapshotError("returned artifact path is redirected")
     if not path.is_dir():
@@ -177,6 +187,19 @@ def admit_workspace(path: Path, required_bytes: int, *, windows_distribution: st
     fs = os.statvfs(path)
     free = fs.f_bavail * fs.f_frsize
     if "microsoft" in Path("/proc/sys/kernel/osrelease").read_text().lower():
+        from stockagent.data_sync.workspace_volume import ENROLLMENT, check as check_e, configuration
+        if ENROLLMENT.exists():
+            workspace = Path(configuration()['mount_point'])
+            if workspace.is_mount() and workspace.stat().st_dev == path.stat().st_dev:
+                # Stable C-facing data aliases may bind E too. Check the
+                # filesystem actually holding these bytes, not the C process.
+                measured = check_e(physical=True)
+                free = min(free, measured['physical_free_bytes'])
+                if free < required_bytes:
+                    raise WorkspaceCapacityDeferred('E workspace lacks real physical free space',
+                        physical_free_bytes=free, required_bytes=required_bytes)
+                return {'filesystem': filesystem, 'physical_free_bytes': free,
+                        'required_bytes': required_bytes, 'physical_volume': 'E:'}
         from stockagent.data_sync.recovery_queue import physical_free_bytes
         if windows_distribution is not None and (
                 not isinstance(windows_distribution, str)
@@ -224,6 +247,12 @@ def metadata_path(path):
 
 def windows_path(path):
     path = Path(path).absolute()
+    # A transport relocated to E ext4 has no D Windows pathname. Source D
+    # reads still use the native byte adapter; the destination uses Linux I/O.
+    if path == Path('/srv/stockagent-backup-ingress-lab203') or Path('/srv/stockagent-backup-ingress-lab203') in path.parents:
+        from stockagent.data_sync.transport_placement import on_e
+        if on_e():
+            return None
     for root, prefix in ALIASES:
         try:
             relative = path.relative_to(root)
@@ -267,9 +296,14 @@ def _configuration_on_checked_mount(
     if native.startswith(READ_ONLY_STAGE_PREFIXES):
         from stockagent.data_sync.packed_backup import mounted_volume
         mount = Path('/srv/stockagent-d-volume')
-        if (mode != 'read' or mounted_volume(mount)[2] != 'D:'
+        legacy_encoding = native.startswith('D:\\stockagent-legacy-archive-stage\\')
+        if (mode not in (('read', 'hash') if legacy_encoding else ('read',)) or mounted_volume(mount)[2] != 'D:'
                 or Path(path).stat().st_dev != mount.stat().st_dev):
             raise SnapshotError('Native completed-stage read requires its actual D volume and read-only mode')
+        if legacy_encoding:
+            from stockagent.data_sync.legacy_artifact_archive import reviewed_retired_stage_path
+            if not reviewed_retired_stage_path(Path(path)):
+                raise SnapshotError('Native legacy-stage read requires an exact reviewed retired encoding')
     config = {'path': native, 'mode': mode, 'offset': offset,
               'prefix_sha256': prefix_sha256, 'reserve_bytes': reserve_bytes}
     if mode == 'write' and not native.startswith('D:\\stockagent-cold-primary\\'):
@@ -315,8 +349,12 @@ def _native_command(configs, *, batched=False, startup_token=None):
             command += "[Console]::Out.Write('" + readiness.decode('ascii') + "' + [char]10)\n"
             command += "[Console]::Out.Flush()\n"
         command += "$batch = [Console]::In.ReadLine() | ConvertFrom-Json\nforeach ($item in $batch) {\n"
-        command += "$env:STOCKAGENT_BINARY_IO_CONFIG = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes(($item | ConvertTo-Json -Compress)))\n"
-        command += SCRIPT.read_text() + '\n}\n'
+        # Keep nested chunk metadata in process memory. An individual Windows
+        # environment value is limited to 32,767 characters; a valid original
+        # with hundreds of extents exceeds that limit after base64 encoding.
+        # A fresh scriptblock scope also prevents per-member state leaking.
+        command += '& { param($stockagentBinaryBatchConfig)\n'
+        command += SCRIPT.read_text() + '\n} $item\n}\n'
     else:
         encoded_config = base64.b64encode(json.dumps(configs[0]).encode()).decode()
         command = "$env:STOCKAGENT_BINARY_IO_CONFIG='" + encoded_config + "';\n" + SCRIPT.read_text()
@@ -370,12 +408,36 @@ def _await_batch_ready(process, token, *, timeout=15.0):
                 raise _BatchNotReady('invalid-marker', received)
 
 
-def _batch(configs):
-    if (not 1 <= len(configs) <= 16 or any(c['mode'] not in {'copy', 'hash'} for c in configs)
+def _communicate_cancellable_hash(process, payload, cancel_event):
+    """Stop only a read-only peer after another verifier has failed.
+
+    Repeated communicate calls after TimeoutExpired retain the already sent
+    input and buffered output. The original one-hour I/O deadline is unchanged.
+    """
+    deadline = time.monotonic() + 3600
+    while True:
+        if cancel_event.is_set():
+            raise SnapshotError('Native read-only batch cancelled after peer verification failed')
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(process.args, 3600)
+        try:
+            return process.communicate(payload, timeout=min(1.0, remaining))
+        except subprocess.TimeoutExpired:
+            payload = None
+
+
+def _batch(configs, *, cancel_event=None):
+    read_only = bool(configs) and all(c['mode'] in {'hash', 'hash-chunks'} for c in configs)
+    member_limit = MAX_HASH_BATCH_MEMBERS if read_only else 16
+    if (not 1 <= len(configs) <= member_limit or any(c['mode'] not in {'copy', 'hash', 'hash-chunks'} for c in configs)
             or sum(c['expected_bytes'] for c in configs) > 16 * 1024**3):
         raise SnapshotError('Native batch exceeds its immutable I/O bounds')
-    read_only = all(c['mode'] == 'hash' for c in configs)
+    if cancel_event is not None and not read_only:
+        raise SnapshotError('Cancellation is supported only for read-only native batches')
     for attempt in range(3):
+        if cancel_event is not None and cancel_event.is_set():
+            raise SnapshotError('Native read-only batch cancelled after peer verification failed')
         token = os.urandom(16).hex()
         process, errors = _launch(configs, batched=True, startup_token=token)
         retry = False
@@ -392,8 +454,12 @@ def _batch(configs):
                     raise SnapshotError(f'Native batch failed (startup-{failure.reason}, '
                         f'output_bytes={len(failure.received)}); no metadata sent') from failure
             if not retry:
-                output, _ = process.communicate(json.dumps(configs, ensure_ascii=True).encode() + b'\n', timeout=3600)
-                if process.returncode or len(output) > 16 * 1024:
+                payload = json.dumps(configs, ensure_ascii=True).encode() + b'\n'
+                if cancel_event is None:
+                    output, _ = process.communicate(payload, timeout=3600)
+                else:
+                    output, _ = _communicate_cancellable_hash(process, payload, cancel_event)
+                if process.returncode or len(output) > max(16 * 1024, len(configs) * 512):
                     errors.seek(0)
                     failure = errors.read(4096)
                     if (read_only and process.returncode and not output and attempt < 2
@@ -424,8 +490,15 @@ def _stable(before, after):
     return all(getattr(before, key) == getattr(after, key) for key in fields)
 
 
-def copy_many(members):
+def _copy_reserve(reserve_bytes):
+    if type(reserve_bytes) is not int or not 32 * 1024**3 <= reserve_bytes <= 64 * 1024**3:
+        raise SnapshotError('Native backup copy reserve must preserve the 32 GiB writer floor')
+    return reserve_bytes
+
+
+def copy_many(members, *, reserve_bytes=64 * 1024**3):
     """One native process, full per-member copy/hash/flush and source proof."""
+    reserve_bytes = _copy_reserve(reserve_bytes)
     members = [(Path(s), Path(d), sha, count) for s, d, sha, count in members]
     if not 1 <= len(members) <= 16 or len({d for _, d, _, _ in members}) != len(members):
         raise SnapshotError('Native copy batch destinations are repeated or unbounded')
@@ -436,7 +509,7 @@ def copy_many(members):
             raise SnapshotError('Native batch source differs from its exact member')
         destination.parent.mkdir(parents=True, exist_ok=True)
         configs.append(_configuration(destination, mode='copy', source=source,
-            expected_sha256=sha, expected_bytes=count, reserve_bytes=64 * 1024**3))
+            expected_sha256=sha, expected_bytes=count, reserve_bytes=reserve_bytes))
         signatures.append(before)
     for (source, destination, sha, count), before, proof in zip(members, signatures, _batch(configs), strict=True):
         after = destination.lstat()
@@ -446,9 +519,9 @@ def copy_many(members):
         destination.chmod(0o600)
 
 
-def hash_many(paths):
+def hash_many(paths, *, cancel_event=None):
     paths = [Path(p) for p in paths]
-    if not 1 <= len(paths) <= 16 or len(set(paths)) != len(paths):
+    if not 1 <= len(paths) <= MAX_HASH_BATCH_MEMBERS or len(set(paths)) != len(paths):
         raise SnapshotError('Native hash batch members are repeated or unbounded')
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
     # No persistent/TTL mount cache: each bounded batch has fresh before/after
@@ -456,31 +529,41 @@ def hash_many(paths):
     # Re-running the shell/Python mount checker for every member dominated
     # small-object recovery despite the already batched Windows process.
     _check_d_primary_mount(Path('/srv/stockagent-packed'))
-    signatures = [p.lstat() for p in paths]
-    if any(not stat.S_ISREG(s.st_mode) for s in signatures):
-        raise SnapshotError('Native batch hash needs regular exact members')
-    configs = [_configuration_on_checked_mount(p, mode='hash', expected_bytes=s.st_size)
-               for p, s in zip(paths, signatures, strict=True)]
-    proofs = _batch(configs)
-    _check_d_primary_mount(Path('/srv/stockagent-packed'))
+    def prepare(path):
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode):
+            raise SnapshotError('Native batch hash needs regular exact members')
+        return before, _configuration_on_checked_mount(path, mode='hash', expected_bytes=before.st_size)
+    # Every member still traverses its path and captures its own generation.
+    # Overlap independent 9p metadata round trips; do not cache permissions or
+    # start native I/O before all member checks have joined successfully.
+    with ThreadPoolExecutor(max_workers=min(len(paths), HASH_METADATA_WORKERS),
+                            thread_name_prefix='native-hash-member') as pool:
+        prepared = list(pool.map(prepare, paths))
+        signatures = [before for before, _ in prepared]
+        configs = [config for _, config in prepared]
+        proofs = _batch(configs) if cancel_event is None else _batch(configs, cancel_event=cancel_event)
+        _check_d_primary_mount(Path('/srv/stockagent-packed'))
+        after = list(pool.map(Path.lstat, paths))
     result = {}
-    for path, before, proof in zip(paths, signatures, proofs, strict=True):
-        if (not _stable(before, path.lstat()) or proof.get('bytes') != before.st_size
+    for path, before, final, proof in zip(paths, signatures, after, proofs, strict=True):
+        if (not _stable(before, final) or proof.get('bytes') != before.st_size
                 or not isinstance(proof.get('sha256'), str) or not re.fullmatch('[0-9a-f]{64}', proof['sha256'])):
             raise SnapshotError('Native batch full hash changed an exact member')
         result[path] = proof['sha256']
     return result
 
 
-def copy_verified(source, destination, *, expected_sha256, expected_bytes):
+def copy_verified(source, destination, *, expected_sha256, expected_bytes, reserve_bytes=64 * 1024**3):
     """Native D-to-D copy/hash/flush; Linux retains all authority/signature gates."""
+    reserve_bytes = _copy_reserve(reserve_bytes)
     source, destination = Path(source), Path(destination)
     before = source.lstat()
     if not stat.S_ISREG(before.st_mode) or before.st_size != expected_bytes:
         raise SnapshotError('Native copy source is not the exact regular member')
     destination.parent.mkdir(parents=True, exist_ok=True)
     process, errors = _process(destination, mode='copy', source=source,
-        expected_sha256=expected_sha256, expected_bytes=expected_bytes, reserve_bytes=64 * 1024**3)
+        expected_sha256=expected_sha256, expected_bytes=expected_bytes, reserve_bytes=reserve_bytes)
     process.stdin.close()
     try:
         output = process.stdout.read(8192)

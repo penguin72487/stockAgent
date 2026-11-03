@@ -54,6 +54,17 @@ test("new versions and genuine zero-target revisions replace rather than invent 
   assert.equal(merge(next, empty).rows.length, 0);
 });
 
+test("an unverified calendar clears dated targets instead of carrying a previous session", () => {
+  const {merge, validate} = contracts();
+  const unverified = snapshot({session_date: null,
+    modes: [{market: "m", label: "模型", status: "calendar_unverified"}], rows: []});
+  const next = merge(merge(null, snapshot()), unverified);
+  assert.equal(next.rows.length, 0);
+  assert.equal(next.modes[0].stale, false);
+  assert.throws(() => validate({...unverified, modes: snapshot().modes}));
+  assert.throws(() => validate({...unverified, rows: snapshot().rows}));
+});
+
 test("website paints published signals while no status or fill API has responded, then updates in place", async () => {
   const nodes = new Map(), requests = [], scheduled = [], optionsSeen = [];
   function node(id) {
@@ -84,6 +95,7 @@ test("website paints published signals while no status or fill API has responded
   assert.equal(optionsSeen[0].refreshOnVisible, "overdue");
   await scheduled[0]();
   assert.match(node("published-signal-body").html, /2330/);
+  assert.equal(context.StockAgentPublishedSignals.getSnapshot().data.rows[0].symbol, "2330");
   assert.doesNotMatch(node("published-signal-body").html, /成交/);
   assert.deepEqual(requests.map(r => r.url), ["api/published-signals"]);
   await scheduled[0]();
@@ -94,10 +106,17 @@ test("website paints published signals while no status or fill API has responded
   await scheduled[0]();
   assert.match(node("published-signal-body").html, /2317/);
   assert.doesNotMatch(node("published-signal-body").html, /2330/);
+  data = {...data, modes: [{...data.modes[0], completed_session_calculation: true}]};
+  etag = '"postclose"';
+  await scheduled[0]();
+  assert.match(node("published-signal-status").html, /盤後計算/);
+  assert.match(node("published-signal-body").html, /盤後計算/);
   fail = true;
   await scheduled[0]();
   assert.match(node("published-signal-body").html, /2317/);
   assert.match(node("published-signal-status").html, /更新失敗/);
+  assert.equal(context.StockAgentPublishedSignals.getSnapshot().data.rows[0].symbol, "2317");
+  assert.match(context.StockAgentPublishedSignals.getSnapshot().error, /更新失敗/);
 });
 
 test("signal-first panel and detailed signals precede the lifecycle table", () => {

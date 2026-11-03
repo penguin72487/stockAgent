@@ -1,0 +1,15 @@
+[Unit]
+Description=StockAgent inode-preserving service storage placement before owners start
+After=local-fs.target
+Before=multi-user.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=@REPO_ROOT@
+ExecStart=/usr/bin/bash @REPO_ROOT@/scripts/run_service_storage_layout.sh
+TimeoutStartSec=180
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

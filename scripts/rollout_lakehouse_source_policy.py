@@ -239,6 +239,47 @@ def migration_checkpoint(state_root):
                                   if row['state'] == 'verified'}}
 
 
+def wait_for_committed_publication(state_root, dataset, deadline, candidate, output):
+    """Preserve a long publisher; restart only after its fixed head is durable.
+
+    This is not full recovery acceptance. The original journal must expose a
+    snapshot and manifest which resolve to that exact closed D version. Any
+    operation/code drift fails before systemd is touched.
+    """
+    from stockagent.data_sync.packed_snapshots import resolve_packed_snapshot_id
+    initial = migration_checkpoint(state_root)
+    if initial is None:
+        raise ValueError('no original migration operation to hand off')
+    directory = Path(initial['operation_directory'])
+    while True:
+        if worker_code_identity() != candidate:
+            raise ValueError('worker candidate changed while waiting for source publication')
+        current = migration_checkpoint(state_root)
+        if current['operation_directory'] != str(directory) or current['plan_sha256'] != initial['plan_sha256']:
+            raise ValueError('original migration operation changed before publication handoff')
+        progress = json.loads((directory/'progress.json').read_bytes())
+        row = progress['datasets'].get(dataset)
+        if row is None:
+            raise ValueError('handoff dataset is not in the original operation')
+        snapshot, digest = row.get('snapshot_id'), row.get('manifest_sha256')
+        if snapshot and digest:
+            for cold in (Path('/srv/stockagent-packed/.local-state/private-history'), Path('/srv/stockagent-packed')):
+                try:
+                    fixed = resolve_packed_snapshot_id(cold, dataset, snapshot, require_objects=False)
+                except (OSError, ValueError, RuntimeError):
+                    continue
+                if fixed.manifest_sha256 == digest:
+                    return {'dataset': dataset, 'snapshot_id': snapshot, 'manifest_sha256': digest,
+                            'publication_only_not_recovery_acceptance': True}
+        if time.monotonic() >= deadline:
+            raise TimeoutError('fixed source publication has not reached the restart boundary')
+        atomic_write_json(output, {'state': 'waiting_for_fixed_source_publication',
+            'observed_at_utc': datetime.now(timezone.utc).isoformat(), 'dataset': dataset,
+            'candidate_code_identity_sha256': candidate, 'plan_sha256': initial['plan_sha256'],
+            'source_retirement': False}, durable=False)
+        time.sleep(5)
+
+
 def verify_migration_checkpoint(checkpoint):
     if checkpoint is None:
         return 0
@@ -269,8 +310,12 @@ async def workflows(c):
     return result
 
 
+class PublicationOwnerBusy(TimeoutError):
+    """Only an unacquired original publication boundary is a normal wait."""
+
+
 @contextmanager
-def publication_boundary(locks, deadline):
+def publication_boundary(locks, deadline, *, on_wait=None):
     """Acquire the complete boundary without parking unrelated owners.
 
     If a later lock is busy, release all earlier locks before waiting on that
@@ -282,7 +327,7 @@ def publication_boundary(locks, deadline):
         try:
             with ExitStack() as stack:
                 if time.monotonic() >= deadline:
-                    raise TimeoutError('publication owner has not reached its handoff boundary')
+                    raise PublicationOwnerBusy('publication owner has not reached its handoff boundary')
                 descriptors = {}
                 for lock in locks:
                     if lock.is_symlink() or lock.parent.resolve() != lock.parent:
@@ -305,12 +350,15 @@ def publication_boundary(locks, deadline):
             raise ValueError('storage owner lock is redirected')
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise TimeoutError('publication owner has not reached its handoff boundary')
+            raise PublicationOwnerBusy('publication owner has not reached its handoff boundary')
+        if on_wait is not None:
+            on_wait(blocked)
+        interval = min(30, remaining)
         with blocked.open('a') as handle:
-            result = subprocess.run(['flock', '--exclusive', '--wait', str(remaining), str(handle.fileno())],
-                                    pass_fds=(handle.fileno(),), capture_output=True, timeout=remaining + 5)
+            result = subprocess.run(['flock', '--exclusive', '--wait', str(interval), str(handle.fileno())],
+                                    pass_fds=(handle.fileno(),), capture_output=True, timeout=interval + 5)
             if result.returncode == 1:
-                raise TimeoutError('publication owner has not reached its handoff boundary')
+                continue
             if result.returncode:
                 raise RuntimeError('canonical owner acquisition failed')
 
@@ -321,8 +369,12 @@ def main(argv=None):
     parser.add_argument('--deadline-seconds',type=int,default=600,
                         help='wait at most 1..86400 seconds for the existing owner boundary')
     parser.add_argument('--reload-code-only',action='store_true',help='reload the existing owner without changing source capacity policy')
+    parser.add_argument('--handoff-status', type=Path,
+                        help='refresh the original enrolled placement wait, separately from publication progress')
     parser.add_argument('--restart-active-owner',action='store_true',
                         help='explicitly authorized code-only restart; retain journals and requeue interrupted work')
+    parser.add_argument('--after-publication-dataset',
+                        help='wait for this original fixed source to commit before the authorized restart')
     parser.add_argument('--retained-source-candidate', type=Path,
                         help='adopt a reviewed fixed FRED binding after draining the original owners; retain all originals')
     parser.add_argument('--enroll-private-root-backups', action='store_true',
@@ -334,6 +386,8 @@ def main(argv=None):
         parser.error('use a new receipt and a bounded handoff deadline')
     if args.restart_active_owner and not args.reload_code_only:
         parser.error('active-owner restart is restricted to an explicitly requested code-only reload')
+    if args.after_publication_dataset and not (args.reload_code_only and args.restart_active_owner):
+        parser.error('publication-boundary wait requires the original authorized code-only restart')
     if args.retained_source_candidate and not args.reload_code_only:
         parser.error('retained enrollment requires code-only reload and the original publication/collector boundary')
     if args.enroll_private_root_backups and (not args.reload_code_only or args.retained_source_candidate
@@ -341,11 +395,32 @@ def main(argv=None):
         parser.error('root backup enrollment requires a drained code-only reload without another cutover')
     original_code_identity=worker_code_identity()
     c=configuration();guard(c)
+    if args.after_publication_dataset:
+        wait_for_committed_publication(c['state_root'], args.after_publication_dataset,
+            time.monotonic()+args.deadline_seconds, original_code_identity,
+            args.output.with_name(args.output.stem+'-waiting.json'))
     cutover = prepare_retained_cutover(ROOT, c, args.retained_source_candidate) if args.retained_source_candidate else None
     root_backups = prepare_root_backup_enrollment(ROOT) if args.enroll_private_root_backups else None
     change = cutover or root_backups
     candidate_identity = (worker_code_identity(source_overrides={CATALOG_RELATIVE: change['catalog_updated']})
                           if change else original_code_identity)
+    wait_status = None
+    if args.handoff_status is not None:
+        path = args.handoff_status
+        if (not args.reload_code_only or path.is_symlink() or path.resolve() != path
+                or path.parent != args.output.parent or path.name != 'worker-reload.json'):
+            raise ValueError('worker handoff observation is outside its original placement owner')
+        wait_status = json.loads(path.read_bytes())
+        if (wait_status.get('contract') != 'stockagent.workspace_worker_handoff.v1'
+                or wait_status.get('state') != 'waiting_for_original_owner'
+                or wait_status.get('candidate_code_identity_sha256') != candidate_identity):
+            raise ValueError('worker handoff observation belongs to another candidate')
+
+    def observe_boundary_wait(lock):
+        if wait_status is not None:
+            atomic_write_json(args.handoff_status, {**wait_status,
+                'observed_at_epoch': time.time(), 'waiting_owner_lock': str(lock),
+                'publication_progress_renewed': False, 'original_active_owner_forced': False})
     policy=(c['source_replication'] if args.reload_code_only else
             json.loads((ROOT/'configs/data_sync/lake_source_replication.json').read_bytes()))
     source_wave_policy({**c,'source_replication':policy})
@@ -389,7 +464,7 @@ def main(argv=None):
             locks.append(cutover['collector_lock'])
         cutover_result = None
         backup_result = None
-        with publication_boundary(locks, deadline) as descriptors:
+        with publication_boundary(locks, deadline, on_wait=observe_boundary_wait) as descriptors:
             # Acquire every original boundary before stopping the worker.
             # A busy catalog cannot reserve the other owners while we wait.
             if worker_code_identity()!=original_code_identity:

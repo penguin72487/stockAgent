@@ -28,6 +28,7 @@ from stockagent.data_sync.immutable_cache_compaction import (
     inode_key as _inode, share_locked_payload_group,
 )
 from stockagent.data_sync.materialized_cache import process_references_many
+from stockagent.service_layout import canonical_service_path
 from stockagent.data_sync.physical_cache_reuse import (
     SOURCE_ABI as SOURCE_ABI,
     SESSION_ENCODING as SESSION_ENCODING,
@@ -67,7 +68,9 @@ def policy_roots(path: Path, repo: Path, *, contract: str = CONTRACT) -> list[Pa
         if (relative.parent != Path("artifacts/cache") or not _CACHE_NAME.fullmatch(relative.name)
                 or relative.as_posix() != name):
             raise ValueError("policy may name only direct artifacts/cache children")
-        root = repo.absolute() / relative
+        # Resolve only the enrolled placement alias. Descendant links and
+        # unexpected destinations still fail the original directory checks.
+        root = canonical_service_path(repo.absolute() / relative, root=repo)
         if root.exists() or root.is_symlink():
             result.append(_real_directory(root))
     return result

@@ -174,6 +174,49 @@ def test_exited_process_during_cwd_recheck_keeps_original_disappearance_rule(tmp
     assert maintenance._ancestor_process_references((source,), scope, []) == []
 
 
+@pytest.mark.parametrize('many', [False, True])
+@pytest.mark.parametrize('change', ['unrelated', 'new-consumer', 'persistent', 'permission'])
+def test_reference_guard_restarts_all_observations_after_cwd_rotation(tmp_path, monkeypatch, change, many):
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    scope = tmp_path/'artifacts/markets'
+    source = scope/'suite/run'
+    source.mkdir(parents=True)
+    alternate = tmp_path/'other-job'
+    alternate.mkdir()
+    process = _fake_argument_process(tmp_path, monkeypatch, ['unrelated'] * 4)
+    original = Path.resolve
+    reads, direct_reads = [], []
+    def direct_probe(*_args):
+        direct_reads.append(True)
+        current = original(process/'cwd', strict=True)
+        return ['fresh-direct-consumer'] if current == source else []
+    monkeypatch.setattr(maintenance, 'process_references', direct_probe)
+    monkeypatch.setattr(maintenance, 'process_references_many', direct_probe)
+    def rotating(path, **options):
+        if path == process/'cwd':
+            reads.append(True)
+            if len(reads) % 2 == 0 and (len(reads) == 2 or change == 'persistent'):
+                if change == 'permission':
+                    raise PermissionError(13, 'lost visibility')
+                current = original(path, strict=True)
+                target = (source if change == 'new-consumer' else
+                          tmp_path if current == alternate else alternate)
+                path.unlink()
+                path.symlink_to(target, target_is_directory=True)
+        return original(path, **options)
+    monkeypatch.setattr(Path, 'resolve', rotating)
+    def call():
+        return (maintenance.artifact_process_references_many((source,), scope) if many
+                else maintenance.artifact_process_references(source, scope))
+    if change in ('persistent', 'permission'):
+        with pytest.raises(SnapshotError):
+            call()
+        assert len(direct_reads) == (3 if change == 'persistent' else 1)
+    else:
+        assert call() == (['fresh-direct-consumer'] if change == 'new-consumer' else [])
+        assert len(direct_reads) == 2
+
+
 def test_unrelated_alias_rotation_is_not_misclassified_as_a_cleanup_consumer(tmp_path, monkeypatch):
     scope = tmp_path / 'artifacts/markets'
     source = scope / 'suite/run'

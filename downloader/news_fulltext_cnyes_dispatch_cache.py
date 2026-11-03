@@ -24,6 +24,9 @@ _WATCHED = {
                        "OLD.key GLOB 'cnyes_index_request_failure_scope_v1:*'"),
     'cnyes_index_revision_rounds': ('1', '1'),
     'cnyes_index_revision_retired': ('1', '1'),
+    # Pending local recovery suppresses only its exact list URL. Releasing
+    # that marker can make the previously empty selection immediately ready.
+    'cnyes_interrupted_page_checkpoints': ("NEW.state='pending'", "OLD.state='pending'"),
 }
 
 

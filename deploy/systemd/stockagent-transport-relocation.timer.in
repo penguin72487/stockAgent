@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the checkpointed D to E transport placement at original owner boundaries
+
+[Timer]
+OnBootSec=30
+OnUnitInactiveSec=60
+AccuracySec=1
+Unit=stockagent-transport-relocation.service
+
+[Install]
+WantedBy=timers.target

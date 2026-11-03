@@ -12,6 +12,7 @@ import io
 import json
 from pathlib import Path
 import sqlite3
+import stat
 import sys
 import time
 
@@ -23,13 +24,18 @@ from downloader.news_fulltext import load_config
 from downloader.news_fulltext_http import NewsHTTP
 from downloader.news_fulltext_queue import utc_now
 from downloader.news_fulltext_urls import original_source_inventory
-from stockagent.data.news_source_catalog import adapter_summary
+from stockagent.data.news_source_catalog import adapter_summary, configuration_paths
 
 
 ENDPOINT_INVENTORY_CONTRACT_VERSION = 2
 FULL_FRONTIER_SCAN_CONTRACT_VERSION = 1
 INVENTORY_SCOPE_CONTRACT_VERSION = 1
 LITERAL_TARGET_COVERAGE_CONTRACT_VERSION = 1
+METADATA_SORT_DAY_QUALITY_CONTRACT_VERSION = 1
+METADATA_SORT_DAY_QUALITY_FIELDS = (
+    'metadata_sort_days_present', 'metadata_sort_days_invalid',
+    'metadata_sort_days_pre_1900', 'metadata_sort_days_after_snapshot_utc',
+)
 
 
 def _provider_scope(providers):
@@ -163,17 +169,54 @@ def inventory_endpoints_only(config_path: Path, *, providers=None) -> dict:
                            'scope': 'one owner-key read and configured endpoint descriptors; no article-frontier scan'}}
 
 
-def inventory(config_path: Path, *, providers=None, resolve_link_coverage=False) -> dict:
+def _offline_snapshot_signature(root: Path) -> dict:
+    """Capture admission evidence, not an exclusive lock on the producer."""
+    def file_signature(path, *, required=False):
+        try:
+            value = path.stat()
+        except FileNotFoundError:
+            if required:
+                raise ValueError('offline database is missing') from None
+            return None
+        if not stat.S_ISREG(value.st_mode):
+            raise ValueError('offline snapshot files must be regular files')
+        return {'device': value.st_dev, 'inode': value.st_ino, 'size': value.st_size,
+                'mtime_ns': value.st_mtime_ns, 'ctime_ns': value.st_ctime_ns}
+
+    return {'database': file_signature(root / 'queue.sqlite3', required=True),
+            'wal': file_signature(root / 'queue.sqlite3-wal'),
+            'journal': file_signature(root / 'queue.sqlite3-journal'),
+            'status': file_signature(root / 'status.json')}
+
+
+def _offline_configuration_signature(config_path: Path) -> dict:
+    return {str(path): sha256_file(path) for path in configuration_paths(config_path)}
+
+
+def inventory(config_path: Path, *, providers=None, resolve_link_coverage=False,
+              offline_immutable=False, sort_day_quality=False) -> dict:
     wall_started, cpu_started = time.perf_counter(), time.process_time()
     selected = _provider_scope(providers)
     if type(resolve_link_coverage) is not bool or (resolve_link_coverage and selected is None):
         raise ValueError('literal target coverage requires an explicit provider selection')
+    if type(offline_immutable) is not bool:
+        raise ValueError('offline immutable selection must be boolean')
+    if type(sort_day_quality) is not bool:
+        raise ValueError('sort-day quality selection must be boolean')
     predicate = 'provider IN (' + ','.join('?' for _ in selected) + ')' if selected is not None else None
     parameters = selected or ()
     frontier = 'FROM articles WHERE ' + predicate if predicate else 'FROM articles NOT INDEXED'
+    configuration = _offline_configuration_signature(config_path) if offline_immutable else None
     config, registry, repo = load_config(config_path)
     root = repo / config["root"]
-    db = sqlite3.connect(f"file:{root / 'queue.sqlite3'}?mode=ro", uri=True)
+    signature = _offline_snapshot_signature(root) if offline_immutable else None
+    if signature and signature['wal'] and signature['wal']['size']:
+        raise ValueError('offline immutable snapshot requires an empty WAL')
+    if signature and signature['journal'] and signature['journal']['size']:
+        raise ValueError('offline immutable snapshot requires an empty rollback journal')
+    uri = ((root / 'queue.sqlite3').resolve().as_uri() + '?mode=ro&immutable=1'
+           if offline_immutable else f"file:{root / 'queue.sqlite3'}?mode=ro")
+    db = sqlite3.connect(uri, uri=True)
     db.row_factory = sqlite3.Row
     try:
         db.execute('PRAGMA query_only=ON')
@@ -189,6 +232,12 @@ def inventory(config_path: Path, *, providers=None, resolve_link_coverage=False)
                   "inventory_implementation_sha256": sha256_file(Path(__file__)),
                   "config_sha256": sha256_file(config_path), "providers": {},
                   "metadata_date_basis": "local sorting dates, not verified publisher clocks or historical completeness",
+                  "metadata_sort_day_quality_requested": sort_day_quality,
+                  "metadata_sort_day_quality_contract_version": (METADATA_SORT_DAY_QUALITY_CONTRACT_VERSION
+                                                                   if sort_day_quality else None),
+                  "metadata_sort_day_quality_basis": (
+                      "calendar syntax and date range flags for sorting hints only; pre-1900 or after the "
+                      "UTC observation day does not by itself prove an incorrect publisher date" if sort_day_quality else None),
                   "article_grain": "normalized source URL; stock associations and body revisions are separate",
                   "unregistered_source_grain": "hostname keys; may include redirectors, duplicate publisher subdomains and aggregators, not unique publishers",
                   "publisher_requests": 0, "production_queue_writes": False,
@@ -203,17 +252,33 @@ def inventory(config_path: Path, *, providers=None, resolve_link_coverage=False)
         # metric. Provider/host groups retain the original inventory grain.
         # Full inventories read every applicable row sequentially. A selected
         # inventory instead uses provider indexes, leaving other heads alone.
+        # The optional checks share the existing frontier scan. Keep the more
+        # expensive calendar parsing out of ordinary inventories and polling.
+        valid_sort_day = ("metadata_order_day GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]' "
+                          "AND substr(metadata_order_day,1,4)!='0000' "
+                          "AND date(metadata_order_day,'+0 days')=metadata_order_day")
+        quality_sql = (",sum(nullif(metadata_order_day,'') IS NOT NULL) AS metadata_sort_days_present,"
+                       "sum(CASE WHEN nullif(metadata_order_day,'') IS NOT NULL AND ("
+                       + valid_sort_day + ") IS NOT 1 THEN 1 ELSE 0 END) AS metadata_sort_days_invalid,"
+                       "sum(CASE WHEN metadata_order_day<'1900-01-01' AND (" + valid_sort_day
+                       + ") THEN 1 ELSE 0 END) AS metadata_sort_days_pre_1900,"
+                       "sum(CASE WHEN metadata_order_day>? AND (" + valid_sort_day
+                       + ") THEN 1 ELSE 0 END) AS metadata_sort_days_after_snapshot_utc") if sort_day_quality else ''
+        quality_parameters = (result['observed_at_utc'][:10],) if sort_day_quality else ()
         for row in db.execute("SELECT provider,host,count(*) AS articles,sum(body_sha256 IS NOT NULL) AS stored_bodies,"
                               "min(nullif(metadata_order_day,'')) AS earliest_metadata_day,"
                               "max(nullif(metadata_order_day,'')) AS latest_metadata_day,max(captured_at_utc) AS latest_body_capture_utc,"
                               "sum(state IN ('retry','retry_cooldown') AND body_sha256 IS NOT NULL) AS stored_body_rechecks,"
-                              "sum(state IN ('pending','retry','retry_cooldown','inflight') AND body_sha256 IS NULL) AS missing_body_work "
-                              + frontier + " GROUP BY provider,host", parameters):
+                              "sum(state IN ('pending','retry','retry_cooldown','inflight') AND body_sha256 IS NULL) AS missing_body_work"
+                              + quality_sql + ' ' + frontier + " GROUP BY provider,host", quality_parameters + parameters):
             item = result["providers"].setdefault(row["provider"], {"hosts": [], "states": {}, "errors": []})
             item["hosts"].append({"host": row["host"], "articles": row["articles"]})
             item["known_urls"] = item.get("known_urls", 0) + row["articles"]
             for key in ("stored_bodies", "stored_body_rechecks", "missing_body_work"):
                 item[key] = item.get(key, 0) + (row[key] or 0)
+            if sort_day_quality:
+                for key in METADATA_SORT_DAY_QUALITY_FIELDS:
+                    item[key] = item.get(key, 0) + (row[key] or 0)
             for key in ("earliest_metadata_day", "latest_metadata_day", "latest_body_capture_utc"):
                 values = [v for v in (item.get(key), row[key]) if v is not None]
                 item[key] = (min(values) if key == "earliest_metadata_day" else max(values)) if values else None
@@ -256,6 +321,9 @@ def inventory(config_path: Path, *, providers=None, resolve_link_coverage=False)
         for provider, item in result["providers"].items():
             for metric in ('known_urls', 'stored_bodies', 'stored_body_rechecks', 'missing_body_work'):
                 item.setdefault(metric, 0)
+            if sort_day_quality:
+                for metric in METADATA_SORT_DAY_QUALITY_FIELDS:
+                    item.setdefault(metric, 0)
             for stamp in ('earliest_metadata_day', 'latest_metadata_day', 'latest_body_capture_utc'):
                 item.setdefault(stamp, None)
             source = registry.sources.get(provider)
@@ -311,9 +379,61 @@ def inventory(config_path: Path, *, providers=None, resolve_link_coverage=False)
         result["inventory_cost"] = {"wall_seconds": time.perf_counter() - wall_started,
                                     "cpu_seconds": time.process_time() - cpu_started,
                                     "scope": "single pinned read-only inventory; no publisher calls"}
+        if offline_immutable:
+            if _offline_snapshot_signature(root) != signature:
+                raise ValueError('offline immutable snapshot changed during inventory')
+            if _offline_configuration_signature(config_path) != configuration:
+                raise ValueError('offline inventory configuration changed during inventory')
+            result['offline_snapshot'] = {'contract_version': 2, 'wal_empty': True,
+                'rollback_journal_empty': True, 'file_signature': signature,
+                'configuration_sha256': configuration, 'writer_exclusion_proven': False,
+                'quiescence_must_be_established_externally': True,
+                'status_observed_at_utc': status.get('updated_at_utc')}
         return result
     finally:
         db.close()
+
+
+def sort_day_summary(result: dict, *, inventory_sha256: str) -> dict:
+    """Compact one full inventory without rescanning the queue for a page view."""
+    if (result.get('inventory_scope') != 'all_known_source_keys'
+            or result.get('all_known_source_keys_included') is not True
+            or result.get('metadata_sort_day_quality_requested') is not True
+            or type(result.get('metadata_sort_day_quality_contract_version')) is not int
+            or result['metadata_sort_day_quality_contract_version'] != METADATA_SORT_DAY_QUALITY_CONTRACT_VERSION
+            or type(result.get('publisher_requests')) is not int or result['publisher_requests'] != 0
+            or result.get('production_queue_writes') is not False
+            or not isinstance(inventory_sha256, str) or len(inventory_sha256) != 64
+            or any(char not in '0123456789abcdef' for char in inventory_sha256)):
+        raise ValueError('sort-day summary requires a complete quality inventory')
+    providers = result.get('providers')
+    if not isinstance(providers, dict):
+        raise ValueError('invalid sort-day inventory')
+    fields = ('known_heads', 'present', 'invalid', 'pre_1900', 'after_snapshot_utc')
+    source_fields = ('known_urls', *METADATA_SORT_DAY_QUALITY_FIELDS)
+    rows, totals = [], dict.fromkeys(fields, 0)
+    for provider, item in sorted(providers.items()):
+        if not isinstance(provider, str) or not isinstance(item, dict):
+            raise ValueError('invalid sort-day source')
+        values = [item.get(field) for field in source_fields]
+        if any(type(value) is not int or value < 0 for value in values):
+            raise ValueError('invalid sort-day counts')
+        known, present, invalid, early, future = values
+        if present > known or invalid + early + future > present:
+            raise ValueError('inconsistent sort-day counts')
+        if not known:
+            continue
+        row = {'provider': provider, **dict(zip(fields, values))}
+        rows.append(row)
+        for field in fields:
+            totals[field] += row[field]
+    observed = result['observed_at_utc']
+    return {'contract': 'news_sort_day_inventory_summary_v1', 'observed_at_utc': observed,
+            'utc_comparison_day': observed[:10], 'source_inventory_sha256': inventory_sha256,
+            'provider_keys_with_heads': len(rows), 'totals': totals,
+            'providers': rows, 'flagged_providers': [row for row in rows if any(row[field] for field in fields[2:])],
+            'publisher_requests': 0, 'production_queue_writes': False,
+            'date_semantics': 'sorting hints only; flags do not establish publication times or errors'}
 
 
 def main(argv=None):
@@ -326,9 +446,25 @@ def main(argv=None):
                         help='Only these exact configured or locally observed source keys; repeat for multiple sources')
     parser.add_argument('--resolve-link-coverage', action='store_true',
                         help='Deduplicate incoming literal targets for selected providers; no publisher requests')
+    parser.add_argument('--offline-immutable', action='store_true',
+                        help='For an externally quiesced queue only: require empty journals and reject changed inputs')
+    parser.add_argument('--sort-day-quality', action='store_true',
+                        help='Inspect sorting-day syntax and date-range flags during the existing frontier scan')
+    parser.add_argument('--sort-day-summary', type=Path,
+                        help='Write a compact full-inventory summary for the read-only dashboard')
     args = parser.parse_args(argv)
     if args.resolve_link_coverage and (not args.provider or args.endpoints_only):
         parser.error('--resolve-link-coverage requires --provider and a provider inventory')
+    if args.offline_immutable and args.endpoints_only:
+        parser.error('--offline-immutable requires a provider inventory')
+    if args.sort_day_quality and args.endpoints_only:
+        parser.error('--sort-day-quality requires a provider inventory')
+    if args.sort_day_summary:
+        if not args.sort_day_quality or args.provider or args.endpoints_only:
+            parser.error('--sort-day-summary requires an all-source --sort-day-quality inventory')
+        destinations = (args.output, args.output.with_suffix('.csv'), args.output.with_suffix('.endpoints.csv'))
+        if args.sort_day_summary.resolve() in {path.resolve() for path in destinations}:
+            parser.error('--sort-day-summary must be separate from inventory outputs')
     if args.endpoints_only:
         result = inventory_endpoints_only(args.config, providers=args.provider)
         args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -342,11 +478,15 @@ def main(argv=None):
         print(json.dumps({'output': str(args.output), 'endpoints': len(result['endpoints']),
                           'scope': result['inventory_scope'], 'publisher_requests': 0}))
         return 0
-    result = inventory(args.config, providers=args.provider, resolve_link_coverage=args.resolve_link_coverage)
+    result = inventory(args.config, providers=args.provider, resolve_link_coverage=args.resolve_link_coverage,
+                       offline_immutable=args.offline_immutable, sort_day_quality=args.sort_day_quality)
     args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(args.output, result)
+    if args.sort_day_summary:
+        atomic_write_json(args.sort_day_summary, sort_day_summary(result, inventory_sha256=sha256_file(args.output)))
     fields = ["provider", "name", "configured", "enabled", "acquisition_mode", "known_urls", "stored_bodies", "stored_body_rechecks",
               "missing_body_work", "earliest_metadata_day", "latest_metadata_day", "latest_body_capture_utc",
+              *METADATA_SORT_DAY_QUALITY_FIELDS,
               "source_role", "adapter", "adapter_registered", "adapter_verified", "adapter_acceptance", "next_action",
               "literal_metadata_links", "original_hosts_json", "literal_target_coverage_json",
               "inventory_scope", "all_known_source_keys_included",

@@ -283,6 +283,87 @@ def test_final_scan_gate_cannot_extend_full_proof_or_hide_generation_changes(tmp
     assert (Path(state['quarantine'])/'source/checkpoint.pt').is_file()
 
 
+@pytest.mark.parametrize('defect', [None, 'source-bytes', 'cold-bytes', 'pin'])
+def test_owned_post_rename_audit_runs_outside_shared_owner_and_preserves_gates(tmp_path, monkeypatch, defect):
+    import fcntl
+    import stockagent.data_sync.artifact_retirement as common
+    from scripts import retire_local_offline_artifacts as cleanup
+
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    options['manual_immediate'] = True
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    original_verified_at = plan['full_verification']['verified_at_epoch']
+    target = tmp_path / 'receipt'
+    target.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', lambda *a: {'ok': True})
+    apply = cleanup.apply_legacy_retirement
+    verify = retirement.verify_packed_snapshot
+    transitions, full_audits = [], []
+
+    def after_rename(spec, **kwargs):
+        try:
+            return apply(spec, **kwargs)
+        except retirement.LegacyQuarantineAuditRequired:
+            state = json.loads(retirement._state_path(options['state_root'], spec.dataset).read_bytes())
+            quarantine = Path(state['quarantine'])
+            assert state['state'] == 'retiring' and not source.exists() and not hot.exists()
+            assert (quarantine / 'source/checkpoint.pt').is_file()
+            transitions.append(quarantine)
+            if defect == 'source-bytes':
+                path = quarantine / 'source/checkpoint.pt'
+                info = path.stat()
+                path.write_bytes(b'X' * info.st_size)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+            elif defect == 'cold-bytes':
+                release = resolve_latest_packed(options['sync_root'], spec.dataset)
+                path = options['sync_root'] / release.manifest['archive']['objects'][0]['relpath']
+                info = path.stat()
+                path.write_bytes(b'X' * info.st_size)
+                os.utime(path, ns=(info.st_atime_ns, info.st_mtime_ns))
+            elif defect == 'pin':
+                monkeypatch.setattr(common, '_pinned_snapshot_ids', lambda *a: {plan['snapshot_id']})
+            raise
+
+    def audited_outside_owner(*args, **kwargs):
+        # The complete packed and original audit must not hold the global
+        # mutation owner or permit a deletion before this full byte check.
+        with cleanup.COMMON_OWNER.open('a') as probe:
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert len(transitions) == 1 and (transitions[0] / 'source/checkpoint.pt').is_file()
+        full_audits.append(True)
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(cleanup, 'apply_legacy_retirement', after_rename)
+    monkeypatch.setattr(retirement, 'verify_packed_snapshot', audited_outside_owner)
+    call = lambda: cleanup.retire_after_convergence(
+        spec, None, target, plan, options, separate_quarantine_audit=True)
+    if defect:
+        with pytest.raises(SnapshotError):
+            call()
+        assert transitions and (transitions[0] / 'source/checkpoint.pt').is_file()
+        assert json.loads(retirement._state_path(options['state_root'], spec.dataset).read_bytes())['state'] == 'retiring'
+    else:
+        result = call()
+        assert result['deleted'] and result['resumed_quarantine'] and full_audits == [True]
+        assert not transitions[0].exists() and not source.exists() and not hot.exists()
+        assert result['full_verification']['contract'] == 'owned-legacy-quarantine-resume-v2'
+        restored = tmp_path / 'restored-after-staged-retirement'
+        restore_archive(spec, options['sync_root'], restored, materialized_root=tmp_path / 'restore-cache')
+        assert (restored / 'checkpoint.pt').read_bytes().startswith(b'old unfinished run')
+    assert plan['full_verification']['verified_at_epoch'] == original_verified_at
+
+
+def test_post_rename_deferral_rejects_automatic_or_unowned_plan_before_mutation(tmp_path, monkeypatch):
+    spec, source, hot, options = _fixture(tmp_path, monkeypatch)
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    with pytest.raises(SnapshotError, match='exact owned manual plan'):
+        retirement.apply_legacy_retirement(spec, expected_fingerprint=plan['plan_fingerprint'],
+                                           owned_verified_plan=plan, defer_owned_post_rename_audit=True,
+                                           **options)
+    assert source.is_dir() and hot.is_dir()
+
+
 @pytest.mark.parametrize('late_change', [None, 'source', 'pin', 'process', 'expired'])
 def test_owned_resume_wait_releases_common_owner_without_repeating_full_bytes(
         tmp_path, monkeypatch, late_change):
@@ -472,9 +553,13 @@ def test_owned_quarantine_resume_decodes_once_outside_mutation_and_binds_full_in
         calls.append(True)
         return verify(*args, **kwargs)
     monkeypatch.setattr(retirement, 'verify_archive_directory', full_audit)
-    resumed = retirement.plan_legacy_quarantine_resume(spec, plan, **options)
+    audit_progress = []
+    resumed = retirement.plan_legacy_quarantine_resume(spec, plan, progress=audit_progress.append, **options)
     full = resumed['full_verification']
     assert calls == [True] and full['contract'] == 'owned-legacy-quarantine-resume-v2'
+    assert audit_progress[0]['audit_step'] == 'bind-quarantine-and-current-generations'
+    assert audit_progress[-1]['audit_step'] == 'full-audit-complete'
+    assert any(p.get('stage') == 'decode-originals' for p in audit_progress)
     if defect == 'old-contract': full['contract'] = 'owned-legacy-quarantine-resume-v1'
     elif defect == 'manifest-proof': full['verified_archive_manifest_sha256'] = '0' * 64
     elif defect == 'file-count': full['original_files'] += 1

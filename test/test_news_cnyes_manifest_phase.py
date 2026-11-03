@@ -1,6 +1,7 @@
 """Finite metadata-phase counts/ETA never become full-text completeness."""
 from datetime import datetime, timezone
 from dataclasses import replace
+import json
 import sqlite3
 import time
 
@@ -325,7 +326,299 @@ def test_partial_phase_does_not_adopt_failure_from_an_unplanned_source_date(queu
     assert result['forecast']['state'] != 'partial_page_waiting'
 
 
-@pytest.mark.parametrize('change', ['bad_witness', 'oversized_witness', 'changed_job', 'missing_job', 'too_many_witnesses'])
+def test_many_unplanned_witnesses_do_not_hide_a_relevant_failure(queue):
+    """Historical page failures outside this phase are not unfinished pages."""
+    from downloader.news_fulltext_cnyes_index import request_failure_scope_key, request_url
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    job = register(queue, page=2)
+    fail_discovery(queue, job, NewsError('cnyes_index_unverified_metadata', retry=True, delay=3600))
+    source = queue.registry.sources['cnyes']
+    template = json.loads(queue.db.execute('SELECT value FROM queue_settings WHERE key=?',
+        (request_failure_scope_key(source, job['url']),)).fetchone()[0])
+    with queue.db:
+        for offset in range(1, 130):
+            url = request_url(source, DAY - offset, 2)
+            value = dict(template, request_url=url)
+            queue.db.execute('INSERT INTO queue_settings VALUES (?,?)',
+                (request_failure_scope_key(source, url), json.dumps(value)))
+    changes = queue.db.total_changes
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'waiting'
+    assert result['partial_page_gate']['failed_pages'] == 1
+    assert result['forecast']['state'] == 'partial_page_waiting'
+    assert queue.db.total_changes == changes
+
+    # The original endpoint witness remains usable for pre-migration queues.
+    with queue.db:
+        queue.db.execute('DELETE FROM queue_settings WHERE key=?',
+            (request_failure_scope_key(source, job['url']),))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'waiting'
+    assert result['partial_page_gate']['failed_pages'] == 1
+
+    # An ambiguous witness anywhere in the bounded scan still forbids an ETA.
+    prefix = request_failure_scope_key(source) + ':'
+    with queue.db:
+        queue.db.execute('INSERT INTO queue_settings VALUES (?,?)', (prefix + 'f' * 64, '{}'))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'unknown'
+    assert result['forecast']['middle_finish_at_utc'] is None
+
+
+def test_many_relevant_failures_are_counted_until_their_own_pages_recover(queue):
+    from downloader.news_fulltext_cnyes_index import request_failure_scope_key, request_url
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=4500)
+    job = register(queue, page=2)
+    fail_discovery(queue, job, NewsError('cnyes_index_unverified_metadata', retry=True, delay=3600))
+    source = queue.registry.sources['cnyes']
+    template = json.loads(queue.db.execute('SELECT value FROM queue_settings WHERE key=?',
+        (request_failure_scope_key(source, job['url']),)).fetchone()[0])
+    with queue.db:
+        for number in range(3, 132):
+            url = request_url(source, DAY, number)
+            queue.db.execute('INSERT INTO discovery '
+                '(url,kind,provider,due,attempts,error_code,last_checked_at_utc) '
+                'SELECT ?,kind,provider,due,attempts,error_code,last_checked_at_utc '
+                'FROM discovery WHERE url=?', (url, job['url']))
+            queue.db.execute('INSERT INTO queue_settings VALUES (?,?)',
+                (request_failure_scope_key(source, url), json.dumps(dict(template, request_url=url))))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'waiting'
+    assert result['partial_page_gate']['failed_pages'] == 130
+    page(queue, number=2, total=4500)
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'waiting'
+    assert result['partial_page_gate']['failed_pages'] == 129
+
+
+@pytest.mark.parametrize('error', [
+    'cnyes_index_not_modified_without_evidence', 'cnyes_index_original_evidence_unverified',
+    'cnyes_index_original_receipt_unverified',
+])
+def test_partial_phase_waits_for_local_evidence_failure_until_success(queue, error):
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    job = register(queue, page=2)
+    fail_discovery(queue, job, NewsError(error, retry=True, delay=3600))
+    now = time.time()
+    result = phase(queue, now_epoch=now, activity='running')
+    assert result['partial_page_gate']['state'] == 'waiting'
+    assert result['partial_page_gate']['failed_pages'] == 1
+    assert result['forecast']['state'] == 'partial_page_waiting'
+    due = datetime.fromisoformat(result['partial_page_gate']['next_probe_at_utc']).timestamp()
+    assert phase(queue, now_epoch=due + 1, activity='running')['partial_page_gate']['state'] == 'rechecking'
+    page(queue, number=2, total=120)
+    assert phase(queue, now_epoch=time.time(), activity='running')['partial_page_gate']['state'] == 'none_observed'
+
+
+def test_partial_phase_ignores_local_failure_from_an_unplanned_date(queue):
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    unrelated = register(queue, page=2, day=DAY - 1)
+    fail_discovery(queue, unrelated, NewsError('cnyes_index_original_receipt_unverified', retry=True, delay=3600))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'none_observed'
+    assert result['partial_page_gate']['failed_pages'] == 0
+
+
+def test_partial_phase_combines_local_and_metadata_failures_without_clearing_either(queue):
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=150)
+    metadata, local = register(queue, page=2), register(queue, page=3)
+    fail_discovery(queue, metadata, NewsError('cnyes_index_unverified_metadata', retry=True, delay=3600))
+    fail_discovery(queue, local, NewsError('cnyes_index_original_receipt_unverified', retry=True, delay=1800))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'waiting'
+    assert result['partial_page_gate']['failed_pages'] == 2
+    page(queue, number=2, total=150)
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'waiting'
+    assert result['partial_page_gate']['failed_pages'] == 1
+    page(queue, number=3, total=150)
+    assert phase(queue, now_epoch=time.time(), activity='running')['partial_page_gate']['state'] == 'none_observed'
+
+
+@pytest.mark.parametrize('change', ['clock', 'deadline', 'attempts', 'superseded', 'provider'])
+def test_partial_phase_does_not_guess_from_inconsistent_local_failure(queue, change):
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    job = register(queue, page=2)
+    fail_discovery(queue, job, NewsError('cnyes_index_original_receipt_unverified', retry=True, delay=3600))
+    updates = {
+        'clock': "last_checked_at_utc='invalid'",
+        'deadline': "due=-1",
+        'attempts': "attempts=0",
+        'superseded': "superseded_by_windows_json='[]'",
+        'provider': "provider='other'",
+    }
+    with queue.db:
+        queue.db.execute('UPDATE discovery SET ' + updates[change] + ' WHERE url=?', (job['url'],))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'unknown'
+    assert result['forecast']['middle_finish_at_utc'] is None
+
+
+@pytest.mark.parametrize('limit', ['PARTIAL_LOCAL_MAX_MISSING_PAGES', 'PARTIAL_LOCAL_MAX_OBSERVED_PAGES'])
+def test_partial_phase_does_not_guess_beyond_local_scan_budget(queue, monkeypatch, limit):
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    monkeypatch.setattr('downloader.news_fulltext_cnyes_index.' + limit, 0)
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'unknown'
+    assert result['forecast']['middle_finish_at_utc'] is None
+
+
+def test_witness_character_budget_keeps_eta_unknown(queue, monkeypatch):
+    from downloader.news_fulltext_cnyes_index import request_failure_scope_key, request_url
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    source = queue.registry.sources['cnyes']
+    url = request_url(source, DAY - 1, 2)
+    with queue.db:
+        queue.db.execute('INSERT INTO queue_settings VALUES (?,?)',
+            (request_failure_scope_key(source, url), json.dumps({'request_url': url})))
+    monkeypatch.setattr('downloader.news_fulltext_cnyes_index.PARTIAL_WITNESS_MAX_CHARS', 10)
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'unknown'
+    assert result['forecast']['middle_finish_at_utc'] is None
+
+
+@pytest.mark.parametrize('legacy', [False, True])
+@pytest.mark.parametrize('padding', [10000, 50000])
+def test_embedded_nul_cannot_bypass_single_witness_size_bound(queue, monkeypatch, legacy, padding):
+    import downloader.news_fulltext_cnyes_index as index
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    job = register(queue, page=2)
+    fail_discovery(queue, job, NewsError('cnyes_index_unverified_metadata', retry=True, delay=3600))
+    source = queue.registry.sources['cnyes']
+    with queue.db:
+        key = index.request_failure_scope_key(source, job['url'])
+        if legacy:
+            queue.db.execute('DELETE FROM queue_settings WHERE key=?', (key,))
+            key = index.request_failure_scope_key(source)
+        queue.db.execute('UPDATE queue_settings SET value=? WHERE key=?',
+            ('{}\x00' + 'x' * padding, key))
+    def must_not_parse(*_args):
+        pytest.fail('oversized witness reached JSON parsing')
+    monkeypatch.setattr(index, '_parse_partial_witness', must_not_parse)
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'unknown'
+    assert result['forecast']['middle_finish_at_utc'] is None
+
+
+def test_witness_byte_bound_preserves_valid_multibyte_text(queue):
+    from downloader.news_fulltext_cnyes_index import request_failure_scope_key, request_url
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    source = queue.registry.sources['cnyes']
+    url = request_url(source, DAY - 1, 2)
+    value = json.dumps({'request_url': url, 'note': '字' * 2000}, ensure_ascii=False)
+    with queue.db:
+        queue.db.execute('INSERT INTO queue_settings VALUES (?,?)',
+            (request_failure_scope_key(source, url), value))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'none_observed'
+
+
+def test_partial_witness_cache_reuses_only_exact_bytes_and_keeps_jobs_live(queue, monkeypatch):
+    import downloader.news_fulltext_cnyes_index as index
+    from test_news_cnyes_public_index import register
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    job = register(queue, page=2)
+    fail_discovery(queue, job, NewsError('cnyes_index_unverified_metadata', retry=True, delay=3600))
+    source = queue.registry.sources['cnyes']
+    cache = PublicIndexRowsCache()
+    key = index.request_failure_scope_key(source, job['url'])
+    original = index._parse_partial_witness
+    calls = []
+    def counted(*args):
+        calls.append(args[1])
+        return original(*args)
+    monkeypatch.setattr(index, '_parse_partial_witness', counted)
+    for _ in range(2):
+        result = progress(queue.db, source, rows_cache=cache, now_epoch=time.time(), activity='running')
+        assert result['manifest_phase']['partial_page_gate']['state'] == 'waiting'
+    assert calls == [key]
+    with queue.db:
+        queue.db.execute('UPDATE discovery SET due=due+10 WHERE url=?', (job['url'],))
+    result = progress(queue.db, source, rows_cache=cache, now_epoch=time.time(), activity='running')
+    assert result['manifest_phase']['partial_page_gate']['state'] == 'unknown'
+    assert calls == [key]  # The witness is cached, not the changed job.
+    with queue.db:
+        queue.db.execute('UPDATE queue_settings SET value=? WHERE key=?', ('{}', key))
+    result = progress(queue.db, source, rows_cache=cache, now_epoch=time.time(), activity='running')
+    assert result['manifest_phase']['partial_page_gate']['state'] == 'unknown'
+    assert calls == [key, key]
+
+
+def test_partial_witness_cache_rechecks_source_identity_and_backward_clock(queue, monkeypatch):
+    import downloader.news_fulltext_cnyes_index as index
+
+    source = queue.registry.sources['cnyes']
+    url = index.request_url(source, DAY, 2)
+    key = index.request_failure_scope_key(source, url)
+    raw = json.dumps({'request_url': url})
+    cache = index.PartialWitnessCache()
+    cache.parse(source, key, raw)
+    changed = replace(source, cnyes_index_data_fingerprint='different-fingerprint')
+    with pytest.raises(ValueError):
+        cache.parse(changed, key, raw)
+    high = index.validate_request(url, source)[3]
+    monkeypatch.setattr(index.time, 'time', lambda: high - 86401)
+    with pytest.raises(NewsError, match='cnyes_index_request_unregistered'):
+        cache.parse(source, key, raw)
+
+
+def test_unbounded_witness_history_remains_unknown(queue):
+    from downloader.news_fulltext_cnyes_index import request_failure_scope_key, request_url
+
+    with queue.db:
+        add_gap(queue, DAY)
+    page(queue, total=120)
+    source = queue.registry.sources['cnyes']
+    with queue.db:
+        for offset in range(1, 4098):
+            url = request_url(source, DAY - offset, 2)
+            queue.db.execute('INSERT INTO queue_settings VALUES (?,?)',
+                (request_failure_scope_key(source, url), json.dumps({'request_url': url})))
+    result = phase(queue, now_epoch=time.time(), activity='running')
+    assert result['partial_page_gate']['state'] == 'unknown'
+    assert result['forecast']['middle_finish_at_utc'] is None
+
+
+@pytest.mark.parametrize('change', ['bad_witness', 'deep_witness', 'oversized_witness', 'changed_job', 'missing_job', 'too_many_witnesses'])
 def test_partial_page_gate_does_not_invent_recovery_from_ambiguous_evidence(queue, change):
     with queue.db:
         add_gap(queue, DAY)
@@ -339,6 +632,8 @@ def test_partial_page_gate_does_not_invent_recovery_from_ambiguous_evidence(queu
     with queue.db:
         if change == 'bad_witness':
             queue.db.execute('UPDATE queue_settings SET value=? WHERE key=?', ('{}', key))
+        elif change == 'deep_witness':
+            queue.db.execute('UPDATE queue_settings SET value=? WHERE key=?', ('[' * 1200 + ']' * 1200, key))
         elif change == 'oversized_witness':
             queue.db.execute('UPDATE queue_settings SET value=? WHERE key=?', ('x' * 8193, key))
         elif change == 'changed_job':

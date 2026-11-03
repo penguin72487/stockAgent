@@ -625,6 +625,56 @@ def test_parallel_signature_survives_cache_eviction_without_losing_fence(tmp_pat
             release.set()
 
 
+def test_parallel_metadata_read_survives_eviction_and_recheck_waits(tmp_path, monkeypatch):
+    for directory in ('first', 'second'):
+        (tmp_path / directory).mkdir()
+        (tmp_path / directory / 'member.json').write_bytes(directory.encode())
+    started, release = threading.Event(), threading.Event()
+    original_open = os.open
+    calls = 0
+    lock = threading.Lock()
+
+    def slow_first_open(path, flags, *args, **kwargs):
+        nonlocal calls
+        if path == 'member.json' and kwargs.get('dir_fd') is not None:
+            with lock:
+                calls += 1
+                first = calls == 1
+            if first:
+                started.set()
+                assert release.wait(5)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', slow_first_open)
+    with PinnedObjectSignatures(tmp_path, max_open_directories=2,
+                                parallel_signatures=True) as reader:
+        try:
+            with ThreadPoolExecutor(max_workers=3) as workers:
+                first = workers.submit(reader.read_metadata, 'first/member.json')
+                assert started.wait(5)
+                second = workers.submit(reader.read_metadata, 'second/member.json')
+                assert second.result(timeout=5)[0] == b'second'
+                assert ('first',) not in reader._directories
+                fence = workers.submit(reader.recheck)
+                assert not fence.done()
+                release.set()
+                assert first.result(timeout=5)[0] == b'first'
+                fence.result(timeout=5)
+            assert reader._inflight_signatures == 0
+        finally:
+            release.set()
+
+
+def test_parallel_metadata_read_rejects_symlink_and_releases_pin(tmp_path):
+    (tmp_path / 'source').write_bytes(b'original')
+    (tmp_path / 'link.json').symlink_to(tmp_path / 'source')
+    with PinnedObjectSignatures(tmp_path, parallel_signatures=True) as reader:
+        with pytest.raises(OSError):
+            reader.read_metadata('link.json')
+        assert reader._inflight_signatures == 0
+        reader.recheck()
+
+
 @pytest.mark.parametrize('parallel_signatures', [False, True])
 @pytest.mark.parametrize('kind', ['symlink', 'directory', 'fifo'])
 def test_regular_member_signature_rejects_nonregular_leaf_without_opening(tmp_path, kind, parallel_signatures):

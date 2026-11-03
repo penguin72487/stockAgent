@@ -95,11 +95,16 @@ public static class TejBridgeNative {
         return r.ToInt64();
     }
     public static void NotifyBinding(long parent,long control,long notify) {
+        NotifyBinding(parent,control,notify,150000u);
+    }
+    public static void NotifyBinding(long parent,long control,long notify,uint timeoutMilliseconds) {
         // Wait for the ONE normal selection event to finish. Reading an
         // already-set combo index after PostMessage did not prove its source
         // company/date menus were refreshed; sent read messages can overtake
         // a posted event. Never repeat a timed-out metadata notification.
-        IntPtr r;if(SendMessageTimeoutW(new IntPtr(parent),0x111,new IntPtr(notify),new IntPtr(control),2,150000,out r)==IntPtr.Zero)
+        if(timeoutMilliseconds!=150000u && timeoutMilliseconds!=600000u)
+            throw new ArgumentOutOfRangeException("timeoutMilliseconds");
+        IntPtr r;if(SendMessageTimeoutW(new IntPtr(parent),0x111,new IntPtr(notify),new IntPtr(control),2,timeoutMilliseconds,out r)==IntPtr.Zero)
             throw new TimeoutException("Binding event unresolved; no notification retry");
     }
     public static long[] Children(long root,string classPrefix) {
@@ -254,6 +259,113 @@ public static class TejBridgeNative {
                 throw new TimeoutException("Vendor catalog read timed out");
             items[i]=b.ToString();
         } return items;
+    }
+    public static string[] SampleLargeCompanyAxis(long root,long control,int expectedPid,string title) {
+        // Read-only evidence for a vendor menu too large for the current
+        // discovery contract. This never turns the sample into an accepted
+        // universe or submits Preview. The live owner repeats its source
+        // binding check before publishing the diagnostic sidecar.
+        AssertControlScope(root,control,expectedPid,title);
+        IntPtr h=new IntPtr(control);
+        if(!IsWindowEnabled(new IntPtr(root))||!IsWindowEnabled(h)||!IsWindowVisible(h)||
+           Dialogs(root).Length!=0||!WindowClass(control).StartsWith("WindowsForms10.LISTBOX.",StringComparison.Ordinal))
+            throw new Exception("Large company-axis sample scope unavailable");
+        long n=SignedControlResult(Message(control,0x18Bu,0,0));
+        if(n<=150000||n>2000000)throw new Exception("Large company-axis sample count outside diagnostic bound");
+        long[] anchors=new long[]{0,n/4,n/2,(3*n)/4,n-4};
+        string[] result=new string[anchors.Length*4];
+        for(int a=0;a<anchors.Length;a++)for(int j=0;j<4;j++) {
+            long index=anchors[a]+j;
+            long len=SignedControlResult(Message(control,0x18Au,index,0));
+            if(len<1||len>4096)throw new Exception("Large company-axis sample text bound differs");
+            var b=new StringBuilder((int)len+1);IntPtr r;
+            if(ReadText(h,0x189u,new IntPtr(index),b,2,10000,out r)==IntPtr.Zero||
+               SignedControlResult(r.ToInt64())!=len||b.Length!=len)
+                throw new Exception("Large company-axis sample readback differs");
+            result[4*a+j]=b.ToString();
+        }
+        AssertControlScope(root,control,expectedPid,title);
+        if(!IsWindowEnabled(new IntPtr(root))||!IsWindowEnabled(h)||!IsWindowVisible(h)||
+           Dialogs(root).Length!=0||SignedControlResult(Message(control,0x18Bu,0,0))!=n)
+            throw new Exception("Large company-axis sample source changed");
+        return result;
+    }
+    public static string[] ReadLargeCompanyAxisPage(long root,long control,int expectedPid,string title,
+                                                    long expectedCount,long start,int length) {
+        // Read one bounded page of the same live vendor list. A caller still
+        // needs a complete source-bound capture, uniqueness/ordering checks,
+        // and a separate admission contract; this method only reads labels.
+        if(expectedCount<=150000||expectedCount>2000000||length<1||length>4096||
+           start<0||start>expectedCount-length)
+            throw new Exception("Large company-axis page range out of bounds");
+        AssertControlScope(root,control,expectedPid,title);IntPtr h=new IntPtr(control);
+        if(!IsWindowEnabled(new IntPtr(root))||!IsWindowEnabled(h)||!IsWindowVisible(h)||
+           Dialogs(root).Length!=0||!WindowClass(control).StartsWith("WindowsForms10.LISTBOX.",StringComparison.Ordinal)||
+           SignedControlResult(Message(control,0x18Bu,0,0))!=expectedCount)
+            throw new Exception("Large company-axis page source unavailable");
+        string[] result=new string[length];var b=new StringBuilder(128);
+        for(int i=0;i<length;i++) {
+            long index=start+i,n=SignedControlResult(Message(control,0x18Au,index,0));
+            if(n<1||n>4096)throw new Exception("Large company-axis page text bound differs");
+            b.Length=0;b.EnsureCapacity((int)n+1);IntPtr r;
+            if(ReadText(h,0x189u,new IntPtr(index),b,2,10000,out r)==IntPtr.Zero||
+               SignedControlResult(r.ToInt64())!=n||b.Length!=n)
+                throw new Exception("Large company-axis page readback differs");
+            result[i]=b.ToString();
+        }
+        AssertControlScope(root,control,expectedPid,title);
+        if(!IsWindowEnabled(new IntPtr(root))||!IsWindowEnabled(h)||!IsWindowVisible(h)||
+           Dialogs(root).Length!=0||SignedControlResult(Message(control,0x18Bu,0,0))!=expectedCount)
+            throw new Exception("Large company-axis page source changed");
+        return result;
+    }
+    public static void CaptureLargeCompanyAxis(long root,long control,int expectedPid,string title,
+                                               long expectedCount,string stagedPath) {
+        CaptureLargeCompanyAxis(root,control,expectedPid,title,expectedCount,stagedPath,null,null,null);
+    }
+    public static void CaptureLargeCompanyAxis(long root,long control,int expectedPid,string title,
+                                               long expectedCount,string stagedPath,
+                                               string progressPath,string task,string attempt) {
+        // A complete menu observation, not a history plan or data query. Keep
+        // only one page in memory, then independently compare a second full
+        // live read with every stored label. The caller must recheck binding
+        // and publish a separate source-bound manifest before it can be used.
+        if(String.IsNullOrEmpty(stagedPath))throw new ArgumentException("Staged path required");
+        const int pageSize=2048;const long maximumBytes=256L*1024*1024;
+        var utf8=new UTF8Encoding(false,true);
+        var progress=System.Diagnostics.Stopwatch.StartNew();
+        using(var file=new System.IO.FileStream(stagedPath,System.IO.FileMode.CreateNew,
+                System.IO.FileAccess.Write,System.IO.FileShare.None,65536))
+        using(var writer=new System.IO.BinaryWriter(file,utf8)) {
+            writer.Write("stockagent_tej_company_axis_binary_v1");writer.Write(expectedCount);
+            for(long start=0;start<expectedCount;start+=pageSize) {
+                int length=(int)Math.Min(pageSize,expectedCount-start);
+                foreach(string label in ReadLargeCompanyAxisPage(root,control,expectedPid,title,expectedCount,start,length)) {
+                    writer.Write(label);
+                    if(file.Position>maximumBytes)throw new Exception("Large company-axis capture exceeds byte bound");
+                }
+                if(progress.Elapsed.TotalSeconds>=10) {
+                    WriteScopeProgress(progressPath,task,attempt,"company_universe_and_lookup");progress.Restart();
+                }
+            }
+            writer.Flush();file.Flush(true);
+        }
+        using(var file=new System.IO.FileStream(stagedPath,System.IO.FileMode.Open,
+                System.IO.FileAccess.Read,System.IO.FileShare.Read,65536))
+        using(var reader=new System.IO.BinaryReader(file,utf8)) {
+            if(reader.ReadString()!="stockagent_tej_company_axis_binary_v1"||reader.ReadInt64()!=expectedCount)
+                throw new Exception("Large company-axis capture header changed");
+            for(long start=0;start<expectedCount;start+=pageSize) {
+                int length=(int)Math.Min(pageSize,expectedCount-start);
+                foreach(string label in ReadLargeCompanyAxisPage(root,control,expectedPid,title,expectedCount,start,length))
+                    if(!String.Equals(reader.ReadString(),label,StringComparison.Ordinal))
+                        throw new Exception("Large company-axis changed between complete reads");
+                if(progress.Elapsed.TotalSeconds>=10) {
+                    WriteScopeProgress(progressPath,task,attempt,"company_universe_and_lookup");progress.Restart();
+                }
+            }
+            if(file.Position!=file.Length)throw new Exception("Large company-axis capture has trailing bytes");
+        }
     }
     private static void ComboScope(long root,long control,bool editable) {
         var r=new IntPtr(root);var h=new IntPtr(control);uint rp,cp;
@@ -541,14 +653,16 @@ public static class TejBridgeNative {
         if(!cls.ToString().StartsWith("WindowsForms10.LISTBOX.",StringComparison.Ordinal))
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: unreviewed lookup control class");
         long count=Message(control,0x18B,0,0);
-        if(count<1||count>150000)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list count out of bounds");
+        // A finite lookup reads the named live item, not the complete list.
+        // Keep the separate full-catalog admission limit unchanged.
+        if(count<1||count>2000000)throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list count out of bounds");
         return count;
     }
     private static int ExactListIndexCore(long control,string label,long count,bool allowAbsent=false) {
         IntPtr h=new IntPtr(control),result;
         if(String.IsNullOrEmpty(label)||label.Length>4096)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: requested source label bound differs");
-        if(count<1||count>150000||WriteText(h,0x1A2u,new IntPtr(-1),label,2,10000,out result)==IntPtr.Zero)
+        if(count<1||count>2000000||WriteText(h,0x1A2u,new IntPtr(-1),label,2,10000,out result)==IntPtr.Zero)
             throw new Exception("LOCAL_SELECTION_BEFORE_QUERY: exact list lookup unresolved");
         long first=SignedControlResult(result.ToInt64()),index=first;int exact=-1;
         if(index<0) {
@@ -1660,7 +1774,7 @@ try {
     }
     function Message([long]$h,[uint32]$m,[long]$w=0,[long]$l=0) {Assert-Scope $h;return [TejBridgeNative]::Message($h,$m,$w,$l)}
     function Items([long]$h,[bool]$combo=$false) {Assert-Scope $h;return ,[TejBridgeNative]::Items($h,$combo)}
-    function Select-Combo([long]$h,[string]$name,[bool]$notifyEvenIfSelected=$false) {
+    function Select-Combo([long]$h,[string]$name,[bool]$notifyEvenIfSelected=$false,[uint32]$notificationTimeoutMs=150000) {
         if([TejBridgeNative]::Dialogs($ExpectedWindow).Count -ne 0 -or
            -not ([Windows.Automation.AutomationElement]::FromHandle([IntPtr]$h)).Current.IsEnabled){throw 'Notice/disabled source selector; no binding change'}
         $deadline=[DateTime]::UtcNow.AddSeconds(150);$i=-1
@@ -1675,7 +1789,11 @@ try {
            -not [TejBridgeNative]::IsWindowEnabled([IntPtr]$h)){throw 'LOCAL_SELECTION_BEFORE_QUERY: combo changed before one binding event'}
         [void](Message $h 0x14E $i);$p=[TejBridgeNative]::GetParent([IntPtr]$h).ToInt64()
         $notify=(([TejBridgeNative]::GetDlgCtrlID([IntPtr]$h) -band 65535) -bor 65536)
-        [TejBridgeNative]::NotifyBinding($p,$h,$notify)
+        [TejBridgeNative]::NotifyBinding($p,$h,$notify,$notificationTimeoutMs)
+        # The option-universe probe can spend longer in the one synchronous
+        # callback than the original pre-selection deadline. Bound its
+        # post-callback readback separately; a timeout still never re-sends.
+        if($notificationTimeoutMs -eq 600000){$deadline=[DateTime]::UtcNow.AddSeconds(30)}
         do {
             try{if((Message $h 0x147) -eq $i -and [TejBridgeNative]::SelectedComboText($ExpectedWindow,$h) -ceq $name){return}}catch{if([DateTime]::UtcNow -ge $deadline){throw}}
             Start-Sleep -Milliseconds 25
@@ -2381,13 +2499,20 @@ try {
         # Reapply its existing metadata notification once after a binding change.
         $refreshUniverse=$queryEditModeChanged -or (-not $bindingAlreadyMatches) -or
             $requestDoc.refresh_company_universe_once -eq $true
-        Select-Combo $sectorCombo 'ALL' $refreshUniverse
+        # Historical option universes have repeatedly spent the entire 150 s
+        # inside this single metadata callback while the vendor process was
+        # still consuming CPU. Probe a finite longer wait, only for this exact
+        # source/plan; all downloads and other selectors keep their old limit.
+        $universeNotificationTimeout=[uint32]150000
+        if($requestDoc.action -ceq 'plan' -and $requestDoc.type -ceq 'Option (ALL)' -and
+           $requestDoc.smart_id -ceq 'TEJ Derivatives'){$universeNotificationTimeout=[uint32]600000}
+        Select-Combo $sectorCombo 'ALL' $refreshUniverse $universeNotificationTimeout
         # NotifyBinding has acknowledged the full normal sector callback.
     }
     $numericScale=Set-NumericScaleDefault
     [void](Verify-EditableScope)
     $availableCompanyCount=Message $companyLists[2].Current.NativeWindowHandle 0x18B
-    $companyIndices=@()
+    $companyIndices=@();$finiteAxisContext=$null
     if($requestDoc.action -eq 'download') {
         $availableCompanies=@()
         # The ALL branch independently reads and validates the complete
@@ -2420,7 +2545,212 @@ try {
                 throw
             }
         }
-    } else {$availableCompanies=Items $companyLists[2].Current.NativeWindowHandle}
+    } else {
+        if($requestDoc.action -ceq 'plan' -and $requestDoc.type -ceq 'Option (ALL)' -and
+           $requestDoc.smart_id -ceq 'TEJ Derivatives' -and $availableCompanyCount -gt 150000) {
+            # Preserve a small, source-bound diagnostic while keeping the
+            # existing full-axis admission guard unchanged. The sample is
+            # not a discovery result and cannot authorize a data query.
+            try {
+                $sampleClock=[Diagnostics.Stopwatch]::StartNew()
+                $sample=@([TejBridgeNative]::SampleLargeCompanyAxis($ExpectedWindow,
+                    $companyLists[2].Current.NativeWindowHandle,$TejProcessId,$ExpectedTitle))
+                $sampleScope=Verify-EditableScope -BindingReadback
+                $sampleEvidence=@{contract='large_company_axis_diagnostic_only_v1';task_id=$requestDoc.task_id;
+                    query_attempt_id=[IO.Path]::GetFileNameWithoutExtension($Output);type=$requestDoc.type;smart_id=$requestDoc.smart_id;
+                    table=$requestDoc.table;available_count=$availableCompanyCount;
+                    anchor_indices=@(0,([long][Math]::Floor($availableCompanyCount/4)),([long][Math]::Floor($availableCompanyCount/2)),
+                        ([long][Math]::Floor(3*$availableCompanyCount/4)),($availableCompanyCount-4));
+                    labels=$sample;source_scope_proof=$sampleScope;seconds=$sampleClock.Elapsed.TotalSeconds;
+                    prepared_request_sha256=(Get-FileHash -LiteralPath $Request).Hash.ToLowerInvariant();
+                    observed_at_utc=[DateTime]::UtcNow.ToString('o');market_data_query_submitted=$false;
+                    full_axis_admitted=$false;credentials_read=$false}
+                [TejBridgeNative]::WriteArtifact(($Output+'.company-axis-sample.json'),
+                    ($sampleEvidence|ConvertTo-Json -Depth 5 -Compress))
+            } catch {} # The diagnostic must never change discovery admission.
+
+            # Optional one-shot raw menu capture is bound to an existing
+            # prioritized plan, its exact prepared request, a prior native
+            # sample and this immutable bridge release. It does not admit the
+            # menu into discovery or authorize a market-data Preview.
+            $ownerRoot=[IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Output))
+            $intentDir=Join-Path $ownerRoot 'large_axis_capture_intents'
+            $intentPath=Join-Path $intentDir ([string]$requestDoc.task_id+'.json')
+            if(Test-Path -LiteralPath $intentPath) {
+                $claimed=$false
+                try {
+                    $attempt=[IO.Path]::GetFileNameWithoutExtension($Output)
+                    $claimedDir=Join-Path $intentDir 'claimed'
+                    if($attempt -cnotmatch ('^'+[string]$requestDoc.task_id+'-[0-9a-f]{32}$') -or
+                       -not (Test-Path -LiteralPath $claimedDir -PathType Container) -or
+                       ((Get-Item -LiteralPath $intentDir).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                       ((Get-Item -LiteralPath $claimedDir).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                        throw 'Capture intent path or attempt identity differs'
+                    }
+                    $intentInfo=Get-Item -LiteralPath $intentPath
+                    if($intentInfo.PSIsContainer -or $intentInfo.Length -gt 65536 -or
+                       ($intentInfo.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                        throw 'Capture intent is not a bounded regular file'
+                    }
+                    $intentSha=(Get-FileHash -LiteralPath $intentPath).Hash.ToLowerInvariant()
+                    $intent=Get-Content -LiteralPath $intentPath -Raw -Encoding UTF8|ConvertFrom-Json
+                    $created=[DateTimeOffset]::Parse([string]$intent.created_at_utc).ToUniversalTime()
+                    $expires=[DateTimeOffset]::Parse([string]$intent.expires_at_utc).ToUniversalTime()
+                    $now=[DateTimeOffset]::UtcNow
+                    if($intent.contract -cne 'tej_large_company_axis_capture_once_v1' -or
+                       $intent.task_id -cne $requestDoc.task_id -or $intent.type -cne $requestDoc.type -or
+                       $intent.smart_id -cne $requestDoc.smart_id -or $intent.table -cne $requestDoc.table -or
+                       $intent.priority_request_id -cnotmatch '^[0-9a-f]{64}$' -or
+                       $intent.prepared_request_sha256 -cne (Get-FileHash -LiteralPath $Request).Hash.ToLowerInvariant() -or
+                       $intent.bridge_script_sha256 -cne (Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant() -or
+                       [long]$intent.expected_count -ne $availableCompanyCount -or
+                       [long]$intent.maximum_capture_bytes -ne 268435456 -or
+                       $intent.market_data_query_authorized -ne $false -or
+                       $intent.provider_queries_by_registration -ne 0 -or
+                       $intent.capacity_checked_at_utc -cne $intent.created_at_utc -or
+                       $intent.capacity.state -cne 'admitted' -or
+                       ([long]$intent.capacity.available_bytes-[long]$intent.capacity.required_bytes) -lt 268435456 -or
+                       ([long]$intent.capacity.backing_volume.physical_free_bytes-[long]$intent.capacity.backing_volume.required_bytes) -lt 268435456 -or
+                       $now -lt $created -or $now -gt $expires -or ($expires-$created).TotalSeconds -gt 720) {
+                        throw 'Capture intent source, release, deadline or capacity differs'
+                    }
+                    if($intent.prior_sample_basename -cnotmatch '^[0-9a-f]{24}-[0-9a-f]{32}\.json\.company-axis-sample\.json$') {
+                        throw 'Capture sample name differs'
+                    }
+                    $priorPath=Join-Path ([IO.Path]::GetDirectoryName($Output)) $intent.prior_sample_basename
+                    $priorInfo=Get-Item -LiteralPath $priorPath
+                    if($priorInfo.PSIsContainer -or $priorInfo.Length -gt 65536 -or
+                       ($priorInfo.Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                       $intent.prior_sample_sha256 -cne (Get-FileHash -LiteralPath $priorPath).Hash.ToLowerInvariant()) {
+                        throw 'Capture prior source sample differs'
+                    }
+                    $prior=Get-Content -LiteralPath $priorPath -Raw -Encoding UTF8|ConvertFrom-Json
+                    if($prior.contract -cne 'large_company_axis_diagnostic_only_v1' -or
+                       $prior.task_id -cne $requestDoc.task_id -or $prior.table -cne $requestDoc.table -or
+                       $prior.prepared_request_sha256 -cne $intent.prepared_request_sha256 -or
+                       $prior.source_scope_proof.binding_readback_verified -ne $true -or
+                       $prior.market_data_query_submitted -ne $false -or $prior.full_axis_admitted -ne $false) {
+                        throw 'Capture prior sample provenance differs'
+                    }
+                    $beforeScope=Verify-EditableScope -BindingReadback
+                    $claimPath=Join-Path $claimedDir ($attempt+'.json')
+                    [IO.File]::Move($intentPath,$claimPath);$claimed=$true
+                    if($intentSha -cne (Get-FileHash -LiteralPath $claimPath).Hash.ToLowerInvariant()) {
+                        throw 'Capture claimed intent changed'
+                    }
+                    $binaryPath=$Output+'.company-axis.snapshot.bin'
+                    $manifestPath=$Output+'.company-axis.snapshot.json'
+                    if((Test-Path -LiteralPath $binaryPath) -or (Test-Path -LiteralPath $manifestPath)) {
+                        throw 'Capture output already exists'
+                    }
+                    $stagePath=$binaryPath+'.partial-'+[Guid]::NewGuid().ToString('N')
+                    $captureClock=[Diagnostics.Stopwatch]::StartNew()
+                    [TejBridgeNative]::CaptureLargeCompanyAxis($ExpectedWindow,$companyLists[2].Current.NativeWindowHandle,
+                        $TejProcessId,$ExpectedTitle,$availableCompanyCount,$stagePath,$progressPath,
+                        [string]$requestDoc.task_id,$attempt)
+                    $afterScope=Verify-EditableScope -BindingReadback
+                    $bytes=(Get-Item -LiteralPath $stagePath).Length
+                    $binarySha=(Get-FileHash -LiteralPath $stagePath).Hash.ToLowerInvariant()
+                    [IO.File]::Move($stagePath,$binaryPath)
+                    $captureEvidence=@{contract='tej_large_company_axis_two_pass_observation_v1';task_id=$requestDoc.task_id;
+                        query_attempt_id=$attempt;type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
+                        prepared_request_sha256=$intent.prepared_request_sha256;bridge_script_sha256=$intent.bridge_script_sha256;
+                        intent_sha256=$intentSha;priority_request_id=$intent.priority_request_id;
+                        prior_sample_sha256=$intent.prior_sample_sha256;labels=$availableCompanyCount;
+                        binary_name=[IO.Path]::GetFileName($binaryPath);binary_sha256=$binarySha;binary_bytes=$bytes;
+                        before_scope=$beforeScope;after_scope=$afterScope;complete_ordered_live_reads=2;
+                        capture_seconds=$captureClock.Elapsed.TotalSeconds;observed_at_utc=[DateTime]::UtcNow.ToString('o');
+                        market_data_query_submitted=$false;full_axis_admitted=$false;credentials_read=$false}
+                    [TejBridgeNative]::WriteArtifact($manifestPath,($captureEvidence|ConvertTo-Json -Depth 6 -Compress))
+                } catch {
+                    $failure=@{contract='tej_large_company_axis_capture_failure_v1';task_id=$requestDoc.task_id;
+                        query_attempt_id=[IO.Path]::GetFileNameWithoutExtension($Output);intent_claimed=$claimed;
+                        error_type=$_.Exception.GetType().Name;observed_at_utc=[DateTime]::UtcNow.ToString('o');
+                        market_data_query_submitted=$false;full_axis_admitted=$false;credentials_read=$false}
+                    try {[TejBridgeNative]::WriteArtifact(($Output+'.company-axis.snapshot-failure.json'),
+                        ($failure|ConvertTo-Json -Depth 4 -Compress))} catch {}
+                }
+            }
+        }
+        # An explicit one-shot intent may observe a bounded set of company
+        # labels plus a bounded date menu.  This is a metadata sidecar only;
+        # it cannot turn a partial company axis into a discovery result.
+        $finiteRoot=[IO.Path]::GetDirectoryName([IO.Path]::GetDirectoryName($Output))
+        $finiteIntentDir=Join-Path $finiteRoot 'finite_axis_capture_intents'
+        $finiteIntentPath=Join-Path $finiteIntentDir ([string]$requestDoc.task_id+'.json')
+        if($requestDoc.action -ceq 'plan' -and $requestDoc.type -ceq 'Option (ALL)' -and
+           $requestDoc.smart_id -ceq 'TEJ Derivatives' -and $availableCompanyCount -gt 150000 -and
+           (Test-Path -LiteralPath $finiteIntentPath)) {
+            $finiteClaimed=$false
+            try {
+                $finiteAttempt=[IO.Path]::GetFileNameWithoutExtension($Output)
+                $finiteClaimedDir=Join-Path $finiteIntentDir 'claimed'
+                if($finiteAttempt -cnotmatch ('^'+[string]$requestDoc.task_id+'-[0-9a-f]{32}$') -or
+                   -not (Test-Path -LiteralPath $finiteClaimedDir -PathType Container) -or
+                   ((Get-Item -LiteralPath $finiteIntentDir).Attributes -band [IO.FileAttributes]::ReparsePoint) -or
+                   ((Get-Item -LiteralPath $finiteClaimedDir).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    throw 'Finite axis intent path or attempt identity differs'
+                }
+                $finiteInfo=Get-Item -LiteralPath $finiteIntentPath
+                if($finiteInfo.PSIsContainer -or $finiteInfo.Length -gt 262144 -or
+                   ($finiteInfo.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    throw 'Finite axis intent is not a bounded regular file'
+                }
+                $finiteIntentSha=(Get-FileHash -LiteralPath $finiteIntentPath).Hash.ToLowerInvariant()
+                $finiteIntent=Get-Content -LiteralPath $finiteIntentPath -Raw -Encoding UTF8|ConvertFrom-Json
+                $finiteCreated=[DateTimeOffset]::Parse([string]$finiteIntent.created_at_utc).ToUniversalTime()
+                $finiteExpires=[DateTimeOffset]::Parse([string]$finiteIntent.expires_at_utc).ToUniversalTime()
+                $finiteCapacityAt=[DateTimeOffset]::Parse([string]$finiteIntent.capacity_checked_at_utc).ToUniversalTime()
+                $finiteNow=[DateTimeOffset]::UtcNow
+                $finiteDay=[DateTime]::ParseExact([string]$finiteIntent.date,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)
+                $lower=[DateTime]::ParseExact([string]$requestDoc.start,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)
+                $upper=[DateTime]::ParseExact([string]$requestDoc.end,'yyyy-MM-dd',[Globalization.CultureInfo]::InvariantCulture)
+                if($finiteIntent.contract -cne 'tej_finite_company_date_axis_capture_once_v1' -or
+                   $finiteIntent.task_id -cne $requestDoc.task_id -or $finiteIntent.type -cne $requestDoc.type -or
+                   $finiteIntent.smart_id -cne $requestDoc.smart_id -or $finiteIntent.table -cne $requestDoc.table -or
+                   $finiteIntent.priority_request_id -cnotmatch '^[0-9a-f]{64}$' -or
+                   $finiteIntent.prepared_request_sha256 -cne (Get-FileHash -LiteralPath $Request).Hash.ToLowerInvariant() -or
+                   $finiteIntent.bridge_script_sha256 -cne (Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant() -or
+                   $finiteIntent.prior_snapshot_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                   $finiteIntent.candidate_manifest_sha256 -cnotmatch '^[0-9a-f]{64}$' -or
+                   [long]$finiteIntent.expected_count -ne $availableCompanyCount -or
+                   $finiteIntent.market_data_query_authorized -ne $false -or
+                   $finiteIntent.provider_queries_by_registration -ne 0 -or
+                   $finiteIntent.capacity.state -cne 'admitted' -or
+                   [long]$finiteIntent.capacity.available_bytes -lt ([long]$finiteIntent.capacity.required_bytes+2097152) -or
+                   [long]$finiteIntent.capacity.backing_volume.physical_free_bytes -lt
+                       ([long]$finiteIntent.capacity.backing_volume.required_bytes+2097152) -or
+                   $finiteCapacityAt -lt $finiteCreated -or $finiteCapacityAt -gt $finiteNow -or
+                   $finiteIntent.company_labels.Count -lt 1 -or $finiteIntent.company_labels.Count -gt 2000 -or
+                   $finiteDay -lt $lower -or $finiteDay -gt $upper -or
+                   $requestDoc.frequency -cne 'daily' -or $sourceKeyMode -notin @(2,3) -or
+                   $finiteNow -lt $finiteCreated -or $finiteNow -gt $finiteExpires -or
+                   ($finiteExpires-$finiteCreated).TotalSeconds -gt 720) {
+                    throw 'Finite axis source, date, release, deadline or scope differs'
+                }
+                $finiteBeforeScope=Verify-EditableScope -BindingReadback
+                $finiteClaim=Join-Path $finiteClaimedDir ($finiteAttempt+'.json')
+                [IO.File]::Move($finiteIntentPath,$finiteClaim);$finiteClaimed=$true
+                if($finiteIntentSha -cne (Get-FileHash -LiteralPath $finiteClaim).Hash.ToLowerInvariant()) {
+                    throw 'Finite axis claimed intent changed'
+                }
+                $finiteLabels=[string[]]@($finiteIntent.company_labels)
+                $finiteIndices=[TejBridgeNative]::ExactListIndices($ExpectedWindow,
+                    $companyLists[2].Current.NativeWindowHandle,$finiteLabels,$TejProcessId,$ExpectedTitle)
+                $finiteAxisContext=@{intent=$finiteIntent;intent_sha256=$finiteIntentSha;labels=$finiteLabels;
+                    indices=$finiteIndices;before_scope=$finiteBeforeScope;attempt=$finiteAttempt}
+            } catch {
+                $finiteFailure=@{contract='tej_finite_company_date_axis_capture_failure_v1';task_id=$requestDoc.task_id;
+                    query_attempt_id=[IO.Path]::GetFileNameWithoutExtension($Output);intent_claimed=$finiteClaimed;
+                    error_type=$_.Exception.GetType().Name;observed_at_utc=[DateTime]::UtcNow.ToString('o');
+                    market_data_query_submitted=$false;full_axis_admitted=$false}
+                try {[TejBridgeNative]::WriteArtifact(($Output+'.finite-axis-failure.json'),
+                    ($finiteFailure|ConvertTo-Json -Depth 4 -Compress))} catch {}
+                throw
+            }
+        }
+        if($null -eq $finiteAxisContext){$availableCompanies=Items $companyLists[2].Current.NativeWindowHandle}
+    }
     Stamp-ScopeTiming 'company_universe_and_lookup'
     Write-ScopeProgress 'date_model_and_lookup'
     $availableDates=@();$selectedDates=@();$dateLists=@()
@@ -2438,8 +2768,10 @@ try {
     if($edits.Count -ne 2){throw 'DATE_INPUT_BEFORE_QUERY: stable outer date boxes unavailable; no date input'}
     $startEdit=$edits[0].Current.NativeWindowHandle;$endEdit=$edits[-1].Current.NativeWindowHandle
     try {
-        [TejBridgeNative]::DateText($ExpectedWindow,$startEdit,$dates.Current.NativeWindowHandle,($requestDoc.start.Replace('-','')))
-        [TejBridgeNative]::DateText($ExpectedWindow,$endEdit,$dates.Current.NativeWindowHandle,($requestDoc.end.Replace('-','')))
+        $dateStart=$(if($null -ne $finiteAxisContext){[string]$finiteAxisContext.intent.date}else{[string]$requestDoc.start})
+        $dateEnd=$(if($null -ne $finiteAxisContext){[string]$finiteAxisContext.intent.date}else{[string]$requestDoc.end})
+        [TejBridgeNative]::DateText($ExpectedWindow,$startEdit,$dates.Current.NativeWindowHandle,($dateStart.Replace('-','')))
+        [TejBridgeNative]::DateText($ExpectedWindow,$endEdit,$dates.Current.NativeWindowHandle,($dateEnd.Replace('-','')))
     } catch {
         # All failures in these two guarded edits occur before Preview. In
         # particular Activate can refuse foreground ownership before the
@@ -2472,6 +2804,42 @@ try {
                 [string[]]$requestDoc.date_labels,$TejProcessId,$ExpectedTitle)
         }
     } else {$availableDates=Items $dateLists[0].Current.NativeWindowHandle}
+    }
+    if($null -ne $finiteAxisContext) {
+        try {
+            $finiteAfterScope=Verify-EditableScope -BindingReadback
+            $finiteSecondIndices=[TejBridgeNative]::ExactListIndices($ExpectedWindow,
+                $companyLists[2].Current.NativeWindowHandle,[string[]]$finiteAxisContext.labels,$TejProcessId,$ExpectedTitle)
+            $finiteSecondDates=Items $dateLists[0].Current.NativeWindowHandle
+            if((Message $companyLists[2].Current.NativeWindowHandle 0x18B) -ne $availableCompanyCount -or
+               ($finiteSecondIndices -join ',') -cne ($finiteAxisContext.indices -join ',') -or
+               -not [TejBridgeNative]::SameItems([string[]]$availableDates,[string[]]$finiteSecondDates)) {
+                throw 'Finite source axes changed between independent readbacks'
+            }
+            $finiteResult=@{contract='tej_finite_company_date_axis_observation_v1';task_id=$requestDoc.task_id;
+                query_attempt_id=$finiteAxisContext.attempt;type=$requestDoc.type;smart_id=$requestDoc.smart_id;table=$requestDoc.table;
+                prepared_request_sha256=(Get-FileHash -LiteralPath $Request).Hash.ToLowerInvariant();
+                bridge_script_sha256=(Get-FileHash -LiteralPath $PSCommandPath).Hash.ToLowerInvariant();
+                intent_sha256=$finiteAxisContext.intent_sha256;priority_request_id=$finiteAxisContext.intent.priority_request_id;
+                prior_snapshot_sha256=$finiteAxisContext.intent.prior_snapshot_sha256;
+                candidate_manifest_sha256=$finiteAxisContext.intent.candidate_manifest_sha256;
+                available_company_count=$availableCompanyCount;company_labels=@($finiteAxisContext.labels);
+                company_indices=@($finiteAxisContext.indices);date_search_start=$dateStart;date_search_end=$dateEnd;
+                date_labels=@($availableDates);fields=@($selectedFields);source_key_mode=$sourceKeyMode;
+                before_scope=$finiteAxisContext.before_scope;
+                after_scope=$finiteAfterScope;complete_live_company_reads=2;complete_date_reads=2;
+                observed_at_utc=[DateTime]::UtcNow.ToString('o');market_data_query_submitted=$false;
+                full_axis_admitted=$false;credentials_read=$false}
+            [TejBridgeNative]::WriteArtifact(($Output+'.finite-axis.json'),($finiteResult|ConvertTo-Json -Depth 7 -Compress))
+        } catch {
+            $finiteFailure=@{contract='tej_finite_company_date_axis_capture_failure_v1';task_id=$requestDoc.task_id;
+                query_attempt_id=$finiteAxisContext.attempt;intent_claimed=$true;error_type=$_.Exception.GetType().Name;
+                observed_at_utc=[DateTime]::UtcNow.ToString('o');market_data_query_submitted=$false;full_axis_admitted=$false}
+            try {[TejBridgeNative]::WriteArtifact(($Output+'.finite-axis-failure.json'),
+                ($finiteFailure|ConvertTo-Json -Depth 4 -Compress))} catch {}
+            throw
+        }
+        throw 'FINITE_AXIS_CAPTURE_COMPLETE_BEFORE_QUERY: partial source evidence retained; no full discovery or Preview'
     }
     Stamp-ScopeTiming 'date_model_and_lookup'
     if($requestDoc.action -in @('plan','recover_plan','resume_plan_empty_fields')) {

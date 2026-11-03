@@ -11,7 +11,8 @@ dashboard_pid=""
 dashboard_started_at=0
 dashboard_failures=0
 SHIOAJI_ENV_FILE="${SHIOAJI_ENV_FILE:-$REPO_ROOT/.env}"
-STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR="${STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR:-$REPO_ROOT/artifacts/cache/tw_day_trade_dashboard_indexes}"
+TW_DAY_TRADE_STATE_DIR="${TW_DAY_TRADE_STATE_DIR:-$(run_fintech_python -c 'from stockagent.service_layout import service_path; print(service_path("tw_day_trade_simulation"))')}"
+STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR="${STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR:-$(run_fintech_python -c 'from stockagent.service_layout import service_path; print(service_path("tw_day_trade_dashboard_indexes", area="cache"))')}"
 mkdir -p "$STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR"
 export STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR
 
@@ -35,7 +36,7 @@ start_dashboard() {
   "$selected_python" scripts/serve_tw_day_trade_dashboard.py \
     --host "${TW_DAY_TRADE_DASHBOARD_HOST:-127.0.0.1}" \
     --port "${TW_DAY_TRADE_DASHBOARD_PORT:-8766}" \
-    --state-dir "${TW_DAY_TRADE_STATE_DIR:-artifacts/live/tw_day_trade_simulation}" \
+    --state-dir "$TW_DAY_TRADE_STATE_DIR" \
     --static-root "${TW_DAY_TRADE_DASHBOARD_STATIC_ROOT:-services/tw_day_trade_dashboard}" &
   dashboard_pid=$!
   dashboard_started_at=$SECONDS
@@ -51,7 +52,7 @@ start_dashboard() {
   fi
   exec "$selected_python" scripts/run_tw_day_trade_simulation.py \
     --markets-dir "${TW_DAY_TRADE_MARKETS_DIR:-services/discord_bot/markets}" \
-    --state-dir "${TW_DAY_TRADE_STATE_DIR:-artifacts/live/tw_day_trade_simulation}" \
+    --state-dir "$TW_DAY_TRADE_STATE_DIR" \
     --poll-seconds "${TW_DAY_TRADE_POLL_SECONDS:-0.1}"
 ) &
 engine_pid=$!

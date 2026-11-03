@@ -9,8 +9,8 @@
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=21">
   <link rel="stylesheet" href="ticks.css?v=1">
-  <link rel="stylesheet" href="storage.css?v=1">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=10">
+  <link rel="stylesheet" href="storage.css?v=4">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=11">
   <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
 <body data-acquisition-page="data-monitor">
@@ -145,9 +145,29 @@
     </section>
 
     <section id="storage-inventory" class="section-block storage-observatory" aria-labelledby="storage-inventory-title">
-      <div class="section-heading"><div><p class="eyebrow">FLEET STORAGE</p><h2 id="storage-inventory-title">所有機器的儲存狀況</h2></div>
-        <p>先看容量，再點開蜂巢檢視各類資料；每個磁碟保留獨立量測時間。</p></div>
+      <div class="section-heading"><div><p class="eyebrow">FLEET STORAGE</p><h2 id="storage-inventory-title">所有機器的儲存與備份</h2></div>
+        <p>先看工作進度與預估時間，再展開磁碟資料分類；各節點保留獨立量測時間。</p></div>
       <p id="storage-observed" class="storage-copy" role="status">等待儲存觀測快照。</p>
+      <div class="storage-explorer-heading"><h3>三端運行狀況</h3><span class="storage-copy">背景每 60 秒取樣</span></div>
+      <div id="storage-runtime" class="storage-runtime" aria-label="Penguin、lab203、Vast 運行狀況"></div>
+      <p class="storage-clock">在線及程序活動不代表備份、還原或訓練驗收完成；各機器保留自己的量測時間。</p>
+      <div id="storage-operations" class="storage-operations" aria-labelledby="storage-operations-title">
+        <div class="storage-explorer-heading"><h3 id="storage-operations-title">備份、驗證與空間回收</h3><span class="storage-copy">唯讀 · 每分鐘取樣</span></div>
+        <p id="storage-operations-observed" class="storage-copy" role="status">等待原程序進度快照。</p>
+        <div id="storage-operations-summary" class="storage-operation-summary"></div>
+        <p id="storage-operations-eta" class="storage-copy"></p>
+        <p id="storage-operations-focus" class="storage-copy"></p>
+        <div id="storage-operation-attention" class="storage-operation-attention" aria-label="目前阻礙與接續方式"></div>
+        <div id="storage-operation-tasks" class="storage-operation-tasks"></div>
+        <details id="storage-operations-more" class="storage-operation-details" hidden><summary id="storage-operations-more-label">其他工作與已完成階段</summary><div id="storage-operation-other-tasks" class="storage-operation-tasks"></div></details>
+        <details id="storage-operation-schedules" class="storage-operation-details"><summary>完整流程、排程與阻擋條件</summary>
+          <p class="storage-copy">以下時間來自已安裝的原排程器；下次檢查不保證立即開始。傳送、NAS 讀回與驗證可並行；回收需等各自的驗收與引用檢查完成。</p>
+          <div id="storage-operation-flow" class="storage-operation-flow"></div>
+          <div id="storage-operation-schedule-list" class="storage-operation-schedule-list"></div>
+          <p id="storage-operation-remote-schedule" class="storage-clock"></p>
+        </details>
+        <p class="storage-clock">各階段獨立計量，不相加為全域百分比。進度達 100% 後仍需原程序驗收；資料集還原、NAS 備份與來源回收各有不同證據。</p>
+      </div>
       <div id="storage-capacities" class="storage-capacities" aria-label="各機器磁碟容量"></div>
       <p id="storage-efficiency" class="storage-copy" hidden></p>
       <p id="storage-tiers" class="storage-copy" hidden></p>
@@ -301,6 +321,6 @@
   <script src="../feature-page-contract.js?v=1" defer></script>
   <script src="app.js?v=53" defer></script>
   <script src="ticks.js?v=6" defer></script>
-  <script src="storage.js?v=5" defer></script>
+  <script src="storage.js?v=27" defer></script>
 </body>
 </html>

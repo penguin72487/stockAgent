@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from stockagent.backtest.tw_execution import TaiwanFeeSchedule
 from stockagent.live.tw_day_trade_dashboard import build_dashboard_snapshot
-from stockagent.live.tw_day_trade_service_sync import load_service_sync
+from stockagent.live.tw_day_trade_service_sync import committed_paper_read_guard, load_service_sync
 from stockagent.live.tw_day_trade_simulation import ModeSpec
 from stockagent.live.tw_overnight_simulation import (
     DELAYED_CLOSE_DEADLINE,
@@ -475,6 +475,22 @@ def test_dashboard_uses_explicit_discord_status_for_overnight_ack(
         "13:00"
     )
     assert snapshot["session_progress"]["phase"] == "armed_waiting_calculation"
+
+
+def test_overnight_metadata_is_inside_the_durable_financial_commit(tmp_path: Path) -> None:
+    engine = TwOvernightSimulationEngine(tmp_path / "state")
+    spec = _spec(tmp_path)
+    for minute in (15, 16):
+        engine.update_readiness([spec], now=_at(9, 13, minute))
+        with committed_paper_read_guard(engine.state_dir):
+            receipt = load_service_sync(engine.state_dir)
+            status = json.loads(engine.status_path.read_text())
+            assert status["product"] == "tw_overnight"
+            assert status["schedule"]["switch_and_wait"] == "13:00 Asia/Taipei"
+            assert status["schedule"]["simulation_only"] is True
+            assert status["state_revision"] == receipt["state_revision"]
+            assert status["modes"][spec.market]["model_trained_for_overnight"] is False
+        assert sum(row["file"] == "status.json" for row in engine.last_persist_metrics["files"]) == 1
 
 
 def test_close_signal_latency_uses_1320_gate_and_separate_stages(

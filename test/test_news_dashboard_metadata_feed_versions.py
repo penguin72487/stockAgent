@@ -78,3 +78,45 @@ def test_metadata_generation_two_keeps_all_original_scope_and_quantity_guards(tm
     _, row = _row(tmp_path, status)
     assert row['metadata_feed_progress'] is None
     assert row['complete_urls'] == 0 and not row['automatic_fulltext_allowed']
+
+
+def test_metadata_local_recovery_is_a_bounded_optional_status_not_a_body_or_eta(tmp_path):
+    status = _metadata_feed_snapshot(tmp_path)
+    raw = status['providers']['ltn']['metadata_feed_progress']
+    raw.update(checkpoint_contract_version=1, pending_recovery_feeds=2, pending_recovery_originals=3,
+               local_recovery_ready=False, next_local_recovery_at_utc=(NOW + timedelta(seconds=4)).isoformat())
+    public, row = _row(tmp_path, status)
+    assert row['metadata_feed_progress']['local_recovery'] == {
+        'pending_feeds': 2, 'pending_originals': 3, 'next_retry_ready': False,
+        'next_retry_at_utc': (NOW + timedelta(seconds=4)).isoformat()}
+    assert row['complete_urls'] == 0 and row['conditional_eta_seconds'] is None
+    assert 'PRIVATE_XML' not in json.dumps(public)
+    raw['next_local_recovery_at_utc'] = (NOW - timedelta(seconds=1)).isoformat()
+    _, row = _row(tmp_path, status)
+    assert row['metadata_feed_progress']['local_recovery']['next_retry_ready']
+    raw['pending_recovery_originals'] = 1  # Fewer originals than distinct feeds is impossible.
+    _, row = _row(tmp_path, status)
+    assert row['metadata_feed_progress']['local_recovery'] is None
+    assert row['metadata_feed_progress']['verified_feeds'] == raw['verified_feeds']
+
+
+def test_legacy_original_index_is_optional_and_cannot_masquerade_as_article_completion(tmp_path):
+    status = _metadata_feed_snapshot(tmp_path)
+    raw = status['providers']['ltn']['metadata_feed_progress']
+    legacy = {'contract_version': 1, 'expected_directories': 28, 'registered_directories': 28,
+              'examined_directories': 10, 'candidate_originals': 12, 'verified_originals': 4,
+              'pending_originals': 5, 'retry_originals': 1, 'invalid_originals': 2,
+              'other_originals': 0, 'discovery_complete': False, 'private_url': 'PRIVATE_XML'}
+    raw['legacy_original_index'] = legacy
+    public, row = _row(tmp_path, status)
+    assert row['metadata_feed_progress']['legacy_original_index'] == {k: v for k, v in legacy.items() if k != 'private_url'}
+    assert row['complete_urls'] == 0 and row['conditional_eta_seconds'] is None
+    assert 'PRIVATE_XML' not in json.dumps(public)
+    legacy['discovery_complete'] = True
+    _, row = _row(tmp_path, status)
+    assert row['metadata_feed_progress']['legacy_original_index'] is None
+    assert row['metadata_feed_progress']['verified_feeds'] == raw['verified_feeds']
+    legacy['discovery_complete'] = False
+    legacy['verified_originals'] = 5
+    _, row = _row(tmp_path, status)
+    assert row['metadata_feed_progress']['legacy_original_index'] is None

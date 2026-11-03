@@ -412,6 +412,9 @@ class PanelData:
     # lot order quantity before the closing auction. The legacy field prefix
     # above remains for compatibility; this follows the configured clock.
     overnight_decision_prices: np.ndarray | None = None
+    # Optional real feature rows before the executable/account calendar.
+    # They do not add dates, returns, masks, prices, or account events.
+    feature_history: Any | None = None
 
     @property
     def num_dates(self) -> int:
@@ -1278,6 +1281,26 @@ def _resolve_external_feature_projection(
     return tuple(selected_names), tuple(external_names[index] for index in external_indices)
 
 
+def _aggregate_external_feature_rows(frame: Any, columns: list[str]) -> Any:
+    """Aggregate only duplicate normalized keys, keeping per-column last values.
+
+    A wide daily source usually has one row per date/symbol. Building a
+    last-non-null group for every value of every singleton wastes both CPU and
+    group state. Prove uniqueness on the two keys; only duplicate groups need
+    value aggregation. Input order within those groups remains unchanged.
+    """
+    frame = frame.select(["date", "symbol", *columns])
+    duplicate = frame.select(["date", "symbol"]).is_duplicated()
+    if not duplicate.any():
+        return frame.sort(["symbol", "date"])
+    repeated = frame.filter(duplicate).group_by(["date", "symbol"]).agg(
+        [pl.col(name).drop_nulls().last().alias(name) for name in columns]
+    )
+    if duplicate.all():
+        return repeated.sort(["symbol", "date"])
+    return pl.concat([frame.filter(~duplicate), repeated]).sort(["symbol", "date"])
+
+
 def _load_external_feature_arrays(
     path: Path,
     *,
@@ -1390,7 +1413,7 @@ def _load_external_feature_arrays(
     model_feature_names = set(feature_names)
 
     def prepare_frame(source: Any, columns: list[str]) -> Any:
-        return (
+        normalized = (
             source.with_columns(
                 [
                     _polars_datetime_ns_expr(source.schema, "date"),
@@ -1417,10 +1440,8 @@ def _load_external_feature_arrays(
             )
             .drop_nulls(["date", "symbol"])
             .filter(pl.col("symbol") != "")
-            .group_by(["date", "symbol"])
-            .agg([pl.col(name).drop_nulls().last().alias(name) for name in columns])
-            .sort(["symbol", "date"])
         )
+        return _aggregate_external_feature_rows(normalized, columns)
 
     frame = prepare_frame(frame, value_columns)
     rule_frame = frame.select(["date", "symbol", *rule_names])
@@ -3253,6 +3274,14 @@ def _load_symbol_arrays_polars_lazy(
     )
 
 
+def _zero_nonfinite_features_inplace(features: np.ndarray) -> np.ndarray:
+    """Replace NaN and both infinities using one reusable boolean mask."""
+    mask = np.isfinite(features)
+    np.logical_not(mask, out=mask)
+    np.copyto(features, 0.0, where=mask)
+    return features
+
+
 def _build_panel_from_symbol_arrays(
     symbol_arrays: list[_SymbolPanelArrays],
     benchmark_name: str = "universe_average_return",
@@ -3543,7 +3572,7 @@ def _build_panel_from_symbol_arrays(
         features[:, :, original_feature_count + offset] = np.isfinite(
             features[:, :, source_index]
         )
-    features = np.nan_to_num(features, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
+    features = _zero_nonfinite_features_inplace(features)
     return PanelData(
         dates=np.asarray(all_dates, dtype="datetime64[ns]"),
         symbols=symbols,

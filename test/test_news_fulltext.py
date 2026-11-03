@@ -23,6 +23,7 @@ def config():
     config = json.loads(Path("configs/news_fulltext.json").read_text())
     config.pop("provider_catalog", None)  # Standalone synthetic publisher fixture.
     config.pop("failure_diagnostic_focus", None)  # This fixture has no real Cnyes URL scope.
+    config.pop("provider_priority", None)  # Production IDs are absent from this isolated fixture.
     # Standalone fixtures cannot inherit live opt-ins requiring a reviewed
     # Cnyes cohort; keep the paired configuration explicit rather than weaken
     # production validation when its focus is missing.
@@ -163,6 +164,9 @@ def test_diagnostic_http_owner_cannot_double_source_pressure(config, tmp_path):
     config["exclusive_http_owner"] = True
     http, session = http_fixture(config, tmp_path, {})
     try:
+        with pytest.raises(NewsError, match="news_http_owner_already_running"):
+            http_fixture(config, tmp_path, {})
+        # Failed construction must never release the real owner's flock.
         with pytest.raises(NewsError, match="news_http_owner_already_running"):
             http_fixture(config, tmp_path, {})
         assert session.calls == []
@@ -1416,8 +1420,9 @@ def test_missing_local_body_retries_unconditionally(config, tmp_path):
     q = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
     with q.db:
         q.add_articles([{"url": "https://publisher.test/a"}])
+        q.db.execute("UPDATE articles SET parquet_path=?,body_sha256=?,etag=?",
+                     ("missing.parquet", "0" * 64, "tag"))
     row = q.claim("publisher", 300)
-    row.update({"parquet_path": "missing.parquet", "body_sha256": "0" * 64, "etag": "tag"})
     try:
         q.unchanged(row)
         head = dict(q.db.execute("SELECT * FROM articles").fetchone())
@@ -1576,3 +1581,144 @@ def test_disabled_bulk_endpoint_never_runs_stale_page_tasks(config, tmp_path):
     finally:
         q.close()
         http.close()
+
+
+def test_http_closes_remaining_sessions_and_unlocks_after_session_error(config, tmp_path):
+    exclusive = deepcopy(config)
+    exclusive['exclusive_http_owner'] = True
+    registry = PolicyRegistry(exclusive, base=tmp_path)
+    owner = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+    closed = []
+
+    class Session:
+        def __init__(self, name, fail=False):
+            self.name, self.fail = name, fail
+
+        def close(self):
+            closed.append(self.name)
+            if self.fail:
+                raise OSError('PRIVATE_SESSION_CLOSE')
+
+    owner._sessions.extend([Session('first', fail=True), Session('second')])
+    try:
+        with pytest.raises(OSError, match='PRIVATE_SESSION_CLOSE'):
+            owner.close()
+        assert closed == ['first', 'second']
+        assert owner.http_owner_lock is None
+        successor = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+        successor.close()
+    finally:
+        if owner.http_owner_lock is not None:
+            owner.http_owner_lock.close()
+            owner.http_owner_lock = None
+
+
+def test_http_closes_lock_when_explicit_unlock_fails(config, tmp_path, monkeypatch):
+    import fcntl
+
+    exclusive = deepcopy(config)
+    exclusive['exclusive_http_owner'] = True
+    registry = PolicyRegistry(exclusive, base=tmp_path)
+    owner = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+    real_flock = fcntl.flock
+
+    def fail_unlock(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError('PRIVATE_UNLOCK')
+        return real_flock(fd, operation)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(fcntl, 'flock', fail_unlock)
+            with pytest.raises(OSError, match='PRIVATE_UNLOCK'):
+                owner.close()
+        assert owner.http_owner_lock is None
+        successor = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+        successor.close()
+    finally:
+        if owner.http_owner_lock is not None:
+            owner.http_owner_lock.close()
+            owner.http_owner_lock = None
+
+
+def test_http_constructor_failure_releases_lock_while_traceback_is_retained(config, tmp_path):
+    exclusive = deepcopy(config)
+    exclusive['exclusive_http_owner'] = True
+    registry = PolicyRegistry(exclusive, base=tmp_path)
+    assert any(source.request_enabled for source in registry.sources.values())
+
+    def fail_limiter(*args, **kwargs):
+        raise OSError('PRIVATE_LIMITER_INITIALIZATION')
+
+    with pytest.raises(OSError, match='PRIVATE_LIMITER_INITIALIZATION') as caught:
+        NewsHTTP(registry, exclusive, tmp_path, limiter_factory=fail_limiter)
+    # Keep the original traceback alive: cleanup must not depend on GC.
+    assert caught.traceback is not None
+    successor = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+    successor.close()
+
+
+def test_http_constructor_preserves_primary_if_unlock_also_fails(config, tmp_path, monkeypatch):
+    import fcntl
+
+    exclusive = deepcopy(config)
+    exclusive['exclusive_http_owner'] = True
+    registry = PolicyRegistry(exclusive, base=tmp_path)
+    real_flock = fcntl.flock
+
+    def fail_unlock(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError('PRIVATE_UNLOCK')
+        return real_flock(fd, operation)
+
+    def fail_limiter(*args, **kwargs):
+        raise RuntimeError('PRIVATE_INITIALIZATION')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(fcntl, 'flock', fail_unlock)
+        with pytest.raises(RuntimeError, match='PRIVATE_INITIALIZATION') as caught:
+            NewsHTTP(registry, exclusive, tmp_path, limiter_factory=fail_limiter)
+    assert any('OSError' in note for note in getattr(caught.value, '__notes__', []))
+    successor = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+    successor.close()
+
+
+def test_http_close_preserves_first_error_while_finishing_other_cleanup(config, tmp_path, monkeypatch):
+    import fcntl
+
+    exclusive = deepcopy(config)
+    exclusive['exclusive_http_owner'] = True
+    registry = PolicyRegistry(exclusive, base=tmp_path)
+    owner = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+    closed = []
+    real_flock = fcntl.flock
+
+    class Session:
+        def __init__(self, name, error):
+            self.name, self.error = name, error
+
+        def close(self):
+            closed.append(self.name)
+            raise self.error
+
+    def fail_unlock(fd, operation):
+        if operation == fcntl.LOCK_UN:
+            raise OSError('PRIVATE_UNLOCK')
+        return real_flock(fd, operation)
+
+    owner._sessions.extend([Session('first', RuntimeError('PRIVATE_FIRST')),
+                            Session('second', ValueError('PRIVATE_SECOND'))])
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(fcntl, 'flock', fail_unlock)
+            with pytest.raises(RuntimeError, match='PRIVATE_FIRST') as caught:
+                owner.close()
+        notes = '\n'.join(getattr(caught.value, '__notes__', []))
+        assert closed == ['first', 'second']
+        assert 'ValueError' in notes and 'OSError' in notes and 'PRIVATE_' not in notes
+        successor = NewsHTTP(registry, exclusive, tmp_path, limiter_factory=FakeLimiter)
+        successor.close()
+    finally:
+        if owner.http_owner_lock is not None:
+            owner.http_owner_lock.close()
+            owner.http_owner_lock = None

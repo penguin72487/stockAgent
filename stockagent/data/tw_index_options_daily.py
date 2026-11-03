@@ -1146,6 +1146,22 @@ def build_taifex_option_full_chain(
                 expiries = {
                     series: taifex_option_expiry(series) for series in candidates
                 }
+                # The weekday calculation is the nominal date, not proof of
+                # actual expiry. A positive day-session trade after that date
+                # directly contradicts silently discarding the series. Stop
+                # rather than publish a partial chain or inject a later final
+                # settlement date into decision-time features. A dated,
+                # point-in-time expiry contract is needed to admit such days.
+                contradicted = sorted({
+                    series for (series, _strike, _right), row in source_rows.items()
+                    if row.volume > 0 and expiries[series] < trading_date
+                })
+                if contradicted:
+                    raise ValueError(
+                        f"{trading_date}: positive TXO day-session volume after "
+                        "nominal expiry requires dated point-in-time expiry evidence; "
+                        f"series={contradicted}"
+                    )
                 candidates = {
                     series
                     for series in candidates
@@ -1258,7 +1274,11 @@ def build_taifex_option_full_chain(
                         )
                 writer.write_table(pa.Table.from_pylist(normalized_rows, schema=schema))
                 total_rows += len(normalized_rows)
-    finally:
+    except BaseException:
+        writer.close()
+        temporary.unlink(missing_ok=True)
+        raise
+    else:
         writer.close()
     if total_rows == 0 and not allow_empty:
         temporary.unlink(missing_ok=True)

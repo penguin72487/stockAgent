@@ -24,7 +24,8 @@ from downloader.artifact_io import sha256_file
 from downloader.news_fulltext_bulk import cnyes_pagination, cnyes_records, wordpress_base
 from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_policy import NewsError, cnyes_bulk_fingerprint
-from downloader.news_fulltext_queue import replay_source_path, source_path, utc_now
+from downloader.news_fulltext_queue import (article_claim_witness, replay_source_path, source_path,
+                                           unleased_article_head_witness, utc_now)
 
 
 REPLAY_CHECKPOINT_CONTRACT_VERSION = 2
@@ -33,6 +34,7 @@ CACHED_BULK_LOCAL_RETRY_MAX_SECONDS = 300
 RETAINED_FAILURE_REPLAY_VERSION = 1
 RETAINED_FAILURE_REASON_CONTRACT_VERSION = 1
 RETAINED_FAILURE_LOCAL_RETRY_CONTRACT_VERSION = 1
+RETAINED_FAILURE_HEAD_CHECKPOINT_CONTRACT_VERSION = 2
 RETAINED_FAILURE_LOCAL_RETRY_MAX_SECONDS = 300
 RETAINED_FAILURE_DEFAULT_RAW_BYTES = 8 << 20
 RETAINED_NONTEXT_OUTCOME_KIND = 'reviewed_retained_nontext_outcome'
@@ -170,6 +172,32 @@ def classify_retained_nontext_outcome(queue, source, target, reference):
     return 'classified_'+outcome
 
 
+def _retained_failure_head_witness_sql(alias):
+    """One SQLite encoding for both the captured and the current head."""
+    from downloader.news_fulltext_cohorts import RETAINED_SUPPLEMENT_HEAD_FIELDS
+    fields = (*RETAINED_SUPPLEMENT_HEAD_FIELDS, 'lease_token')
+    value = 'json_object(' + ','.join(f"'{field}',{alias}.{field}" for field in fields) + ')'
+    # A different worker may have attached a binary body digest between the
+    # candidate scan and this read. Never feed that BLOB to SQLite JSON.
+    return f'CASE WHEN {alias}.body_sha256 IS NULL THEN {value} END'
+
+
+def _ensure_retained_failure_checkpoint_schema(queue):
+    if getattr(queue, '_retained_failure_checkpoint_schema_ready', False):
+        return
+    with queue.db:
+        queue.db.execute('''CREATE TABLE IF NOT EXISTS retained_failure_replays(
+            receipt_path TEXT NOT NULL,parser_fingerprint TEXT NOT NULL,state TEXT NOT NULL,
+            error_code TEXT,checked_at_utc TEXT NOT NULL,head_witness_json TEXT,
+            PRIMARY KEY(receipt_path,parser_fingerprint)) WITHOUT ROWID''')
+        columns = {row[1] for row in queue.db.execute('PRAGMA table_info(retained_failure_replays)')}
+        if 'head_witness_json' not in columns:
+            # Legacy checkpoints lack a head witness. Preserve them, but do
+            # not let an unverifiable old verdict hide an eligible original.
+            queue.db.execute('ALTER TABLE retained_failure_replays ADD COLUMN head_witness_json TEXT')
+    queue._retained_failure_checkpoint_schema_ready = True
+
+
 def _ensure_retained_failure_retry_schema(queue):
     """Retry only local reads; the original response and HTTP budget stay put."""
     with queue.db:
@@ -183,8 +211,37 @@ def _ensure_retained_failure_retry_schema(queue):
     queue._retained_failure_retry_schema_ready = True
 
 
+def _defer_retained_failure_local_retry(queue, source, focus, job, error_code, counter):
+    """Persist a bounded local retry without changing the source head or budget."""
+    with queue.db:
+        old = queue.db.execute('''SELECT local_attempts FROM retained_failure_local_retries
+            WHERE receipt_path=? AND parser_fingerprint=?''', (job[4], source.parser_repair_fingerprint)).fetchone()
+        attempts = (old[0] if old else 0) + 1
+        delay = min(RETAINED_FAILURE_LOCAL_RETRY_MAX_SECONDS, 2 ** min(attempts - 1, 9))
+        queue.db.execute('''INSERT INTO retained_failure_local_retries VALUES (?,?,?,?,?,?,?,?,?)
+            ON CONFLICT(receipt_path,parser_fingerprint) DO UPDATE SET
+                not_before_epoch=max(retained_failure_local_retries.not_before_epoch,excluded.not_before_epoch),
+                local_attempts=excluded.local_attempts,last_attempt_at_utc=excluded.last_attempt_at_utc,
+                last_error=excluded.last_error''',
+            (job[4], source.parser_repair_fingerprint, focus.id, job[0], job[1],
+             time.time() + delay, attempts, utc_now(), error_code))
+        queue.counter(counter, 1)
+
+
+def _defer_changed_retained_failure_if_ready(queue, source, focus, job, current, error_code):
+    """Only defer a superseded original if its current head can run now."""
+    if (current is None or current['body_sha256'] is not None
+            or current['state'] not in {'pending', 'retry', 'retry_cooldown', 'body_not_found'}
+            or current['lease_owner'] is not None or current['lease_until'] is not None
+            or current['due'] > time.time()):
+        return False
+    _defer_retained_failure_local_retry(queue, source, focus, job, error_code,
+                                        'retained_failure_local_commit_deferrals')
+    return True
+
+
 def retained_failure_next_wake_delay(queue, maximum):
-    """Deadline hint for eligible local retries, never a source request grant."""
+    """Deadline hint for eligible originals, never a source request grant."""
     if type(maximum) not in (int, float) or not math.isfinite(maximum) or maximum < 0:
         raise ValueError('invalid_retained_failure_wake_bound')
     focus = getattr(queue, 'failure_diagnostic_focus', None)
@@ -198,20 +255,29 @@ def retained_failure_next_wake_delay(queue, maximum):
         if not present:
             return maximum
         queue._retained_failure_retry_schema_ready = True
+    checkpoint_ready = getattr(queue, '_retained_failure_checkpoint_schema_ready', False)
+    if not checkpoint_ready:
+        columns = {row[1] for row in queue.db.execute('PRAGMA table_info(retained_failure_replays)')}
+        checkpoint_ready = 'head_witness_json' in columns
+        if checkpoint_ready:
+            queue._retained_failure_checkpoint_schema_ready = True
     now = time.time()
-    row = queue.db.execute('''SELECT min(max(r.not_before_epoch,a.due))
-        FROM retained_failure_local_retries r
-        JOIN failure_evidence_focus_attempts f ON f.provider='cnyes'
-            AND f.url_sha256=r.url_sha256 AND f.attempt_number=r.attempt_number
-            AND f.receipt_path=r.receipt_path AND f.cohort_id=r.cohort_id AND f.outcome='raw_saved'
-        JOIN articles a ON a.id=r.url_sha256 AND a.provider='cnyes'
-        WHERE r.cohort_id=? AND r.parser_fingerprint=? AND a.body_sha256 IS NULL
+    head_witness = _retained_failure_head_witness_sql('a')
+    checkpoint_filter = (f'''AND NOT EXISTS(SELECT 1 FROM retained_failure_replays done
+                WHERE done.receipt_path=f.receipt_path AND done.parser_fingerprint=?
+                    AND done.head_witness_json={head_witness})''' if checkpoint_ready else '')
+    row = queue.db.execute(f'''SELECT min(max(coalesce(r.not_before_epoch,0),a.due))
+        FROM failure_evidence_focus_attempts f
+        JOIN articles a ON a.id=f.url_sha256 AND a.provider=f.provider
+        LEFT JOIN retained_failure_local_retries r ON r.receipt_path=f.receipt_path
+            AND r.parser_fingerprint=?
+        WHERE f.cohort_id=? AND f.provider='cnyes' AND f.outcome='raw_saved' AND a.body_sha256 IS NULL
             AND f.reserved_bytes<=?
             AND a.state IN ('pending','retry','retry_cooldown','body_not_found')
             AND a.lease_owner IS NULL AND a.lease_until IS NULL
-            AND NOT EXISTS(SELECT 1 FROM retained_failure_replays done
-                WHERE done.receipt_path=r.receipt_path AND done.parser_fingerprint=r.parser_fingerprint)''',
-        (focus.id, source.parser_repair_fingerprint, RETAINED_FAILURE_DEFAULT_RAW_BYTES)).fetchone()
+            {checkpoint_filter}''',
+        (source.parser_repair_fingerprint, focus.id, RETAINED_FAILURE_DEFAULT_RAW_BYTES,
+         *((source.parser_repair_fingerprint,) if checkpoint_ready else ()))).fetchone()
     return min(maximum, max(0.0, row[0] - now)) if row and row[0] is not None else maximum
 
 
@@ -236,24 +302,21 @@ def replay_retained_cnyes_failures(queue, *, maximum_responses=4, maximum_wall_s
             or not 0 < maximum_wall_seconds <= 2 or type(maximum_raw_bytes) is not int
             or not 1 <= maximum_raw_bytes <= 16 << 20):
         raise ValueError('unbounded retained failure replay')
-    with queue.db:
-        queue.db.execute('''CREATE TABLE IF NOT EXISTS retained_failure_replays(
-            receipt_path TEXT NOT NULL,parser_fingerprint TEXT NOT NULL,state TEXT NOT NULL,
-            error_code TEXT,checked_at_utc TEXT NOT NULL,
-            PRIMARY KEY(receipt_path,parser_fingerprint)) WITHOUT ROWID''')
+    _ensure_retained_failure_checkpoint_schema(queue)
     _ensure_retained_failure_retry_schema(queue)
-    jobs = queue.db.execute('''SELECT f.url_sha256,f.attempt_number,f.reserved_bytes,
+    head_witness = _retained_failure_head_witness_sql('a')
+    jobs = queue.db.execute(f'''SELECT f.url_sha256,f.attempt_number,f.reserved_bytes,
             f.response_sha256,f.receipt_path FROM failure_evidence_focus_attempts f
         JOIN articles a ON a.id=f.url_sha256 AND a.provider=f.provider
-        WHERE f.cohort_id=? AND f.outcome='raw_saved' AND NOT EXISTS(
+        WHERE f.cohort_id=? AND f.outcome='raw_saved' AND f.reserved_bytes<=? AND NOT EXISTS(
             SELECT 1 FROM retained_failure_replays r WHERE r.receipt_path=f.receipt_path
-                AND r.parser_fingerprint=?)
+                AND r.parser_fingerprint=? AND r.head_witness_json={head_witness})
             AND NOT EXISTS(SELECT 1 FROM retained_failure_local_retries r
                 WHERE r.receipt_path=f.receipt_path AND r.parser_fingerprint=? AND r.not_before_epoch>?)
             AND a.body_sha256 IS NULL AND a.state IN ('pending','retry','retry_cooldown','body_not_found')
             AND a.lease_owner IS NULL AND a.lease_until IS NULL AND a.due<=?
         ORDER BY f.attempt_number DESC LIMIT 128''',
-        (focus.id, source.parser_repair_fingerprint, source.parser_repair_fingerprint,
+        (focus.id, maximum_raw_bytes, source.parser_repair_fingerprint, source.parser_repair_fingerprint,
          time.time(), time.time())).fetchall()
     started = time.monotonic()
     totals = Counter(responses_checked=0, accepted_heads=0, raw_bytes_checked=0, local_io_deferrals=0)
@@ -261,7 +324,9 @@ def replay_retained_cnyes_failures(queue, *, maximum_responses=4, maximum_wall_s
         if (totals['responses_checked'] >= maximum_responses or time.monotonic() - started >= maximum_wall_seconds
                 or stop and stop.is_set()):
             break
-        head = queue.db.execute('SELECT * FROM articles WHERE id=? AND provider=?', (job[0], 'cnyes')).fetchone()
+        head = queue.db.execute(f'SELECT a.*, {head_witness} AS _retained_failure_head_witness '
+                                'FROM articles a WHERE a.id=? AND a.provider=?',
+                                (job[0], 'cnyes')).fetchone()
         if (head is None or head['body_sha256'] is not None or head['state'] not in {'pending', 'retry', 'retry_cooldown', 'body_not_found'}
                 or head['lease_owner'] is not None or head['lease_until'] is not None):
             continue
@@ -324,42 +389,127 @@ def replay_retained_cnyes_failures(queue, *, maximum_responses=4, maximum_wall_s
         totals['responses_checked'] += 1
         if state == 'deferred_local':
             totals['local_io_deferrals'] += 1
-            with queue.db:
-                old = queue.db.execute('''SELECT local_attempts FROM retained_failure_local_retries
-                    WHERE receipt_path=? AND parser_fingerprint=?''', (job[4], source.parser_repair_fingerprint)).fetchone()
-                attempts = (old[0] if old else 0) + 1
-                delay = min(RETAINED_FAILURE_LOCAL_RETRY_MAX_SECONDS, 2 ** min(attempts - 1, 9))
-                queue.db.execute('''INSERT INTO retained_failure_local_retries VALUES (?,?,?,?,?,?,?,?,?)
-                    ON CONFLICT(receipt_path,parser_fingerprint) DO UPDATE SET
-                        not_before_epoch=max(retained_failure_local_retries.not_before_epoch,excluded.not_before_epoch),
-                        local_attempts=excluded.local_attempts,last_attempt_at_utc=excluded.last_attempt_at_utc,
-                        last_error=excluded.last_error''',
-                    (job[4], source.parser_repair_fingerprint, focus.id, job[0], job[1],
-                     time.time() + delay, attempts, utc_now(), code))
-                queue.counter('retained_failure_local_io_deferrals', 1)
+            _defer_retained_failure_local_retry(queue, source, focus, job, code,
+                                                'retained_failure_local_io_deferrals')
             continue
         if record is not None and state == 'validated':
-            # Claim only AFTER validation. No failed local parse consumes an
-            # HTTP attempt or changes the original source failure/deadline.
-            row = queue.claim_url(head['url'], 600)
+            # Claim only the exact head validated above: a later source check
+            # may have superseded it while the original was being parsed.
+            row = queue.claim_url(head['url'], 600, retained_failure_replay=True,
+                                  expected_missing_head={key: head[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS})
             if row is None:
+                current = queue.db.execute('SELECT * FROM articles WHERE id=? AND provider=?',
+                                           (job[0], 'cnyes')).fetchone()
+                unchanged = current is not None and all(
+                    current[key] == head[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS)
+                still_ready = (current is not None and current['body_sha256'] is None
+                    and current['state'] in {'pending', 'retry', 'retry_cooldown', 'body_not_found'}
+                    and current['lease_owner'] is None and current['lease_until'] is None
+                    and current['due'] <= time.time())
+                if unchanged or still_ready:
+                    # Even a changed head can remain immediately eligible for
+                    # this original. A repeated claim race must not make the
+                    # service's next-wake hint spin. Defer only this receipt;
+                    # the next attempt revalidates the then-current head and
+                    # neither its source retry nor other originals are delayed.
+                    _defer_retained_failure_local_retry(queue, source, focus, job,
+                        ('retained_failure_claim_no_progress' if unchanged else 'retained_failure_claim_changed_head'),
+                        'retained_failure_local_claim_deferrals')
+                    totals['local_claim_deferrals'] += 1
                 continue
             witness = queue.db.execute('SELECT * FROM articles WHERE id=?', (job[0],)).fetchone()
+            claim_changes = {'state', 'attempts', 'lease_owner', 'lease_until'}
+            claim_current = (witness is not None and witness['state'] == 'inflight'
+                and witness['lease_owner'] == row.get('_article_claim_owner')
+                and witness['lease_token'] == row.get('_article_claim_token')
+                and witness['attempts'] == head['attempts'] + 1
+                and all(witness[key] == head[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS
+                        if key not in claim_changes))
+            if not claim_current:
+                totals['superseded_heads'] += 1
+                if _defer_changed_retained_failure_if_ready(queue, source, focus, job, witness,
+                        'retained_failure_post_claim_changed_head'):
+                    totals['local_commit_deferrals'] += 1
+                continue
+            record['article_claim_witness_json'] = article_claim_witness(row)
             record['retained_failure_head_json'] = json.dumps(
                 {key: witness[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS}, sort_keys=True)
-            queue.accept([record])  # Disk/receipt/commit errors intentionally propagate.
-            totals['accepted_heads'] += 1
-            state = 'accepted'
+            try:
+                _, adopted = queue.accept([record], return_adopted=True)  # Storage errors intentionally propagate.
+            except ValueError as error:
+                if error.args != ('retained_failure_head_changed_before_acceptance',):
+                    raise
+                current = queue.db.execute('SELECT * FROM articles WHERE id=? AND provider=?',
+                                           (job[0], 'cnyes')).fetchone()
+                # The rejection also covers source/ledger authorization. Do
+                # not hide those failures when the head itself is unchanged.
+                if (current is not None and current['lease_token'] == witness['lease_token']
+                        and all(current[key] == witness[key] for key in RETAINED_SUPPLEMENT_HEAD_FIELDS)):
+                    raise
+                totals['superseded_heads'] += 1
+                if _defer_changed_retained_failure_if_ready(queue, source, focus, job, current,
+                        'retained_failure_accept_changed_head'):
+                    totals['local_commit_deferrals'] += 1
+                continue
+            if bytes.fromhex(record['article_id']) in adopted:
+                totals['accepted_heads'] += 1
+                state = 'accepted'
+            else:
+                totals['superseded_heads'] += 1
+                # A newer lease may later fail without a usable body. Preserve
+                # this original as pending so it can be rechecked against the
+                # later head; do not checkpoint an obsolete attempt as done.
+                # If that head is already eligible, repeatedly losing at the
+                # commit fence would otherwise rewrite the same durable body
+                # without waiting. Apply the same per-original local retry as
+                # a failed claim; leave source deadlines and other work alone.
+                current = queue.db.execute('SELECT * FROM articles WHERE id=? AND provider=?',
+                                           (job[0], 'cnyes')).fetchone()
+                if _defer_changed_retained_failure_if_ready(queue, source, focus, job, current,
+                        'retained_failure_commit_changed_head'):
+                    totals['local_commit_deferrals'] += 1
+                continue
         with queue.db:
-            queue.db.execute('INSERT OR IGNORE INTO retained_failure_replays VALUES (?,?,?,?,?)',
-                (job[4], source.parser_repair_fingerprint, state, code, utc_now()))
-            queue.db.execute('DELETE FROM retained_failure_local_retries WHERE receipt_path=? AND parser_fingerprint=?',
-                             (job[4], source.parser_repair_fingerprint))
-    for key in ('responses_checked', 'accepted_heads'):
+            if state == 'accepted':
+                # Acceptance has its own claim and durable receipt fence. If a
+                # body is later lost, a NULL witness permits revalidation.
+                written = queue.db.execute('''INSERT INTO retained_failure_replays
+                    (receipt_path,parser_fingerprint,state,error_code,checked_at_utc,head_witness_json)
+                    VALUES (?,?,?,?,?,NULL) ON CONFLICT(receipt_path,parser_fingerprint) DO UPDATE SET
+                    state=excluded.state,error_code=excluded.error_code,checked_at_utc=excluded.checked_at_utc,
+                    head_witness_json=NULL''',
+                    (job[4], source.parser_repair_fingerprint, state, code, utc_now())).rowcount
+            else:
+                # The failure depends on the head used in validation. Test and
+                # write in one statement so a concurrent head update cannot
+                # make a stale result into a completion checkpoint.
+                witness = head['_retained_failure_head_witness']
+                written = queue.db.execute(f'''INSERT INTO retained_failure_replays
+                    (receipt_path,parser_fingerprint,state,error_code,checked_at_utc,head_witness_json)
+                    SELECT ?,?,?,?,?,? FROM articles a WHERE a.id=? AND {head_witness}=?
+                    ON CONFLICT(receipt_path,parser_fingerprint) DO UPDATE SET
+                    state=excluded.state,error_code=excluded.error_code,checked_at_utc=excluded.checked_at_utc,
+                    head_witness_json=excluded.head_witness_json''',
+                    (job[4], source.parser_repair_fingerprint, state, code, utc_now(), witness,
+                     job[0], witness)).rowcount
+            if written:
+                queue.db.execute('DELETE FROM retained_failure_local_retries WHERE receipt_path=? AND parser_fingerprint=?',
+                                 (job[4], source.parser_repair_fingerprint))
+        if not written:
+            current = queue.db.execute('SELECT * FROM articles WHERE id=? AND provider=?',
+                                       (job[0], 'cnyes')).fetchone()
+            totals['superseded_heads'] += 1
+            if _defer_changed_retained_failure_if_ready(queue, source, focus, job, current,
+                    'retained_failure_validation_changed_head'):
+                totals['local_commit_deferrals'] += 1
+            continue
+        totals['local_checkpoints'] += written
+    for key in ('responses_checked', 'accepted_heads', 'superseded_heads'):
         queue.metrics.count('cnyes', 'retained_failure_' + key, totals[key])
     return {**totals, 'contract_version': RETAINED_FAILURE_REPLAY_VERSION, 'http_requests': 0,
             'reason_contract_version': RETAINED_FAILURE_REASON_CONTRACT_VERSION,
             'local_retry_contract_version': RETAINED_FAILURE_LOCAL_RETRY_CONTRACT_VERSION,
+            'head_checkpoint_contract_version': RETAINED_FAILURE_HEAD_CHECKPOINT_CONTRACT_VERSION,
             'all_history_complete': False, 'original_observation_clocks_preserved': True}
 
 
@@ -603,7 +753,7 @@ def replay_cached_cnyes(queue, *, maximum_pages=64, maximum_wall_seconds=0.75,
                 break
             digest = job[0]
             accepted, error_code, state = 0, None, 'checked'
-            eligible, waiting_ids = [], []
+            eligible, waiting_ids, eligible_heads = [], [], {}
             try:
                 relative = 'quarantine/' + digest + '.parquet'
                 path = replay_source_path(queue.root, relative)
@@ -644,11 +794,12 @@ def replay_cached_cnyes(queue, *, maximum_pages=64, maximum_wall_seconds=0.75,
                         raise ValueError('cached_bulk_row_count_invalid')
                     records, errors = cnyes_records(response, SimpleNamespace(registry=queue.registry), source)
                     for record in records:
-                        row = queue.db.execute('SELECT state,due,body_sha256 FROM articles WHERE id=?',
+                        row = queue.db.execute('SELECT * FROM articles WHERE id=?',
                                                (bytes.fromhex(record['article_id']),)).fetchone()
                         if row and row['body_sha256']:
                             continue
-                        if row and (row['state'] == 'inflight' or
+                        if row and (row['state'] == 'inflight' or row['lease_owner'] is not None
+                                    or row['lease_until'] is not None or row['lease_token'] is not None or
                                     row['state'] in {'retry', 'retry_cooldown'} and row['due'] > time.time()):
                             waiting_ids.append(bytes.fromhex(record['article_id']))
                             continue
@@ -657,6 +808,8 @@ def replay_cached_cnyes(queue, *, maximum_pages=64, maximum_wall_seconds=0.75,
                         record.update(captured_at_utc=raw['captured_at_utc'],
                                       source_observed_at_utc=raw['captured_at_utc'], reparsed_at_utc=utc_now(),
                                       acquisition_transport='retained_raw_reparse', replay_source_parquet=relative)
+                        if row is not None:
+                            eligible_heads[record['article_id']] = row
                         eligible.append(record)
                     totals['still_missing_body_rows'] += sum(e['error'] not in {'bulk_exact_duplicate_row'} for e in errors)
             except OSError:
@@ -691,8 +844,19 @@ def replay_cached_cnyes(queue, *, maximum_pages=64, maximum_wall_seconds=0.75,
                 eligible[0]['raw_response_body'] = response.body
                 for record in eligible:
                     record['source_response_article_id'] = eligible[0]['article_id']
-                queue.accept(eligible)
-                accepted = len(eligible)
+                    head = eligible_heads.get(record['article_id'])
+                    if head is None:
+                        head = queue.db.execute('SELECT * FROM articles WHERE id=?',
+                                                (bytes.fromhex(record['article_id']),)).fetchone()
+                    if head is None:
+                        raise ValueError('cached_bulk_article_head_missing')
+                    record['unleased_article_head_witness_json'] = unleased_article_head_witness(head)
+                _, adopted = queue.accept(eligible, return_adopted=True)
+                accepted = len(adopted)
+                # A concurrent newer head is not a completed replay. Wait on
+                # its existing state/deadline before examining this page again.
+                waiting_ids.extend(bytes.fromhex(record['article_id']) for record in eligible
+                                   if bytes.fromhex(record['article_id']) not in adopted)
             with queue.db:
                 queue.db.execute('DELETE FROM cached_bulk_local_retries WHERE source_fingerprint=? AND response_sha256=?',
                                  (fingerprint, digest))
@@ -700,9 +864,10 @@ def replay_cached_cnyes(queue, *, maximum_pages=64, maximum_wall_seconds=0.75,
                                  (fingerprint, digest))
                 if not error_code and waiting_ids:
                     state = 'deferred'
+                    distinct_waits = set(waiting_ids)
                     queue.db.executemany('INSERT INTO cached_bulk_replay_waits VALUES (?,?,?)',
-                                         ((fingerprint, digest, key) for key in waiting_ids))
-                    queue.metrics.count('cnyes', 'cached_bulk_temporarily_blocked_heads', len(waiting_ids))
+                                         ((fingerprint, digest, key) for key in distinct_waits))
+                    queue.metrics.count('cnyes', 'cached_bulk_temporarily_blocked_heads', len(distinct_waits))
                 queue.db.execute('UPDATE cached_bulk_replays SET state=?,error_code=?,accepted_heads=accepted_heads+?,checked_at_utc=?,checkpoint_contract_version=? '
                     'WHERE response_sha256=? AND source_fingerprint=?',
                     (state, error_code, accepted, utc_now(), REPLAY_CHECKPOINT_CONTRACT_VERSION, digest, fingerprint))

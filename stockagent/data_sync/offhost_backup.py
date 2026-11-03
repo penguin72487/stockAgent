@@ -17,12 +17,12 @@ import re
 import stat
 import subprocess
 import time
-from typing import Any
+from typing import Any, Callable
 
 from downloader.artifact_io import atomic_write_json
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_bytes
 from stockagent.data_sync.packed_backup import (
-    PinnedObjectSignatures, object_descriptor, safe_path, signature,
+    PinnedObjectSignatures, object_descriptor, safe_path, same_file_signature, signature,
 )
 from stockagent.data_sync.packed_snapshots import (
     PACKED_HEAD_SCHEMA_VERSION, _validate_manifest, resolve_packed_snapshot_id,
@@ -68,6 +68,8 @@ def _sha(path: Path) -> str:
 
 def _regular(path: Path) -> Path:
     # Check the unresolved path too: resolve() must not bless a symlink.
+    from stockagent.service_layout import canonical_service_path
+    path = canonical_service_path(path)
     if any(parent.is_symlink() for parent in (path, *path.parents)):
         raise SnapshotError("backup input must not traverse a symlink")
     if not stat.S_ISREG(path.stat().st_mode):
@@ -324,7 +326,7 @@ NATIVE_COPY_MIN_BYTES = 8 * 1024**2  # Penguin full copy/flush/SHA comparison, 2
 
 def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha256: str,
                         expected_bytes: int, payload: bytes | None = None,
-                        native_windows_io: bool = False) -> None:
+                        native_windows_io: bool = False, native_reserve_bytes: int | None = None) -> None:
     """One source read/hash while copying, then stable inode proof and fsync.
 
     The closed-delivery verifier independently hashes the destination. Avoid
@@ -338,7 +340,8 @@ def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha2
         origin, target = windows_path(source), windows_path(destination)
         if (origin and target and origin.startswith('D:\\stockagent-cold-primary\\')
                 and target.startswith('D:\\stockagent-backup-ingress-lab203\\.staging\\')):
-            copy_verified(source, destination, expected_sha256=expected_sha256, expected_bytes=expected_bytes)
+            copy_verified(source, destination, expected_sha256=expected_sha256, expected_bytes=expected_bytes,
+                          **({} if native_reserve_bytes is None else {'reserve_bytes': native_reserve_bytes}))
             if signature(source) != before:
                 raise SnapshotError('native incremental source changed during copy')
             return
@@ -363,11 +366,12 @@ def copy_verified_bytes(source: Path | None, destination: Path, *, expected_sha2
         raise SnapshotError("incremental source bytes differ from the canonical selection")
 
 
-def copy_verified_many(members, *, native_windows_io: bool = False):
+def copy_verified_many(members, *, native_windows_io: bool = False, native_reserve_bytes: int | None = None):
     """Amortize native process startup without weakening per-member proofs."""
     if type(native_windows_io) is not bool:
         raise SnapshotError('native grouped copy I/O must be an explicit boolean')
     from stockagent.data_sync.windows_cold_io import windows_path, copy_many
+    reserve_options = {} if native_reserve_bytes is None else {'native_reserve_bytes': native_reserve_bytes}
     native = []
     for source, destination, sha, count in members:
         origin, target = windows_path(source), windows_path(destination)
@@ -377,7 +381,7 @@ def copy_verified_many(members, *, native_windows_io: bool = False):
             native.append((source, destination, sha, count))
         else:
             copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count,
-                                **({'native_windows_io': True} if native_windows_io else {}))
+                                **({'native_windows_io': True} if native_windows_io else {}), **reserve_options)
     groups, group, count = [], [], 0
     for member in native:
         if group and (len(group) == 16 or count + member[3] > 16 * 1024**3):
@@ -390,15 +394,17 @@ def copy_verified_many(members, *, native_windows_io: bool = False):
     for group in groups:
         if len(group) == 1 and not native_windows_io:
             source, destination, sha, count = group[0]
-            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count)
+            copy_verified_bytes(source, destination, expected_sha256=sha, expected_bytes=count, **reserve_options)
         else:
-            copy_many(group)
+            copy_many(group, **({} if native_reserve_bytes is None else {'reserve_bytes': native_reserve_bytes}))
 
 
 def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: Path, *,
                                 catalog_identity: str, read_root: Path | None = None,
                                 copy_workers: int = 1, verify_workers: int = 1,
-                                namespace: str = 'cold', native_windows_io: bool = False) -> dict:
+                                namespace: str = 'cold', native_windows_io: bool = False,
+                                source_authority_guard: Callable[[], None] | None = None,
+                                native_reserve_bytes: int | None = None) -> dict:
     """Export bounded, deduplicated canonical objects or fixed metadata.
 
     A wave deliberately need not contain a whole release. Its envelope proves
@@ -410,6 +416,15 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
         raise SnapshotError("incremental export needs 1 to 16 bounded workers")
     if namespace not in ('cold', 'private-history') or type(native_windows_io) is not bool:
         raise SnapshotError('incremental export needs an explicit cold/private namespace and I/O policy')
+    if native_reserve_bytes is not None:
+        from stockagent.data_sync.windows_cold_io import _copy_reserve
+        _copy_reserve(native_reserve_bytes)
+        if namespace != 'private-history' or native_windows_io is not True:
+            raise SnapshotError('backup reserve is scoped to explicit private immutable transport')
+    reserve_options = {} if native_reserve_bytes is None else {'native_reserve_bytes': native_reserve_bytes}
+    if source_authority_guard is not None and (
+            namespace != 'private-history' or not callable(source_authority_guard)):
+        raise SnapshotError('device renumbering requires the guarded private authority')
     if not _HASH.fullmatch(catalog_identity) or not rows:
         raise SnapshotError("incremental delivery requires a pinned nonempty catalog selection")
     cold = cold_root.absolute()
@@ -433,9 +448,17 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
             raise SnapshotError("incremental selection is outside canonical cold metadata/objects")
         if type(row["bytes"]) is not int or row["bytes"] < 0:
             raise SnapshotError("invalid incremental member size")
+    if source_authority_guard is not None:
+        source_authority_guard()
     destination.mkdir(parents=True, mode=0o700)
     members = []
     with PinnedObjectSignatures(cold) as pinned:
+        # A WSL reboot may renumber the guarded D: mount. Admit that one
+        # historical device-number difference only while retaining every
+        # other recorded attribute; pin the current full signature for all
+        # subsequent checks in this delivery. Content and destination SHA are
+        # still verified independently below.
+        admitted_signatures: dict[str, tuple[int, ...]] = {}
         def unchanged(row: dict) -> None:
             if "captured_bytes_utf8" in row:
                 raw = row["captured_bytes_utf8"].encode("utf-8")
@@ -445,7 +468,15 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
                 return
             observed = (pinned.signature(row["relative"]) if row["relative"].startswith("objects/")
                         else signature(_regular(safe_path(cold, row["relative"]))))
-            if list(observed) != list(row["signature"]):
+            relative = row["relative"]
+            admitted = admitted_signatures.get(relative)
+            if admitted is None:
+                if (list(observed) != list(row["signature"])
+                        and (source_authority_guard is None
+                             or not same_file_signature(row["signature"], observed))):
+                    raise SnapshotError("incremental source changed after its fixed capture")
+                admitted_signatures[relative] = observed
+            elif observed != admitted:
                 raise SnapshotError("incremental source changed after its fixed capture")
 
         # Pin every source directory before worker threads share the read-only
@@ -460,7 +491,7 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
             target = safe_path(destination, relative)
             copy_verified_bytes(source, target, expected_sha256=row["sha256"], expected_bytes=row["bytes"],
                                 payload=row["captured_bytes_utf8"].encode("utf-8") if source is None else None,
-                                **({'native_windows_io': True} if native_windows_io else {}))
+                                **({'native_windows_io': True} if native_windows_io else {}), **reserve_options)
             unchanged(row)
             return {"relative": relative, "sha256": row["sha256"], "bytes": row["bytes"]}
 
@@ -489,7 +520,7 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
                 unchanged(row)
             copy_verified_many([(_regular(safe_path(reader_root, row['relative'])),
                                  safe_path(destination, namespace + '/' + row['relative']),
-                                 row['sha256'], row['bytes']) for row in group], native_windows_io=True)
+                                 row['sha256'], row['bytes']) for row in group], native_windows_io=True, **reserve_options)
             for row in group:
                 unchanged(row)
             return [{'relative': namespace + '/' + row['relative'],
@@ -518,6 +549,8 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
         for row in rows:
             unchanged(row)
         pinned.recheck()
+        if source_authority_guard is not None:
+            source_authority_guard()
         atomic_write_bytes(destination / "READY", (envelope["identity_sha256"] + "\n").encode(), mode=0o600)
     return {"state": "closed_incremental_delivery_verified", "destination": str(destination),
             "envelope_identity_sha256": envelope["identity_sha256"], "transport": transport,

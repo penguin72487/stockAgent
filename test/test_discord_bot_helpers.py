@@ -24,6 +24,31 @@ PENGUIN_DAY_TRADE_MARKETS = (
 )
 
 
+def test_final_publication_window_rechecks_old_warm_proof_once_per_epoch(monkeypatch):
+    cfg = SimpleNamespace(market="fixture", preopen_prepare_time="08:15", open_time="09:00",
+        schedule_interval_minutes=None, day_trade_simulation_enabled=True)
+    now = datetime.fromisoformat("2026-10-30T08:55:00+08:00")
+    monkeypatch.setattr(discord_bot, "_scheduled_market_session_day", lambda *_: (True, "fixture"))
+    monkeypatch.setattr(discord_bot, "_day_trade_schedule_state", lambda *_: "retry")
+    monkeypatch.setattr(discord_bot, "_preopen_market_ready_for_session", lambda *_: True)
+    armed = [True]
+    monkeypatch.setattr(discord_bot, "_preopen_market_final_armed_for_session", lambda *_: armed[0])
+    monkeypatch.setattr(discord_bot, "live_panel_cache_epoch", lambda: 3)
+    monkeypatch.setenv("STOCKAGENT_PREOPEN_FINAL_ARM_LEAD_MINUTES", "15")
+    receipt = {"markets": {"fixture": {"final_arm": {"completed_at": "2026-10-30T08:46:00+08:00"}}}}
+    monkeypatch.setattr(discord_bot, "_preopen_readiness_payload", lambda: receipt)
+    assert discord_bot._preopen_prepare_key(cfg, now.replace(minute=54)) is None
+    key = discord_bot._preopen_prepare_key(cfg, now)
+    assert key == "2026-10-30:fixture:epoch-3:late:preopen-final-arm"
+    assert key.endswith(":preopen-final-arm")
+    armed[0] = False  # A failed late pass must retry late, not the completed early key.
+    assert discord_bot._preopen_prepare_key(cfg, now) == key
+    armed[0] = True
+    receipt["markets"]["fixture"]["final_arm"]["completed_at"] = now.isoformat()
+    assert discord_bot._preopen_prepare_key(cfg, now.replace(minute=56)) is None
+    assert discord_bot._preopen_prepare_key(cfg, now.replace(hour=9, minute=0)) is None
+
+
 @pytest.mark.parametrize("at,deadline,active,expected", [
     ("18:00", "2026-10-13T18:10:00+08:00", None, True),
     ("01:00", "2026-10-13T01:10:00+08:00", None, True),
@@ -588,12 +613,17 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
                 "coverage_to_signal_ready_ms": 500.0,
             },
             "live_latency": {
+                "pre_quote_prepare_ms": 0.0,
                 "quote_fetch_ms": 250.0,
+                "pre_inference_prepare_ms": 0.0,
                 "checkpoint_contract_build_ms": 8.0,
                 "checkpoint_contract_validate_ms": 0.05,
                 "quote_preparation_queue_ms": 12.0,
                 "compute_before_publish_ms": 300.0,
                 "model_inference_ms": 40.0,
+                "post_inference_format_ms": 0.0,
+                "post_inference_format_steps_ms": {"weight_rows": 0.0},
+                "post_inference_format_steps_contract": "sequential_nested_wall_time_v1",
                 "artifact_publish_ms": 25.0,
                 "quote_transport": {
                     "server_provider_fetch_ms": 200.0,
@@ -636,6 +666,8 @@ def test_opening_signal_latency_record_preserves_stage_and_source_boundaries(
     assert payload["stages"]["checkpoint_contract_validate_ms"] == 0.05
     assert payload["stages"]["quote_preparation_queue_ms"] == 12.0
     assert payload["stages"]["signal_other_compute_ms"] == 10.0
+    assert payload["post_inference_format_steps_ms"] == {"weight_rows": 0.0}
+    assert payload["post_inference_format_steps_contract"] == "sequential_nested_wall_time_v1"
     assert payload["stages"]["quote_request_body_ms"] == 150.0
     assert payload["stages"]["quote_usage_before_ms"] == 0.0
     assert payload["stages"]["quote_traffic_record_ms"] == 3.0
@@ -664,6 +696,7 @@ def test_failed_opening_measurement_keeps_work_and_redacts_credentials(monkeypat
         result=None, error=RuntimeError("source failure private-key-fixture"))
     assert result["failure_stage"] == "input_validation"
     assert result["stages"]["signal_quote_fetch_ms"] == 75.0
+    assert result["stages"]["signal_other_compute_ms"] is None
     assert result["stages"]["scheduler_wake_ms"] == 3.0
     assert result["attempt_from_open_ms"] == 6000.0
     assert result["opening_input_coverage"]["opens"] == 33

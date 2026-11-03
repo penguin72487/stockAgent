@@ -421,6 +421,7 @@ def materialize_margin_market_rows(
     *, slot_count: int = 2816, market_dates: pl.DataFrame | None = None,
     portfolio_lifetimes: pl.DataFrame | None = None,
     portfolio_universe: pl.DataFrame | None = None,
+    allow_unobserved_catalog_products: bool = False,
 ) -> tuple[pl.DataFrame, pl.DataFrame]:
     """Preserve identities and marks without inventing executable prices/rules.
 
@@ -434,8 +435,12 @@ def materialize_margin_market_rows(
         raise ValueError("duplicate/null requested product identity")
     if set(universe["settlement_currency"]) != {"TWD"}:
         raise ValueError("the requested universe must be exclusively TWD")
-    if set(physical["product"]) != set(universe["product"]):
-        raise ValueError("physical history must cover exactly every requested TWD product")
+    if type(allow_unobserved_catalog_products) is not bool:
+        raise ValueError("catalog-only admission requires an explicit Boolean")
+    physical_products, requested_products = set(physical["product"]), set(universe["product"])
+    if (not physical_products or not physical_products <= requested_products
+            or (not allow_unobserved_catalog_products and physical_products != requested_products)):
+        raise ValueError("physical history must cover exactly every requested TWD product unless catalog-only admission is explicit")
     if physical.select(KEYS).is_duplicated().any():
         raise ValueError("ambiguous physical identity on one product/contract/day")
     if physical.select("date", "physical_instance").is_duplicated().any():
@@ -448,6 +453,9 @@ def materialize_margin_market_rows(
         raise ValueError("duplicate observed general-session contract-day")
     if raw.select(KEYS).join(physical.select(KEYS), on=KEYS, how="anti").height:
         raise ValueError("physical history drops requested observed contract-days")
+    # A catalog entry without any physical rows is neither a listing claim nor
+    # a zero-volume trading day. It owns no slot, mark, or trade. The preceding
+    # anti-join still rejects any source observation omitted from physical.
     calendar_source = physical.select("date").unique() if market_dates is None else market_dates.select("date")
     if (calendar_source['date'].null_count() or calendar_source['date'].is_duplicated().any()
             or physical.select('date').unique().join(calendar_source,on='date',how='anti').height):

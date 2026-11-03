@@ -587,6 +587,28 @@ def _verified_tw_exchange_schedule_cached(
     )
 
 
+def tw_actual_session_receipt_inputs(summary: Any) -> dict[str, Any]:
+    """Exact receipt inputs shared by session verification and feature proofs.
+
+    Collection timestamps and report paths do not certify a non-session.
+    Keep the verifier on this projection so its feature dependency cannot
+    silently omit a newly consumed receipt field.
+    """
+    if not isinstance(summary, dict):
+        raise ValueError("TAIEX actual-session receipt is not an object")
+    receipt = summary.get("output_receipt") or {}
+    if not isinstance(receipt, dict):
+        raise ValueError("TAIEX actual-session output receipt is not an object")
+    return {
+        **{name: summary.get(name) for name in (
+            "dataset", "source", "source_product", "coverage_complete",
+            "replacement_promoted", "failed_count", "unresolved_month_count",
+            "effective_start_date", "effective_end_date", "output_rows",
+        )},
+        "output_receipt": {name: receipt.get(name) for name in ("size", "sha256")},
+    }
+
+
 @lru_cache(maxsize=8)
 def _verified_tw_actual_sessions_cached(
     path_text: str,
@@ -594,17 +616,21 @@ def _verified_tw_actual_sessions_cached(
     path_mtime_ns: int,
     path_device: int,
     path_inode: int,
+    path_ctime_ns: int,
     summary_text: str,
     summary_size: int,
     summary_mtime_ns: int,
     summary_device: int,
     summary_inode: int,
+    summary_ctime_ns: int,
 ) -> tuple[frozenset[date], date, date]:
     """Verify the immutable byte receipt before using absence as closure proof."""
 
     path = Path(path_text)
     summary_path = Path(summary_text)
-    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    summary = tw_actual_session_receipt_inputs(
+        json.loads(summary_path.read_text(encoding="utf-8"))
+    )
     receipt = summary.get("output_receipt") or {}
     if (
         summary.get("dataset") != "twse_taiex_ohlc"
@@ -621,10 +647,10 @@ def _verified_tw_actual_sessions_cached(
     path_stat = path.stat()
     summary_stat = summary_path.stat()
     if (
-        (path_stat.st_size, path_stat.st_mtime_ns, path_stat.st_dev, path_stat.st_ino)
-        != (path_size, path_mtime_ns, path_device, path_inode)
-        or (summary_stat.st_size, summary_stat.st_mtime_ns, summary_stat.st_dev, summary_stat.st_ino)
-        != (summary_size, summary_mtime_ns, summary_device, summary_inode)
+        (path_stat.st_size, path_stat.st_mtime_ns, path_stat.st_dev, path_stat.st_ino, path_stat.st_ctime_ns)
+        != (path_size, path_mtime_ns, path_device, path_inode, path_ctime_ns)
+        or (summary_stat.st_size, summary_stat.st_mtime_ns, summary_stat.st_dev, summary_stat.st_ino, summary_stat.st_ctime_ns)
+        != (summary_size, summary_mtime_ns, summary_device, summary_inode, summary_ctime_ns)
     ):
         raise ValueError("TAIEX actual-session files changed during verification")
     if pq is None:
@@ -655,10 +681,10 @@ def _verified_tw_actual_sessions_cached(
     path_stat = path.stat()
     summary_stat = summary_path.stat()
     if (
-        (path_stat.st_size, path_stat.st_mtime_ns, path_stat.st_dev, path_stat.st_ino)
-        != (path_size, path_mtime_ns, path_device, path_inode)
-        or (summary_stat.st_size, summary_stat.st_mtime_ns, summary_stat.st_dev, summary_stat.st_ino)
-        != (summary_size, summary_mtime_ns, summary_device, summary_inode)
+        (path_stat.st_size, path_stat.st_mtime_ns, path_stat.st_dev, path_stat.st_ino, path_stat.st_ctime_ns)
+        != (path_size, path_mtime_ns, path_device, path_inode, path_ctime_ns)
+        or (summary_stat.st_size, summary_stat.st_mtime_ns, summary_stat.st_dev, summary_stat.st_ino, summary_stat.st_ctime_ns)
+        != (summary_size, summary_mtime_ns, summary_device, summary_inode, summary_ctime_ns)
     ):
         raise ValueError("TAIEX actual-session files changed during verification")
     return frozenset(sessions), start, end
@@ -691,9 +717,9 @@ def tw_stock_day_decision(
                 summary_stat = summary_path.stat()
                 sessions, start, end = _verified_tw_actual_sessions_cached(
                     str(path.resolve()), path_stat.st_size, path_stat.st_mtime_ns,
-                    path_stat.st_dev, path_stat.st_ino,
+                    path_stat.st_dev, path_stat.st_ino, path_stat.st_ctime_ns,
                     str(summary_path.resolve()), summary_stat.st_size, summary_stat.st_mtime_ns,
-                    summary_stat.st_dev, summary_stat.st_ino,
+                    summary_stat.st_dev, summary_stat.st_ino, summary_stat.st_ctime_ns,
                 )
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
                 if day < local_now.date():

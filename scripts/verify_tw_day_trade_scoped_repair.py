@@ -6,6 +6,8 @@ import argparse
 from datetime import datetime, timedelta
 import hashlib
 import json
+import math
+from collections import defaultdict
 from pathlib import Path
 import subprocess
 import sys
@@ -86,17 +88,39 @@ def source_no_trade_minutes(files: list[dict], day: str) -> dict[str, set[str]]:
     return result
 
 
-def verify_carried_minute(row: dict, *, no_trade_symbols: set[str], held_symbols: set[str]) -> None:
+def verify_carried_minute(row: dict, *, no_trade_symbols: set[str], held_symbols: set[str] | list[str]) -> None:
     carried = int(row.get("last_trade_carried_position_count") or 0)
     if (row.get("historical_minute_replay") is not True
             or row.get("minute_valuation_contract") != "right_labelled_historical_last_trade_mark_v1"
             or row.get("missing_price_position_count") != 0
             or carried <= 0 or carried != int(row.get("stale_position_count") or 0)
-            or carried != len(no_trade_symbols & held_symbols)):
+            or carried != sum(symbol in no_trade_symbols for symbol in held_symbols)):
         raise RuntimeError("carried valuation lacks explicit zero-trade source evidence")
 
 
-def verify_api_positions(rows: list[dict], expected: list[dict], signal_id: str) -> dict:
+def verify_minute_source_coverage(mode: dict, marks: list[dict], *, market: str, day: str,
+                                  source_files: list[dict]) -> dict:
+    selected = [row for row in marks if row.get("market") == market and row.get("session_date") == day]
+    by_minute = {str(row["minute"])[:16]: row for row in selected}
+    start = datetime.fromisoformat(f"{day}T09:01:00+08:00")
+    expected = {(start + timedelta(minutes=i)).isoformat()[:16] for i in range(270)}
+    if set(by_minute) != expected or len(selected) != 270:
+        raise RuntimeError("exactly 270 source-backed marks, without duplicate minutes, required")
+    no_trades = source_no_trade_minutes(source_files, day)
+    carried = []
+    for minute, row in by_minute.items():
+        if int(row.get("missing_price_position_count") or 0):
+            raise RuntimeError(f"minute has an unsourced held position: {minute}")
+        if row.get("valuation_stale"):
+            held = [str(position["symbol"]) for position in mode["positions"].values()
+                    if str(position["entry_at"])[:16] <= minute < str(position.get("exit_at") or f"{day}T13:31")[:16]]
+            verify_carried_minute(row, no_trade_symbols=no_trades.get(minute, set()), held_symbols=held)
+            carried.append(minute)
+    return {"minute_points": len(by_minute), "duplicate_minute_points": 0,
+            "explicit_zero_trade_carried_minutes": sorted(carried), "unsourced_held_price_minutes": 0}
+
+
+def verify_api_positions(rows: list[dict], expected: list[dict], signal_id: str | set[str]) -> dict:
     """Compare financial meaning even when the public DTO redacts private IDs."""
     fields = (
         "market", "session_date", "symbol", "side", "target_weight",
@@ -104,7 +128,8 @@ def verify_api_positions(rows: list[dict], expected: list[dict], signal_id: str)
         "entry_price", "exit_at", "exit_price", "realized_net_pnl_twd",
         "total_net_pnl_twd", "simulation_replay",
     )
-    identity = lambda row: tuple(str(row.get(field) or "") for field in fields[:4])
+    identity = lambda row: tuple(str(row.get(field) or "") for field in fields)
+    signal_ids = {signal_id} if isinstance(signal_id, str) else signal_id
     actual = sorted(rows, key=identity)
     canonical = sorted(expected, key=identity)
     if len(actual) != len(canonical):
@@ -112,11 +137,133 @@ def verify_api_positions(rows: list[dict], expected: list[dict], signal_id: str)
     for row, source in zip(actual, canonical, strict=True):
         if any(field not in row or row[field] != source.get(field) for field in fields):
             raise RuntimeError("API repaired position economics or provenance differ")
-        if row.get("signal_id") not in (None, signal_id):
+        if row.get("signal_id") is not None and row["signal_id"] not in signal_ids:
             raise RuntimeError("API disclosed a different repaired signal identity")
     return {"position_rows": len(actual),
             "private_signal_ids_redacted": all(row.get("signal_id") is None for row in actual),
             "exact_position_fields_verified": list(fields)}
+
+
+def verify_published_fill_accounting(mode: dict, fills: list[dict], *, day: str,
+                                     plan: dict, bars: dict, prior_realized: float,
+                                     terminal_close_sources: list[dict] | tuple = ()) -> dict:
+    """Independent quantity/price/fee oracle, not a second execution engine."""
+    positions = {key: row for key, row in mode["positions"].items() if row.get("session_date") == day}
+    totals = defaultdict(lambda: defaultdict(float))
+    volume_used = defaultdict(int)
+    selected = {row["signal_id"]: row for row in plan["versions"] if row["effective_entry_at"]}
+    source_ids = {position["signal_id"]: (position.get("signal_id") or "").split(":published-minute-repair:")[0]
+                  for position in positions.values()}
+    terminal_prices = {}
+    for source_file in terminal_close_sources:
+        path = Path(source_file["path"])
+        exchange = {"twse_daily_ohlcv": "twse", "tpex_daily_ohlcv": "tpex"}.get(path.parent.name)
+        if exchange is None or repair._sha256(path) != source_file["sha256"]:
+            raise RuntimeError("terminal official source identity changed")
+        from scripts.settle_tw_day_trade_official_close import official_closes
+        prices, _ = official_closes(path.parent.parent, datetime.fromisoformat(day).date(), exchanges=(exchange,))
+        if terminal_prices.keys() & prices.keys():
+            raise RuntimeError("duplicate terminal official symbol")
+        terminal_prices.update(prices)
+    entry_shares = exit_shares = 0
+    for fill in fills:
+        if fill.get("market") != mode["market"] or fill.get("session_date") != day:
+            raise RuntimeError("candidate append contains a non-target fill")
+        position = positions.get(fill.get("position_id"))
+        if position is None or fill.get("simulation_only") is not True or fill.get("simulation_replay") is not True:
+            raise RuntimeError("unowned/non-replay fill")
+        quantity, price = int(fill["quantity"]), float(fill["price"])
+        if quantity <= 0 or quantity != fill["quantity"] or quantity % int(position["lot_size"]):
+            raise RuntimeError("invalid share/whole-lot quantity")
+        at = datetime.fromisoformat(fill["fill_at"])
+        key = at.isoformat(timespec="minutes")
+        is_entry = fill.get("purpose") in {"entry", "entry_completion"}
+        source = selected[source_ids[position["signal_id"]]]
+        if is_entry and (at < datetime.fromisoformat(source["effective_entry_at"])
+                         or at.time() >= repair.time(13, 20)):
+            raise RuntimeError("entry violates publication/full-minute/exit priority clock")
+        terminal = fill.get("purpose") in {"13_30_terminal_ledger_flatten", "official_close_reconciliation",
+                                          "13_30_unlimited_close_paper_settlement"}
+        if terminal:
+            proof = terminal_prices.get(str(position["symbol"])) or {}
+            receipt = fill.get("terminal_close_receipt") or {}
+            evidence = receipt.get("source_evidence") or {}
+            contract = "source_close_full_deliverable_residual_no_capacity_paper_only_v1"
+            raw_row = proof.get("official_row") or {}
+            try:
+                volume = float(str(raw_row.get("成交股數", raw_row.get("成交量", ""))).replace(",", ""))
+            except (ValueError, TypeError):
+                volume = 0.
+            expected_at = datetime.fromisoformat(f"{day}T13:30:00+08:00")
+            if (at != expected_at or fill.get("fill_contract") != contract
+                    or receipt.get("contract") != contract or receipt.get("broker_fill") is not False
+                    or receipt.get("full_quantity_is_user_assumption") is not True
+                    or receipt.get("effective_at") != expected_at.isoformat()
+                    or proof.get("price") is None or not math.isfinite(volume) or volume <= 0
+                    or not math.isclose(price, float(proof["price"]), rel_tol=0, abs_tol=1e-9)
+                    or any(evidence.get(key) != value for key, value in {
+                        "session_date": day, "price": proof.get("price"),
+                        "source": proof.get("source"), "source_sha256": proof.get("source_sha256"),
+                        "price_basis": "official_session_close"}.items())):
+                raise RuntimeError("terminal fill lacks matching traded official close evidence")
+        else:
+            bar = (bars.get(str(position["symbol"])) or {}).get(key)
+            if bar is None or not float(bar["low"]) <= price <= float(bar["high"]):
+                raise RuntimeError(f"fill lacks observed minute price range: {position['symbol']}/{key}")
+            if is_entry:
+                expected_price = float(bar["vwap"])
+                if not math.isclose(price, expected_price, abs_tol=1e-8, rel_tol=1e-12):
+                    raise RuntimeError("entry differs from source minute VWAP/Close")
+            volume_used[(position["symbol"], key)] += quantity
+        side = position["side"]
+        rate = float(position[("buy_fee_rate" if side == "long" else "sell_fee_rate") if is_entry
+                              else ("sell_fee_rate" if side == "long" else "buy_fee_rate")])
+        fee = quantity * price * (rate - float(position.get("commission_rebate_rate") or 0))
+        if not math.isclose(float(fill["fee_and_tax_twd"]), fee, rel_tol=1e-10, abs_tol=1e-6):
+            raise RuntimeError("fill fee/tax differs from frozen per-security schedule")
+        values = totals[fill["position_id"]]
+        prefix = "entry" if is_entry else "exit"
+        values[prefix + "_shares"] += quantity
+        values[prefix + "_notional"] += quantity * price
+        values[prefix + "_fees"] += fee
+        if is_entry:
+            entry_shares += quantity
+            tp, sl = float(position["take_profit_price"]), float(position["stop_trigger_price"])
+            if not (sl < price < tp if side == "long" else tp < price < sl):
+                raise RuntimeError("entry violates original TP/SL price guard")
+        else:
+            exit_shares += quantity
+    for (symbol, minute), quantity in volume_used.items():
+        bar = bars[symbol][minute]
+        capacity = int(float(bar["volume_shares"]) * .5 // 1000) * 1000
+        if quantity > capacity:
+            raise RuntimeError(f"shared minute volume consumed twice: {symbol}/{minute}: {quantity}>{capacity}")
+    realized = fees = 0.
+    for key, position in positions.items():
+        values = totals[key]
+        quantity = int(position["filled_shares"])
+        if (values["entry_shares"] != quantity or values["exit_shares"] != quantity
+                or int(position.get("signed_shares") or 0) != 0):
+            raise RuntimeError("position entry/exit quantities do not reconcile")
+        direction = 1 if position["side"] == "long" else -1
+        gross = direction * (values["exit_notional"] - values["entry_notional"])
+        fee = values["entry_fees"] + values["exit_fees"]
+        net = gross - fee
+        for actual, expected in ((position["entry_price"], values["entry_notional"] / quantity),
+                (position["realized_gross_pnl_twd"], gross), (position["entry_fee_twd"], values["entry_fees"]),
+                (position["realized_exit_fee_twd"], values["exit_fees"]), (position["realized_net_pnl_twd"], net)):
+            if not math.isclose(float(actual), expected, rel_tol=1e-9, abs_tol=1e-5):
+                raise RuntimeError("position price/fee/PnL differs from independent fill reduction")
+        realized += net
+        fees += fee
+    if entry_shares != exit_shares or not math.isclose(
+            float(mode["cumulative_realized_net_pnl_twd"]) - prior_realized, realized,
+            rel_tol=1e-9, abs_tol=1e-5):
+        raise RuntimeError("daily realized PnL/closed inventory does not reconcile")
+    return {"position_cohorts": len(positions), "entry_shares": entry_shares, "exit_shares": exit_shares,
+            "net_fees_and_tax_twd": fees, "session_realized_net_pnl_twd": realized,
+            "original_tp_sl_guards_verified": True, "shared_minute_capacity_verified": True,
+            "publication_and_full_minute_clocks_verified": True}
 
 
 def verify_applied_source_provenance(manifest: dict) -> dict:
@@ -207,9 +354,10 @@ def verify(root: Path, api_bases: list[str]) -> dict:
     for item in manifest["applied_sessions"]:
         day, signal_id = item["session_date"], item["signal_id"]
         selected = [row for row in fills if row.get("market") == market and row.get("session_date") == day]
-        entry = sum(int(row["quantity"]) for row in selected if row.get("purpose") == "entry")
-        exit_quantity = sum(int(row["quantity"]) for row in selected if row.get("purpose") != "entry")
-        if entry != item["entry_requested_shares"] or exit_quantity != entry:
+        entry = sum(int(row["quantity"]) for row in selected if row.get("purpose") in {"entry", "entry_completion"})
+        exit_quantity = sum(int(row["quantity"]) for row in selected if row.get("purpose") not in {"entry", "entry_completion"})
+        published = manifest.get("published_revisions") is True
+        if (not published and entry != item["entry_requested_shares"]) or exit_quantity != entry:
             raise RuntimeError("entry/exit journal quantities do not balance")
         by_minute = {str(row["minute"])[:16]: row for row in marks
                      if row.get("market") == market and row.get("session_date") == day}
@@ -218,22 +366,38 @@ def verify(root: Path, api_bases: list[str]) -> dict:
         if set(by_minute) != expected:
             raise RuntimeError("270 exact source-backed minute marks required")
         source = next(source for source in manifest["sessions"] if source["session_date"] == day)
-        no_trades = source_no_trade_minutes(source["minute_source_after"]["source_files"], day)
-        carried_minutes = []
-        for minute, row in by_minute.items():
-            if int(row.get("missing_price_position_count") or 0):
-                raise RuntimeError(f"minute has an unsourced held position: {minute}")
-            if row.get("valuation_stale"):
-                held = {str(p["symbol"]) for p in mode["positions"].values()
-                        if str(p["entry_at"])[:16] <= minute < str(p.get("exit_at") or f"{day}T13:31")[:16]}
-                verify_carried_minute(row, no_trade_symbols=no_trades.get(minute, set()), held_symbols=held)
-                carried_minutes.append(minute)
+        coverage = verify_minute_source_coverage(mode, marks, market=market, day=day,
+            source_files=source["minute_source_after"]["source_files"])
+        carried_minutes = coverage["explicit_zero_trade_carried_minutes"]
+        if published and coverage != manifest["candidate_minute_source_coverage"]:
+            raise RuntimeError("applied minute source coverage differs from validated candidate")
         endpoints = []
         expected_positions = [position for position in mode["positions"].values()
-                              if position.get("session_date") == day and position.get("signal_id") == signal_id]
+                              if position.get("session_date") == day and (published or position.get("signal_id") == signal_id)]
+        signal_ids = {position["signal_id"] for position in expected_positions} if published else signal_id
+        accounting = {}
+        if published:
+            bars, _ = replay._minute_bar_rows(tuple(Path(value) for value in manifest["minute_roots"]),
+                trading_date=datetime.fromisoformat(day).date(), symbols={position["symbol"] for position in expected_positions})
+            accounting = verify_published_fill_accounting(mode, selected, day=day,
+                plan=manifest["published_revision_plan"], bars=bars,
+                prior_realized=float(manifest["anchor"]["cumulative_realized_net_pnl_twd"]),
+                terminal_close_sources=(item.get("closing_proof") or {}).get("terminal_close_sources", []))
+            if accounting != manifest["candidate_fill_accounting"]:
+                raise RuntimeError("applied fill accounting differs from validated candidate")
         for base in api_bases:
-            positions = _api(base, "positions", {"mode": market, "date": day, "limit": 10})
-            position_proof = verify_api_positions(positions["rows"], expected_positions, signal_id)
+            position_rows = []
+            offset = 0
+            while True:
+                positions = _api(base, "positions", {"mode": market, "date": day, "limit": 200, "offset": offset})
+                page = positions["rows"]
+                position_rows.extend(page)
+                if not positions.get("has_more"):
+                    break
+                if not page or len(position_rows) > len(expected_positions):
+                    raise RuntimeError("position pagination did not make bounded progress")
+                offset += len(page)
+            position_proof = verify_api_positions(position_rows, expected_positions, signal_ids)
             history = _api(base, "history", {"range": "all", "resolution": "1m", "start_date": day, "end_date": day})
             series = next(row for row in history["minute_series"] if row["series_id"] == market)
             points = series["points"]
@@ -244,14 +408,15 @@ def verify(root: Path, api_bases: list[str]) -> dict:
                               "first_point": points[0], "last_point": points[-1]})
         proofs.append({"session_date": day, "entry_shares": entry, "exit_shares": exit_quantity,
                        "minute_points": len(by_minute), "explicit_zero_trade_carried_minutes": sorted(carried_minutes),
-                       "unsourced_held_price_minutes": 0, "api_evidence": endpoints})
+                       "unsourced_held_price_minutes": 0, "api_evidence": endpoints,
+                       **({"progressive_fill_accounting": accounting} if published else {})})
     unit = subprocess.run(["systemctl", "show", repair.SERVICE, "-p", "ActiveState", "-p", "InvocationID", "-p", "MainPID"],
                           check=True, text=True, capture_output=True).stdout
     if "ActiveState=active" not in unit:
         raise RuntimeError("native paper owner did not recover")
     result = {"status": "accepted", "market": market, "recorded_at": datetime.now(repair.TAIPEI).isoformat(),
               "original_journal_prefixes_sha256_verified": True, "source_provenance": source_proof,
-              "original_weights_unchanged": manifest.get("preserve_original_signal") is True,
+              "original_weights_unchanged": manifest.get("preserve_original_signal") is True or manifest.get("published_revisions") is True,
               "non_target_modes_unchanged_during_append": True, "candidate_live_economics_equal": True,
               "simulation_only": True, "production_order_possible": False, "sessions": proofs,
               "total_equity_twd": mode["total_equity_twd"], "native_owner": unit}

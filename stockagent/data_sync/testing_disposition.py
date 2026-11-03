@@ -21,6 +21,7 @@ def real(path: Path) -> Path:
 
 CONTRACT = "explicit-testing-artifact-discard-v1"
 PREPARATION_CONTRACT = "explicit-local-preparation-benchmark-discard-v1"
+LOCAL_TESTING_CONTRACT = "explicit-local-testing-artifact-discard-v1"
 DEFAULT_POLICY = Path(__file__).resolve().parents[2] / "configs/data_sync/testing_artifact_disposition_20261007_v2.json"
 
 
@@ -28,10 +29,11 @@ def load_policy(path: Path) -> dict:
     value = json.loads(real(path).read_bytes())
     body = {k: v for k, v in value.items() if k != "identity_sha256"}
     local_preparation = value.get("contract") == PREPARATION_CONTRACT
+    local_testing = value.get("contract") == LOCAL_TESTING_CONTRACT
     if (set(body) != {"contract", "authority_node_id", "origin_node_id", "authorization", "decision", "targets"}
-            or value.get("contract") not in {CONTRACT, PREPARATION_CONTRACT}
+            or value.get("contract") not in {CONTRACT, PREPARATION_CONTRACT, LOCAL_TESTING_CONTRACT}
             or value.get("authority_node_id") != "penguin"
-            or value.get("origin_node_id") != ("penguin" if local_preparation else "vastai1T")
+            or value.get("origin_node_id") != ("penguin" if local_preparation or local_testing else "vastai1T")
             or value.get("decision") != "discard_without_preservation"
             or not isinstance(value.get("authorization"), str) or not value["authorization"].strip()
             or value.get("identity_sha256") != identity(body)
@@ -39,7 +41,8 @@ def load_policy(path: Path) -> dict:
         raise SnapshotError("invalid explicit testing-artifact disposition")
     seen = set()
     for row in value["targets"]:
-        allowed_bases = {"preparation-benchmark"} if local_preparation else {"artifact", "engineering"}
+        allowed_bases = ({"preparation-benchmark"} if local_preparation else
+                         {"artifact"} if local_testing else {"artifact", "engineering"})
         if set(row) != {"base", "relative", "kind", "reason"} or row["base"] not in allowed_bases:
             raise SnapshotError("invalid exact testing target")
         relative = _safe_relative_path(row["relative"], "testing discard target")
@@ -55,6 +58,9 @@ def load_policy(path: Path) -> dict:
         elif row["base"] == "artifact":
             if len(relative.parts) < 2 or relative.parts[0] not in {"smoke", "markets", "operations", "ablations", "cache", "benchmarks"}:
                 raise SnapshotError("testing discard cannot target an artifact namespace")
+            if local_testing and (relative.parts[0] not in {"benchmarks", "operations"}
+                                  or row["reason"] not in {"benchmark", "validation-test"}):
+                raise SnapshotError("local testing discard requires an exact reviewed performance artifact")
         elif (len(relative.parts) < 3 or not relative.parts[0].startswith(
                 ("stockagent-remote-build-measurement-", "stockagent-control-pilot-")) or row["kind"] != "file"):
             raise SnapshotError("engineering discard must name an individual measurement file")
@@ -72,7 +78,7 @@ def target_path(policy: dict, target: dict, *, repo_root: Path, engineering_root
         raise SnapshotError("testing target is outside the exact disposition")
     if policy["contract"] == PREPARATION_CONTRACT and target["base"] == "preparation-benchmark":
         base = repo_root
-    elif policy["contract"] == CONTRACT and target["base"] in {"artifact", "engineering"}:
+    elif policy["contract"] in {CONTRACT, LOCAL_TESTING_CONTRACT} and target["base"] in {"artifact", "engineering"}:
         base = repo_root / "artifacts" if target["base"] == "artifact" else engineering_root
     else:
         raise SnapshotError("testing target base disagrees with its disposition")
@@ -90,6 +96,9 @@ def discarded_root(relative: str, policy: dict) -> bool:
 
 
 def manifest_discarded(manifest: dict, policy: dict) -> bool:
+    if policy["contract"] == LOCAL_TESTING_CONTRACT:
+        # Local work-copy disposal grants no D/NAS deletion or recovery waiver.
+        return False
     meta = manifest.get("metadata", {})
     if meta.get("origin_node_id") not in {None, "vastai1T"}:
         return False

@@ -51,6 +51,8 @@ def test_protected_runway_dispatches_only_source_owner_and_keeps_normal_history_
     monkeypatch.setattr(window, "evaluate", lambda *a, **k: {"allowed": False})
     monkeypatch.setattr(runner, "_retry_dispatch_state_path", lambda: tmp_path / "state.json")
     commands = []
+    monkeypatch.setattr(runner, "_retry_owner_invocation", lambda _: {
+        "active_state": "inactive", "invocation_id": "old", "job": ""})
     monkeypatch.setattr(runner.subprocess, "run", lambda cmd, **kwargs: commands.append(cmd))
     probe = {"due": True, "due_keys": ["source_projection_refresh:factorized", "history"],
              "wakeup_fingerprint": "one"}
@@ -77,6 +79,8 @@ def test_priority_source_retry_does_not_wait_for_history_coalescing_interval(tmp
     monkeypatch.setattr(runner, "retry_probe", lambda: {"due": True,
         "due_keys": ["source_projection_refresh:factorized"], "wakeup_fingerprint": "unchanged"})
     commands = []
+    monkeypatch.setattr(runner, "_retry_owner_invocation", lambda _: {
+        "active_state": "failed", "invocation_id": "old", "job": ""})
     monkeypatch.setattr(runner.subprocess, "run", lambda cmd, **_kwargs: commands.append(cmd))
     assert runner.request_due_retry() == 0
     assert commands == [["systemctl", "start", "--no-block", runner.PRIORITY_SOURCE_UNIT]]

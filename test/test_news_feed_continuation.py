@@ -17,6 +17,357 @@ from test_news_fulltext import bulk_fixture, bulk_posts, config
 from test_news_provider_efficiency import feed_fixture, feed_item, rss
 
 
+@pytest.mark.parametrize('kind', ['rss_fulltext', 'wordpress_posts'])
+@pytest.mark.parametrize('observation', ['older', 'newer', 'missing', 'in_flight'])
+def test_current_bulk_page_cannot_overwrite_newer_article_metadata(config, tmp_path, kind, observation):
+    if kind == 'rss_fulltext':
+        http, queue = feed_fixture(config, tmp_path)
+        seed_discovery(queue)
+        task = dict(queue.db.execute("SELECT * FROM discovery WHERE kind='rss_fulltext'").fetchone())
+        raw = Response(task['url'], 200, {}, rss([feed_item(1), feed_item(2)]))
+        records, errors = feed_records(raw, http, http.registry.sources['publisher'])
+    else:
+        queue, http, _, task, _ = bulk_fixture(config, tmp_path, count=2)
+        raw, _, records, errors = fetch_discovery(http, task)
+    try:
+        article_url = records[0]['requested_url']
+        with queue.db:
+            queue.add_articles([{'url': article_url, 'title': 'independent article title'}])
+            queue.db.execute('UPDATE articles SET last_seen_utc=? WHERE url=?',
+                             ('2000-01-01T00:00:00+00:00' if observation == 'newer'
+                              else '2026-01-02T00:00:00+00:00' if observation == 'in_flight'
+                              else '2099-01-01T00:00:00+00:00', article_url))
+        if observation != 'missing':
+            task['_discovery_request_started_at_utc'] = '2026-01-01T00:00:00+00:00'
+            task['_discovery_response_observed_at_utc'] = '2026-01-03T00:00:00+00:00'
+        else:
+            task.pop('_discovery_request_started_at_utc', None)
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+        accept_discovery(queue, task, raw, links, records, errors)
+        article = queue.db.execute('SELECT title,last_seen_utc FROM articles WHERE url=?', (article_url,)).fetchone()
+        assert article['title'] == (records[0]['title'] if observation == 'newer' else 'independent article title')
+        if observation != 'newer':
+            assert article['last_seen_utc'] == ('2026-01-02T00:00:00+00:00' if observation == 'in_flight'
+                                                else '2099-01-01T00:00:00+00:00')
+        assert queue.db.execute('SELECT 1 FROM articles WHERE url=?', (records[1]['requested_url'],)).fetchone()
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone()) != before
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_live_rss_dispatch_records_observation_before_queue_commit(config, tmp_path, monkeypatch):
+    from contextlib import closing
+    import downloader.news_fulltext as module
+    from test_news_fulltext import FakeResponse, http_fixture
+
+    url = 'https://publisher.test/feed/'
+    config['providers'][0]['fulltext_feeds'] = [url]
+    http, session = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(rss([feed_item(1), feed_item(2)])),
+    })
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    with closing(http), closing(NewsQueue(tmp_path, http.registry)) as queue:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'rss_fulltext','publisher')", (url,))
+        original = module.accept_discovery
+        observed = {}
+        def article_advances_after_fetch(queue, task, response, links, records, errors):
+            observed['start'] = task.get('_discovery_request_started_at_utc')
+            observed['end'] = task.get('_discovery_response_observed_at_utc')
+            article_url = records[0]['requested_url']
+            with queue.db:
+                queue.add_articles([{'url': article_url, 'title': 'independent article title'}])
+                queue.db.execute("UPDATE articles SET last_seen_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (article_url,))
+            return original(queue, task, response, links, records, errors)
+        monkeypatch.setattr(module, 'accept_discovery', article_advances_after_fetch)
+        module.run_cycle(queue, http, config, max_articles=0, max_discovery_requests=1)
+        assert datetime.fromisoformat(observed['start']).utcoffset() is not None
+        assert datetime.fromisoformat(observed['start']) <= datetime.fromisoformat(observed['end'])
+        assert [called for called, _ in session.calls] == ['https://publisher.test/robots.txt', url]
+        assert queue.db.execute("SELECT title FROM articles WHERE url='https://publisher.test/story/1'").fetchone()[0] == 'independent article title'
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 2
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def test_backwards_local_clock_cannot_authorize_article_overwrite(config, tmp_path, monkeypatch):
+    from contextlib import closing
+    import downloader.news_fulltext as module
+    from test_news_fulltext import FakeResponse, http_fixture
+
+    url = 'https://publisher.test/feed/'
+    config['providers'][0]['fulltext_feeds'] = [url]
+    http, _ = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(rss([feed_item(1)])),
+    })
+    with closing(http), closing(NewsQueue(tmp_path, http.registry)) as queue:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'rss_fulltext','publisher')", (url,))
+            queue.add_articles([{'url': 'https://publisher.test/story/1', 'title': 'existing title'}])
+            queue.db.execute("UPDATE articles SET last_seen_utc='2000-01-01T00:00:00+00:00'")
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        clocks = iter(('2026-01-02T00:00:00+00:00', '2026-01-01T00:00:00+00:00'))
+        monkeypatch.setattr(module, 'utc_now', lambda: next(clocks))
+        result = module.fetch_discovery(http, task)
+        assert task['_discovery_request_started_at_utc'] is None
+        assert task['_discovery_response_observed_at_utc'] == '2026-01-01T00:00:00+00:00'
+        # Restore a normal clock for acceptance; the request-start witness
+        # remains absent and cannot update the existing article title.
+        from downloader.news_fulltext_queue import utc_now
+        monkeypatch.setattr(module, 'utc_now', utc_now)
+        module.accept_discovery(queue, task, *result)
+        assert queue.db.execute("SELECT title FROM articles WHERE url='https://publisher.test/story/1'").fetchone()[0] == 'existing title'
+
+
+@pytest.mark.parametrize('clock', [None, 'not-a-clock', '2026-01-01T00:00:00'])
+def test_unordered_discovery_clock_keeps_existing_article_but_registers_new(config, tmp_path, clock):
+    from downloader.news_fulltext import _article_links_started_after_heads
+
+    http, queue = feed_fixture(config, tmp_path)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': 'https://publisher.test/story/1', 'title': 'existing'}])
+        with queue.db:
+            queue.db.execute('BEGIN IMMEDIATE')
+            result = _article_links_started_after_heads(queue, [
+                ('https://publisher.test:443/story/1#fragment', 'old title', ''),
+                ('https://publisher.test/story/2', 'new identity', '')], clock)
+        assert result == [('https://publisher.test/story/2', 'new identity', '')]
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_current_article_head_lookup_normalizes_and_batches(config, tmp_path):
+    from downloader.news_fulltext import _article_links_started_after_heads
+
+    http, queue = feed_fixture(config, tmp_path)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': f'https://publisher.test/story/{i}'} for i in (1, 501, 1101)])
+            queue.db.execute("UPDATE articles SET last_seen_utc='2099-01-01T00:00:00+00:00' WHERE url IN (?,?)",
+                             ('https://publisher.test/story/1', 'https://publisher.test/story/501'))
+            queue.db.execute("UPDATE articles SET last_seen_utc='2000-01-01T00:00:00+00:00' WHERE url=?",
+                             ('https://publisher.test/story/1101',))
+        links = [(f'https://publisher.test/story/{i}', f'Story {i}', '') for i in range(1, 1202)]
+        links.append(('https://publisher.test:443/story/1#fragment', 'duplicate spelling', ''))
+        queries = []
+        queue.db.set_trace_callback(lambda query: queries.append(query) if query.startswith('SELECT url,last_seen_utc,') else None)
+        with queue.db:
+            queue.db.execute('BEGIN IMMEDIATE')
+            result = _article_links_started_after_heads(queue, links, '2026-01-01T00:00:00+00:00')
+        queue.db.set_trace_callback(None)
+        assert len(result) == 1199
+        assert ('https://publisher.test/story/1101', 'Story 1101', '') in result
+        assert all(link[0] not in {'https://publisher.test/story/1', 'https://publisher.test/story/501',
+                                   'https://publisher.test:443/story/1#fragment'} for link in result)
+        assert len(queries) == 3
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_current_article_head_requires_all_clocks_to_be_orderable(config, tmp_path):
+    from downloader.news_fulltext import _article_links_started_after_heads
+
+    http, queue = feed_fixture(config, tmp_path)
+    try:
+        urls = [f'https://publisher.test/story/{i}' for i in range(1, 7)]
+        with queue.db:
+            queue.add_articles([{'url': url} for url in urls])
+            queue.db.execute("UPDATE articles SET last_seen_utc='2000-01-01T00:00:00+00:00'")
+            queue.db.execute("UPDATE articles SET last_checked_at_utc='2026-01-01T00:00:00+00:00' WHERE url=?", (urls[0],))
+            queue.db.execute("UPDATE articles SET last_checked_at_utc='not-a-clock' WHERE url=?", (urls[1],))
+            queue.db.execute("UPDATE articles SET last_checked_at_utc='2025-01-01T00:00:00' WHERE url=?", (urls[2],))
+            queue.db.execute("UPDATE articles SET body_sha256=?,captured_at_utc=NULL WHERE url=?", ('a' * 64, urls[3]))
+            queue.db.execute("UPDATE articles SET captured_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (urls[4],))
+        links = [(url, 'incoming', '') for url in urls] + [('https://publisher.test/story/new', 'new', '')]
+        with queue.db:
+            queue.db.execute('BEGIN IMMEDIATE')
+            result = _article_links_started_after_heads(queue, links, '2026-01-01T00:00:00+00:00')
+        assert result == [(urls[5], 'incoming', ''), ('https://publisher.test/story/new', 'new', '')]
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('same_body', [False, True])
+def test_inflight_wordpress_response_keeps_newer_body_and_retry(config, tmp_path, same_body):
+    from downloader.news_fulltext_bulk import wordpress_records
+
+    posts = bulk_posts(1)
+    queue, http, _, task, _ = bulk_fixture(config, tmp_path, count=1, posts=posts)
+    try:
+        first = fetch_discovery(http, task)
+        assert accept_discovery(queue, task, *first) == 1
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+        task['_discovery_request_started_at_utc'] = '2026-01-01T00:00:00+00:00'
+        task['_discovery_response_observed_at_utc'] = '2026-01-03T00:00:00+00:00'
+        article_url = posts[0]['link']
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state='retry',error_code='http_429',attempts=3,due=0,"
+                             "captured_at_utc='2026-01-02T00:00:00+00:00',"
+                             "last_checked_at_utc='2026-01-02T00:00:00+00:00' WHERE url=?", (article_url,))
+        before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        if not same_body:
+            posts[0]['content']['rendered'] = '<p>Earlier source representation. ' + 'old ' * 50 + '</p>'
+        raw = Response(task['url'], 200, {'content-type': 'application/json', 'x-wp-total': '1',
+                                          'x-wp-totalpages': '1'}, json.dumps(posts).encode())
+        records, errors = wordpress_records(raw, http, http.registry.sources['publisher'])
+        records[0]['captured_at_utc'] = '2026-01-03T00:00:00+00:00'
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        accept_discovery(queue, task, raw, links, records, errors)
+        after = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        for key in ('body_sha256', 'parquet_path', 'captured_at_utc', 'state', 'error_code', 'attempts', 'last_checked_at_utc'):
+            assert after[key] == before[key]
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('kind', ['rss_fulltext', 'wordpress_posts'])
+@pytest.mark.parametrize('status', [200, 304])
+def test_stale_bulk_response_keeps_newer_source_and_article_heads(config, tmp_path, kind, status):
+    if kind == 'rss_fulltext':
+        http, queue = feed_fixture(config, tmp_path)
+        seed_discovery(queue)
+        task = dict(queue.db.execute("SELECT * FROM discovery WHERE kind='rss_fulltext'").fetchone())
+        raw = Response(task['url'], 200, {}, rss([feed_item(1), feed_item(2)]))
+        records, errors = feed_records(raw, http, http.registry.sources['publisher'])
+    else:
+        queue, http, _, task, _ = bulk_fixture(config, tmp_path, count=2)
+        raw, _, records, errors = fetch_discovery(http, task)
+    try:
+        article_url = records[0]['requested_url']
+        links = [(record['requested_url'], record['title'], record['metadata_date_raw']) for record in records]
+        with queue.db:
+            queue.add_articles([{'url': article_url, 'title': 'newer title'}])
+            queue.db.execute("UPDATE articles SET state='retry',error_code='http_429',attempts=3,"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00',"
+                             "last_seen_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (article_url,))
+            queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=5,due=?,"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                             (time.time() + 7200, task['url']))
+            queue.db.execute('INSERT INTO bulk_item_errors VALUES (?,?,?,?,?,?)',
+                             (task['url'], 0, 'publisher', article_url, 'newer_item_error', '2099-01-01T00:00:00+00:00'))
+        before_source = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+        before_article = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        before_errors = [tuple(row) for row in queue.db.execute('SELECT * FROM bulk_item_errors WHERE request_url=?', (task['url'],))]
+        if status == 304:
+            raw, links, records, errors = Response(task['url'], 304, {}, b''), [], [], []
+        assert accept_discovery(queue, task, raw, links, records, errors) == (2 if status == 200 else 0)
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone()) == before_source
+        assert [tuple(row) for row in queue.db.execute('SELECT * FROM bulk_item_errors WHERE request_url=?', (task['url'],))] == before_errors
+        current = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        for key in ('title', 'last_seen_utc', 'state', 'error_code', 'attempts', 'last_checked_at_utc'):
+            assert current[key] == before_article[key]
+        assert queue.db.execute('SELECT count(*) FROM bulk_api_coverage').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM bulk_page_evidence').fetchone()[0] == 0
+        if status == 200:
+            assert current['body_sha256'] == records[0]['body_sha256']
+            assert verify_bodies(tmp_path)['accepted']
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('kind', ['rss_fulltext', 'wordpress_posts'])
+def test_stale_mixed_rights_page_does_not_persist_protected_text_or_overwrite_state(config, tmp_path, kind):
+    if kind == 'rss_fulltext':
+        http, queue = feed_fixture(config, tmp_path)
+        seed_discovery(queue)
+        task = dict(queue.db.execute("SELECT * FROM discovery WHERE kind='rss_fulltext'").fetchone())
+        raw = Response(task['url'], 200, {}, rss([feed_item(1), feed_item(2, rights='All rights reserved'), feed_item(3)]))
+        records, errors = feed_records(raw, http, http.registry.sources['publisher'])
+    else:
+        posts = bulk_posts(3)
+        posts[1]['content']['protected'] = True
+        queue, http, _, task, _ = bulk_fixture(config, tmp_path, count=3, posts=posts)
+        raw, _, records, errors = fetch_discovery(http, task)
+    try:
+        links = [(record['requested_url'], record['title'], record['metadata_date_raw']) for record in records]
+        article_url = records[0]['requested_url']
+        with queue.db:
+            queue.add_articles([{'url': article_url, 'title': 'newer title'}])
+            queue.db.execute("UPDATE articles SET last_seen_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (article_url,))
+            queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=5,due=?,"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                             (time.time() + 7200, task['url']))
+        before_source = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+        before_article = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        assert accept_discovery(queue, task, raw, links, records, errors) == 0
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone()) == before_source
+        assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone()) == before_article
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 2
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM bulk_item_errors').fetchone()[0] == 0
+        assert not list(tmp_path.glob('**/*.parquet'))
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_live_rss_failure_does_not_overwrite_newer_source_state(config, tmp_path, monkeypatch):
+    from contextlib import closing
+    import downloader.news_fulltext as module
+    from test_news_fulltext import FakeResponse, http_fixture
+
+    url = 'https://publisher.test/feed/'
+    config['providers'][0]['fulltext_feeds'] = [url]
+    http, session = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(status=500),
+    })
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    with closing(http), closing(NewsQueue(tmp_path, http.registry)) as queue:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'rss_fulltext','publisher')", (url,))
+        original = module.fail_discovery
+        observed = {}
+        def newer_head_before_failure(queue, task, error, **kwargs):
+            with queue.db:
+                queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=5,due=?,"
+                                 "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                                 (time.time() + 7200, url))
+                observed['head'] = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+            return original(queue, task, error, **kwargs)
+        monkeypatch.setattr(module, 'fail_discovery', newer_head_before_failure)
+        module.run_cycle(queue, http, config, max_articles=0, max_discovery_requests=1)
+        assert [called for called, _ in session.calls] == ['https://publisher.test/robots.txt', url]
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == observed['head']
+        assert queue.db.execute("SELECT value FROM counters WHERE key='discovery_failure_superseded'").fetchone()[0] == 1
+
+
+def test_stale_discovery_missing_links_are_normalized_and_batched(config, tmp_path):
+    from downloader.news_fulltext import _missing_article_links
+
+    http, queue = feed_fixture(config, tmp_path)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': f'https://publisher.test/story/{i}'} for i in (1, 501, 1101)])
+        links = [(f'https://publisher.test/story/{i}', f'Story {i}', '') for i in range(1, 1202)]
+        links.append(('https://publisher.test:443/story/1#fragment', 'duplicate spelling', ''))
+        queries = []
+        queue.db.set_trace_callback(lambda query: queries.append(query) if query.startswith('SELECT url FROM articles WHERE url IN') else None)
+        with queue.db:
+            queue.db.execute('BEGIN IMMEDIATE')
+            pending = _missing_article_links(queue, links)
+        queue.db.set_trace_callback(None)
+        assert len(pending) == 1198
+        assert all(link[0] not in {'https://publisher.test/story/1', 'https://publisher.test/story/501',
+                                   'https://publisher.test/story/1101', 'https://publisher.test:443/story/1#fragment'}
+                   for link in pending)
+        assert len(queries) == 3
+    finally:
+        queue.close()
+        http.close()
+
+
 @pytest.mark.parametrize('all_restricted', [False, True])
 def test_rss_mixed_page_continues_without_saving_any_envelope_or_body(config, tmp_path, all_restricted):
     http, queue = feed_fixture(config, tmp_path)
@@ -36,6 +387,7 @@ def test_rss_mixed_page_continues_without_saving_any_envelope_or_body(config, tm
         assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == int(not all_restricted)
         assert not list(tmp_path.glob('**/*.parquet'))
         assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM bulk_interrupted_page_payloads').fetchone()[0] == 0
         assert queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (feed_url(source.fulltext_feeds[0], 47),)).fetchone()
         checkpoint = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
         assert checkpoint['error_code'] == 'bulk_response_contains_restricted_text'
@@ -133,6 +485,7 @@ def test_wordpress_mixed_history_advances_and_never_retains_protected_raw(config
         assert queue.db.execute("SELECT count(*) FROM discovery WHERE kind='wordpress_posts'").fetchone()[0] == 2
         assert queue.db.execute('SELECT error_code FROM discovery WHERE url=?', (task['url'],)).fetchone()[0] == 'bulk_response_contains_restricted_text'
         assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM bulk_interrupted_page_payloads').fetchone()[0] == 0
     finally:
         queue.close()
         http.close()

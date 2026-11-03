@@ -10,6 +10,87 @@ import polars as pl
 from scripts import verify_tw_day_trade_scoped_repair as verify
 
 
+def _revision_accounting_fixture():
+    repaired = "source:published-minute-repair:token"
+    entry_fee, exit_fee = 1000 * 100 * .000285, 1000 * 101 * .001785
+    position = dict(market="m", session_date="2026-10-29", signal_id=repaired, symbol="2330",
+        side="long", lot_size=1000, filled_shares=1000, signed_shares=0, entry_price=100.,
+        buy_fee_rate=.001425, sell_fee_rate=.002925, commission_rebate_rate=.00114,
+        take_profit_price=103., stop_trigger_price=97., realized_gross_pnl_twd=1000.,
+        entry_fee_twd=entry_fee, realized_exit_fee_twd=exit_fee,
+        realized_net_pnl_twd=1000. - entry_fee - exit_fee)
+    mode = dict(market="m", positions={"p": position},
+                cumulative_realized_net_pnl_twd=position["realized_net_pnl_twd"])
+    common = dict(market="m", session_date="2026-10-29", position_id="p", quantity=1000,
+                  simulation_only=True, simulation_replay=True)
+    fills = [dict(common, fill_at="2026-10-29T09:01:00+08:00", purpose="entry", price=100., fee_and_tax_twd=entry_fee),
+             dict(common, fill_at="2026-10-29T09:03:00+08:00", purpose="next_signal_inventory_delta_minute_sweep",
+                  price=101., fee_and_tax_twd=exit_fee)]
+    plan = dict(versions=[dict(signal_id="source", effective_entry_at="2026-10-29T09:01:00+08:00")])
+    bars = {"2330": {f"2026-10-29T09:0{i}+08:00": dict(low=99., high=102., volume_shares=4000., vwap=price)
+                      for i, price in ((1, 100.), (3, 101.))}}
+    return mode, fills, plan, bars
+
+
+def test_revision_fill_oracle_reconciles_quantities_prices_net_fees_and_pnl():
+    mode, fills, plan, bars = _revision_accounting_fixture()
+    result = verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars, prior_realized=0.)
+    assert result["entry_shares"] == result["exit_shares"] == 1000
+    assert result["session_realized_net_pnl_twd"] == pytest.approx(791.215)
+
+
+@pytest.mark.parametrize("damage", ["fee", "volume", "clock", "replay"])
+def test_revision_fill_oracle_rejects_financial_or_source_mismatch(damage):
+    mode, fills, plan, bars = _revision_accounting_fixture()
+    if damage == "fee":
+        fills[0]["fee_and_tax_twd"] += 1
+    elif damage == "volume":
+        bars["2330"]["2026-10-29T09:01+08:00"]["volume_shares"] = 1000
+    elif damage == "clock":
+        plan["versions"][0]["effective_entry_at"] = "2026-10-29T09:02:00+08:00"
+    else:
+        fills[0]["simulation_replay"] = False
+    with pytest.raises(RuntimeError):
+        verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars, prior_realized=0.)
+
+
+@pytest.mark.parametrize("damage", [None, "missing_source", "source_hash", "receipt_hash", "price", "volume", "clock"])
+def test_revision_terminal_close_requires_pinned_traded_official_evidence(tmp_path, damage):
+    mode, fills, plan, bars = _revision_accounting_fixture()
+    path = tmp_path / "twse_daily_ohlcv" / "2026-10-29.json"
+    path.parent.mkdir()
+    path.write_text(json.dumps({"date": "20261029", "stat": "OK", "tables": [
+        {"fields": ["證券代號", "收盤價", "成交股數"],
+         "data": [["2330", "101", "0" if damage == "volume" else "1000"]]}]}))
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    sources = [{"path": str(path), "sha256": digest}]
+    close = fills[1]
+    close.update(fill_at="2026-10-29T13:30:00+08:00", purpose="13_30_unlimited_close_paper_settlement",
+        fill_contract="source_close_full_deliverable_residual_no_capacity_paper_only_v1")
+    close["terminal_close_receipt"] = dict(contract=close["fill_contract"], broker_fill=False,
+        full_quantity_is_user_assumption=True, effective_at=close["fill_at"],
+        source_evidence=dict(session_date="2026-10-29", price=101., source="twse_official_daily_close",
+                             source_sha256=digest, price_basis="official_session_close"))
+    if damage == "missing_source":
+        sources = []
+    elif damage == "source_hash":
+        sources[0]["sha256"] = "0" * 64
+    elif damage == "receipt_hash":
+        close["terminal_close_receipt"]["source_evidence"]["source_sha256"] = "0" * 64
+    elif damage == "price":
+        close["price"] = 102.
+    elif damage == "clock":
+        close["fill_at"] = "2026-10-29T13:29:00+08:00"
+    if damage is not None:
+        with pytest.raises(RuntimeError):
+            verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars,
+                prior_realized=0., terminal_close_sources=sources)
+    else:
+        result = verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars,
+            prior_realized=0., terminal_close_sources=sources)
+        assert result["session_realized_net_pnl_twd"] == pytest.approx(791.215)
+
+
 def test_prefix_verification_accepts_append_but_not_overwrite_or_truncation(tmp_path):
     path = tmp_path / "journal"
     original = b"original\n"

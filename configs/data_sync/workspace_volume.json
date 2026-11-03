@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "contract": "penguin_e_pre_cold_workspace_v1",
+  "authority_node_id": "penguin",
+  "physical_volume": "E:",
+  "volume_id": "8d21b58a-e583-4941-9d0e-cd0a15dc18c8",
+  "disk_unique_id": "eui.002538CC5100084F",
+  "distribution": "StockAgentData",
+  "install_location": "E:\\StockAgent\\workspace",
+  "shared_root": "/mnt/wsl/stockagent-workspace",
+  "mount_point": "/srv/stockagent-workspace",
+  "minimum_free_bytes": 68719476736,
+  "cold_root": "/srv/stockagent-packed",
+  "cold_physical_volume": "D:"
+}

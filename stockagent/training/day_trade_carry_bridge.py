@@ -178,6 +178,7 @@ class PackedDayTradeCarrySession:
     unresolved_action_gap_mask: torch.Tensor
     daily_proxy_mask: torch.Tensor
     terminal_liquidation_price: torch.Tensor | None = None
+    short_limit_up_penalty_per_share: torch.Tensor | None = None
     entry_path: torch.Tensor | None = None
     stop_hits: torch.Tensor | None = None
 
@@ -236,6 +237,13 @@ class PackedDayTradeCarrySession:
             or self.terminal_liquidation_price.dtype != torch.float64
         ):
             raise ValueError("invalid terminal liquidation price transport")
+        if self.short_limit_up_penalty_per_share is not None and (
+            self.short_limit_up_penalty_per_share.shape != (symbols,)
+            or self.short_limit_up_penalty_per_share.dtype != torch.float64
+            or not bool((torch.isfinite(self.short_limit_up_penalty_per_share)
+                         & (self.short_limit_up_penalty_per_share >= 0)).all())
+        ):
+            raise ValueError("invalid short limit-up penalty transport")
 
 
 def _stack_transport_tensors(
@@ -462,7 +470,7 @@ class PreparedDayTradeCarryBatch:
         terminal_prices = tuple(
             session.terminal_liquidation_price for session in sessions
         )
-        for name in ("entry_path", "stop_hits"):
+        for name in ("entry_path", "stop_hits", "short_limit_up_penalty_per_share"):
             values = tuple(getattr(session, name) for session in sessions)
             if all(value is None for value in values):
                 continue

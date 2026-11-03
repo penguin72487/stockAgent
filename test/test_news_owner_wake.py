@@ -12,6 +12,7 @@ import pytest
 
 from downloader.artifact_io import atomic_write_bytes
 from downloader.news_fulltext_wake import OwnerMailboxWake, OwnerStopEvent
+from test_news_fulltext import config
 
 
 class Metrics:
@@ -96,9 +97,137 @@ def test_unarchived_repair_is_not_a_level_triggered_busy_loop(wake):
     assert wake.queue.metrics.counts['local_repairs', 'owner_mailbox_input_wakeups'] == 1
 
 
+@pytest.mark.parametrize('kind', ['candidate', 'repair'])
+def test_temporary_discovery_error_after_event_does_not_lose_wake(wake, monkeypatch, kind):
+    from downloader import news_fulltext_candidate_diagnostics as candidates
+    from downloader import news_fulltext_repairs as repairs
+    module = candidates if kind == 'candidate' else repairs
+    original = module._pending
+    failed = []
+
+    def transient(directory):
+        if not failed:
+            failed.append(True)
+            raise OSError(errno.EIO, 'temporary inbox scan failure')
+        return original(directory)
+
+    seal(inbox(wake, kind)/('d'*64+'.json'))
+    monkeypatch.setattr(module, '_pending', transient)
+    assert wake.wait(.15)
+    assert failed
+
+
+def test_mailbox_scan_retries_back_off_per_inbox_and_clear(wake):
+    from downloader.news_fulltext_wake import (clear_mailbox_scan_retry, defer_mailbox_scan_retry,
+        mailbox_scan_retry_delay, mailbox_scan_retry_ready)
+    delays = []
+    for _ in range(8):
+        defer_mailbox_scan_retry(wake.queue, 'candidate')
+        delays.append(mailbox_scan_retry_delay(wake.queue, 10))
+    assert delays[0] == pytest.approx(.25, abs=.03)
+    assert delays[1] == pytest.approx(.5, abs=.03)
+    assert delays[-1] == pytest.approx(5, abs=.03)
+    assert not mailbox_scan_retry_ready(wake.queue, 'candidate')
+    assert mailbox_scan_retry_ready(wake.queue, 'repair')
+    defer_mailbox_scan_retry(wake.queue, 'repair')
+    clear_mailbox_scan_retry(wake.queue, 'candidate')
+    assert mailbox_scan_retry_delay(wake.queue, 10) == pytest.approx(.25, abs=.03)
+    clear_mailbox_scan_retry(wake.queue, 'repair')
+    assert mailbox_scan_retry_delay(wake.queue, 10) == 10
+
+
+@pytest.mark.parametrize('kind', ['candidate', 'repair'])
+@pytest.mark.parametrize('pending', [False, True])
+def test_mailbox_hint_does_not_reset_failed_pump_backoff(wake, kind, pending):
+    from downloader.news_fulltext_wake import defer_mailbox_scan_retry
+    if pending:
+        seal(inbox(wake, kind)/('e'*64+'.json'))
+    defer_mailbox_scan_retry(wake.queue, kind)
+    defer_mailbox_scan_retry(wake.queue, kind)
+    wake.queue._mailbox_scan_retries[kind] = (time.monotonic()-1, 2)
+    assert wake.has_pending(include_repairs=True) is pending
+    assert wake.queue._mailbox_scan_retries[kind][1] == 2
+    defer_mailbox_scan_retry(wake.queue, kind)
+    assert wake.queue._mailbox_scan_retries[kind][1] == 3
+
+
+@pytest.mark.parametrize('kind', ['candidate', 'repair'])
+def test_service_retries_mailbox_after_event_and_pump_errors(config, tmp_path, monkeypatch, kind):
+    from downloader import news_fulltext as main
+    from downloader import news_fulltext_candidate_diagnostics as candidates
+    from downloader import news_fulltext_repairs as repairs
+    from downloader.news_fulltext_queue import NewsQueue
+    from test_news_fulltext import http_fixture
+
+    module = candidates if kind == 'candidate' else repairs
+    pump_name = 'pump_candidates' if kind == 'candidate' else 'consume_repairs'
+    http, session = http_fixture(config, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    waiting = threading.Event()
+    drained, checking, failures, errors = [False], [False], [], []
+    original_wait, original_drain = OwnerMailboxWake.wait, OwnerMailboxWake._drain
+    original_has, original_pump, original_pending = OwnerMailboxWake.has_pending, getattr(module, pump_name), module._pending
+
+    def wait(self, seconds, *, enabled=True):
+        if enabled:
+            waiting.set()
+        return original_wait(self, seconds, enabled=enabled)
+
+    def drain(self):
+        relevant = original_drain(self)
+        if relevant:
+            drained[0] = True
+        return relevant
+
+    def scoped(function):
+        def call(*args, **kwargs):
+            checking[0] = True
+            try:
+                return function(*args, **kwargs)
+            finally:
+                checking[0] = False
+        return call
+
+    def pending(directory):
+        if drained[0] and checking[0] and len(failures) < 2:
+            failures.append(time.monotonic())
+            raise OSError(errno.EIO, 'temporary mailbox discovery failure')
+        return original_pending(directory)
+
+    def writer():
+        try:
+            assert waiting.wait(2)
+            seal(inbox(SimpleNamespace(queue=queue), kind)/('e'*64+'.json'))
+        except BaseException as error:
+            errors.append(error)
+            http.stop.set()
+
+    monkeypatch.setattr(OwnerMailboxWake, 'wait', wait)
+    monkeypatch.setattr(OwnerMailboxWake, '_drain', drain)
+    monkeypatch.setattr(OwnerMailboxWake, 'has_pending', scoped(original_has))
+    monkeypatch.setattr(module, pump_name, scoped(original_pump))
+    monkeypatch.setattr(module, '_pending', pending)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+    thread = threading.Thread(target=writer)
+    thread.start()
+    try:
+        main.run_service(queue, http, config, max_articles=0, max_discovery_requests=0, duration_seconds=2)
+        thread.join(2)
+        assert not thread.is_alive() and not errors and len(failures) == 2
+        assert failures[1] - failures[0] >= .1
+        rejected = list((tmp_path/'reviewed_repairs'/'rejected').glob('*.input'))
+        assert len(rejected) == 1 and rejected[0].read_bytes() == b'{"synthetic":true}'
+        assert not session.calls and not getattr(queue, '_mailbox_scan_retries', {})
+    finally:
+        http.stop.set()
+        thread.join(2)
+        http.close()
+        queue.close()
+
+
 def test_already_registered_paused_candidate_does_not_wake_again(wake, monkeypatch):
     from downloader import news_fulltext_candidate_diagnostics as jobs
-    monkeypatch.setattr(jobs, 'has_unadmitted_candidates', lambda queue: False)
+    monkeypatch.setattr(jobs, 'has_unadmitted_candidates', lambda queue, **kwargs: False)
     seal(inbox(wake)/('c'*64+'.json'))
     assert not wake.wait(.04)
     assert not wake.queue.metrics.counts['local_repairs', 'owner_mailbox_input_wakeups']

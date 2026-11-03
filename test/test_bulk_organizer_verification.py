@@ -287,6 +287,7 @@ def test_remote_inventory_unavailable_defers_without_hiding_cohort_failure(tmp_p
     monkeypatch.setattr(organizer, "COORDINATOR_LOCK", tmp_path / "owner.lock")
     monkeypatch.setattr(organizer, "COORDINATOR_STATUS", tmp_path / "private/status.json")
     monkeypatch.setattr(organizer, "native_guard", lambda: None)
+    monkeypatch.setattr(organizer.shutil, "disk_usage", lambda *_: SimpleNamespace(free=1024**3))
     monkeypatch.setattr(organizer.socket, "gethostname", lambda: "penguin")
     monkeypatch.setattr(organizer.os, "umask", lambda *_: 0o022)
     monkeypatch.setattr(organizer, "received_batches", lambda: [])
@@ -322,6 +323,106 @@ def test_inventory_transport_failure_is_typed_and_private(tmp_path, monkeypatch,
     assert "private transport diagnostic" not in str(caught.value)
     assert not args.output.exists()
     assert json.loads(args.output.with_suffix(".error.json").read_bytes())["stderr"] == "private transport diagnostic"
+
+
+@pytest.mark.parametrize("message,is_unavailable", [
+    ("ssh: connect to host example.invalid port 22: No route to host\n", True),
+    ("ssh: connect to host example.invalid port 22: Network is unreachable\n", True),
+    ("ssh: connect to host example.invalid port 22: Connection timed out\n", True),
+    ("ssh: connect to host example.invalid port 22: Connection refused\n", True),
+    ("Permission denied (publickey).\n", False),
+    ("ssh: connect to host example.invalid port 22: Connection reset by peer\n", False),
+    ("remote program failed\nssh: connect to host example.invalid port 22: No route to host\n", False),
+])
+def test_retirement_defers_only_proven_preconnection_failures(tmp_path, monkeypatch, message, is_unavailable):
+    monkeypatch.setattr(organizer, "ROOT", tmp_path)
+    monkeypatch.setattr(organizer, "_ssh_base", lambda *_: ["ssh"])
+    monkeypatch.setattr(organizer, "_validate_ssh_target", lambda target: target)
+    monkeypatch.setattr(organizer.subprocess, "run", lambda *_, **__: SimpleNamespace(
+        returncode=255, stdout="", stderr=message))
+    args = SimpleNamespace(identity_file=tmp_path / "key", ssh_port=22, ssh_target="root@example.invalid")
+    with pytest.raises(SnapshotError) as caught:
+        organizer._private_request(args, "unused", "a" * 64)
+    assert isinstance(caught.value, organizer.RemotePreservationUnavailable) == is_unavailable
+    assert "example.invalid" not in str(caught.value)
+    receipts = list((tmp_path / "artifacts/operations/vast_bulk_return_20261004/retirement-errors").glob("*.json"))
+    assert len(receipts) == 1
+    assert json.loads(receipts[0].read_bytes())["stderr"] == message
+
+
+def test_preconnection_text_with_other_exit_code_is_still_a_hard_error(tmp_path, monkeypatch):
+    monkeypatch.setattr(organizer, "ROOT", tmp_path)
+    monkeypatch.setattr(organizer, "_ssh_base", lambda *_: ["ssh"])
+    monkeypatch.setattr(organizer, "_validate_ssh_target", lambda target: target)
+    monkeypatch.setattr(organizer.subprocess, "run", lambda *_, **__: SimpleNamespace(
+        returncode=1, stdout="", stderr="ssh: connect to host host port 22: No route to host\n"))
+    args = SimpleNamespace(identity_file=tmp_path / "key", ssh_port=22, ssh_target="root@host")
+    with pytest.raises(SnapshotError) as caught:
+        organizer._private_request(args, "unused", "a" * 64)
+    assert not isinstance(caught.value, organizer.RemotePreservationUnavailable)
+
+
+def test_remote_outage_defers_remaining_retirements_and_retries_next_cycle(tmp_path, monkeypatch):
+    monkeypatch.setattr(organizer, "INCOMING", tmp_path)
+    batches = []
+    for number in range(2):
+        directory = tmp_path / f"20261006T00000{number}-abcdef012345"
+        directory.mkdir()
+        (directory / "intent.json").write_text(json.dumps({
+            "authority_node_id": "penguin", "origin_node_id": "vastai1T", "scopes": ["cache"]}))
+        (directory / "cache.receipt.json").write_text(json.dumps({
+            "scope": "cache", "state": "compressed_transport_received",
+            "completed_at_epoch": 1, "compressed_sha256": "a" * 64}))
+        batches.append(directory)
+    calls = []
+    reachable = False
+
+    def process(args, directory, receipt):
+        phase = "preserve" if getattr(args, "_preserve_only", False) else "retire"
+        calls.append((phase, directory))
+        if phase == "retire" and not reachable:
+            raise organizer.RemotePreservationUnavailable("preconnection; private receipt")
+        return True
+
+    monkeypatch.setattr(organizer, "organize", process)
+    args = SimpleNamespace(batch=batches, watch=False, apply=True, retire=True)
+    assert organizer.run_batches(args) == 75
+    assert calls == [("preserve", p) for p in batches] + [("retire", batches[0])]
+    deferred = json.loads((batches[0] / "cache.organization-deferred.json").read_bytes())
+    assert deferred["source_deleted_by_failed_request"] is False
+    assert not (batches[0] / "cache.organization-error.json").exists()
+
+    calls.clear()
+    reachable = True
+    assert organizer.run_batches(args) == 0
+    assert calls == [("preserve", p) for p in batches] + [("retire", p) for p in batches]
+
+
+def test_remote_outage_does_not_hide_a_prior_preservation_failure(tmp_path, monkeypatch):
+    monkeypatch.setattr(organizer, "INCOMING", tmp_path)
+    batches = []
+    for number in range(2):
+        directory = tmp_path / f"20261006T00000{number}-abcdef012345"
+        directory.mkdir()
+        (directory / "intent.json").write_text(json.dumps({
+            "authority_node_id": "penguin", "origin_node_id": "vastai1T", "scopes": ["cache"]}))
+        (directory / "cache.receipt.json").write_text(json.dumps({
+            "scope": "cache", "state": "compressed_transport_received",
+            "completed_at_epoch": 1, "compressed_sha256": "a" * 64}))
+        batches.append(directory)
+
+    def process(args, directory, receipt):
+        if getattr(args, "_preserve_only", False):
+            if directory == batches[0]:
+                raise SnapshotError("cold identity mismatch")
+            return True
+        raise organizer.RemotePreservationUnavailable("preconnection; private receipt")
+
+    monkeypatch.setattr(organizer, "organize", process)
+    args = SimpleNamespace(batch=batches, watch=False, apply=True, retire=True)
+    assert organizer.run_batches(args) == 2
+    assert "cold identity mismatch" in (batches[0] / "cache.organization-error.json").read_text()
+    assert json.loads((batches[1] / "cache.organization-deferred.json").read_bytes())["source_deleted_by_failed_request"] is False
 
 
 def test_busy_publication_owner_defers_without_ignoring_next_batch(tmp_path, monkeypatch):
@@ -367,6 +468,22 @@ def test_existing_coordinator_prevents_competing_retirement_journal(tmp_path, mo
     with lock.open("a+b") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         assert organizer.main() == 75
+
+
+def test_full_cold_volume_defers_before_decoding_or_source_retirement(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setattr(organizer, 'COORDINATOR_LOCK', tmp_path / 'owner.lock')
+    monkeypatch.setattr(organizer, 'COORDINATOR_STATUS', tmp_path / 'private/status.json')
+    monkeypatch.setattr(organizer, 'native_guard', lambda: None)
+    monkeypatch.setattr(organizer.socket, 'gethostname', lambda: 'penguin')
+    monkeypatch.setattr(organizer.os, 'umask', lambda *_: 0o022)
+    monkeypatch.setattr(organizer.shutil, 'disk_usage', lambda *_: SimpleNamespace(free=0))
+    monkeypatch.setattr(organizer, 'run_batches', lambda *_: pytest.fail('decoded despite full D'))
+    monkeypatch.setattr(sys, 'argv', ['organizer', '--apply', '--retire'])
+    assert organizer.main() == 75
+    status = json.loads(organizer.COORDINATOR_STATUS.read_bytes())
+    assert status['state'] == 'waiting_cold_physical_capacity'
+    assert status['source_deleted'] is False and status['full_history_verified'] is False
 
 
 def test_every_received_cohort_is_preserved_before_remote_retirement(tmp_path, monkeypatch):

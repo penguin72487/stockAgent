@@ -145,7 +145,25 @@ def test_full_peer_fairness_and_lease_sequence_matches_ungated_selector(config,t
         try:
             for i in range(160):
                 provider='peer' if i%2 else 'publisher'
-                assert gated.claim(provider,300,**options)==oracle.claim(provider,300,**options)
+                actual_claim=gated.claim(provider,300,**options)
+                expected_claim=oracle.claim(provider,300,**options)
+                if actual_claim is None or expected_claim is None:
+                    assert actual_claim is None and expected_claim is None
+                    continue
+                # Independent queues must have different live owner/token
+                # identities. Compare selection semantics while verifying each
+                # claim's own durable lease rather than equating random UUIDs.
+                for q,claim in ((gated,actual_claim),(oracle,expected_claim)):
+                    token=claim['_article_claim_token']
+                    assert isinstance(token,str) and len(token)==32
+                    assert claim['_article_claim_owner']==q.owner
+                    lease=q.db.execute('SELECT state,lease_owner,lease_token FROM articles WHERE id=?',
+                                       (claim['id'],)).fetchone()
+                    assert tuple(lease)==('inflight',q.owner,token)
+                assert actual_claim['_article_claim_token']!=expected_claim['_article_claim_token']
+                transient={'_article_claim_token','_article_claim_owner'}
+                assert {k:v for k,v in actual_claim.items() if k not in transient} == {
+                    k:v for k,v in expected_claim.items() if k not in transient}
             fields='url,state,due,attempts,lease_until,body_sha256,metadata_order_day,error_code'
             actual=[tuple(r) for r in gated.db.execute('SELECT '+fields+' FROM articles ORDER BY url')]
             expected=[tuple(r) for r in raw.execute('SELECT '+fields+' FROM articles ORDER BY url')]

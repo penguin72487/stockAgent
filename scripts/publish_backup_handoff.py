@@ -57,7 +57,8 @@ STORAGE_OBSERVER_FILES = (
     "scripts/lab203_storage_monitor.py", "stockagent/__init__.py", "stockagent/data_sync/__init__.py",
     "stockagent/data_sync/desync_snapshots.py", "stockagent/data_sync/packed_snapshots.py",
     "stockagent/data_sync/packed_metadata.py", "stockagent/data_sync/packed_backup.py", "stockagent/data_sync/nas_target.py",
-    "stockagent/data_sync/storage_monitor.py",
+    "stockagent/data_sync/storage_monitor.py", "stockagent/data_sync/storage_progress.py",
+    "stockagent/data_sync/storage_runtime.py", "stockagent/service_layout.py", "stockagent/storage_layout.py",
 )
 STORAGE_RELAY_NAME = "storage-relay-20261026-v1"
 STORAGE_RELAY_FILES = (*STORAGE_OBSERVER_FILES,
@@ -99,6 +100,18 @@ STORAGE_RUNTIME_FILES = (*STORAGE_CANONICAL_FILES,
     "scripts/diagnose_training_rescue_runtime.py",
     "docs/lab203_original_runtime_supplement_2026-10-28.md",
 )
+STORAGE_SOURCE_EVIDENCE_NAME = "storage-source-evidence-20261029-v1"
+STORAGE_SOURCE_EVIDENCE_FILES = (
+    "artifacts/operations/storage-single-authority-20261025/lab203-source-evidence-20261029-v1.json",
+)
+STORAGE_CAPSULE_BINDING_NAME = "storage-capsule-binding-20261029-v1"
+STORAGE_CAPSULE_BINDING_FILES = (
+    "artifacts/operations/storage-single-authority-20261025/lab203-training-capsule-binding-20261029-v1.json",
+)
+STORAGE_RETIRED_SCAN_NAME = "storage-retired-scan-20261029-v1"
+STORAGE_RETIRED_SCAN_FILES = (
+    "artifacts/operations/storage-single-authority-20261025/source-retired-unscanned-20261029.private.json",
+)
 NEWS_PRIVATE_NAME = "news-private-backup-20261028-v1"
 NEWS_PRIVATE_FILES = (
     "scripts/__init__.py", "scripts/verify_backup_delivery.py", "scripts/backup_delivery_receipt.py",
@@ -112,7 +125,7 @@ MAX_CONTROL_HANDOFF_BYTES = 2 * 1024**2
 def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
                     wait_for_owner: bool = False, publish_recovery_tasks: bool = False,
                     physical_transport_alias: Path | None = None) -> dict:
-    if name not in {NEWS_PRIVATE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2", "continuous-backup-20261004-v3",
+    if name not in {NEWS_PRIVATE_NAME, STORAGE_RETIRED_SCAN_NAME, STORAGE_CAPSULE_BINDING_NAME, STORAGE_SOURCE_EVIDENCE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2", "continuous-backup-20261004-v3",
                     "continuous-backup-20261004-v4", "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
                     "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9",
                     "continuous-backup-20261004-v10"}:
@@ -143,6 +156,9 @@ def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
         fcntl.flock(owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
         queue.storage_guard()
         files = (NEWS_PRIVATE_FILES if name == NEWS_PRIVATE_NAME else
+                 STORAGE_RETIRED_SCAN_FILES if name == STORAGE_RETIRED_SCAN_NAME else
+                 STORAGE_CAPSULE_BINDING_FILES if name == STORAGE_CAPSULE_BINDING_NAME else
+                 STORAGE_SOURCE_EVIDENCE_FILES if name == STORAGE_SOURCE_EVIDENCE_NAME else
                  STORAGE_RUNTIME_FILES if name == STORAGE_RUNTIME_NAME else
                  STORAGE_CANONICAL_FILES if name == STORAGE_CANONICAL_NAME else
                  STORAGE_INCREMENTAL_FILES if name == STORAGE_INCREMENTAL_NAME else
@@ -240,7 +256,7 @@ def main() -> None:
     parser.add_argument("--publish-recovery-requests", action="store_true")
     parser.add_argument("--physical-transport-alias",type=Path,
         help="Publish only a bounded immutable control package independently of the long data owner")
-    parser.add_argument("--name", choices=(NEWS_PRIVATE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2",
+    parser.add_argument("--name", choices=(NEWS_PRIVATE_NAME, STORAGE_RETIRED_SCAN_NAME, STORAGE_CAPSULE_BINDING_NAME, STORAGE_SOURCE_EVIDENCE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2",
                                          "continuous-backup-20261004-v3", "continuous-backup-20261004-v4",
                                          "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
                                          "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9", "continuous-backup-20261004-v10"),

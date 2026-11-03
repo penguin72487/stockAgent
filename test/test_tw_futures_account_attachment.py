@@ -84,7 +84,7 @@ def test_dated_checkpoint_pins_event_tape_and_rejects_legacy_resume(tmp_path, mo
     from stockagent.config import load_config
     from stockagent.data.tw_futures_decision_clock import CLOCK_DATASET, decision_clock_contract
     from stockagent.training.checkpoint_contract import (
-        build_checkpoint_manifest, validate_checkpoint_manifest,
+        _configuration_fingerprint_snapshot, build_checkpoint_manifest, validate_checkpoint_manifest,
     )
 
     panel, config = _fixture(tmp_path, monkeypatch)
@@ -139,6 +139,43 @@ def test_dated_checkpoint_pins_event_tape_and_rejects_legacy_resume(tmp_path, mo
     with pytest.raises(ValueError, match="requires its explicit calendar"):
         build_checkpoint_manifest(legacy_panel, active, include_data_content=False)
 
+    # A source notice changes checkpoint identity even when the synthetic
+    # account tape itself is otherwise unchanged.
+    from test_tw_futures_holiday_account_dates import _source
+    holiday, _, holiday_dir = _source(tmp_path)
+    assert "tw_futures_holiday_account_dates_source" not in _configuration_fingerprint_snapshot(active)["trading"]
+    with monkeypatch.context() as context:
+        context.chdir(tmp_path)
+        with_holiday = replace(active, trading=replace(
+            trading, tw_futures_holiday_account_dates_source=str(holiday_dir)))
+        evidence_manifest = build_checkpoint_manifest(panel, with_holiday)
+    assert (_configuration_fingerprint_snapshot(with_holiday)["trading"]
+            ["tw_futures_holiday_account_dates_source"] == str(holiday_dir))
+    evidence = evidence_manifest["contracts"]["trading"]["futures_margin_contract"]["holiday_account_dates"]
+    assert evidence["manifest_sha256"] == holiday.fingerprint
+    assert evidence["scope"] == "processing_calendar_only_separate_valuation_admission"
+    with pytest.raises(RuntimeError, match="trading"):
+        validate_checkpoint_manifest({"experiment_manifest": current}, evidence_manifest,
+                                     checkpoint_path=tmp_path / "current.pt", scope="resume")
+
+    from test_tw_futures_holiday_c11 import _source as c11_source
+    c11_workspace = tmp_path / "c11_workspace"
+    c11_workspace.mkdir()
+    c11, _, c11_daily, c11_folder = c11_source(c11_workspace)
+    assert "tw_futures_holiday_valuation_source" not in _configuration_fingerprint_snapshot(active)["trading"]
+    with monkeypatch.context() as context:
+        context.chdir(c11_workspace)
+        with_c11 = replace(active, trading=replace(
+            trading, tw_futures_portfolio_data_path=str(c11_daily),
+            tw_futures_holiday_valuation_source=str(c11_folder)))
+        c11_manifest = build_checkpoint_manifest(panel, with_c11, include_data_content=False)
+        evidence = c11_manifest["contracts"]["trading"]["futures_margin_contract"]["holiday_valuations"]
+        assert evidence["manifest_sha256"] == c11.fingerprint
+        assert evidence["financial_daily_sha256"] == c11.financial_daily_sha256
+        with pytest.raises(RuntimeError, match="trading"):
+            validate_checkpoint_manifest({"experiment_manifest": current}, c11_manifest,
+                                         checkpoint_path=tmp_path / "current.pt", scope="resume")
+
 
 def test_dated_calendar_config_requires_complete_margin_carry_contract(tmp_path):
     import yaml
@@ -166,6 +203,12 @@ def test_dated_calendar_config_requires_complete_margin_carry_contract(tmp_path)
         with pytest.raises(ValueError, match="futures account calendar|dated futures account calendar"):
             read()
         raw[group][key] = original
+
+    raw["trading"]["tw_futures_holiday_account_dates_source"] = str(tmp_path / "reviewed_dates")
+    assert read().trading.tw_futures_holiday_account_dates_source == str(tmp_path / "reviewed_dates")
+    raw["trading"]["tw_futures_account_calendar_contract"] = None
+    with pytest.raises(ValueError, match="holiday account date evidence"):
+        read()
 
 
 @pytest.mark.parametrize("event_capacity", [1., float("nan")])
@@ -331,6 +374,39 @@ def test_attachment_rejects_unreviewed_early_holiday_crossing(tmp_path, monkeypa
     # A clipped interval that does not cross the holiday needs no event from it.
     attachment._reject_unreviewed_early_holiday_calendars(dates[:1])
     attachment._reject_unreviewed_early_holiday_calendars(dates[1:])
+
+
+@pytest.mark.parametrize("published,before,first,second,after", [
+    ("2010-12-16", "2011-01-28", "2011-01-31", "2011-02-01", "2011-02-08"),
+    ("2011-12-02", "2012-01-18", "2012-01-19", "2012-01-20", "2012-01-30"),
+])
+def test_early_holiday_reviewed_dates_need_exact_rows_and_separate_valuation_review(
+        tmp_path, published, before, first, second, after):
+    # These notices are synthetic fixtures. They do not establish real-world
+    # dates or financial rules and are never published as training evidence.
+    from test_tw_futures_holiday_account_dates import _source
+    source, raw, _ = _source(tmp_path, published=published, last=before,
+                             account_dates=(first, second), reopening=after)
+    dates = np.asarray([before, after], dtype="datetime64[D]")
+    days = pl.DataFrame({"date": [date.fromisoformat(x) for x in (before, first, second, after)],
+                         "accounting_only_date": [False, True, True, False]})
+    assert attachment._reject_unreviewed_early_holiday_calendars(
+        dates, source=source, days=days) == (first, second)
+    with pytest.raises(ValueError, match="absent or not account-only"):
+        attachment._reject_unreviewed_early_holiday_calendars(dates, source=source, days=days.head(2))
+    conflict = days.with_columns(pl.when(pl.col("date") == date.fromisoformat(first))
+                                 .then(False).otherwise(pl.col("accounting_only_date"))
+                                 .alias("accounting_only_date"))
+    with pytest.raises(ValueError, match="absent or not account-only"):
+        attachment._reject_unreviewed_early_holiday_calendars(dates, source=source, days=conflict)
+    path = tmp_path / "holiday_account.parquet"
+    pl.DataFrame({"date": [date.fromisoformat(first)], "product": ["TX"],
+                  "accounting_only_date": [True], "cash_settlement": [False]}).write_parquet(path)
+    with pytest.raises(ValueError, match="holiday nonterminal valuations"):
+        attachment._reject_unreviewed_holiday_valuations(path, dates, extra_holiday_dates=(first, second))
+    raw.write_bytes(b"changed")
+    with pytest.raises(ValueError, match="source input changed"):
+        attachment._reject_unreviewed_early_holiday_calendars(dates, source=source, days=days)
 
 
 def test_dated_dataset_binds_same_event_source_through_window_operations(tmp_path, monkeypatch):

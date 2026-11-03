@@ -100,6 +100,111 @@ def test_queue_is_durable_without_network_and_merges_old_schema(
     assert len(receipt["generation"]) == 32
 
 
+def test_bounded_retry_timeout_applies_to_every_scan_without_claiming_peer_delivery(queue_root, monkeypatch):
+    monkeypatch.setattr(scan, '_local_scan_endpoint', lambda: ('http://127.0.0.1:8384', 'test-key'))
+    monkeypatch.setattr(scan.subprocess, 'run', lambda *a, **kw: SimpleNamespace(returncode=0, stderr=''))
+    calls = []
+
+    def request(req, *, timeout):
+        calls.append((urllib.parse.parse_qs(urllib.parse.urlsplit(req.full_url).query)['sub'], timeout))
+        return _Response()
+
+    monkeypatch.setattr(scan.urllib.request, 'urlopen', request)
+    assert scan.scan_after_publish(queue_root, 'dataset', new_object_paths=('objects/x',),
+                                   batch_object_paths=True, request_timeout_seconds=480)
+    assert calls == [(['objects/x'], 480), (['manifests/dataset'], 480), (['heads/dataset'], 480)]
+    assert not (queue_root / '.local-state/scan-pending/dataset.json').exists()
+
+
+def test_exact_manifest_queue_merges_and_scans_only_committed_versions(queue_root, scan_api):
+    first = 'manifests/dataset/version-one.json'
+    second = 'manifests/dataset/version-two.json'
+    scan.queue_after_publish(queue_root, 'dataset', new_object_paths=('objects/one',),
+                             new_manifest_paths=(first,))
+    scan.queue_after_publish(queue_root, 'dataset', new_object_paths=('objects/two',),
+                             new_manifest_paths=(second,))
+    pending = queue_root / '.local-state/scan-pending/dataset.json'
+    assert json.loads(pending.read_bytes())['new_manifest_paths'] == [first, second]
+    assert scan.scan_after_publish(queue_root, 'dataset', retry_full=True, batch_object_paths=True)
+    assert scan_api['calls'] == [['objects/one', 'objects/two'], [first, second], ['heads/dataset']]
+    assert not pending.exists()
+
+
+def test_legacy_manifest_queue_keeps_full_scan_even_after_exact_new_publication(queue_root, scan_api):
+    pending = queue_root / '.local-state/scan-pending/dataset.json'
+    pending.parent.mkdir(parents=True)
+    pending.write_text(json.dumps({'schema_version': 1, 'dataset': 'dataset',
+                                   'new_object_paths': ['objects/old']}))
+    scan.queue_after_publish(queue_root, 'dataset', new_manifest_paths=('manifests/dataset/new.json',))
+    assert json.loads(pending.read_bytes())['full_manifests_scan'] is True
+    assert scan.scan_after_publish(queue_root, 'dataset', retry_full=True)
+    assert scan_api['calls'] == [['objects/old'], ['manifests/dataset'], ['heads/dataset']]
+
+
+def test_exact_manifest_batches_keep_limits_and_head_last():
+    manifests = tuple(f'manifests/dataset/{i:03}.json' for i in range(65))
+    groups = scan._scan_request_groups('dataset', ('objects/a',), full_objects_scan=False,
+                                       batch_object_paths=True, new_manifest_paths=manifests)
+    assert groups == (('objects/a',), manifests[:64], manifests[64:], ('heads/dataset',))
+
+
+def test_new_exact_manifest_during_scan_keeps_both_versions_pending(queue_root, monkeypatch):
+    first = 'manifests/dataset/one.json'
+    second = 'manifests/dataset/two.json'
+    scan.queue_after_publish(queue_root, 'dataset', new_manifest_paths=(first,))
+    started, release = threading.Event(), threading.Event()
+
+    def blocked(*_args, **kwargs):
+        assert kwargs['new_manifest_paths'] == (first,)
+        started.set()
+        assert release.wait(timeout=5)
+
+    monkeypatch.setattr(scan, '_scan_pending', blocked)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(scan.scan_after_publish, queue_root, 'dataset', retry_full=True)
+        try:
+            assert started.wait(timeout=3)
+            scan.queue_after_publish(queue_root, 'dataset', new_manifest_paths=(second,))
+        finally:
+            release.set()
+        assert future.result(timeout=5) is False
+    pending = json.loads((queue_root / '.local-state/scan-pending/dataset.json').read_bytes())
+    assert pending['new_manifest_paths'] == [first, second]
+    assert pending['full_manifests_scan'] is False
+
+
+def test_exact_manifest_scan_failure_preserves_complete_retry_intent(queue_root, scan_api):
+    manifest = 'manifests/dataset/version.json'
+    scan.queue_after_publish(queue_root, 'dataset', new_object_paths=('objects/one',),
+                             new_manifest_paths=(manifest,))
+    pending = queue_root / '.local-state/scan-pending/dataset.json'
+    original = pending.read_bytes()
+    scan_api['fail_at'] = 2
+    with pytest.raises(SnapshotError, match='API unavailable'):
+        scan.scan_after_publish(queue_root, 'dataset', retry_full=True, batch_object_paths=True)
+    assert pending.read_bytes() == original
+    scan_api['fail_at'] = None
+    scan_api['calls'].clear()
+    assert scan.scan_after_publish(queue_root, 'dataset', retry_full=True, batch_object_paths=True)
+    assert scan_api['calls'] == [['objects/one'], [manifest], ['heads/dataset']]
+
+
+@pytest.mark.parametrize('path', ['../outside.json', 'manifests/other/version.json',
+                                 'manifests/dataset/../../outside.json',
+                                 'manifests/dataset/sub/version.json', 'manifests/dataset/.json'])
+def test_exact_manifest_queue_rejects_unbound_paths(queue_root, path):
+    with pytest.raises(SnapshotError, match='manifest'):
+        scan.queue_after_publish(queue_root, 'dataset', new_manifest_paths=(path,))
+    assert not (queue_root / '.local-state/scan-pending/dataset.json').exists()
+
+
+@pytest.mark.parametrize('timeout', [True, 0, 481, 120.0, '480'])
+def test_invalid_scan_timeout_never_queues_or_requests(queue_root, timeout):
+    with pytest.raises(SnapshotError, match='timeout'):
+        scan.scan_after_publish(queue_root, 'dataset', request_timeout_seconds=timeout)
+    assert not (queue_root / '.local-state/scan-pending/dataset.json').exists()
+
+
 @pytest.mark.parametrize("same_paths", [False, True])
 def test_queue_during_blocked_scan_is_prompt_and_new_generation_stays_pending(
     queue_root: Path, monkeypatch: pytest.MonkeyPatch, same_paths: bool,

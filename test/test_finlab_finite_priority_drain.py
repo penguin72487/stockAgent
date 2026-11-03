@@ -26,6 +26,18 @@ def test_drain_stops_when_the_existing_owner_has_no_more_actionable_work():
     assert result['full_history_completion_claim'] is False
 
 
+def test_workspace_drain_accepts_only_a_confirmed_workspace_pass():
+    code, result = drain(1, futures_workspace_only=True, run_batch=lambda: (0, _pass(0)),
+                         owner_digest=lambda: 'stable')
+    assert code == 1 and result['state'] == 'unexpected_child_result'
+    response = {**_pass(0), 'futures_workspace_only': True}
+    code, result = drain(1, futures_workspace_only=True, run_batch=lambda: (0, response),
+                         owner_digest=lambda: 'stable')
+    assert code == 0 and result['state'] == 'no_more_actionable_in_pass'
+    with pytest.raises(ValueError):
+        drain(1, kind='tw_tick', futures_workspace_only=True)
+
+
 def test_drain_preserves_partial_attempts_and_yields_on_real_owner_defer():
     responses = iter([(0, _pass(4)), (75, _pass(1, state='quota_margin_reached'))])
     code, result = drain(5, run_batch=lambda: next(responses), owner_digest=lambda: 'stable')
@@ -117,6 +129,32 @@ def test_capacity_wait_times_out_without_admitting_unknown_capacity():
                                  sleep=lambda seconds: now.__setitem__(0, now[0] + seconds))
 
 
+def test_capacity_wait_detects_superseded_owner_before_next_probe():
+    now = [0.0]
+    valid = [True]
+    samples = []
+
+    def sleep(seconds):
+        now[0] += seconds
+        valid[0] = False
+
+    assert not wait_for_headroom(3600, sample=lambda: samples.append(True) or {'state': 'deferred'},
+                                 clock=lambda: now[0], sleep=sleep,
+                                 still_valid=lambda: valid[0])
+    assert now[0] == 60 and len(samples) == 1
+
+
+def test_capacity_wait_rechecks_owner_after_an_admitted_probe():
+    valid = [True]
+
+    def sample():
+        valid[0] = False
+        return {'state': 'admitted'}
+
+    assert not wait_for_headroom(3600, sample=sample, clock=lambda: 0,
+                                 still_valid=lambda: valid[0])
+
+
 def test_cli_wait_duration_is_bounded_and_reaches_waiter(monkeypatch):
     monkeypatch.setattr(finite_drain.time, 'monotonic', lambda: 100.0)
     observed = []
@@ -165,7 +203,8 @@ def test_drain_does_not_retry_unknown_prelock_deferrals():
     assert result['state'] == 'child_deferred'
 
 
-@pytest.mark.parametrize('waiting', ['waiting_required_general_data', 'waiting_required_minutes'])
+@pytest.mark.parametrize('waiting', ['waiting_required_general_data', 'waiting_required_minutes',
+                                    'opening_window_yield'])
 def test_drain_rechecks_owner_admission_without_losing_partial_attempts(waiting):
     responses = iter([(75, _pass(1, state=waiting)), (0, _pass(2))])
     sleeps = []

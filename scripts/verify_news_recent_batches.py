@@ -17,11 +17,11 @@ from types import SimpleNamespace
 
 from downloader.artifact_io import atomic_write_json, sha256_file
 from downloader.news_fulltext import load_config
-from downloader.news_fulltext_queue import utc_now
+from downloader.news_fulltext_queue import BODY_BATCH_VERIFICATION_CONTRACT_VERSION, utc_now
 from scripts.benchmark_cnyes_acquisition import verify_batches
 
 
-VERIFICATION_CONTRACT_VERSION = 2
+VERIFICATION_CONTRACT_VERSION = 6
 
 
 def verify_recent_batches(root: Path, maximum_batches: int = 128, *, batch_paths=None) -> dict:
@@ -43,6 +43,7 @@ def verify_recent_batches(root: Path, maximum_batches: int = 128, *, batch_paths
             paths = list(batch_paths)
         result = {
             "verification_contract_version": VERIFICATION_CONTRACT_VERSION,
+            "body_batch_verification_contract_version": BODY_BATCH_VERIFICATION_CONTRACT_VERSION,
             "database_snapshot_at_utc": snapshot_at,
             "owner_id": owner[0] if owner else None,
             "verification_scope": "newest committed batches in a pinned read-only queue snapshot; not the whole lake, future writes or source history",
@@ -61,6 +62,7 @@ def verify_recent_batches(root: Path, maximum_batches: int = 128, *, batch_paths
                 proof = verify_batches(SimpleNamespace(root=root, db=db), paths, allow_superseded_heads=True)
                 result.update(body_versions_verified=proof["body_versions"],
                               private_raw_bytes=proof["private_raw_bytes"],
+                              raw_response_hash_operations=proof['raw_response_hash_operations'],
                               verified_ids_sha256=proof["verified_ids_sha256"], accepted=proof["accepted"])
                 result.update({key: proof[key] for key in ('current_heads_verified', 'current_heads_outside_cohort',
                     'superseded_body_versions_verified', 'distinct_article_ids_checked', 'head_verification_scope')})
@@ -68,7 +70,8 @@ def verify_recent_batches(root: Path, maximum_batches: int = 128, *, batch_paths
                 result["errors"].append({"error": type(error).__name__ + ":" + str(error)[:160]})
         result["verified_at_utc"] = utc_now()
         result['implementation_sha256'] = {str(path): sha256_file(path) for path in (
-            Path(__file__), Path(__file__).with_name('benchmark_cnyes_acquisition.py'))}
+            Path(__file__), Path(__file__).with_name('benchmark_cnyes_acquisition.py'),
+            Path(__file__).resolve().parent.parent / 'downloader/news_fulltext_queue.py')}
         return result
     finally:
         db.close()

@@ -14,7 +14,7 @@ from downloader.news_fulltext_http import Response
 from downloader.news_fulltext_policy import PolicyRegistry
 from downloader.news_fulltext_queue import NewsQueue, verify_bodies
 from downloader import news_fulltext_repairs as repair
-from downloader.news_fulltext_stored_quality import submit_stored_quality_reviews
+from downloader.news_fulltext_stored_quality import prepare_stored_quality_reviews, submit_stored_quality_reviews
 from test_news_fulltext import article_html, config
 
 
@@ -44,6 +44,48 @@ def legacy(queue, *, masked=True):
 def submit(queue):
     return submit_stored_quality_reviews(queue.root, queue.registry, [URL],
         reason='Review the retained original member mask', expected_error='paywall_or_login')
+
+
+def test_prepare_request_is_read_only_and_matches_canonical_owner_contract(config, tmp_path, monkeypatch):
+    from downloader.news_fulltext_stored_quality import validate_request
+    with closing(NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))) as queue:
+        before = legacy(queue)
+        changes = queue.db.total_changes
+        monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.__init__', lambda *a, **k: pytest.fail('no HTTP'))
+        prepared = prepare_stored_quality_reviews(queue.root, queue.registry, [URL],
+            reason='Review the retained original member mask', expected_error='paywall_or_login')
+        request = validate_request(prepared['request'])
+        assert json.loads(prepared['payload']) == request
+        assert hashlib.sha256(prepared['payload']).hexdigest() == prepared['request_id']
+        assert request['targets'][0]['body_sha256'] == before['body_sha256']
+        assert request['originals'][request['targets'][0]['id']]['parquet_path'] == before['parquet_path']
+        assert not prepared['submitted'] and not prepared['queue_mutations'] and prepared['publisher_requests'] == 0
+        assert not (tmp_path / 'reviewed_repairs').exists()
+        assert queue.db.total_changes == changes and head(queue) == before
+
+
+def test_private_stage_deduplicates_only_identical_body_and_evidence(config, tmp_path):
+    from scripts.prepare_news_cmnews_retained_reviews import _same_previous, prior_targets
+    source = tmp_path / 'source'
+    source.mkdir()
+    with closing(NewsQueue(source, PolicyRegistry(config, base=tmp_path))) as queue:
+        legacy(queue)
+        built = prepare_stored_quality_reviews(queue.root, queue.registry, [URL],
+            reason='Review the retained original member mask', expected_error='paywall_or_login')
+        stage = tmp_path / 'stage'
+        stage.mkdir()
+        request_path = stage / (built['request_id'] + '.json')
+        request_path.write_bytes(built['payload'])
+        (stage / 'manifest.json').write_text(json.dumps({'staged': [
+            {'request_id': built['request_id'], 'targets': 1}]}))
+        previous, _digest = prior_targets(stage)
+        target = built['request']['targets'][0]
+        assert _same_previous(built['request'], target, previous)
+        changed = dict(target, body_sha256='0' * 64)
+        assert not _same_previous(built['request'], changed, previous)
+        request_path.write_bytes(built['payload'] + b' ')
+        with pytest.raises(ValueError, match='prior_staged_request_digest_mismatch'):
+            prior_targets(stage)
 
 
 def test_owner_reclassifies_only_reviewed_head_with_no_http_or_payload_change(config, tmp_path, monkeypatch):

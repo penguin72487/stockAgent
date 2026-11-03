@@ -15,6 +15,95 @@ DAY = "2026-09-24"
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+def test_history_uses_pinned_header_without_rereading_replaced_state(tmp_path, monkeypatch):
+    original = dashboard._object
+
+    def read(path, **kwargs):
+        if path == tmp_path / "state.json":
+            pytest.fail("the committed history header must not race a later state rename")
+        return original(path, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_object", read)
+    result = dashboard.build_dashboard_history_snapshot(state_dir=tmp_path,
+        _committed_history_state={"product": "tw_day_trade", "enabled_markets": ["one"]},
+        use_memory_cache=False, use_persistent_cache=False, use_session_projection=False)
+    assert result["returned_points"] == 0
+
+
+def test_feature_summary_fences_racing_cache(tmp_path, monkeypatch):
+    source = tmp_path / "summary.json"
+    source.write_text(json.dumps({
+        "weights": list(range(1000)),
+        "source_publication_contract": {"research_only": True},
+        "model_explanation": {"all_feature_drivers": [{"feature": "open", "weighted_abs_value": 1}]},
+    }))
+    monkeypatch.setattr(dashboard, "_SIGNAL_FEATURE_SUMMARY_CACHE", {})
+    original = dashboard._object
+
+    def race(path):
+        result = original(path)
+        source.write_text(source.read_text().replace('"weighted_abs_value": 1', '"weighted_abs_value": 2'))
+        return result
+
+    monkeypatch.setattr(dashboard, "_object", race)
+    first = dashboard._read_signal_feature_record(source)
+    assert first == {"drivers": [{"feature": "open", "weighted_abs_value": 1}], "research_only": True}
+    assert not dashboard._SIGNAL_FEATURE_SUMMARY_CACHE
+    monkeypatch.setattr(dashboard, "_object", original)
+    assert dashboard._read_signal_feature_record(source)["drivers"][0]["weighted_abs_value"] == 2
+    assert len(dashboard._SIGNAL_FEATURE_SUMMARY_CACHE) == 1
+
+
+def test_feature_summary_retains_canonical_manifest_validation_and_no_parent_cache(tmp_path, monkeypatch):
+    source = tmp_path / "summary.json"
+    source.write_text('{"paper_mode_\\u0073napshot":null}')
+    monkeypatch.setattr(dashboard, "_SIGNAL_FEATURE_SUMMARY_CACHE", {})
+    calls = []
+
+    def canonical(path):
+        calls.append(path)
+        return {"model_explanation": {"top_feature_drivers": [{"feature": "open"}]}}
+
+    monkeypatch.setattr(dashboard, "_object", canonical)
+    assert dashboard._read_signal_feature_record(source)["drivers"] == [{"feature": "open", "weighted_abs_value": 0}]
+    dashboard._read_signal_feature_record(source)
+    assert calls == [source, source]
+    assert not dashboard._SIGNAL_FEATURE_SUMMARY_CACHE
+
+
+@pytest.mark.parametrize("hour", [2, 8, 12])
+def test_preopen_uses_selected_session_without_backdating_observation(tmp_path, hour):
+    session = "2026-10-30"
+    observed = datetime(2026, 10, 31, hour, tzinfo=TAIPEI)
+    stamp = f"{session}T08:30:00+08:00"
+    preopen = tmp_path / "discord.json"
+    preopen.write_text(json.dumps({"updated_at": stamp, "markets": {
+        "m": {"status": "ready", "completed_at": stamp},
+    }}))
+    result = dashboard._preopen_progress(
+        path=preopen, modes=[{"market": "m"}], observed=observed, session_date=session,
+    )
+    assert result["status"] == "ready"
+    assert result["session_date"] == session
+    assert result["source_age_seconds"] == (observed - datetime.fromisoformat(stamp)).total_seconds()
+    assert result["markets"][0]["final_arm_current_process_required"] is False
+
+    simulation = tmp_path / "simulation.json"
+    simulation.write_text(json.dumps({"session_date": session, "status": "ready", "components": {
+        "eligibility": {"status": "ready"}, "shioaji_quote": {"status": "ready"},
+    }}))
+    assert dashboard._simulation_preopen_progress(
+        path=simulation, observed=observed, session_date=session,
+    )["ready"] is True
+    # Previous-session readiness must never admit the next trading session.
+    assert dashboard._simulation_preopen_progress(
+        path=simulation, observed=observed, session_date="2026-11-02",
+    )["ready"] is False
+    assert dashboard._preopen_progress(
+        path=preopen, modes=[{"market": "m"}], observed=observed, session_date="2026-11-02",
+    )["status"] == "pending"
+
+
 def _write_rows(path: Path, rows: list[dict]) -> None:
     path.write_text("".join(json.dumps(row) + "\n" for row in rows))
 
@@ -90,13 +179,17 @@ def test_latest_signal_page_reads_all_imported_accounts(fragmented_accounts):
 
 @pytest.mark.parametrize("narrow", [False, True])
 @pytest.mark.parametrize("has_book", [False, True])
+@pytest.mark.parametrize("latest", [False, True])
+@pytest.mark.parametrize("stream_full", [False, True])
 def test_fragmented_signal_history_uses_complete_session_projections(
-    fragmented_accounts, monkeypatch, narrow, has_book,
+    fragmented_accounts, monkeypatch, narrow, has_book, latest, stream_full,
 ):
     root, _, active = fragmented_accounts
     cache = root / "cache"
     cache.mkdir()
     monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    if stream_full:
+        monkeypatch.setattr(dashboard, "_COLUMNAR_LEDGER_MAX_BYTES", 128)
     rows = [json.loads(line) for line in (root / "signals.jsonl").read_text().splitlines()]
     # Same-date/same-mode revisions must keep their original append order.
     for row in rows:
@@ -113,7 +206,7 @@ def test_fragmented_signal_history_uses_complete_session_projections(
             row.pop("bid", None)
     _write_rows(root / "signals.jsonl", rows)
     before = (root / "signals.jsonl").read_bytes()
-    request = dict(state_dir=root, start_date="2026-09-23", end_date=DAY, limit=100)
+    request = dict(state_dir=root, start_date=DAY if latest else "2026-09-23", end_date=DAY, limit=100)
     expected = dashboard.build_dashboard_signal_page(**request, maximum_scan_rows=1000)
     dashboard._SIGNAL_PAGE_CACHE.clear()
     dashboard._SIGNAL_RANGE_SUMMARY_CACHE.clear()
@@ -123,7 +216,9 @@ def test_fragmented_signal_history_uses_complete_session_projections(
     assert actual["scan_limit_reached"] is False
     for key in ("total", "rows", "direction_summary", "opening_execution_audit"):
         assert actual[key] == expected[key]
-    assert actual["source_rows_scanned"] == len(rows)
+    assert actual["source_rows_scanned"] == sum(
+        not latest or row["session_date"] == DAY for row in rows
+    )
     # Once the immutable per-day shards exist, both readers must reuse them,
     # even if an imported account split every day into multiple file spans.
     dashboard._SIGNAL_PAGE_CACHE.clear()
@@ -132,6 +227,8 @@ def test_fragmented_signal_history_uses_complete_session_projections(
                         lambda *_a, **_k: pytest.fail("must reuse complete session shards"))
     monkeypatch.setattr(dashboard, "_rows_for_sessions",
                         lambda *_a, **_k: pytest.fail("must not use capped raw history"))
+    monkeypatch.setattr(dashboard, "_latest_contiguous_session_rows",
+                        lambda *_a, **_k: pytest.fail("latest signals must not use capped raw rows"))
     reused = dashboard.build_dashboard_signal_page(
         **request, maximum_scan_rows=1, _allow_narrow_projection=narrow,
     )
@@ -391,6 +488,53 @@ def test_status_aggregates_complete_session_before_limiting_response(
     assert snapshot["payload_window"]["events"] == 1
 
 
+@pytest.mark.parametrize("damage", [b"\x00\x00{\"event\":\"revision\"}\n", b"\xff\n", b"{broken}\n"])
+def test_corrupt_opening_diagnostic_degrades_only_the_telemetry_view(
+    fragmented_accounts, damage,
+):
+    root, now, active = fragmented_accounts
+    path = root / "opening_signal_latency.jsonl"
+    valid = json.dumps({
+        "source": "discord_scheduled_signal", "status": "ready",
+        "session_date": DAY, "market": active[0], "signal_id": "a",
+        "gate_at": f"{DAY}T09:00:00+08:00",
+        "signal_started_at": f"{DAY}T09:00:00+08:00",
+        "signal_ready_at": f"{DAY}T09:00:00.1+08:00",
+    }).encode() + b"\n"
+    raw = valid + damage
+    path.write_bytes(raw)
+    snapshot = dashboard.build_dashboard_snapshot(
+        state_dir=root, now=now, session_date=DAY, include_ledger_session_dates=False,
+    )
+    latency = snapshot["opening_signal_latency"]
+    assert latency["integrity"] == {
+        "state": "partial_corrupt", "scope": "last_physical_lines",
+        "maximum_lines": 10000, "malformed_lines": 1,
+    }
+    assert latency["observed_mode_count"] == 1
+    assert latency["first_signal_goal_met"] is None
+    assert latency["all_modes_goal_met"] is None
+    assert latency["final_ledger_ms"] is None
+    assert latency["replay_without_live_measurement"] is None
+    assert all(not row["complete"] and row["all_modes_goal_met"] is None
+               for row in latency["trend"])
+    assert snapshot["health"] == "degraded"
+    assert any(issue["code"] == "opening_signal_telemetry_corrupt"
+               for issue in snapshot["operational_issues"])
+    assert snapshot["execution_records"]["all_modes_filled"] is True
+    assert path.read_bytes() == raw
+    with pytest.raises((ValueError, UnicodeDecodeError)):
+        dashboard._tail(path, 10000, row_decoder=dashboard._decode_opening_latency_row)
+
+
+def test_corrupt_telemetry_never_masks_corrupt_financial_state(fragmented_accounts):
+    root, now, _ = fragmented_accounts
+    (root / "opening_signal_latency.jsonl").write_bytes(b"\x00{}\n")
+    (root / "state.json").write_bytes(b"{broken}")
+    with pytest.raises(json.JSONDecodeError):
+        dashboard.build_dashboard_snapshot(state_dir=root, now=now, session_date=DAY)
+
+
 def test_latest_session_reader_extends_index_after_backfill(tmp_path):
     path = tmp_path / "signals.jsonl"
     _write_rows(path, [{"session_date": DAY, "symbol": "2330"}])
@@ -476,6 +620,23 @@ def test_latest_no_fill_warning_does_not_erase_prior_positions(open_positions):
     assert "88,000 股" in issue["detail"]
     assert ("12 筆先前建立的未平模擬持倉" in issue["detail"]) is bool(open_positions)
     assert "沒有建立任何成交部位" not in issue["detail"]
+
+
+@pytest.mark.parametrize("open_positions", [0, 9])
+def test_divergent_ledger_warning_explains_exit_processing_is_suspended(open_positions):
+    mode = {
+        "market": "tw_day_trade_multi_basis_22", "label": "多基底22",
+        "session_date": DAY, "open_position_count": open_positions,
+        "engine_status": "critical_ledger_state_divergence",
+    }
+    issues = dashboard._operational_issues(
+        modes=[mode], preopen={}, observed=datetime(2026, 9, 24, 11, tzinfo=TAIPEI),
+    )
+    issue = next(row for row in issues if row["code"] == "critical_ledger_state_divergence")
+    assert issue["severity"] == "error"
+    assert "行情處理" in issue["detail"]
+    assert "停損及收盤沖銷不會自動處理" in issue["detail"]
+    assert "不能直接解除隔離" in issue["detail"]
 
 
 @pytest.mark.parametrize("source_time,warning", [("09:00:12", False), ("09:01:00", False), ("09:10:03", True)])

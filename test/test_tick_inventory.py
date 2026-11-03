@@ -305,6 +305,24 @@ def test_catalog_transaction_preserves_unknown_fields_and_exact_numbers(tmp_path
     assert cache.read_text() == json.dumps(expected, ensure_ascii=False, sort_keys=True, separators=(",", ":")) + "\n"
 
 
+def test_bar_catalog_failed_encoding_preserves_previous_cache(tmp_path, monkeypatch):
+    from scripts import snapshot_data_refresh_services as producer
+    output = tmp_path / "public_status.json"
+    cache = output.with_name("bar_inventory_cache.json")
+    original = b'{"cycle":3,"version":1}\n'
+    cache.write_bytes(original)
+    def build(root, *, previous, now, audit_seconds):
+        return {}, {**previous, "cycle": 4}
+    def fail(_value):
+        raise ValueError("encoding failed")
+    monkeypatch.setattr(producer.private_json, "compact_sorted_bytes", fail)
+    with pytest.raises(ValueError, match="encoding failed"):
+        producer._catalog_snapshot(output, name="bar", builder=build,
+                                   observed=datetime.now(UTC), audit_seconds=2.)
+    assert cache.read_bytes() == original
+    assert not list(tmp_path.glob("bar_inventory_cache.json.tmp.*"))
+
+
 @pytest.mark.parametrize("raw", [b"{broken", b"null", b"[]"])
 def test_catalog_transaction_keeps_legacy_unreadable_cache_rebuild(tmp_path, raw):
     from scripts import snapshot_data_refresh_services as producer

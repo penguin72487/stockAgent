@@ -57,6 +57,10 @@ class RescueError(RuntimeError):
     pass
 
 
+class RescueCapacityWait(RescueError):
+    """Expected D admission wait; never a failed checkpoint/runtime proof."""
+
+
 class SourceIdentityChanged(RescueError):
     def __init__(self):
         super().__init__("source SSH profile now points to another boot/instance; explicit re-enrollment required")
@@ -334,7 +338,7 @@ class Rescue:
             raise RescueError("rescue cold payloads must stay in the excluded private D namespace")
         self.cold.mkdir(parents=True, mode=0o700, exist_ok=True)
         if shutil.disk_usage(self.cold).free < self.policy["reserve_bytes"]:
-            raise RescueError("D reserve reached; never fall back to C")
+            raise RescueCapacityWait("D reserve reached; never fall back to C")
 
     def path(self, run: str) -> Path:
         return self.state / "runs" / identifier(run)

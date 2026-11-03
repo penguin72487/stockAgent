@@ -166,17 +166,25 @@ def main(argv=None):
     metrics = NewsMetrics()
     from stockagent.data.news_worker_lifecycle import NewsWorkerLifecycle
     lifecycle = NewsWorkerLifecycle(root)
+    queue = None
     try:
         with metrics.measure("owner_initialization"):
             queue = NewsQueue(root, registry, metrics=metrics, lifecycle=lifecycle,
                               defer_initial_finite_freeze=args.command in {'enqueue', 'fetch'})
-    except BaseException:
-        lifecycle.finish(failed=True)
+    except BaseException as startup_error:
+        if queue is not None:
+            try:
+                queue.close(failed=True, error=startup_error)
+            except BaseException as cleanup_error:
+                startup_error.add_note(f'news queue startup cleanup failed: {type(cleanup_error).__name__}')
+        else:
+            lifecycle.finish(failed=True, error=startup_error)
         raise
     http = None
     old_handlers = {}
     configuration_changed = False
     failed = False
+    failure = None
 
     def refresh_metadata():
         nonlocal configuration_changed
@@ -345,22 +353,43 @@ def main(argv=None):
             atomic_write_json(root / "status.json", result, durable=False)
         print_status(result, compact=args.continuous)
         return 75 if configuration_changed else 0
-    except BaseException:
+    except BaseException as error:
         # Recovered in-flight leases remain visible, never forged complete.
         failed = True
-        queue.status(activity="interrupted")
+        failure = error
+        try:
+            queue.status(activity="interrupted")
+        except BaseException as report_error:
+            # Reporting an error is best effort; do not replace its cause.
+            error.add_note(f'news interrupted status failed: {type(report_error).__name__}')
         raise
     finally:
+        cleanup_errors = []
         for signum, handler in old_handlers.items():
-            signal.signal(signum, handler)
+            try:
+                signal.signal(signum, handler)
+            except BaseException as cleanup_error:
+                cleanup_errors.append(('signal restore', cleanup_error))
         try:
             if http:
                 http.close()
-        finally:
-            try:
-                queue.close()
-            finally:
-                lifecycle.finish(failed=failed)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(('http close', cleanup_error))
+        try:
+            first_cleanup = cleanup_errors[0][1] if cleanup_errors else None
+            queue.close(failed=failed or first_cleanup is not None,
+                        error=failure if failure is not None else first_cleanup)
+        except BaseException as cleanup_error:
+            cleanup_errors.append(('queue close', cleanup_error))
+        if cleanup_errors:
+            # Keep the first operational failure as the raised exception.
+            # If only cleanup failed, its first exception remains actionable.
+            primary = failure if failure is not None else cleanup_errors[0][1]
+            for step, cleanup_error in cleanup_errors:
+                if cleanup_error is not primary:
+                    primary.add_note(f'news {step} failed: {type(cleanup_error).__name__}')
+            if failure is None:
+                raise primary
 
 
 if __name__ == "__main__":

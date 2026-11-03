@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import argparse
+import base64
 from datetime import UTC, datetime
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -33,6 +35,39 @@ def _expected_beacon_csp_denial(message):
     match = re.match(r"Loading the script '([^']+)' violates the following Content Security Policy directive:", message)
     return bool(match and _is_cloudflare_beacon(match[1])
                 and "script-src 'self'" in message and "The action has been blocked." in message)
+
+
+_REVIEWED_CF_BOOTSTRAPS = frozenset({
+    # Edge-injected JSD wrappers observed on 2026-10-29; only ray/time vary.
+    # Unknown wrappers and application inline scripts remain fatal errors.
+    "32dd00da7156de2e1f44f48ea8972b238fbedcb16bef47954bf8dbe365d304a3",
+    "072eeb8879312bc19e59eb987245943ca4dd32673ede1e9b14ebfb4bcfa4e523",
+})
+
+
+def _expected_challenge_csp_denial(message, inline_scripts):
+    """Record an exact blocked edge wrapper, never permit inline execution.
+
+    Bind the console's SHA to the actual DOM script bytes and then verify the
+    complete reviewed wrapper, not merely a CDN substring or an error prefix.
+    This is security evidence, not a claim that Cloudflare JSD executed.
+    """
+    if (not message.startswith("Executing inline script violates the following Content Security Policy directive ")
+            or "script-src 'self'" not in message or "The action has been blocked." not in message):
+        return False
+    for source in inline_scripts:
+        if not isinstance(source, str) or not 0 < len(source) < 8192:
+            continue
+        params = re.search(r"r:'([a-f0-9]{16})',t:'([A-Za-z0-9+/]{8,64}={0,2})'", source)
+        if params is None:
+            continue
+        normalized = source.replace(params[1], "<ray>").replace(params[2], "<time>")
+        if hashlib.sha256(normalized.encode()).hexdigest() not in _REVIEWED_CF_BOOTSTRAPS:
+            continue
+        digest = base64.b64encode(hashlib.sha256(source.encode()).digest()).decode()
+        if f"'sha256-{digest}'" in message:
+            return True
+    return False
 
 
 def _verify_signal_boundary(payload, *, market, day, private_features=False):
@@ -132,7 +167,7 @@ def main():
                     stage = "create_page"
                     page = None
                     network_events = []
-                    errors, aborted, blocked_beacons = [], [], []
+                    errors, aborted, blocked_beacons, blocked_challenges = [], [], [], []
                     def trace(kind, url, **fields):
                         if len(network_events) < 256 and "/api/" in urlsplit(url).path:
                             network_events.append({"kind": kind, "url": url,
@@ -239,6 +274,11 @@ def main():
                         page.locator("#mode-cards").scroll_into_view_if_needed()
                         cards_image = args.output_dir / f"{name}_cards.png"
                         page.screenshot(path=str(cards_image))
+                        inline_scripts = page.locator("script:not([src])").evaluate_all(
+                            "elements => elements.map(element => element.textContent)")
+                        blocked_challenges = [message for message in errors
+                            if _expected_challenge_csp_denial(message, inline_scripts)]
+                        errors[:] = [message for message in errors if message not in blocked_challenges]
                         if errors:
                             raise ValueError(f"browser/runtime errors: {errors[:8]}")
                         receipt["viewports"].append({"name": name, "css_width": width, "height": height,
@@ -249,6 +289,8 @@ def main():
                             "public_first_last_signal_boundaries": boundaries,
                             "signal_count": page.locator("#signal-count").inner_text(),
                             "blocked_optional_third_party_beacons": blocked_beacons,
+                            "blocked_cloudflare_challenge_bootstraps": blocked_challenges,
+                            "csp_relaxed": False,
                             "intentional_request_aborts": aborted, "screenshots": [str(chart_image), str(cards_image)],
                             "elapsed_seconds": time.perf_counter() - viewport_started,
                             "network_events": network_events})
@@ -261,6 +303,7 @@ def main():
                             "network_events": network_events, "browser_errors": errors,
                             "intentional_request_aborts": aborted,
                             "blocked_optional_third_party_beacons": blocked_beacons}
+                        failure["blocked_cloudflare_challenge_bootstraps"] = blocked_challenges
                         if page is not None:
                             failure.update(_failed_viewport_evidence(page, args.output_dir, name))
                         receipt["viewports"].append(failure)

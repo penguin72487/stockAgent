@@ -68,6 +68,84 @@ def parse_stock_futures_catalog(html: str) -> list[dict[str, Any]]:
     return sorted(records, key=lambda row: (row["symbol"], row["product"]))
 
 
+def parse_stock_option_catalog(html: str) -> list[dict[str, Any]]:
+    """Read current option families and weekly eligibility from the same table.
+
+    The source provides underlying families, not the individual listed
+    expiry/strike/right contracts, fills, or historical membership.  The
+    futures parser first validates the shared identities and its subtotal.
+    """
+    from bs4 import BeautifulSoup
+
+    base = {row["product"]: row for row in parse_stock_futures_catalog(html)}
+    soup = BeautifulSoup(html, "html.parser")
+    tables = [table for table in soup.find_all("table") if "證券代號" in table.get_text()]
+    if len(tables) != 1:
+        raise ValueError("expected exactly one complete TAIFEX stockLists table")
+    fields = {
+        "product": "股票期貨、選擇權商品代碼",
+        "symbol": "證券代號",
+        "option": "是否為股票選擇權標的",
+        "weekly": "是否為股票選擇權週契約標的",
+        "listed_stock": "上市普通股標的證券",
+        "otc_stock": "上櫃普通股標的證券",
+        "listed_etf": "上市ETF標的證券",
+        "otc_etf": "上櫃ETF標的證券",
+    }
+    labels = {
+        "option": "是股票選擇權標的", "weekly": "是股票選擇權週契約標的",
+        "listed_stock": "是上市普通股標的證券", "otc_stock": "是上櫃普通股標的證券",
+        "listed_etf": "是上市ETF標的證券", "otc_etf": "是上櫃ETF標的證券",
+    }
+    totals = None
+    indexes = None
+    seen: set[str] = set()
+    counts = {key: 0 for key in labels}
+    options = []
+    for tr in tables[0].find_all("tr"):
+        headers = [re.sub(r"\s+", "", cell.get_text()) for cell in tr.find_all("th")]
+        if headers:
+            try:
+                indexes = {key: headers.index(name) for key, name in fields.items()}
+            except ValueError as error:
+                raise ValueError("TAIFEX option catalog schema changed") from error
+            continue
+        cells = [cell.get_text(" ", strip=True) for cell in tr.find_all("td")]
+        if not cells:
+            continue
+        if indexes is None or len(cells) <= max(indexes.values()):
+            raise ValueError("incomplete TAIFEX option catalog row")
+        if "標的合計數" in " ".join(cells):
+            if totals is not None:
+                raise ValueError("ambiguous TAIFEX option catalog subtotal")
+            try:
+                totals = {key: int(cells[indexes[key]].replace(",", "")) for key in labels}
+            except ValueError as error:
+                raise ValueError("invalid TAIFEX option catalog subtotal") from error
+            continue
+        product, symbol = cells[indexes["product"]], cells[indexes["symbol"]]
+        if product in seen or product not in base or base[product]["symbol"] != symbol:
+            raise ValueError("TAIFEX option and futures family identity mismatch")
+        seen.add(product)
+        flags = {}
+        for key, label in labels.items():
+            value = re.sub(r"\s+", "", cells[indexes[key]])
+            remainder = value.replace("●", "").replace("◎", "")
+            if remainder not in ("", label) or (value and not remainder and value not in ("●", "◎")):
+                raise ValueError("unrecognized TAIFEX option catalog membership flag")
+            flags[key] = bool(value)
+            counts[key] += flags[key]
+        kinds = [key for key in ("listed_stock", "otc_stock", "listed_etf", "otc_etf") if flags[key]]
+        if len(kinds) != 1 or (flags["weekly"] and not flags["option"]):
+            raise ValueError("ambiguous TAIFEX option kind or weekly membership")
+        if flags["option"]:
+            options.append({"product": product, "symbol": symbol, "name": base[product]["name"],
+                            "underlying_kind": kinds[0], "has_weekly": flags["weekly"]})
+    if seen != set(base) or totals is None or totals != counts:
+        raise ValueError("TAIFEX option catalog rows or totals do not match")
+    return sorted(options, key=lambda row: (row["symbol"], row["product"]))
+
+
 @lru_cache(maxsize=4)
 def _read_verified(path: Path, signature: tuple[int, ...]) -> dict[str, Any]:
     if signature[2] > MAX_CATALOG_BYTES:

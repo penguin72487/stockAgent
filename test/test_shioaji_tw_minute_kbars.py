@@ -44,6 +44,42 @@ from scripts.build_shioaji_tw_minute_dataset import (
 )
 
 
+def test_minute_worker_times_login_and_contracts_without_logging_keys(monkeypatch, capsys):
+    from downloader import download_shioaji_tw_minute_kbars as collector
+    calls = []
+    api = SimpleNamespace(login=lambda **kw: calls.append(kw))
+    monkeypatch.setattr(collector, "stock_contract_map", lambda _: {"2330": "contract"})
+    assert collector._initialize_minute_worker(api, api_key="private-key", secret_key="private-secret",
+        worker_index=1, receive_window_ms=60_000) == {"2330": "contract"}
+    assert calls == [{"api_key": "private-key", "secret_key": "private-secret",
+                      "subscribe_trade": False, "receive_window": 60_000}]
+    log = capsys.readouterr().out
+    assert "phase=login status=ok" in log and "phase=contracts status=ok" in log
+    assert "elapsed_ms=" in log and "receive_window_ms=60000" in log
+    assert "private-key" not in log and "private-secret" not in log
+
+
+def test_minute_worker_preserves_signature_failure_without_blind_retry(monkeypatch, capsys):
+    from downloader import download_shioaji_tw_minute_kbars as collector
+    calls = []
+    error = RuntimeError("Sign data is timeout.")
+    def fail(**kw):
+        calls.append(kw)
+        raise error
+    monkeypatch.setattr(collector, "stock_contract_map", lambda _: pytest.fail("contracts after failed login"))
+    with pytest.raises(RuntimeError) as caught:
+        collector._initialize_minute_worker(SimpleNamespace(login=fail), api_key="private-key",
+            secret_key="private-secret", worker_index=2, receive_window_ms=60_000)
+    assert caught.value is error and len(calls) == 1
+    log = capsys.readouterr().out
+    assert "failure_kind=signature_timeout" in log and "elapsed_ms=" in log
+    assert "private-key" not in log and "private-secret" not in log
+    with pytest.raises(ValueError, match="positive integer"):
+        collector._initialize_minute_worker(SimpleNamespace(login=fail), api_key="private-key",
+            secret_key="private-secret", worker_index=2, receive_window_ms=0)
+    assert len(calls) == 1
+
+
 def test_provisional_tail_uses_official_calendar_not_weekday_guess(tmp_path: Path) -> None:
     reference = tmp_path / "2330.parquet"
     pl.DataFrame({

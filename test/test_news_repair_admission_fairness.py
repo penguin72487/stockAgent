@@ -1,10 +1,12 @@
 """A partial large review must not monopolize every owner admission slice."""
 from collections import Counter
 from copy import deepcopy
+import errno
 import json
 from pathlib import Path
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -74,6 +76,69 @@ def test_stop_does_not_spend_the_next_review_turn(queue):
     assert dict(queue.db.execute('SELECT key,value FROM queue_settings')) == before
     repair.consume_repairs(queue, limit=1)
     assert admissions(queue) == {row['request_id']:1 for row in submitted}
+
+
+@pytest.mark.parametrize('slow_step', ['discovery', 'validation'])
+def test_slow_inbox_still_admits_one_target_per_slice_and_rotates(queue, monkeypatch, slow_step):
+    before, submitted = two_reviews(queue)
+    now = [0.0]
+    monkeypatch.setattr(repair, 'time', SimpleNamespace(monotonic=lambda: now[0], time=time.time))
+    name = '_pending' if slow_step == 'discovery' else '_load_for_admission'
+    original = getattr(repair, name)
+
+    def delayed(*args):
+        result = original(*args)
+        now[0] += 1.0
+        return result
+
+    monkeypatch.setattr(repair, name, delayed)
+    monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.__init__',
+        lambda *args, **kwargs: pytest.fail('admission must not create HTTP'))
+    for _ in range(2):
+        assert repair.consume_repairs(queue, limit=1, max_seconds=.05)['outcomes'] == {'enqueued': 1}
+    assert admissions(queue) == {row['request_id']: 1 for row in submitted}
+    for url, previous in before.items():
+        current = head(queue, url)
+        assert current == dict(previous, state=current['state'])
+        assert current['state'] in {previous['state'], 'retry'}
+
+
+def test_stop_during_slow_discovery_does_not_admit_or_spend_turn(queue, monkeypatch):
+    before, _ = two_reviews(queue)
+    settings = dict(queue.db.execute('SELECT key,value FROM queue_settings'))
+    stopped = threading.Event()
+    original = repair._pending
+
+    def interrupted(directory):
+        result = original(directory)
+        stopped.set()
+        return result
+
+    monkeypatch.setattr(repair, '_pending', interrupted)
+    assert repair.consume_repairs(queue, limit=1, stop=stopped)['processed'] == 0
+    assert dict(queue.db.execute('SELECT key,value FROM queue_settings')) == settings
+    assert not queue.db.execute("SELECT 1 FROM sqlite_master WHERE name='reviewed_repair_items'").fetchone()
+    assert all(head(queue, url) == previous for url, previous in before.items())
+
+
+def test_transient_request_read_failure_is_deferred_and_later_review_runs(queue, monkeypatch):
+    before, submitted = two_reviews(queue)
+    paths = sorted(Path(row['request_path']) for row in submitted)
+    original = repair._load_for_admission
+    unavailable = [True]
+
+    def transient(owner, path):
+        if path == paths[0] and unavailable[0]:
+            raise OSError(errno.EIO, 'temporary request read error')
+        return original(owner, path)
+
+    monkeypatch.setattr(repair, '_load_for_admission', transient)
+    assert repair.consume_repairs(queue, limit=1, max_seconds=.1)['outcomes'] == {'request_io_deferred': 1}
+    assert paths[0].exists() and all(head(queue, url) == previous for url, previous in before.items())
+    assert repair.consume_repairs(queue, limit=1, max_seconds=.1)['outcomes'] == {'enqueued': 1}
+    unavailable[0] = False
+    assert repair.consume_repairs(queue, limit=1, max_seconds=.1)['outcomes'] == {'enqueued': 1}
+    assert admissions(queue) == {row['request_id']: 1 for row in submitted}
 
 
 def test_independent_providers_both_reach_the_original_dispatcher(config, tmp_path):

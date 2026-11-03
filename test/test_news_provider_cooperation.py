@@ -11,8 +11,21 @@ import time
 import pytest
 
 from downloader.news_fulltext import run_cycle
+from downloader.news_fulltext_policy import PolicyRegistry
 from downloader.news_fulltext_queue import NewsQueue, verify_bodies
 from test_news_fulltext import FakeResponse, article_html, config, http_fixture
+
+
+class AdvancingCycleClock:
+    """Only the scheduler clock advances; HTTP fixtures keep the real clock."""
+    def __init__(self):
+        self.advance = 0
+
+    def monotonic(self):
+        return time.monotonic() + self.advance
+
+    def __getattr__(self, name):
+        return getattr(time, name)
 
 
 def cooperative_config(config):
@@ -26,6 +39,376 @@ def cooperative_config(config):
     config['providers'] = [background, foreground, disabled]
     config.update(workers=2, batch_articles=1)
     return config
+
+
+@pytest.mark.parametrize('priority', ['publisher', ['missing'], ['publisher', 'publisher'], [{}], None])
+def test_provider_priority_rejects_invalid_or_unknown_ids(config, tmp_path, priority):
+    from downloader.news_fulltext import validated_provider_priority
+
+    config = cooperative_config(config)
+    config['provider_priority'] = priority
+    with pytest.raises(ValueError, match='provider_priority'):
+        validated_provider_priority(config, PolicyRegistry(config, base=tmp_path))
+
+
+def test_provider_priority_accepts_registered_disabled_sources_without_enabling_them(config, tmp_path):
+    from downloader.news_fulltext import validated_provider_priority
+
+    config = cooperative_config(config)
+    config['provider_priority'] = ['publisher', 'disabled']
+    registry = PolicyRegistry(config, base=tmp_path)
+    assert validated_provider_priority(config, registry) == ['publisher', 'disabled']
+    assert not registry.sources['disabled'].request_enabled
+
+
+def test_repository_priority_retains_user_order_without_enabling_sources():
+    from pathlib import Path
+    from downloader.news_fulltext import load_config
+
+    config, registry, _ = load_config(Path('configs/news_fulltext.json'))
+    assert config['provider_priority'] == [
+        'cnyes', 'cmoney', 'udn', 'globalvoices', 'wantmedia',
+        'money_link', 'cmnews', 'moneydj', 'ltn',
+    ]
+    assert not registry.sources['udn'].request_enabled
+    assert not registry.sources['moneydj'].request_enabled
+
+
+@pytest.mark.parametrize('priority_cooling', [False, True])
+def test_explicit_priority_uses_next_worker_but_yields_during_cooldown(config, tmp_path, monkeypatch, priority_cooling):
+    """A priority source gets a free slot; its refusal never blocks a peer."""
+    from downloader import news_fulltext as main
+
+    config = cooperative_config(config)
+    config.update(workers=1, provider_priority=['publisher'])
+    routes = {
+        'https://background.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        'https://background.test/story': FakeResponse(article_html()),
+        'https://publisher.test/story': FakeResponse(article_html()),
+    }
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    original_accept = queue.accept
+
+    def accept_and_stop(records, **kwargs):
+        result = original_accept(records, **kwargs)
+        http.stop.set()
+        return result
+
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+    monkeypatch.setattr(queue, 'accept', accept_and_stop)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': 'https://background.test/story'}, {'url': 'https://publisher.test/story'}])
+        if priority_cooling:
+            http.defer('publisher', 120)
+        run_cycle(queue, http, config, max_articles=1, max_discovery_requests=0,
+                  continuous_budgets=True, max_run_seconds=4)
+        started = [url for url, _ in session.calls if url.endswith('/story')]
+        assert started == ['https://background.test/story' if priority_cooling else 'https://publisher.test/story']
+        assert verify_bodies(tmp_path)['errors'] == []
+        remaining = queue.db.execute("SELECT state,attempts FROM articles WHERE url=?",
+            ('https://publisher.test/story' if priority_cooling else 'https://background.test/story',)).fetchone()
+        assert tuple(remaining) == ('pending', 0)
+    finally:
+        http.close()
+        queue.close()
+
+
+def test_priority_fills_available_parallel_slots_before_other_history(config, tmp_path, monkeypatch):
+    from protego import Protego
+    from downloader import news_fulltext as main
+
+    config = cooperative_config(config)
+    config['providers'][1].update(parallelism=2, interval_seconds=.00001)
+    config.update(workers=2, provider_priority=['publisher'])
+    priority_urls = ['https://publisher.test/story/1', 'https://publisher.test/story/2']
+    peer_url = 'https://background.test/story'
+    http, session = http_fixture(config, tmp_path, {url: FakeResponse(article_html())
+                                                   for url in [*priority_urls, peer_url]})
+    queue = NewsQueue(tmp_path, http.registry)
+    starts, priority_started, received = [], Event(), [0]
+    original_get, original_accept = session.get, queue.accept
+
+    def observe_get(url, **kwargs):
+        starts.append(url)
+        if url in priority_urls:
+            if sum(value in priority_urls for value in starts) == 2:
+                priority_started.set()
+            priority_started.wait(.8)
+        return original_get(url, **kwargs)
+
+    def accept(records, **kwargs):
+        result = original_accept(records, **kwargs)
+        received[0] += len(records)
+        if received[0] == 3:
+            http.stop.set()
+        return result
+
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+    monkeypatch.setattr(session, 'get', observe_get)
+    monkeypatch.setattr(queue, 'accept', accept)
+    parser = Protego.parse('User-agent: *\nAllow: /')
+    http.robots_parsers.update({origin: (time.time(), parser)
+                                for origin in ('https://publisher.test', 'https://background.test')})
+    try:
+        with queue.db:
+            queue.add_articles([{'url': url} for url in [peer_url, *priority_urls]])
+        run_cycle(queue, http, config, max_articles=1, max_discovery_requests=0,
+                  continuous_budgets=True, max_run_seconds=5)
+        assert set(starts[:2]) == set(priority_urls) and starts[2:] == [peer_url]
+        assert received == [3] and verify_bodies(tmp_path)['errors'] == []
+    finally:
+        http.close()
+        queue.close()
+
+
+def test_slow_recent_recheck_does_not_start_discovery_seed_after_deadline(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext as main
+
+    http, session = http_fixture(config, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    clock, stages = AdvancingCycleClock(), []
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+
+    def slow_recheck(*args, **kwargs):
+        stages.append('recheck')
+        clock.advance += 10
+
+    monkeypatch.setattr(queue, 'schedule_recent_rechecks', slow_recheck)
+    monkeypatch.setattr(main, 'seed_discovery', lambda *_: stages.append('seed'))
+    try:
+        result = run_cycle(queue, http, config, max_articles=1, max_discovery_requests=1,
+                           continuous_budgets=True, max_run_seconds=2, defer_final_status=True)
+        assert stages == ['recheck']
+        assert not session.calls and result['cycle']['article_attempts_started'] == 0
+        assert queue.db.execute('SELECT COUNT(*) FROM discovery').fetchone()[0] == 0
+    finally:
+        http.close()
+        queue.close()
+
+
+def test_slow_url_repair_admission_does_not_start_remaining_inbox_slices(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext as main
+    import downloader.news_fulltext_candidate_diagnostics as candidates
+    import downloader.news_fulltext_repairs as repairs
+    import downloader.news_fulltext_url_metadata as url_metadata
+
+    http, session = http_fixture(config, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    clock, stages = AdvancingCycleClock(), []
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+
+    def slow_urls(*args, **kwargs):
+        stages.append('urls')
+        clock.advance += 10
+
+    monkeypatch.setattr(url_metadata, 'consume_urls', slow_urls)
+    monkeypatch.setattr(repairs, 'consume_repairs', lambda *args, **kwargs: stages.append('repairs'))
+    monkeypatch.setattr(candidates, 'pump_candidates', lambda *args, **kwargs: stages.append('candidates'))
+    try:
+        result = run_cycle(queue, http, config, max_articles=1, max_discovery_requests=0,
+                           continuous_budgets=True, max_run_seconds=2, defer_final_status=True)
+        assert stages == ['urls']
+        assert not session.calls and result['cycle']['article_attempts_started'] == 0
+    finally:
+        http.close()
+        queue.close()
+
+
+@pytest.mark.parametrize('continuous_budgets', [False, True])
+def test_slow_namespace_maintenance_cannot_start_work_after_cycle_deadline(
+        config, tmp_path, monkeypatch, continuous_budgets):
+    import downloader.news_fulltext as main
+
+    foreground = config['providers'][0]
+    foreground.update(id='cmoney', domains=['cmoney.tw'], parallelism=1,
+                      article_path_pattern=r'^/forum/article/[0-9]+$')
+    peer = deepcopy(foreground)
+    peer.update(id='publisher', domains=['publisher.test'], article_path_pattern=r'^/story$')
+    config['providers'] = [foreground, peer]
+    config.update(workers=2, batch_articles=1)
+    routes = {'https://www.cmoney.tw/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://www.cmoney.tw/forum/article/55': FakeResponse(article_html()),
+              'https://publisher.test/story': FakeResponse(article_html())}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    clock, slices = AdvancingCycleClock(), []
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+
+    def slow_namespace(*, stop=None):
+        slices.append(True)
+        clock.advance += 10  # The local slice started within the two-second budget.
+        return {'completed': True}
+
+    monkeypatch.setattr(queue, 'backfill_cmoney_note_detail_exclusions', slow_namespace)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': 'https://www.cmoney.tw/forum/article/55'},
+                                {'url': 'https://publisher.test/story'}])
+        result = run_cycle(queue, http, config, max_articles=2, max_discovery_requests=0,
+                           continuous_budgets=continuous_budgets, max_run_seconds=2,
+                           defer_final_status=True)
+        assert slices == [True]
+        assert not session.calls and result['cycle']['article_attempts_started'] == 0
+        assert [tuple(row) for row in queue.db.execute('SELECT state,attempts FROM articles ORDER BY url')] == [
+            ('pending', 0), ('pending', 0)]
+    finally:
+        http.close()
+        queue.close()
+
+
+@pytest.mark.parametrize('queued_discovery', [False, True])
+def test_deadline_during_slow_discovery_lookup_drains_existing_peer_without_new_claim(
+        config, tmp_path, monkeypatch, queued_discovery):
+    import downloader.news_fulltext as main
+
+    config = cooperative_config(config)
+    if queued_discovery:
+        config['providers'][1]['feeds'] = ['https://publisher.test/feed']
+    routes = {'https://background.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://background.test/story': FakeResponse(article_html()),
+              'https://publisher.test/story': FakeResponse(article_html())}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    clock = AdvancingCycleClock()
+    original = queue.discovery_candidates
+    slowed = []
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+
+    def slow_second(source, *args, **kwargs):
+        candidates = original(source, *args, **kwargs)
+        if source.provider == 'publisher':
+            slowed.append(True)
+            clock.advance += 10
+        return candidates
+
+    monkeypatch.setattr(queue, 'discovery_candidates', slow_second)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': 'https://background.test/story'},
+                                {'url': 'https://publisher.test/story'}])
+        result = run_cycle(queue, http, config, max_articles=2, max_discovery_requests=2,
+                           continuous_budgets=True, max_run_seconds=2, defer_final_status=True)
+        assert slowed == [True]
+        assert result['cycle']['article_attempts_started'] == 1
+        assert queue.db.execute("SELECT state,attempts FROM articles WHERE provider='background'").fetchone()[:] == ('complete', 1)
+        assert queue.db.execute("SELECT state,attempts FROM articles WHERE provider='publisher'").fetchone()[:] == ('pending', 0)
+        assert any(url == 'https://background.test/story' for url, _ in session.calls)
+        assert not any('publisher.test' in url for url, _ in session.calls)
+        if queued_discovery:
+            head = queue.db.execute("SELECT attempts,error_code,last_checked_at_utc FROM discovery "
+                                    "WHERE url='https://publisher.test/feed'").fetchone()
+            assert head[:] == (0, None, None)
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        http.close()
+        queue.close()
+
+
+@pytest.mark.parametrize('stop_kind', ['deadline', 'signal'])
+def test_stop_during_discovery_preparation_does_not_dispatch_unclaimed_request(
+        config, tmp_path, monkeypatch, stop_kind):
+    import downloader.news_fulltext as main
+    import downloader.news_fulltext_cnyes_revision as revision
+
+    feed = 'https://publisher.test/feed'
+    config['providers'][0]['feeds'] = [feed]
+    http, session = http_fixture(config, tmp_path, {})
+    queue = NewsQueue(tmp_path, http.registry)
+    clock, prepared = AdvancingCycleClock(), []
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+
+    def slow_prepare(q, task):
+        prepared.append(task['url'])
+        if stop_kind == 'signal':
+            http.stop.set()
+        else:
+            clock.advance += 130
+
+    monkeypatch.setattr(revision, 'prepare_dispatch', slow_prepare)
+    try:
+        result = run_cycle(queue, http, config, max_articles=0, max_discovery_requests=1,
+                           continuous_budgets=True, max_run_seconds=120, defer_final_status=True)
+        assert prepared == [feed]
+        assert result['cycle']['discovery_attempts_started'] == 0 and not session.calls
+        head = queue.db.execute('SELECT attempts,error_code,last_checked_at_utc FROM discovery WHERE url=?',
+                                (feed,)).fetchone()
+        assert head[:] == (0, None, None)
+    finally:
+        http.close()
+        queue.close()
+
+
+def test_slow_original_route_sync_does_not_start_a_second_local_slice_or_http(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext as main
+    import downloader.news_fulltext_urls as urls
+
+    routes = {'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://publisher.test/story': FakeResponse(article_html())}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    clock, stages = AdvancingCycleClock(), []
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+
+    def slow_sync(*args, **kwargs):
+        stages.append('sync')
+        clock.advance += 10
+
+    monkeypatch.setattr(urls, 'sync_original_url_routes', slow_sync)
+    monkeypatch.setattr(urls, 'backfill_original_urls', lambda *args, **kwargs: stages.append('backfill'))
+    try:
+        with queue.db:
+            queue.add_articles([{'url': 'https://publisher.test/story'}])
+        result = run_cycle(queue, http, config, max_articles=1, max_discovery_requests=0,
+                           continuous_budgets=True, max_run_seconds=2, defer_final_status=True)
+        assert stages == ['sync']
+        assert not session.calls and result['cycle']['article_attempts_started'] == 0
+        assert queue.db.execute('SELECT state,attempts FROM articles').fetchone()[:] == ('pending', 0)
+    finally:
+        http.close()
+        queue.close()
+
+
+def test_claim_started_before_deadline_is_drained_and_committed_after_deadline(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext as main
+
+    routes = {'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://publisher.test/story': FakeResponse(article_html())}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    clock, original = AdvancingCycleClock(), queue.claim
+    monkeypatch.setattr(main, 'time', clock)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+
+    def slow_claim(*args, **kwargs):
+        row = original(*args, **kwargs)
+        assert row is not None
+        clock.advance += 10
+        return row
+
+    monkeypatch.setattr(queue, 'claim', slow_claim)
+    try:
+        with queue.db:
+            queue.add_articles([{'url': 'https://publisher.test/story'}])
+        result = run_cycle(queue, http, config, max_articles=1, max_discovery_requests=0,
+                           continuous_budgets=True, max_run_seconds=2, defer_final_status=True)
+        assert result['cycle']['article_attempts_started'] == 1
+        assert queue.db.execute('SELECT state,attempts,lease_owner FROM articles').fetchone()[:] == ('complete', 1, None)
+        assert any(url == 'https://publisher.test/story' for url, _ in session.calls)
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        http.close()
+        queue.close()
 
 
 @pytest.mark.parametrize('continuous_budgets', [False, True])
@@ -132,6 +515,43 @@ def test_priority_body_is_durable_while_background_response_still_waits(config, 
         assert 'disabled' not in http.limiters
     finally:
         focus_committed.set()
+        http.close()
+        queue.close()
+
+
+@pytest.mark.parametrize(('provider', 'continuous_budgets'), [('publisher', True), ('cnyes', False)])
+def test_unused_cnyes_priority_wake_does_not_busy_poll(config, tmp_path, monkeypatch, provider, continuous_budgets):
+    import downloader.news_fulltext as main
+
+    class SlowResponse(FakeResponse):
+        def iter_content(self, **kwargs):
+            Event().wait(.25)
+            yield self.body
+
+    config['providers'][0]['id'] = provider
+    routes = {'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+              'https://publisher.test/story': SlowResponse(article_html())}
+    http, session = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    queue._cnyes_original_priority_needs_wake = True
+    timeouts, original_wait = [], main.wait
+
+    def measured_wait(futures, *, timeout, return_when):
+        timeouts.append(timeout)
+        return original_wait(futures, timeout=timeout, return_when=return_when)
+
+    monkeypatch.setattr(main, 'wait', measured_wait)
+    monkeypatch.setattr(main, 'refresh_disk_admission', lambda *_: False)
+    try:
+        queue.add_articles([{'url': 'https://publisher.test/story'}])
+        result = run_cycle(queue, http, config, max_articles=2, max_discovery_requests=0,
+                           continuous_budgets=continuous_budgets, max_run_seconds=3, defer_final_status=True)
+        assert any(timeout > 0 for timeout in timeouts)
+        assert timeouts.count(0) <= 2, f'unused wake caused repeated polling: {len(timeouts)} waits'
+        if provider == 'publisher':
+            assert result['cycle']['durably_accepted_versions'] == 1
+        assert any(url == 'https://publisher.test/story' for url, _ in session.calls)
+    finally:
         http.close()
         queue.close()
 

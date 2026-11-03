@@ -126,6 +126,7 @@ def registry_digest_oracle():
 def test_original_export_path_uses_every_shared_digest_before_any_publication(
         tmp_path, monkeypatch, registry_digest_oracle):
     from stockagent.control import lakehouse
+    from stockagent.data_sync import catalog_incremental
     registry, expected = registry_digest_oracle
     original, observed = lakehouse._registered_table_digest, {}
     def record(connection, name):
@@ -140,7 +141,7 @@ def test_original_export_path_uses_every_shared_digest_before_any_publication(
     monkeypatch.setattr(lakehouse, 'guard', lambda c: None)
     monkeypatch.setattr(lakehouse, 'connect', lambda *a, **kw: registry)
     monkeypatch.setattr(lakehouse, '_registered_table_digest', record)
-    monkeypatch.setattr(lakehouse.shutil, 'copytree', forbid_copy)
+    monkeypatch.setattr(catalog_incremental, 'copy_catalog_data', forbid_copy)
     with pytest.raises(BeforePayloadPublication):
         lakehouse.export({'state_root': str(state), 'lake_root': str(root)}, 7)
     assert observed == expected

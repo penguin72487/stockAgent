@@ -18,7 +18,8 @@ def _sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _source(tmp_path):
+def _source(tmp_path, *, published="2023-12-01", last="2024-02-05",
+            account_dates=("2024-02-06", "2024-02-07"), reopening="2024-02-15"):
     body = b"synthetic-notice"
     raw = tmp_path / "source/raw.gz"
     raw.parent.mkdir(parents=True)
@@ -28,12 +29,11 @@ def _source(tmp_path):
     parsed.write_text(json.dumps({"source_url": "https://example.test/notice", "content_sha256": body_hash}))
     script = tmp_path / "artifacts/operations/futures-universe765-repair-20261027-v1/stage-holiday-account-dates-v1.py"
     script.parent.mkdir(parents=True)
-    script.write_text("SPECS = " + repr((("2023-12-01", "2024-02-05",
-        ("2024-02-06", "2024-02-07"), "2024-02-15", body_hash),)) + "\n")
+    script.write_text("SPECS = " + repr(((published, last, account_dates, reopening, body_hash),)) + "\n")
     data = tmp_path / "data_source"
     data.mkdir()
-    period = {"indexed_date": "2023-12-01", "last_session": "2024-02-05",
-              "account_dates": ["2024-02-06", "2024-02-07"], "reopening_session": "2024-02-15",
+    period = {"indexed_date": published, "last_session": last,
+              "account_dates": list(account_dates), "reopening_session": reopening,
               "extraction": "first_page_visual_review_of_exact_pdf", "source_url": "https://example.test/notice",
               "raw_path": str(raw.relative_to(tmp_path)), "raw_sha256": _sha(raw), "content_sha256": body_hash,
               "parsed_path": str(parsed.relative_to(tmp_path)), "parsed_sha256": _sha(parsed)}
@@ -96,6 +96,15 @@ def test_account_date_source_rejects_manifest_date_edits_even_if_order_is_valid(
     path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="dates differ from the reviewed original"):
         load_holiday_account_dates(data, workspace=tmp_path)
+
+
+def test_account_date_source_rejects_in_memory_identity_edits(tmp_path):
+    from dataclasses import replace
+    source, _, _ = _source(tmp_path)
+    changed = replace(source, periods=((date(2024, 2, 5), date(2024, 2, 15),
+                                        (date(2024, 2, 8),)),))
+    with pytest.raises(ValueError, match="source identities changed"):
+        changed.verify()
 
 
 def test_account_date_supplement_clips_to_source_horizon(tmp_path):

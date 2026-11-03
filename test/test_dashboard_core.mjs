@@ -346,6 +346,31 @@ test("conditional refresh consumes 304 without parsing or recording an error", a
   assert.equal(core.performanceSnapshot().at(-1).outcome, "ok");
 });
 
+test("unconsumed conditional 304 closes its lifetime at headers, not a later timeout", async () => {
+  let signal, removed = 0;
+  const parent = new AbortController();
+  const remove = parent.signal.removeEventListener.bind(parent.signal);
+  parent.signal.removeEventListener = (...args) => { removed++; remove(...args); };
+  const {core} = loadCore({fetchImpl: async (_input, options) => {
+    signal = options.signal;
+    return {ok: false, status: 304, headers: {get: () => null},
+      text: async () => assert.fail("conditional caller need not consume a body")};
+  }});
+  const response = await core.fetchWithTimeout("/tw-day-trade/api/published-signals", {
+    timeoutMs: 20, signal: parent.signal, headers: {"If-None-Match": '"retained"'},
+  });
+  assert.equal(response.status, 304);
+  assert.equal(removed, 1);
+  assert.equal(core.performanceSnapshot().length, 1);
+  assert.equal(core.performanceSnapshot()[0].outcome, "ok");
+  assert.equal(core.performanceSnapshot()[0].bodyMs, 0);
+  await new Promise(resolve => setTimeout(resolve, 40));
+  assert.equal(signal.aborted, false);
+  assert.equal(core.performanceSnapshot().length, 1);
+  parent.abort();
+  assert.equal(signal.aborted, false);
+});
+
 test("latest-request guard cancels and invalidates superseded work", () => {
   const {core} = loadCore();
   const latest = core.createLatestRequest();

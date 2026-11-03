@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "contract": "stockagent.frozen_retirement_queue.v1",
+  "authority_node_id": "penguin",
+  "enabled": true,
+  "user_instruction": "2026-10-31：所有既有已授權的驗證、同步、安全回收自動排程，不再逐次手動命令；只續跑以下固定清冊，原完整還原、容量、程序引用與刪除條件保留。",
+  "state_root": "service_data/storage-retirement",
+  "capacity_reserve_policy": "use_backup_reserve",
+  "backup_reserve_instruction": "2026-11-01 使用者：原本保留就是留給備份用的。僅本固定清冊的 guarded-D 備份、驗證、安全回收可動用保留池，仍檢查全額工作空間與原有恢復、引用、退休證據；一般下載器保留量不變。",
+  "parallelism": 2,
+  "maximum_error_attempts": 3,
+  "retry_delays_seconds": [60, 300, 1800],
+  "cohorts": [
+    {
+      "id": "workflow-round12-20261031",
+      "inventory": "artifacts/operations/storage-single-authority-20261025/workflow-round12-symlinks-d-20261031.inventory.json",
+      "inventory_sha256": "0a6e275cc80fa22a8e1affe2782a789741a4708dd408aadab2692ad586c9f0a3",
+      "receipt_directory": "artifacts/operations/storage-single-authority-20261025/workflow-round12-symlinks-d-retirement",
+      "resource_mode": "fixed_d_stage_only",
+      "manifest_sha256": "aa61936bfe3f10493a1e3a0291e2a8ddde608dfc63093b330baaa0268e93470c"
+    },
+    {
+      "id": "workflow-round13-20261031",
+      "inventory": "artifacts/operations/storage-single-authority-20261025/workflow-round13-symlinks-d-v2-20261031.inventory.json",
+      "inventory_sha256": "3e5666742e7635fec3d550ef607a48759ad58d50d175d27573a6506bdcd8d999",
+      "receipt_directory": "artifacts/operations/storage-single-authority-20261025/workflow-round13-symlinks-d-retirement",
+      "resource_mode": "d_stage_recovery_only"
+    },
+    {
+      "id": "workflow-round15-20261101",
+      "inventory": "artifacts/operations/storage-single-authority-20261025/workflow-round15-symlinks-d-20261101.inventory.json",
+      "inventory_sha256": "b57b184b0a21c0912dae0dfebc3eb730b9e900fe1564fdc3302e5b093280aa87",
+      "receipt_directory": "artifacts/operations/storage-single-authority-20261025/workflow-round15-symlinks-d-retirement",
+      "resource_mode": "d_stage_recovery_only"
+    }
+  ]
+}

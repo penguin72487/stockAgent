@@ -77,10 +77,11 @@ def test_first_second_uses_certified_real_open_or_fails_closed(official_open, ex
         dict(date=[DAY], physical_contract=[contract], observed_open=[official_open])))
     _, _, events = stock_print_views(prints, day=DAY, source_sha256='a'*64,
                                      opening_evidence=evidence)
+    assert events.filter(pl.col('is_session_open'))['opening_order_proven'].to_list() == [False]
     previous = pl.DataFrame(dict(physical_contract=[contract], price=[9.9],
         trade_date=[date(2020, 3, 20)], trade_ts=[datetime(2020, 3, 20, 13, 30)],
         available_by=[datetime(2020, 3, 20, 13, 31)], source_sha256=['b'*64],
-        is_session_open=[False], opening_ambiguous=[False]))
+        is_session_open=[False], opening_ambiguous=[False], opening_order_proven=[False]))
     events = pl.concat([previous, events], how='vertical_relaxed')
     decisions = pl.DataFrame(dict(date=[DAY], physical_contract=[contract]))
     early = resolve_opening_references(decisions, events, decision_time='08:45').row(0, named=True)
@@ -164,6 +165,34 @@ def test_bulk_full_day_certificate_rejects_quantity_deficit_instead_of_inventing
         expected=expected,source_sha256='a'*64)
     assert coverage.filter(pl.col('contract')=='202004')['verified'].item() is False
     assert events.filter(pl.col('physical_contract')=='DDF:202004@life1').is_empty()
+
+
+def test_unverified_prints_are_a_separate_bounded_diagnostic_not_a_clock():
+    from stockagent.data.tw_futures_finmind_ticks import normalize_bulk_stock_ticks
+    raw, expected = bulk_fixture()
+    # The last minute is missing: the two earlier minutes are real observations,
+    # but they do not certify the complete book or the opening reference.
+    raw = raw.head(3).vstack(raw.slice(4))
+    bars, coverage, events, partial = normalize_bulk_stock_ticks(
+        raw, day=DAY, expected=expected, source_sha256='a' * 64,
+        return_unverified_observations=True)
+    name = 'DDF:202004@life1'
+    assert not coverage.filter(pl.col('physical_contract') == name)['verified'].item()
+    assert bars.filter(pl.col('physical_contract') == name).is_empty()
+    assert events.filter(pl.col('physical_contract') == name).is_empty()
+    assert partial.filter(pl.col('physical_contract') == name).sort('minute')['volume'].to_list() == [1., 3.]
+    # Volume above the official outright book or any print outside official
+    # daily bounds cannot become even a partial observation candidate.
+    for bad in [expected.with_columns(pl.when(pl.col('contract') == '202004').then(3)
+                    .otherwise(pl.col('outright_volume')).alias('outright_volume')),
+                expected.with_columns(pl.when(pl.col('contract') == '202004').then(10.1)
+                    .otherwise(pl.col('low')).alias('low'))]:
+        _, _, _, candidate = normalize_bulk_stock_ticks(raw, day=DAY, expected=bad,
+            source_sha256='a' * 64, return_unverified_observations=True)
+        assert candidate.filter(pl.col('physical_contract') == name).is_empty()
+    with pytest.raises(ValueError, match='flag must be boolean'):
+        normalize_bulk_stock_ticks(raw, day=DAY, expected=expected, source_sha256='a' * 64,
+            return_unverified_observations='yes')
 
 
 @pytest.mark.parametrize('value',[10.06,float('nan'),0.,10.051])

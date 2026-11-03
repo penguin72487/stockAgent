@@ -42,6 +42,14 @@ worker before launch. Scope and commands: [Vast training rescue](../vast_trainin
   effective scales separately. A historical resumed ablation with changed RMS
   is a confounded trajectory, not a clean architecture-only comparison. See
   `docs/tw_day_trade_v8_ofat_analysis_2026-09-23.md`.
+- The optional `training.early_stopping_reference_epochs` decouples patience
+  from the maximum `training.epochs`: a positive reference gives
+  `ceil(reference * early_stopping_no_improve_ratio)` consecutive non-improving
+  validation checks, subject to the runner's existing lower bound. Zero keeps
+  the historical `ceil(epochs * ratio)` behavior and old fingerprint. A
+  positive value is part of the checkpoint training contract; use a compatible
+  new artifact root and reject incompatible optimizer resume. Reaching the
+  maximum epochs is not evidence that early stopping or convergence occurred.
 - Exact-feature FinancialTransformer transfer also supports a source and target
   without a continuous-feature bottleneck. Require identical ordered feature
   names and compatible state, and copy persistent RMS with the learned weights;

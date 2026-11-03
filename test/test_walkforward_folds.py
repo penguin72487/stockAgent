@@ -149,6 +149,82 @@ def test_checkpoint_inference_fold_requires_saved_test_year() -> None:
         build_checkpoint_inference_fold(dates, checkpoint)
 
 
+def _deployment_config():
+    return SimpleNamespace(
+        walk_forward=SimpleNamespace(
+            min_train_years=1, val_years=1, require_future_test_year=True,
+            split_start_year=None, year_boundary_mode="calendar",
+        ),
+        training=SimpleNamespace(lookback=32),
+    )
+
+
+def _deployment_checkpoint():
+    return dict(fold_id=11, train_years=list(range(2014, 2025)),
+                val_years=[2025], test_years=[2026])
+
+
+def test_inference_restores_saved_fold_before_training_fold_construction():
+    from train import _build_requested_walk_forward_folds
+
+    # The 2025 rows validate the saved model.  They are not 2025 test output,
+    # and old training observations need not be rebuilt to restore fitted state.
+    dates = _year_end_dates(2025, 2026)
+    cfg = _deployment_config()
+    with pytest.raises(ValueError, match="No valid walk-forward"):
+        _build_requested_walk_forward_folds(dates, cfg)
+    folds = _build_requested_walk_forward_folds(
+        dates, cfg, checkpoint=_deployment_checkpoint(), requested_fold=11,
+    )
+    assert len(folds) == 1
+    fold = folds[0]
+    assert fold.fold_id == 11
+    assert fold.train_years == list(range(2014, 2025))
+    assert fold.train_indices.size == 0
+    np.testing.assert_array_equal(fold.val_indices, [0])
+    np.testing.assert_array_equal(fold.test_indices, [1])
+    assert fold.test_years == [2026]
+
+
+def test_checkpoint_first_inference_keeps_other_full_calendar_folds():
+    from train import _build_requested_walk_forward_folds
+
+    dates = _year_end_dates(2014, 2026)
+    cfg = _deployment_config()
+    original = _build_requested_walk_forward_folds(dates, cfg)
+    restored = _build_requested_walk_forward_folds(
+        dates, cfg, checkpoint=_deployment_checkpoint(), requested_fold=11,
+    )
+    assert len(restored) == len(original)
+    for expected, actual in zip(original, restored):
+        assert expected.fold_id == actual.fold_id
+        assert expected.train_years == actual.train_years
+        np.testing.assert_array_equal(expected.test_indices, actual.test_indices)
+
+
+@pytest.mark.parametrize("failure", ["missing_validation", "wrong_fold", "invalid_split", "bad_checkpoint"])
+def test_checkpoint_first_inference_does_not_waive_other_failures(failure):
+    from train import _build_requested_walk_forward_folds
+
+    dates = _year_end_dates(2025, 2026)
+    cfg, checkpoint, requested = _deployment_config(), _deployment_checkpoint(), 11
+    if failure == "missing_validation":
+        dates = _year_end_dates(2026, 2026)
+        expected = "missing_val_years"
+    elif failure == "wrong_fold":
+        requested, expected = 10, "does not match checkpoint"
+    elif failure == "invalid_split":
+        cfg.walk_forward.split_start_year = 2014
+        expected = "split_start_year is absent"
+    else:
+        del checkpoint["val_years"]
+        expected = "missing metadata"
+    with pytest.raises(ValueError, match=expected):
+        _build_requested_walk_forward_folds(
+            dates, cfg, checkpoint=checkpoint, requested_fold=requested,
+        )
+
+
 def _day_trade_panel(
     actionable: bool,
     *,

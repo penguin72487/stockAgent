@@ -19,6 +19,35 @@ def _parse(frame):
     return frame.select("date", pl.col("value").cast(pl.Float64), pl.col("name").str.strip_chars())
 
 
+@pytest.mark.parametrize("kind", ["row", "merge"])
+def test_registered_service_cache_alias_keeps_same_owner_and_rejects_other_links(tmp_path, monkeypatch, kind):
+    from stockagent import service_layout
+    from stockagent.data.official_merge_projection import OfficialMergeProjection
+
+    legacy, target = tmp_path / "artifacts/cache", tmp_path / "service_data/cache"
+    legacy.parent.mkdir(parents=True)
+    target.mkdir(parents=True)
+    legacy.symlink_to(target)
+    monkeypatch.setattr(service_layout, "service_moves", lambda _root: {legacy: target})
+    projection = ParquetGroupProjection if kind == "row" else OfficialMergeProjection
+    assert projection(legacy / "groups", {}).root == target / "groups"
+    assert projection(target / "groups", {}).root == target / "groups"
+
+    outside = tmp_path / "other"
+    outside.mkdir()
+    (target / "redirected").symlink_to(outside)
+    with pytest.raises(ValueError, match="redirected"):
+        projection(legacy / "redirected/groups", {})
+    unregistered = tmp_path / "unregistered"
+    unregistered.symlink_to(target)
+    with pytest.raises(ValueError, match="redirected"):
+        projection(unregistered / "groups", {})
+    legacy.unlink()
+    legacy.symlink_to(outside)
+    with pytest.raises(ValueError, match="unregistered"):
+        projection(legacy / "groups", {})
+
+
 @pytest.mark.parametrize("change", ["append", "revision", "delete", "schema", "regroup", "implementation"])
 def test_projection_reuses_only_exact_groups_and_matches_original_parser(tmp_path, change):
     source, cache = tmp_path / "source.parquet", tmp_path / "cache"

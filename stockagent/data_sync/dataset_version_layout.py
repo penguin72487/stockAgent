@@ -80,6 +80,39 @@ def source_root_entries(repo_root: Path, catalog: list[dict[str, Any]]) -> list[
     return selected
 
 
+def _news_generation_verification(root: Path, manifest: Mapping[str, Any]) -> tuple[dict[str, Any], str]:
+    """Read the receipt for this pinned manifest, falling back only for legacy releases.
+
+    Root convenience files may already describe a candidate whose manifest has
+    not yet been committed. A present but invalid generation receipt must never
+    be hidden by falling back to the moving root copy.
+    """
+    generation = manifest.get('generation')
+    if not isinstance(generation, str):
+        raise SnapshotError('invalid news generation')
+    relative = Path(generation)
+    if relative.is_absolute() or len(relative.parts) < 2 or relative.parts[0] != 'versions' or '..' in relative.parts:
+        raise SnapshotError('invalid news generation')
+    root = root.resolve()
+    generation_root = (root / relative).resolve()
+    if not generation_root.is_relative_to(root):
+        raise SnapshotError('news generation is outside its source root')
+    pinned = generation_root / 'verification.json'
+    if pinned.exists() or pinned.is_symlink():
+        path, source = pinned, 'generation'
+    else:
+        path, source = root / 'verification.json', 'legacy_root'
+        if not path.exists() and not path.is_symlink():
+            return {}, 'missing'
+    resolved = path.resolve(strict=True)
+    if not resolved.is_relative_to(root) or not resolved.is_file():
+        raise SnapshotError('news verification receipt is outside its source root')
+    proof = json.loads(resolved.read_text(encoding='utf-8'))
+    if not isinstance(proof, dict):
+        raise SnapshotError('news verification receipt must be an object')
+    return proof, source
+
+
 def inventory_version_layout(
     repo_root: Path, catalog: list[dict[str, Any]], *, sync_root: Path | None = None,
 ) -> dict[str, Any]:
@@ -133,16 +166,25 @@ def inventory_version_layout(
         root = repo_root / name
         local_layout = None
         if name == "data_news" and (root / "manifest.json").is_file():
-            current = json.loads((root / "manifest.json").read_text(encoding="utf-8"))
+            current_bytes = (root / "manifest.json").read_bytes()
+            current = json.loads(current_bytes)
             local_layout = current.get("storage_layout", "legacy_full_generation_v1")
         native_acceptance = None
         native_rollout = None
         writer = "news_copy_on_write_parts" if name == "data_news" else "shared_packed_file_and_chunk_cas"
         if local_layout == "news_incremental_parts_v2":
-            proof_path = root / "verification.json"
-            proof = json.loads(proof_path.read_text(encoding="utf-8")) if proof_path.is_file() else {}
+            try:
+                proof, proof_source = _news_generation_verification(root, current)
+                proof_error = None
+            except (SnapshotError, OSError, ValueError) as error:
+                proof, proof_source, proof_error = {}, 'invalid', type(error).__name__
+            try:
+                if (root / 'manifest.json').read_bytes() != current_bytes:
+                    proof_error = 'manifest_changed_during_inventory'
+            except OSError:
+                proof_error = 'manifest_unreadable_during_inventory'
             accepted = (
-                current.get("state") == "ready" and current.get("contract_version") == 2
+                proof_error is None and current.get("state") == "ready" and current.get("contract_version") == 2
                 and proof.get("state") == "verified" and proof.get("generation") == current.get("generation")
                 and proof.get("manifest_content_sha256") == hashlib.sha256(
                     json.dumps(current, sort_keys=True).encode()).hexdigest()
@@ -155,6 +197,7 @@ def inventory_version_layout(
             native_acceptance = {"state": "verified_receipt" if accepted else "acceptance_pending",
                 "generation": current.get("generation"),
                 "verified_at_utc": proof.get("verified_at_utc") if accepted else None,
+                "verification_source": proof_source, "verification_error_type": proof_error,
                 "payload_reverified_this_inventory": False}
             native_rollout = "local_news_v2_verified_receipt" if accepted else "local_news_v2_acceptance_pending"
         if name == "data_cftc_legacy":

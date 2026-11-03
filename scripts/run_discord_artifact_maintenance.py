@@ -30,6 +30,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
 
 discord_bot: ModuleType | None = None
 ARTIFACT_OWNER_UNIT = "stockagent-discord-artifact-maintenance.service"
@@ -367,10 +368,10 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
             # No canonical lock owner exists. The full worker will verify its
             # current artifacts/clock before recovering this interrupted job.
             candidates.append((key, market))
-        elif job.get("status") == "failed":
+        elif job.get("status") in {"failed", "waiting_source"}:
             retry_at = job.get("next_retry_at")
             if not isinstance(retry_at, str):
-                raise ValueError("failed artifact job has no retry deadline")
+                raise ValueError("retryable artifact job has no retry deadline")
             deadline = datetime.fromisoformat(retry_at)
             if deadline.tzinfo is None:
                 raise ValueError("artifact retry deadline must be timezone-aware")
@@ -444,6 +445,21 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
     return finish()
 
 
+def _retry_owner_invocation(unit: str) -> dict[str, str]:
+    """Read systemd's real unit/job identity; a queued start is not a run."""
+
+    result = subprocess.run(
+        ["systemctl", "show", "--no-pager", "--property=ActiveState",
+         "--property=InvocationID", "--property=Job", unit],
+        check=True, capture_output=True, text=True, timeout=10,
+    )
+    fields = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+    if not {"ActiveState", "InvocationID", "Job"}.issubset(fields) or not fields["ActiveState"]:
+        raise ValueError("systemd retry owner state is incomplete")
+    return {"active_state": fields["ActiveState"], "invocation_id": fields["InvocationID"],
+            "job": fields["Job"]}
+
+
 def request_due_retry() -> int:
     probe = retry_probe()
     if not probe["due"]:
@@ -456,6 +472,15 @@ def request_due_retry() -> int:
     owner_unit = PRIORITY_SOURCE_UNIT if priority_source else ARTIFACT_OWNER_UNIT
     wakeup_seconds = (PRIORITY_SOURCE_RETRY_WAKEUP_SECONDS if priority_source
                       else UNCHANGED_RETRY_WAKEUP_SECONDS)
+    owner = _retry_owner_invocation(owner_unit)
+    # The worker's OS lock can be released just before systemd observes its
+    # process exiting. Starting an already-active unit is a successful no-op,
+    # not an invocation; wait for a later timer rather than recording success.
+    if owner["active_state"] not in {"inactive", "failed"} or owner["job"]:
+        _emit(**probe, requested=False, owner_unit=owner_unit,
+              dispatch_reason="owner_unit_busy_or_job_pending",
+              owner_active_state=owner["active_state"])
+        return 0
     if (previous.get("wakeup_fingerprint") == probe["wakeup_fingerprint"]
             and previous.get("owner_unit", ARTIFACT_OWNER_UNIT) == owner_unit):
         accepted_at = datetime.fromisoformat(previous["dispatch_accepted_at"])
@@ -464,7 +489,13 @@ def request_due_retry() -> int:
         # A backwards wall-clock jump must not stall recovery indefinitely.
         # The canonical worker lock still protects a conservative fresh wakeup.
         elapsed = (now - accepted_at).total_seconds()
-        if 0 <= elapsed < wakeup_seconds:
+        previous_invocation = previous.get("owner_invocation_id_before")
+        invocation_started = (
+            isinstance(previous_invocation, str)
+            and bool(owner["invocation_id"])
+            and owner["invocation_id"] != previous_invocation
+        )
+        if 0 <= elapsed < wakeup_seconds and invocation_started:
             _emit(
                 **probe,
                 requested=False,
@@ -494,6 +525,10 @@ def request_due_retry() -> int:
         "advisory_only": True,
         "dispatch_accepted_at": datetime.now(timezone.utc).isoformat(),
         "owner_unit": owner_unit,
+        # A subsequent probe coalesces only if systemd actually changed the
+        # invocation after this request. Older receipts without this evidence
+        # receive one conservative wakeup, not a false success claim.
+        "owner_invocation_id_before": owner["invocation_id"],
         "due_keys": probe["due_keys"],
         "wakeup_fingerprint": probe["wakeup_fingerprint"],
     }
@@ -761,7 +796,16 @@ def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warmin
     attempted = 0
     failures = 0
     deferred = 0
-    for market in markets:
+    # A full worker may spend its entire source-recovery budget preparing the
+    # shared Factorized/MGDA projection. Publish independent close caches first
+    # instead of making them wait behind that cold source. This is a stable
+    # partition, not another worker or a change to inference/report semantics.
+    ordered_markets = (
+        sorted(markets, key=lambda market: _owns_factorized_source_updater(
+            discord_bot._resolve_market(market)))
+        if allow_source_warming else markets
+    )
+    for market in ordered_markets:
         cfg = discord_bot._resolve_market(market)
         if not discord_bot._is_tw_daily_signal_market(cfg):
             continue
@@ -809,23 +853,61 @@ def _populate_postclose_signal_caches(markets: list[str], *, allow_source_warmin
         acknowledged = wakeup.acknowledge(ROOT, wakeup_before, discord_bot)
         _emit(status="postclose_wakeup_readback", acknowledged=acknowledged,
               advisory_only=True)
+        if not acknowledged:
+            # Every call may have succeeded against a different source epoch.
+            # A false readback cannot attribute a stale dependency to one mode,
+            # but it does prove this whole pass is not yet coherent/complete.
+            # Preserve successful artifacts and let the existing owner retry;
+            # do not convert a source transition into a failed model attempt.
+            deferred += 1
+            _emit(status="postclose_cache_deferred",
+                  reason="canonical_readback_not_accepted", owner_unit=ARTIFACT_OWNER_UNIT)
     return attempted, failures, deferred
 
 
+def _record_signal_cache_maintenance_run(status: str, *, reason: str | None = None,
+                                         attempted: int = 0, failures: int = 0,
+                                         deferred: int = 0) -> dict:
+    """Keep the independently locked cache worker out of history's receipt."""
+    bot = _load_discord_bot()
+    observed = datetime.now().astimezone().isoformat(timespec="seconds")
+    with bot._artifact_backfill_status_guard():
+        payload = bot._load_artifact_backfill_status()
+        previous = payload.get("signal_cache_maintenance_run")
+        previous = previous if isinstance(previous, dict) else {}
+        row = {"status": status, "reason": reason, "attempted": int(attempted),
+               "failures": int(failures), "deferred": int(deferred),
+               "run_id": bot._BOT_RUN_ID, "updated_at": observed}
+        if status == "running":
+            row["started_at"] = (previous.get("started_at")
+                if previous.get("run_id") == bot._BOT_RUN_ID else None) or observed
+        else:
+            row["started_at"] = (previous.get("started_at")
+                if previous.get("run_id") == bot._BOT_RUN_ID else None) or observed
+            row["completed_at"] = observed
+        payload["signal_cache_maintenance_run"] = row
+        payload["schema_version"] = max(2, int(payload.get("schema_version") or 1))
+        payload["updated_at"] = observed
+        bot._write_artifact_backfill_status(payload)
+    return dict(row)
+
+
 def _populate_postclose_signal_caches_or_defer(
-        markets: list[str], *, allow_source_warming: bool = True) -> tuple[int, int, int] | None:
+        markets: list[str], *, allow_source_warming: bool = True,
+        record_worker=None) -> tuple[int, int, int] | None:
     try:
         return _populate_postclose_signal_caches(markets, allow_source_warming=allow_source_warming)
     except TWPublicSourceUpdatePending as exc:
         discord_bot = _load_discord_bot()
-        discord_bot._record_artifact_maintenance_run(
+        (record_worker or discord_bot._record_artifact_maintenance_run)(
             "waiting_source", reason="tw_public_refresh_in_progress", deferred=1,
         )
         _emit(status="waiting_source", **exc.details)
         return None
 
 
-def _wait_for_tw_public_refresh(*, record_maintenance_run: bool = True) -> bool:
+def _wait_for_tw_public_refresh(*, record_maintenance_run: bool = True,
+                                record_worker=None) -> bool:
     """Wait through a transient writer collision instead of losing the run."""
 
     discord_bot = _load_discord_bot()
@@ -842,8 +924,10 @@ def _wait_for_tw_public_refresh(*, record_maintenance_run: bool = True) -> bool:
     while discord_bot._tw_public_refresh_in_progress():
         elapsed = time.monotonic() - started
         if first:
-            if record_maintenance_run:
-                discord_bot._record_artifact_maintenance_run(
+            recorder = record_worker or (discord_bot._record_artifact_maintenance_run
+                                         if record_maintenance_run else None)
+            if recorder is not None:
+                recorder(
                     "waiting_source",
                     reason="tw_public_refresh_in_progress",
                 )
@@ -856,10 +940,10 @@ def _wait_for_tw_public_refresh(*, record_maintenance_run: bool = True) -> bool:
         if elapsed >= timeout:
             return False
         time.sleep(min(poll, max(0.0, timeout - elapsed)))
-    if not first and record_maintenance_run:
+    if not first and (record_maintenance_run or record_worker is not None):
         # The source became available; make the durable worker state match the
         # work that is about to resume rather than leaving it at waiting_source.
-        discord_bot._record_artifact_maintenance_run("running")
+        (record_worker or discord_bot._record_artifact_maintenance_run)("running")
     return True
 
 
@@ -886,7 +970,7 @@ def _completed_session_retry_key(cfg, status, *, now: datetime) -> str | None:
         job = (bot._load_artifact_backfill_status().get("jobs") or {}).get(key)
     if (not isinstance(job, dict) or job.get("market") != cfg.market
             or job.get("key", key) != key
-            or job.get("status") not in {"failed", "running"}):
+            or job.get("status") not in {"failed", "running", "waiting_source"}):
         return None
     return key
 
@@ -909,21 +993,25 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             _emit(status="already_running", lock_path=str(worker_lock_path))
             return 0
 
-        discord_bot._record_artifact_maintenance_run("running")
+        record_worker = (_record_signal_cache_maintenance_run if signal_cache_only
+                         else discord_bot._record_artifact_maintenance_run)
+        record_worker("running")
         if discord_bot._opening_critical_work_pending():
-            discord_bot._record_artifact_maintenance_run(
+            record_worker(
                 "deferred", reason="opening_critical_work_pending"
             )
             _emit(status="deferred", reason="opening_critical_work_pending")
             return 0
         if discord_bot._interactive_signal_work_pending():
-            discord_bot._record_artifact_maintenance_run(
+            record_worker(
                 "deferred", reason="interactive_signal_work_pending"
             )
             _emit(status="deferred", reason="interactive_signal_work_pending")
             return 0
-        if not _wait_for_tw_public_refresh():
-            discord_bot._record_artifact_maintenance_run(
+        source_available = (_wait_for_tw_public_refresh(record_maintenance_run=False, record_worker=record_worker)
+                            if signal_cache_only else _wait_for_tw_public_refresh())
+        if not source_available:
+            record_worker(
                 "deferred", reason="tw_public_refresh_wait_timeout"
             )
             _emit(status="deferred", reason="tw_public_refresh_wait_timeout")
@@ -931,19 +1019,22 @@ def run_once(*, signal_cache_only: bool = False) -> int:
 
         markets = discord_bot._artifact_maintenance_markets()
         if signal_cache_only:
-            population = _populate_postclose_signal_caches_or_defer(markets, allow_source_warming=False)
+            population = _populate_postclose_signal_caches_or_defer(
+                markets, allow_source_warming=False, record_worker=record_worker,
+            )
             if population is None:
                 return 0
             cache_attempted, cache_failures, cache_deferred = population
             cache_status = ("degraded" if cache_failures else
-                            "waiting_source" if cache_deferred else "complete")
+                            "waiting_source" if cache_deferred else
+                            "complete" if cache_attempted else "not_applicable")
             _emit(
                 status=f"signal_cache_{cache_status}",
                 attempted=cache_attempted,
                 failures=cache_failures,
                 deferred=cache_deferred,
             )
-            discord_bot._record_artifact_maintenance_run(
+            record_worker(
                 cache_status,
                 reason="postclose_cache_failed" if cache_failures else
                        "postclose_source_deferred" if cache_deferred else None,
@@ -965,16 +1056,40 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                     reason="postclose_signal_cache_in_progress",
                 )
                 return 0
-            population = _populate_postclose_signal_caches_or_defer(markets)
+            _record_signal_cache_maintenance_run("running")
+
+            def record_both_cache_and_history(status: str, **kwargs) -> None:
+                _record_signal_cache_maintenance_run(status, **kwargs)
+                record_worker(status, **kwargs)
+
+            try:
+                population = _populate_postclose_signal_caches_or_defer(
+                    markets, record_worker=record_both_cache_and_history,
+                )
+            except Exception as exc:
+                _record_signal_cache_maintenance_run(
+                    "degraded", reason=f"unhandled_{type(exc).__name__}", failures=1,
+                )
+                raise
             if population is None:
                 return 0
             cache_attempted, cache_failures, cache_deferred = population
+            cache_status = ("degraded" if cache_failures else
+                            "waiting_source" if cache_deferred else
+                            "complete" if cache_attempted else "not_applicable")
+            _record_signal_cache_maintenance_run(
+                cache_status,
+                reason="postclose_cache_failed" if cache_failures else
+                       "postclose_source_deferred" if cache_deferred else None,
+                attempted=cache_attempted, failures=cache_failures, deferred=cache_deferred,
+            )
 
         attempted = 0
         failures = 0
         deferred = 0
         retry_deferred = 0
         source_deferred = 0
+        lock_deferred = 0
         for market in markets:
             cfg = discord_bot._resolve_market(market)
             if _factorized_source_preparation_busy(cfg):
@@ -1070,6 +1185,19 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             try:
                 result = discord_bot._run_artifact_backfill_sync(cfg)
                 _verify_maintenance_gateway_generation()
+            except (TWPublicSourceUpdatePending, CapacityDeferred) as exc:
+                deferred += 1
+                lock_deferred += int(isinstance(exc, TWPublicSourceUpdatePending))
+                waiting = discord_bot._finish_artifact_backfill(
+                    key, market, status="waiting_source", exc=exc,
+                )
+                _emit(
+                    status="waiting_source", market=market, key=key,
+                    attempt=waiting.get("attempt"),
+                    next_retry_at=waiting.get("next_retry_at"),
+                    **exc.details,
+                )
+                continue
             except Exception as exc:
                 failures += 1
                 failed = discord_bot._finish_artifact_backfill(
@@ -1122,6 +1250,7 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             deferred=deferred,
             retry_deferred=retry_deferred,
             source_deferred=source_deferred,
+            lock_deferred=lock_deferred,
             cache_attempted=cache_attempted,
             cache_failures=cache_failures,
             cache_deferred=cache_deferred,
@@ -1131,6 +1260,7 @@ def run_once(*, signal_cache_only: bool = False) -> int:
             reason=("postclose_cache_failed" if cache_failures else
                     "artifact_retry_deferred" if retry_deferred else
                     "factorized_projection_in_progress" if source_deferred else
+                    "tw_public_refresh_observed_in_child" if lock_deferred else
                     "postclose_source_deferred" if cache_deferred else None),
             attempted=attempted,
             failures=failures,
@@ -1185,7 +1315,9 @@ def main() -> None:
         # A worker-level crash must not leave the durable state stuck at
         # `running`; per-market receipts remain untouched for diagnosis/retry.
         if discord_bot is not None:
-            discord_bot._record_artifact_maintenance_run(
+            record_worker = (_record_signal_cache_maintenance_run if args.signal_cache_only
+                             else discord_bot._record_artifact_maintenance_run)
+            record_worker(
                 "degraded",
                 reason=f"unhandled_{type(exc).__name__}",
                 failures=1,

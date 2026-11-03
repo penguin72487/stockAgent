@@ -276,32 +276,42 @@ def stock_print_views(prints: pl.DataFrame, *, day: date, source_sha256: str,
         pl.when(pl.col('_matched_open').is_not_null()).then(pl.col('_matched_open'))
           .otherwise(pl.col('price')).alias('price'),
         pl.lit(True).alias('is_session_open'),
+        # A later daily OPEN may reconcile a first-second tie for retrospective
+        # research, but it does not prove that order was observable at 09:00.
+        (pl.col('_first_second_prices') == 1).alias('opening_order_proven'),
         pl.when(pl.col('_official_open').is_finite() & (pl.col('_official_open') > 0))
           .then(pl.col('_matched_open').is_null())
           .otherwise(pl.col('_first_second_prices') > 1).alias('opening_ambiguous')
         ).drop('_first_second_prices', '_official_open', '_matched_open')
     last = ordered.group_by(keys).last().with_columns(pl.lit(False).alias('is_session_open'),
-                                                       pl.lit(False).alias('opening_ambiguous'))
+        pl.lit(False).alias('opening_order_proven'), pl.lit(False).alias('opening_ambiguous'))
     prefix = ordered.filter(pl.col('minute') <= 540).group_by(keys).last().with_columns(
-        pl.lit(False).alias('is_session_open'), pl.lit(False).alias('opening_ambiguous'))
+        pl.lit(False).alias('is_session_open'), pl.lit(False).alias('opening_order_proven'),
+        pl.lit(False).alias('opening_ambiguous'))
     events = pl.concat([first, last, prefix], how='vertical_relaxed').select(
         'physical_contract', 'price', pl.col('date').alias('trade_date'),
         pl.col('event_ts').cast(pl.Datetime('us')).alias('trade_ts'),
         (pl.col('date').cast(pl.Datetime('us')) + pl.duration(minutes=pl.col('minute'))).alias('available_by'),
-        pl.lit(source_sha256).alias('source_sha256'), 'is_session_open', 'opening_ambiguous').unique()
+        pl.lit(source_sha256).alias('source_sha256'), 'is_session_open', 'opening_ambiguous',
+        'opening_order_proven').unique()
     return bars, stats, events
 
 
 def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.DataFrame,
                                source_sha256: str, asset_scope='stock_only',
                                price_representation='finmind_float32',
-                               unknown_final_mode='intersection'):
+                               unknown_final_mode='intersection',
+                               return_unverified_observations=False):
     """Columnar daily adapter for all selected delivery months, including zeros.
 
     Community native-decimal supplements must round-trip through the same
     unique dated tick-grid decoder without changing the original quote. Only
     the authenticated exchange-original adapter may use the union candidate;
-    this function emits prints only after matching the full official book.
+    The standard three outputs emit prints only after matching the full official
+    book. The explicit diagnostic option additionally returns a fourth frame
+    of positive observed bars from incomplete books with bounded volume and
+    price. Those bars are not a complete window, a zero-trade certificate, an
+    opening reference, an order fill, or an admitted execution clock.
     """
     from stockagent.data.tw_price_rules import taifex_futures_day_session_minutes
     from stockagent.data.tw_futures_decision_clock import clock_asset_classes
@@ -310,6 +320,10 @@ def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.D
             and (unknown_final_mode != 'union_for_full_book_verification'
                  or price_representation != 'native_decimal' or asset_scope != 'all_twd')):
         raise ValueError('unknown-final union requires native all-TWD full-book verification')
+    if not isinstance(return_unverified_observations, bool):
+        raise ValueError('unverified observation diagnostic flag must be boolean')
+    if return_unverified_observations and unknown_final_mode != 'intersection':
+        raise ValueError('unverified observations require the conservative session intersection')
     keys = ['date', 'physical_contract']
     metadata=[]
     if asset_scope=='all_twd':
@@ -396,9 +410,19 @@ def normalize_bulk_stock_ticks(frame: pl.DataFrame, *, day: date, expected: pl.D
               & (pl.col('tick_low')-pl.col('low')).abs().le(1e-6)
               & (pl.col('tick_close')-pl.col('close')).abs().le(1e-6)))).fill_null(False).alias('verified'),
         pl.lit(source_sha256).alias('source_file_sha256'))
+    if return_unverified_observations:
+        partial = coverage.filter(~pl.col('verified') & (pl.col('tick_volume') > 0)
+            & pl.col('outright_volume').is_finite()
+            & (pl.col('tick_volume') <= pl.col('outright_volume'))
+            & pl.col('high').is_finite() & pl.col('low').is_finite()
+            & (pl.col('tick_high') <= pl.col('high') + 1e-6)
+            & (pl.col('tick_low') >= pl.col('low') - 1e-6)).select(keys)
+        partial_bars = bars.join(partial, on=keys, how='semi')
     verified = coverage.filter(pl.col('verified')).select(keys)
     bars = bars.join(verified, on=keys, how='semi')
     events = events.join(verified.rename({'date': 'trade_date'}), on=['trade_date', 'physical_contract'], how='semi')
+    if return_unverified_observations:
+        return bars, coverage, events, partial_bars
     return bars, coverage, events
 
 

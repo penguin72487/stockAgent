@@ -12,6 +12,19 @@ from scripts import run_wsl_retirement_waves as runner
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
+@pytest.fixture(autouse=True)
+def authority_mount_namespace_for_unit_tests(monkeypatch):
+    """Unit plans use fake owners; do not depend on the invoking shell's mount namespace."""
+    readlink = runner.os.readlink
+
+    def observed_namespace(path, *args, **kwargs):
+        if str(path) in {'/proc/self/ns/mnt', '/proc/1/ns/mnt'}:
+            return 'mnt:[unit-test-authority]'
+        return readlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(runner.os, 'readlink', observed_namespace)
+
+
 def test_owner_rejects_changed_pinned_inventory_before_receipt_or_apply(tmp_path, monkeypatch):
     inventory, receipt = tmp_path / 'inventory.json', tmp_path / 'receipt'
     inventory.write_bytes(b'original inventory')
@@ -326,6 +339,35 @@ def test_queued_wave_defers_if_inventory_changes_during_scheduler_wait(tmp_path,
     assert waits == [1] and len(owner_attempts) == 1
 
 
+@pytest.mark.parametrize('changed', [False, True])
+def test_busy_scheduler_is_awaited_before_active_preflight_and_identity_is_pinned(tmp_path, monkeypatch, changed):
+    pairs = _setup_executor(tmp_path, monkeypatch)[:1]
+    runner.SCHEDULER_LOCK.touch()
+    held = runner.SCHEDULER_LOCK.open('r+')
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    events = []
+    def inspect(pairs, parallelism):
+        plan = _plan_for(pairs, parallelism)
+        if events and changed:
+            plan['cohorts'][0]['inventory_sha256'] = 'f' * 64
+        return plan
+    def sleep(seconds):
+        events.append('wait')
+        fcntl.flock(held, fcntl.LOCK_UN)
+    def execute(*args, **kwargs):
+        events.append('execute')
+        return 0
+    monkeypatch.setattr(runner, '_inspect', inspect)
+    monkeypatch.setattr(runner.time, 'sleep', sleep)
+    monkeypatch.setattr(runner, 'execute', execute)
+    try:
+        code = runner.wait_and_execute(pairs, 1, wait_for_scheduler=True, poll_seconds=1)
+    finally:
+        held.close()
+    assert code == (75 if changed else 0)
+    assert events == (['wait'] if changed else ['wait', 'execute'])
+
+
 def test_scheduler_busy_without_queue_fails_before_owner(tmp_path, monkeypatch):
     pairs = _setup_executor(tmp_path, monkeypatch)[:1]
     runner.SCHEDULER_LOCK.touch()
@@ -468,6 +510,14 @@ def test_completion_requires_bound_owner_acceptance_and_source_absence(tmp_path)
         runner._accepted(cohort)
 
 
+def test_completion_can_bind_an_enrolled_manifest_after_stage_retirement(tmp_path):
+    cohort, _progress, _source = _completed_fixture(tmp_path)
+    proof = runner._accepted(cohort, expected_manifest_sha256='a'*64)
+    assert proof['manifest_sha256'] == 'a'*64
+    with pytest.raises(ValueError, match='another enrolled cold manifest'):
+        runner._accepted(cohort, expected_manifest_sha256='b'*64)
+
+
 def test_completion_rejects_inventory_change_and_redirected_acceptance(tmp_path):
     cohort, _progress, _source = _completed_fixture(tmp_path)
     inventory = Path(cohort['inventory'])
@@ -515,3 +565,19 @@ def test_only_actual_own_agent_cgroup_is_excluded(monkeypatch):
     monkeypatch.setattr(runner.planner, 'build_plan', lambda cohorts, parallelism, free: cohorts)
     runner._inspect(pairs, 1)
     assert [run['run_id'] for run in seen] == ['other']
+
+
+def test_backup_pool_reaches_the_original_owner_and_rejects_unscoped_work(monkeypatch):
+    monkeypatch.setattr(runner.planner, 'observe_active_supervisors', lambda: [])
+    monkeypatch.setattr(runner.planner, 'capacity_observation', lambda: {})
+    monkeypatch.setattr(runner.planner, 'inspect_cohort', lambda *a, **kw:
+                        {'canonical_argv': ['original-owner'], **kw})
+    seen = []
+    monkeypatch.setattr(runner.planner, 'build_plan', lambda rows, parallelism, free, **kw:
+                        seen.append(kw) or rows)
+    pairs = [(Path('/fixed-inventory'), Path('/original-receipt'))]
+    observed = runner._inspect(pairs, 1, d_stage_recovery_only=True, use_backup_reserve=True)
+    assert observed[0]['canonical_argv'] == ['original-owner', '--use-backup-reserve']
+    assert seen == [{'use_backup_reserve': True}]
+    with pytest.raises(ValueError, match='guarded-D'):
+        runner._inspect(pairs, 1, use_backup_reserve=True)

@@ -33,6 +33,151 @@
     "unregistered:www.nstock.tw": "nstock"
   },
   "providers": {
+    "unregistered:www.facebook.com": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-30T06:17:14.989812+00:00",
+      "evidence_urls": [],
+      "observation_scope": "Indexed read-only census of this host in the stopped local queue; no request to the platform and no current access or policy review.",
+      "observation": "The 2026-10-30 local snapshot contains 948 URL heads: 659 have a post-permalink-like shape, ten a video-like shape and 279 another shape. All await authorization; recorded attempt counters and stored-body pointers are zero. The 998 source-link rows represent 1,895 associations from 273 origins. URL shape does not establish original publisher, article identity, access, text availability, reuse rights or complete history.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_offline_inventory_20261029/social_candidate_census_20261030.json"
+      ],
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-30T06:17:14.989812+00:00",
+        "queue_url_heads": 948,
+        "awaiting_authorization_heads": 948,
+        "heads_with_recorded_attempts": 0,
+        "heads_with_body_pointer": 0,
+        "post_permalink_candidates": 659,
+        "video_candidates": 10,
+        "other_url_shapes": 279,
+        "source_link_rows": 998,
+        "source_association_rows": 1895,
+        "source_origins": 273,
+        "source_review_grants_capture_access": false,
+        "url_shape_proves_news_article_or_publisher": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Count local URL heads, observed shape categories, body pointers, recorded attempt counters and associations without accessing the platform."
+        ],
+        "remaining_questions": [
+          "Verify the current permitted and supported account or export routes before requesting platform content after maintenance.",
+          "Identify which links actually contain relevant news text or point to original reporting, and preserve source identity and attribution from evidence.",
+          "Determine accessible history, publication clocks, reuse scope and incremental discovery from permitted evidence rather than URL shape."
+        ]
+      }
+    },
+    "unregistered:www.youtube.com": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-30T06:17:14.989812+00:00",
+      "evidence_urls": [],
+      "observation_scope": "Indexed read-only census of this host in the stopped local queue; no request to the platform and no current access or policy review.",
+      "observation": "The 2026-10-30 local snapshot contains 153 URL heads: 148 are watch links containing a nonempty video ID and five have another shape. All await authorization; recorded attempt counters and stored-body pointers are zero. The 153 source-link rows represent 186 associations from 131 origins. A video URL is not an article, transcript, proof of original reporting or proof of access, reuse rights or complete history.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_offline_inventory_20261029/social_candidate_census_20261030.json"
+      ],
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-30T06:17:14.989812+00:00",
+        "queue_url_heads": 153,
+        "awaiting_authorization_heads": 153,
+        "heads_with_recorded_attempts": 0,
+        "heads_with_body_pointer": 0,
+        "watch_with_video_id_candidates": 148,
+        "other_url_shapes": 5,
+        "source_link_rows": 153,
+        "source_association_rows": 186,
+        "source_origins": 131,
+        "source_review_grants_capture_access": false,
+        "url_shape_proves_news_article_or_publisher": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Count local URL heads, observed shape categories, body pointers, recorded attempt counters and associations without accessing the platform."
+        ],
+        "remaining_questions": [
+          "Verify the current permitted and supported API or export routes before requesting platform content after maintenance.",
+          "Determine whether each candidate links to relevant news, an original article, a supported caption or other media; retain source and attribution evidence.",
+          "Determine accessible history, publication clocks, reuse scope and incremental discovery from permitted evidence rather than URL shape."
+        ]
+      }
+    },
+    "unregistered:gotv.ctitv.com.tw": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-30T06:11:42.727855+00:00",
+      "evidence_urls": [
+        "https://www.mediawatch.org.tw/sites/default/files/files/%E3%80%8A%E7%B6%B2%E8%B7%AF%E6%96%B0%E8%81%9E%E5%B0%88%E6%A5%AD%E8%A1%A8%E7%8F%BE%E8%A9%95%E9%91%91%EF%BC%9A%E6%AF%8F%E6%97%A5%E6%96%B0%E8%81%9E%E5%AA%92%E9%AB%94%E8%87%89%E6%9B%B8%E7%B2%89%E7%B5%B2%E5%B0%88%E9%A0%81%E8%A9%95%E6%AF%94%E4%B9%8B%E5%88%9D%E6%8E%A2%E3%80%8B%E7%B5%90%E6%A1%88%E5%A0%B1%E5%91%8A.pdf"
+      ],
+      "observation_scope": "Indexed read-only census of one stopped local queue, plus a historical independent media-monitoring report; no request to the publisher and no current robots or rights review.",
+      "observation": "The 2026-10-30 local snapshot contains 52 distinct URL heads for this host: 49 HTTPS and three HTTP, all with a dated numeric .htm path, awaiting authorization, zero recorded attempts, no body pointer and no metadata order day. Their 52 source-link rows represent 66 source associations across 50 origins; URL heads, associations and unique stories are different grains. A 2018 independent Media Watch report identifies the Quick TV social page with CTI and lists this host as its website at that time. It does not prove the current host operator, authorship of these specific URLs, their publication clocks, body availability, collection permission, current robots rules or full historical coverage. Preserve the 52 existing identities and avoid treating HTTP/HTTPS variants as equivalent without source evidence.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_offline_inventory_20261029/gotv_candidate_census_20261030.json"
+      ],
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-30T06:11:42.727855+00:00",
+        "queue_url_heads": 52,
+        "awaiting_authorization_heads": 52,
+        "heads_with_recorded_attempts": 0,
+        "heads_with_body_pointer": 0,
+        "source_link_rows": 52,
+        "source_association_rows": 66,
+        "source_origins": 50,
+        "source_review_grants_capture_access": false,
+        "metadata_or_path_dates_are_publication_clocks": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Count this exact host's URL heads, stored-body pointers, existing attempt counters and source associations in a stopped, read-only indexed queue snapshot.",
+          "Record the 2018 independent report's historical relationship between the Quick TV page, CTI and this host without treating it as a present ownership or rights decision."
+        ],
+        "remaining_questions": [
+          "When maintenance ends, verify current source-specific robots and terms and establish whether any authorized access route exists before issuing publisher requests.",
+          "Verify literal response identity, article body, author, attribution and publication clock before implementing or admitting a source-specific adapter.",
+          "Test HTTP and HTTPS or moved-domain equivalence only from source evidence; retain each existing URL and association until equivalence is proved.",
+          "Establish actual archive scope, incremental discovery and source pacing from permitted evidence without inferring whole history from 52 local URL heads."
+        ]
+      }
+    },
+    "fed_board": {
+      "capture_decision": "review_incomplete",
+      "reviewed_at_utc": "2026-10-30T00:43:43.731734+00:00",
+      "evidence_urls": [
+        "https://www.federalreserve.gov/disclaimer.htm"
+      ],
+      "observation_scope": "Offline readback of the existing quiescent news snapshot and previously recorded source scope; no publisher request or new rights review.",
+      "observation": "The canonical source configuration records Board-authored public-domain text and excludes non-Board media; that earlier source review was not repeated now. In the 2026-10-29 snapshot, 13,864 of 13,871 known URL heads have a body pointer. All 555 corresponding batches passed retained-source, receipt and body checks, including 20 reused batch proofs; a separate process read back membership and file identities without rehashing every body or replaying the current parser. Of those heads, 1,729 records have a nonempty published_at_raw and none has a timezone-aware ISO or mail clock parsed by this audit. This describes recorded fields, not proof the publisher never supplied a clock. Four image-only PDFs and three document landing pages are separately classified; previous OCR is candidate text, not accepted native PDF text. Preserve source evidence, actual publication and observation clocks, third-party scope, current collection policy and all source deadlines.",
+      "review_artifacts": [
+        "artifacts/data_quality/news_offline_inventory_20261029/fed_board_provider_storage_readback_20261030.json",
+        "artifacts/data_quality/news_offline_inventory_20261029/inventory_current_locked_20261029.json"
+      ],
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-30T00:43:43.731734+00:00",
+        "source_snapshot_at_utc": "2026-10-29T14:36:16.924658+00:00",
+        "known_url_heads": 13871,
+        "stored_body_heads": 13864,
+        "missing_body_heads": 7,
+        "image_only_pdf_heads": 4,
+        "document_landing_page_heads": 3,
+        "queued_or_inflight_missing_body_heads": 0,
+        "verified_storage_batches": 555,
+        "reused_previously_verified_batches": 20,
+        "newly_verified_batches": 535,
+        "heads_with_nonempty_published_at_raw": 1729,
+        "heads_with_audit_parsed_aware_publication_clock": 0,
+        "independent_readback_rehashes_all_bodies": false,
+        "independent_readback_replays_current_parser": false,
+        "blank_recorded_clock_proves_no_publisher_clock": false,
+        "review_annotation_grants_new_capture_access": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Audit and independently read back the 13,864 retained URL heads and 555 batch identities in one quiescent local snapshot, reusing 20 prior verified batch proofs.",
+          "Keep the four image-only PDFs and three document landing pages distinct from the stored body count; retain the earlier OCR as an unaccepted candidate."
+        ],
+        "remaining_questions": [
+          "Investigate recorded publication-clock gaps against retained exact originals, preserving absent fields and timezone uncertainty instead of substituting metadata or observation dates.",
+          "Validate usable text or structured figures from the four scanned PDFs against their source pages, without treating prior OCR output as accepted original text.",
+          "Continue permitted source discovery and incremental capture through the existing owner after maintenance; the recorded URLs and completed local audit do not prove complete Board history.",
+          "Keep the previously recorded Board-authored scope and third-party exclusions distinct from a new rights review or permission for derived training uses."
+        ]
+      }
+    },
     "unregistered:www.nbd.com.cn": {
       "capture_decision": "review_incomplete",
       "reviewed_at_utc": "2026-10-27T23:47:19+00:00",
@@ -4570,6 +4715,45 @@
     },
     "ettoday": {
       "capture_decision": "reviewed_existing_scope",
+      "current_scope_review": {
+        "recorded_at_utc": "2026-10-30T00:31:36.565587+00:00",
+        "source_snapshot_at_utc": "2026-10-29T14:36:16.924658+00:00",
+        "known_url_heads": 24310,
+        "stored_body_heads": 17549,
+        "missing_body_heads": 6761,
+        "missing_attribution_heads": 4881,
+        "retained_body_attribution_head": 1,
+        "missing_identity_heads": 62,
+        "missing_rights_or_scope_excluded_heads": 1366,
+        "unsupported_article_path_heads": 433,
+        "unsupported_www_article_path_with_query_heads": 103,
+        "unsupported_finance_article_path_with_query_heads": 23,
+        "unsupported_house_article_path_with_query_heads": 10,
+        "unsupported_other_routes_heads": 297,
+        "unsupported_current_literal_identity_matches": 0,
+        "missing_source_not_found_heads": 18,
+        "missing_redirect_not_article_heads": 1,
+        "verified_storage_batches": 435,
+        "reused_previously_verified_batches": 342,
+        "newly_verified_batches": 93,
+        "storage_audit_readback": "artifacts/data_quality/news_offline_inventory_20261029/ettoday_provider_storage_readback_20261030.json",
+        "census_evidence": "artifacts/data_quality/news_offline_inventory_20261029/inventory_current_locked_20261029.json",
+        "unsupported_route_inventory": "artifacts/operations/agent-workflow/runs/news-ettoday-route-inventory-202-20261030T003620-a532a703/run.log",
+        "independent_readback_rehashes_all_bodies": false,
+        "independent_readback_replays_current_parser": false,
+        "review_annotation_grants_new_capture_access": false,
+        "whole_publisher_history_complete": false,
+        "completed_questions": [
+          "Audit and independently read back the quiescent scope of 17,549 retained ETtoday URL heads and 435 batches, with 342 previously verified batches reused; the independent readback does not rehash every body or replay the current parser.",
+          "Retain the already completed source diagnostics and distinguish the one attribution-failed head with a previously saved body from attribution failures without bodies."
+        ],
+        "remaining_questions": [
+          "For 4,881 body-missing attribution outcomes, proceed only with new permitted exact-article original evidence; retain the observed byline and creator distinctions without reopening closed questions.",
+          "Investigate 62 body-missing identity outcomes and 433 unsupported paths with source-declared article identity and policy; the 136 familiar article paths with query strings are candidates, not proven aliases, and other routes or hosts need separate review.",
+          "Keep 1,366 rights or scope exclusions, 18 source-not-found outcomes and one non-article redirect as separately recorded states; seek new permitted evidence rather than declaring body completion.",
+          "Resume permitted historical and incremental acquisition only through the existing owner after maintenance, respecting CNYES priority and source gates; whole-publisher coverage and completion time remain unknown."
+        ]
+      },
       "evidence_urls": [
         "https://member.ettoday.net/clause_member.php7",
         "https://member.ettoday.net/clause_copyright.php7",
@@ -5070,24 +5254,30 @@
         "onlynotecontent_stored_same_slug_candidates": 6,
         "missing_identity_heads_with_prior_candidate_jobs": 26,
         "missing_identity_heads_with_reused_failure_literal": 4,
-        "missing_identity_heads_with_new_pending_diagnostic": 2,
+        "missing_identity_heads_with_new_observed_diagnostic": 2,
+        "missing_identity_heads_with_new_pending_diagnostic": 0,
+        "missing_identity_original_heads_matching_prior": 32,
+        "identity_reconciled_at_utc": "2026-10-29T02:41:21.230879+00:00",
         "census_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-current-scope-census-20261028.json",
         "candidate_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-onlynotecontent-existing-candidates.json",
         "identity_diagnostic_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-unanswered-identity-diagnostics-20261028.json",
+        "identity_reconciliation_evidence": "artifacts/data_quality/news_offline_inventory_20261029/cmnews_completed_observations_reuse_20261029.json",
         "literal_original_reuse_evidence": "artifacts/data_quality/news_goal_stage01_20261009/planning_resume_20261021/metadata_efficiency_20261028/cmnews-existing-literal-originals-reuse-20261028.json",
+        "tag_exact_discovery_snapshot_evidence": "artifacts/data_quality/news_offline_inventory_20261029/cmnews_tag_exact_discovery_snapshot_20261029.json",
         "same_slug_is_proven_alias": false,
         "missing_heads_are_unique_articles": false,
         "whole_publisher_history_complete": false,
         "completed_questions": [
           "Reuse six already stored same-slug article candidates and their independent body readback; shared slug and title do not prove equivalence to the unsupported onlynotecontent heads.",
           "Count retained bodies separately from latest states in a single read-only snapshot; source refusals and historical results remain unchanged.",
-          "Reuse 26 previously diagnosed identity heads and four exact source-declared original locators whose current CMoneylearning body heads match earlier accepted batch proofs. The remaining two heads have new pending same-owner diagnostic submissions; no body or alias is accepted."
+          "Reuse 26 previously diagnosed identity heads and four exact source-declared original locators. The two subsequently submitted observations are now observed; their declared original heads match the separately accepted 2026-10-20 body readback. All 32 original heads match the earlier relation snapshot and committed-batch references. None proves a CMNews parent body or alias.",
+          "A 2026-10-29 read-only exact-URL join of the 137 current unsupported /tag/ heads found zero corresponding discovery tasks, zero checked head timestamps and zero stored bodies. The heads are linked to 79 existing metadata origins. This does not exhaust retained raw evidence or URL variants, and attempts counters are not HTTP request evidence."
         ],
         "remaining_questions": [
           "For six onlynotecontent heads, seek publisher-declared identity and access evidence before changing their local scope outcome or accepting any alias.",
-          "Resolve the two pending identity observations after storage admission, and assess the 26 prior diagnostics, four source-declared originals and 80 missing source-not-found heads without repeating closed questions or assuming alias equivalence.",
+          "Preserve the 32 unresolved CMNews parent identities and assess the 80 missing source-not-found heads when genuinely new evidence is available; do not repeat completed locator questions or assume alias equivalence.",
           "Keep 720 missing paywall or login heads as access-limited and the image-only head as nontext until independent permitted evidence exists; do not infer body text or entitlement.",
-          "The 137 tag paths are discovery or metadata candidates, not established article bodies; assess useful discovery separately from body completeness.",
+          "The 137 tag paths are discovery or metadata candidates, not established article bodies. Assess whether permitted source responses can yield useful article links after maintenance; the completed exact-URL join alone does not establish content, authorize discovery, or exclude other retained raw evidence.",
           "After physical storage admission, verify natural rechecks and new committed bodies through the canonical owner; known URL heads are not the whole historical universe."
         ]
       },

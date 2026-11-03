@@ -167,7 +167,7 @@ def test_byte_plane_storage_preserves_raw_bits_nulls_types_and_all_three_readers
     write_parquet(table, path, attrs={'unit': 'shares'}, row_group_size=2,
                   use_dictionary=False, use_byte_stream_split=True)
     with duckdb.connect() as connection:
-        sql_readback = connection.execute('SELECT * FROM read_parquet(?)', [str(path)]).to_arrow_table()
+        sql_readback = connection.sql('SELECT * FROM read_parquet(?)', params=[str(path)]).to_arrow_table()
     readers = [pq.read_table(path), canonical_arrow(pl.read_parquet(path)), sql_readback]
     for actual in readers:
         assert actual.schema.equals(table.schema, check_metadata=False)

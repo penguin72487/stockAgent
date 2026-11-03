@@ -1,4 +1,4 @@
-"""Bounded, single-owner OCR using retained RapidOCR models and ONNX Runtime.
+"""OCR using retained RapidOCR models and ONNX Runtime.
 
 PDF rendering and source/receipt publication stay with the canonical extractor.
 Only neural inference moves to CUDA; preprocessing, decoding and coordinates
@@ -18,11 +18,16 @@ import time
 
 from downloader.artifact_io import sha256_file
 from stockagent.ocr.fastpath import (
-    ComponentBoundary, ExactDetPreprocess, GPUDetPreprocess, InferenceCall, Optimizations, TimedCall,
+    AvoidDetUpscale, ComponentBoundary, ExactDetPreprocess, GPUDetPreprocess, InferenceCall,
+    Optimizations, TimedCall,
 )
 
 NATIVE_THREAD_VARIABLES = (
     "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+)
+INHERITED_THREAD_LIMIT_VARIABLES = (
+    "OMP_THREAD_LIMIT", "OPENBLAS_DEFAULT_NUM_THREADS", "GOTO_NUM_THREADS",
+    "BLIS_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
 )
 
 
@@ -30,19 +35,27 @@ NATIVE_THREAD_VARIABLES = (
 class ExecutionBudget:
     device: str = "cuda"
     device_id: int = 0
-    cpu_threads: int = 1
-    cpu_cores: int = 4
-    nice: int = 10
-    gpu_memory_mb: int = 2048  # Per ONNX session arena, not total device memory.
+    cpu_threads: int | None = 1
+    cpu_cores: int | None = 4
+    nice: int | None = 10
+    gpu_memory_mb: int | None = 2048  # Per ONNX session arena, not total device memory.
     model_memory_mb: dict | None = None
-    min_free_gpu_mb: int = 2048
+    min_free_gpu_mb: int | None = 2048
     disable_thp: bool = True
+    exclusive_gpu_owner: bool = True
+    shared_thread_pool: bool = False
 
     def __post_init__(self):
         if self.device not in {"cpu", "cuda"}:
             raise ValueError("OCR device must be cpu or cuda")
         if type(self.disable_thp) is not bool:
             raise ValueError("disable_thp must be boolean")
+        if type(self.exclusive_gpu_owner) is not bool:
+            raise ValueError("exclusive_gpu_owner must be boolean")
+        if type(self.shared_thread_pool) is not bool:
+            raise ValueError("shared_thread_pool must be boolean")
+        if self.shared_thread_pool and self.cpu_threads is not None:
+            raise ValueError("shared thread pool requires automatic thread sizing")
         limits = {
             "device_id": (0, 63), "cpu_threads": (1, 8), "cpu_cores": (1, 256),
             "nice": (0, 19), "gpu_memory_mb": (128, 131072),
@@ -50,6 +63,8 @@ class ExecutionBudget:
         }
         for name, (low, high) in limits.items():
             value = getattr(self, name)
+            if value is None and name != "device_id":
+                continue
             if type(value) is not int or not low <= value <= high:
                 raise ValueError(f"invalid OCR execution budget: {name}")
         if self.model_memory_mb is not None:
@@ -57,6 +72,34 @@ class ExecutionBudget:
                     or not set(self.model_memory_mb) <= {'Det', 'Rec', 'Cls'}
                     or any(type(v) is not int or not 128 <= v <= 131072 for v in self.model_memory_mb.values())):
                 raise ValueError('invalid per-model GPU memory budget')
+
+
+def _configure_native_thread_environment(budget):
+    # Must run before NumPy/OpenMP are imported in this dedicated process.
+    # An unrestricted profile also removes inherited thread-count overrides.
+    for key in NATIVE_THREAD_VARIABLES:
+        if budget.cpu_threads is None:
+            os.environ.pop(key, None)
+        else:
+            os.environ[key] = str(budget.cpu_threads)
+    if budget.cpu_threads is None:
+        for key in INHERITED_THREAD_LIMIT_VARIABLES:
+            os.environ.pop(key, None)
+
+
+def _cuda_provider_options(budget, optimizations, name):
+    options = {
+        "device_id": budget.device_id,
+        "arena_extend_strategy": "kSameAsRequested",
+        "cudnn_conv_algo_search": optimizations.conv_search,
+        "cudnn_conv_use_max_workspace": str(int(optimizations.conv_workspace)),
+        "use_tf32": str(int(optimizations.use_tf32)),
+        "do_copy_in_default_stream": "1",
+    }
+    arena_mb = (budget.model_memory_mb or {}).get(name, budget.gpu_memory_mb)
+    if arena_mb is not None:
+        options["gpu_mem_limit"] = arena_mb * 1024**2
+    return options
 
 
 def rapidocr_runtime(config_path):
@@ -68,7 +111,7 @@ def _rapidocr_runtime(config_path):
     """Verify retained models/packages before importing an inference engine.
 
 Legacy CPU configuration and receipt fields are deliberately kept compatible.
-An execution block opts into the bounded runner and a separate fingerprint.
+An execution block opts into the configurable runner and a separate fingerprint.
 """
     config_path = Path(config_path)
     config = json.loads(config_path.read_text())
@@ -118,8 +161,7 @@ An execution block opts into the bounded runner and a separate fingerprint.
                     raise RuntimeError(f"{name} is already loaded from another runtime; use a fresh process")
         # The CLI calls this before collector imports can initialize NumPy's
         # native pools. Setting these only when creating ORT sessions is late.
-        for key in NATIVE_THREAD_VARIABLES:
-            os.environ[key] = str(budget.cpu_threads)
+        _configure_native_thread_environment(budget)
     sys.path.insert(0, str(libraries))
     installed = {name: metadata.version(name) for name in sorted(package_names)}
     if installed != config["packages"]:
@@ -127,7 +169,9 @@ An execution block opts into the bounded runner and a separate fingerprint.
     runtime = dict(engine="rapidocr", packages=installed, model_sha256=hashes,
                    config_sha256=sha256_file(config_path))
     if "execution" in config:
-        runtime.update(execution=asdict(budget), implementation="bounded_rapidocr_v2",
+        implementation = ("bounded_rapidocr_v2" if budget.cpu_threads is not None
+                          and budget.exclusive_gpu_owner else "configurable_rapidocr_v3")
+        runtime.update(execution=asdict(budget), implementation=implementation,
                        optimizations=asdict(optimization),
                        implementation_sha256=sha256_file(Path(__file__)),
                        implementation_files_sha256={name: sha256_file(Path(__file__).with_name(name))
@@ -184,10 +228,10 @@ def summarize_profile(path):
 
 
 class RapidOCRRunner:
-    """One process owns the three reusable sessions and bounded line batches.
+    """One process reuses the three inference sessions.
 
-The caller uses a dedicated process: thread budgets, niceness and affinity are
-process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
+The caller uses a dedicated process: optional thread budgets, niceness and
+affinity are process-wide. The legacy profile retains its per-device lock.
 """
 
     def __init__(self, config_path, *, profile_dir=None):
@@ -224,17 +268,16 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
             # this host in synchronous huge-page memory compaction.
             if libc.prctl(41, 1, 0, 0, 0) != 0 or libc.prctl(42, 0, 0, 0, 0) != 1:
                 raise OSError(ctypes.get_errno(), "cannot disable THP for this OCR process")
-        for key in NATIVE_THREAD_VARIABLES:
-            os.environ[key] = str(budget.cpu_threads)
+        _configure_native_thread_environment(budget)
         tids = [int(p.name) for p in Path('/proc/self/task').iterdir()] if sys.platform.startswith('linux') else [0]
-        if hasattr(os, "sched_getaffinity"):
+        if budget.cpu_cores is not None and hasattr(os, "sched_getaffinity"):
             cpus = sorted(os.sched_getaffinity(0))[-budget.cpu_cores:]
             for tid in tids:
                 try:
                     os.sched_setaffinity(tid, cpus)
                 except ProcessLookupError:
                     pass
-        if hasattr(os, "setpriority"):
+        if budget.nice is not None and hasattr(os, "setpriority"):
             for tid in tids:
                 try:
                     os.setpriority(os.PRIO_PROCESS, tid, max(budget.nice, os.getpriority(os.PRIO_PROCESS, tid)))
@@ -242,24 +285,32 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
                     pass
         ort = import_module("onnxruntime")
         cv2 = import_module("cv2")
-        cv2.setNumThreads(budget.cpu_threads)
+        if budget.shared_thread_pool:
+            # Det, Cls and Rec run sequentially in this owner. Reuse ORT's
+            # automatically sized global pools instead of creating three idle
+            # session pools. No explicit thread-count ceiling is configured.
+            ort.set_global_thread_pool_sizes()
+        if budget.cpu_threads is not None:
+            cv2.setNumThreads(budget.cpu_threads)
         if budget.device == "cuda":
             if "CUDAExecutionProvider" not in ort.get_available_providers():
                 raise RuntimeError("CUDAExecutionProvider unavailable; CPU fallback is forbidden")
-            import fcntl
-            self.lock = open(f"/tmp/stockagent-ocr-{os.getuid()}-cuda-{budget.device_id}.lock", "a+")
-            try:
-                fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError as exc:
-                raise RuntimeError("another GPU OCR process owns this device") from exc
+            if budget.exclusive_gpu_owner:
+                import fcntl
+                self.lock = open(f"/tmp/stockagent-ocr-{os.getuid()}-cuda-{budget.device_id}.lock", "a+")
+                try:
+                    fcntl.flock(self.lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError as exc:
+                    raise RuntimeError("another GPU OCR process owns this device") from exc
             # Importing the project's CUDA-compatible torch loads CUDA/cuDNN
             # libraries without modifying the training environment installation.
             import torch
             if not torch.cuda.is_available() or budget.device_id >= torch.cuda.device_count():
                 raise RuntimeError("requested CUDA device unavailable; CPU fallback is forbidden")
-            torch.set_num_threads(budget.cpu_threads)
+            if budget.cpu_threads is not None:
+                torch.set_num_threads(budget.cpu_threads)
             free_bytes, _ = torch.cuda.mem_get_info(budget.device_id)
-            if free_bytes < budget.min_free_gpu_mb * 1024**2:
+            if budget.min_free_gpu_mb is not None and free_bytes < budget.min_free_gpu_mb * 1024**2:
                 raise RuntimeError("insufficient free GPU memory for the OCR budget")
             self.runtime["cuda_runtime"] = dict(torch=torch.__version__, cuda=torch.version.cuda,
                 cudnn=torch.backends.cudnn.version(), device=torch.cuda.get_device_name(budget.device_id))
@@ -267,25 +318,22 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
             self.profile_dir.mkdir(parents=True, exist_ok=True)
         for name, entry in config["models"].items():
             opts = ort.SessionOptions()
-            opts.intra_op_num_threads = budget.cpu_threads
-            opts.inter_op_num_threads = 1
+            if budget.shared_thread_pool:
+                opts.use_per_session_threads = False
+            if budget.cpu_threads is not None:
+                opts.intra_op_num_threads = budget.cpu_threads
+                opts.inter_op_num_threads = 1
             opts.enable_cpu_mem_arena = False
             opts.enable_mem_pattern = self.optimizations.memory_pattern
-            opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
-            opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
+            if budget.cpu_threads is not None:
+                opts.add_session_config_entry("session.intra_op.allow_spinning", "0")
+                opts.add_session_config_entry("session.inter_op.allow_spinning", "0")
             if self.profile_dir:
                 opts.enable_profiling = True
                 opts.profile_file_prefix = str(self.profile_dir / name)
             providers = ["CPUExecutionProvider"]
             if budget.device == "cuda":
-                providers.insert(0, ("CUDAExecutionProvider", {
-                    "device_id": budget.device_id,
-                    "gpu_mem_limit": (budget.model_memory_mb or {}).get(name, budget.gpu_memory_mb) * 1024**2,
-                    "arena_extend_strategy": "kSameAsRequested",
-                    "cudnn_conv_algo_search": self.optimizations.conv_search,
-                    "cudnn_conv_use_max_workspace": str(int(self.optimizations.conv_workspace)),
-                    "use_tf32": str(int(self.optimizations.use_tf32)), "do_copy_in_default_stream": "1",
-                }))
+                providers.insert(0, ("CUDAExecutionProvider", _cuda_provider_options(budget, self.optimizations, name)))
             model_path = config['compact_rec_model']['path'] if name == 'Rec' and self.optimizations.compact_ctc else entry['path']
             if name == 'Det' and self.optimizations.gpu_det_normalize:
                 model_path = config['uint8_det_model']['path']
@@ -337,11 +385,14 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
         native_preprocess = self.engine.text_det.get_preprocess
 
         def get_preprocess(*args):
-            operation = native_preprocess(*args)
+            native = native_preprocess(*args)
+            operation = native
             if self.optimizations.det_normalize_lut:
                 operation = ExactDetPreprocess(operation)
             elif self.optimizations.gpu_det_normalize:
                 operation = GPUDetPreprocess(operation, det_lut_sha256)
+            if self.optimizations.avoid_det_upscale:
+                operation = AvoidDetUpscale(operation, native)
             return TimedCall(operation, 'Det.preprocess', self.events)
 
         self.engine.text_det.get_preprocess = get_preprocess
@@ -359,7 +410,7 @@ process-wide. Concurrent GPU OCR owners are rejected with a per-device lock.
             cpu_affinity=sorted(os.sched_getaffinity(0)) if hasattr(os, "sched_getaffinity") else None,
             nice=os.getpriority(os.PRIO_PROCESS, 0) if hasattr(os, "getpriority") else None,
             opencv_threads=cv2.getNumThreads(), disable_thp=budget.disable_thp,
-            native_thread_env={key: os.environ[key] for key in NATIVE_THREAD_VARIABLES})
+            native_thread_env={key: os.environ.get(key) for key in NATIVE_THREAD_VARIABLES})
 
     def __call__(self, image):
         if self.closed or os.getpid() != self.owner_pid:

@@ -466,6 +466,9 @@ def test_successful_rss_parse_clears_old_error_projection_but_304_preserves_it(c
         task['parser_fingerprint'] = discovery_fingerprint(http.registry.sources['publisher'])
         accept_discovery(queue, task, response, [], [], [])
         assert queue.db.execute('SELECT count(*) FROM bulk_item_errors').fetchone()[0] == 1
+        # Each real request dispatch snapshots the current row; the 304 has
+        # already advanced this head, so the original task is now superseded.
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
         response = Response(task['url'], 200, {}, rss([feed_item()]))
         records, errors = feed_records(response, http, http.registry.sources['publisher'])
         accept_discovery(queue, task, response, [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records], records, errors)

@@ -1,7 +1,10 @@
 """Real local owner generation, initialization handoff and honest snapshot UI."""
-from contextlib import closing
+from contextlib import closing, contextmanager
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
+import errno
 import json
+import sqlite3
 import threading
 
 import pytest
@@ -41,6 +44,360 @@ def seed(root, *, now=None):
     return status, lifecycle
 
 
+def test_closed_owner_cannot_overwrite_successor_lifecycle(config, tmp_path):
+    registry = PolicyRegistry(config, base=tmp_path)
+    old = NewsWorkerLifecycle(tmp_path)
+    first = NewsQueue(tmp_path, registry, lifecycle=old)
+    first.close()
+    new = NewsWorkerLifecycle(tmp_path)
+    second = NewsQueue(tmp_path, registry, lifecycle=new)
+    try:
+        before = new.path.read_bytes()
+        # This is the CLI's old finish-after-unlock ordering, with a new owner
+        # acquiring the lock exactly in the gap.
+        old.finish()
+        old.phase('acceptance_recovery', receipts_decoded=123)
+        assert new.path.read_bytes() == before
+        assert json.loads(before)['owner_id'] == second.owner
+    finally:
+        second.close()
+
+
+def test_startup_failure_is_recorded_before_unlock_and_survives_restart(config, tmp_path, monkeypatch):
+    registry = PolicyRegistry(config, base=tmp_path)
+    original = NewsQueue.recover_acceptance
+    old = NewsWorkerLifecycle(tmp_path)
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EIO, 'PRIVATE_STARTUP_PATH_OR_TOKEN')
+
+    monkeypatch.setattr(NewsQueue, 'recover_acceptance', fail)
+    with pytest.raises(OSError, match='PRIVATE_STARTUP_PATH_OR_TOKEN'):
+        NewsQueue(tmp_path, registry, lifecycle=old)
+    failed = json.loads(old.path.read_bytes())
+    assert failed['state'] == 'failed'
+    assert failed['last_failure']['phase'] == 'acceptance_recovery'
+    assert failed['last_failure']['reason'] == 'local_io'
+    assert 'PRIVATE_STARTUP_PATH_OR_TOKEN' not in json.dumps(failed)
+
+    monkeypatch.setattr(NewsQueue, 'recover_acceptance', original)
+    new = NewsWorkerLifecycle(tmp_path)
+    second = NewsQueue(tmp_path, registry, lifecycle=new)
+    try:
+        before = new.path.read_bytes()
+        old.finish(failed=True)
+        assert new.path.read_bytes() == before
+        assert new.record['last_failure'] == failed['last_failure']
+        public = read_news_worker_lifecycle(tmp_path, snapshot_owner_id=None,
+                                           snapshot_at=None, now=datetime.now(UTC))
+        assert public['last_failure']['phase'] == 'acceptance_recovery'
+        assert public['last_failure']['reason'] == 'local_io'
+        assert public['last_failure']['current_owner'] is False
+    finally:
+        second.close()
+
+
+def test_last_failure_survives_a_clean_generation_as_historical_evidence(tmp_path):
+    first = NewsWorkerLifecycle(tmp_path)
+    first.started('a' * 32)
+    first.phase('acceptance_recovery', receipts_decoded=128)
+    first.finish(failed=True, error=OSError(errno.EIO, 'PRIVATE'))
+    failure = deepcopy(first.record['last_failure'])
+    second = NewsWorkerLifecycle(tmp_path)
+    second.started('b' * 32)
+    second.snapshot_written()
+    second.finish()
+    third = NewsWorkerLifecycle(tmp_path)
+    third.started('c' * 32)
+    result = read_news_worker_lifecycle(tmp_path, snapshot_owner_id=None,
+                                        snapshot_at=None, now=datetime.now(UTC))
+    assert third.record['last_failure'] == failure
+    assert result['last_failure']['current_owner'] is False
+    assert result['last_failure']['receipts_decoded'] == 128
+
+
+@pytest.mark.parametrize('error,phase,expected', [
+    (None, 'acceptance_recovery', 'unknown'),
+    (KeyboardInterrupt(), 'queue_initialization', 'interrupted'),
+    (PermissionError(errno.EACCES, 'PRIVATE'), 'acceptance_recovery', 'permission'),
+    (FileNotFoundError(errno.ENOENT, 'PRIVATE'), 'acceptance_recovery', 'missing_file'),
+    (OSError(errno.EIO, 'PRIVATE'), 'acceptance_recovery', 'local_io'),
+    (OSError(errno.ECONNRESET, 'PRIVATE'), 'snapshot_published', 'io_error'),
+    (json.JSONDecodeError('PRIVATE', '{', 0), 'acceptance_recovery', 'invalid_json'),
+    (ValueError('PRIVATE'), 'policy_reconciliation', 'validation'),
+    (RuntimeError('PRIVATE'), 'policy_reconciliation', 'unexpected'),
+])
+def test_public_failure_category_is_bounded_and_never_contains_exception_text(tmp_path, error, phase, expected):
+    lifecycle = NewsWorkerLifecycle(tmp_path)
+    lifecycle.started('b' * 32)
+    if phase == 'snapshot_published':
+        lifecycle.snapshot_written()
+    else:
+        lifecycle.phase(phase)
+    lifecycle.finish(failed=True, error=error)
+    value = read_news_worker_lifecycle(tmp_path, snapshot_owner_id=None,
+                                      snapshot_at=None, now=datetime.now(UTC))
+    assert value['last_failure']['reason'] == expected
+    assert value['last_failure']['phase'] == phase
+    assert value['last_failure']['current_owner'] is True
+    assert 'PRIVATE' not in json.dumps(value)
+
+
+def test_actual_sqlite_exception_is_identified_without_error_text(tmp_path):
+    connection = sqlite3.connect(':memory:')
+    try:
+        try:
+            connection.execute('SELECT * FROM intentionally_missing_fixture_table')
+        except sqlite3.Error as error:
+            lifecycle = NewsWorkerLifecycle(tmp_path)
+            lifecycle.started('b' * 32)
+            lifecycle.phase('queue_initialization')
+            lifecycle.finish(failed=True, error=error)
+    finally:
+        connection.close()
+    value = read_news_worker_lifecycle(tmp_path, snapshot_owner_id=None,
+                                      snapshot_at=None, now=datetime.now(UTC))
+    assert value['last_failure']['reason'] == 'local_database'
+    assert 'intentionally_missing_fixture_table' not in json.dumps(value)
+
+
+@pytest.mark.parametrize('change', [
+    {'contract_version': True}, {'contract_version': 2},
+    {'phase': 'PRIVATE_PHASE'}, {'phase': ['acceptance_recovery']},
+    {'reason': 'PRIVATE_REASON'}, {'reason': {'private': 'value'}},
+    {'observed_at_utc': '2020-01-01T00:00:00'},
+    {'observed_at_utc': '9999-01-01T00:00:00+00:00'},
+    {'receipts_decoded': -1}, {'receipts_decoded': True}, {'receipts_decoded': 2**63},
+])
+def test_malformed_last_failure_is_not_exposed_or_copied_to_new_owner(tmp_path, change):
+    lifecycle = NewsWorkerLifecycle(tmp_path)
+    lifecycle.started('a' * 32)
+    lifecycle.phase('acceptance_recovery', receipts_decoded=128)
+    lifecycle.finish(failed=True, error=OSError(errno.EIO, 'PRIVATE'))
+    record = deepcopy(lifecycle.record)
+    record['last_failure'].update(change)
+    atomic_write_json(lifecycle.path, record)
+    public = read_news_worker_lifecycle(tmp_path, snapshot_owner_id=None,
+                                       snapshot_at=None, now=datetime.now(UTC))
+    assert public['available'] and public['last_failure'] is None
+    assert 'PRIVATE' not in json.dumps(public)
+    new = NewsWorkerLifecycle(tmp_path)
+    new.started('b' * 32)
+    assert 'last_failure' not in new.record
+
+
+def test_deeply_nested_old_telemetry_cannot_block_new_owner_or_public_reader(tmp_path):
+    path = tmp_path / 'owner_lifecycle.json'
+    path.write_bytes(b'[' * 1500 + b']' * 1500)
+    public = read_news_worker_lifecycle(tmp_path, snapshot_owner_id=None,
+                                       snapshot_at=None, now=datetime.now(UTC))
+    assert public == {'contract_version': 1, 'available': False}
+    lifecycle = NewsWorkerLifecycle(tmp_path)
+    lifecycle.started('b' * 32)
+    assert lifecycle.record['state'] == 'initializing'
+    assert 'last_failure' not in lifecycle.record
+
+
+@pytest.mark.parametrize('change', [
+    {'owner_id': 'PRIVATE_OWNER'}, {'state': 'PRIVATE_STATE'},
+    {'phase': 'PRIVATE_PHASE'}, {'started_at_utc': '2020-01-01T00:00:00'},
+    {'updated_at_utc': '9999-01-01T00:00:00+00:00'},
+])
+def test_invalid_previous_owner_record_cannot_supply_failure_to_successor(tmp_path, change):
+    lifecycle = NewsWorkerLifecycle(tmp_path)
+    lifecycle.started('a' * 32)
+    lifecycle.phase('acceptance_recovery')
+    lifecycle.finish(failed=True, error=OSError(errno.EIO, 'PRIVATE'))
+    record = {**lifecycle.record, **change}
+    atomic_write_json(lifecycle.path, record)
+    successor = NewsWorkerLifecycle(tmp_path)
+    successor.started('b' * 32)
+    assert 'last_failure' not in successor.record
+
+
+def test_queue_cleanup_failure_is_recorded_while_lock_is_held(config, tmp_path, monkeypatch):
+    import downloader.news_fulltext_metadata_legacy as metadata
+    registry = PolicyRegistry(config, base=tmp_path)
+    lifecycle = NewsWorkerLifecycle(tmp_path)
+    queue = NewsQueue(tmp_path, registry, lifecycle=lifecycle)
+
+    def fail(_queue):
+        raise OSError(errno.EIO, 'PRIVATE_CLEANUP')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(metadata, 'close_scanner', fail)
+        with pytest.raises(OSError, match='PRIVATE_CLEANUP'):
+            queue.close()
+    failed = json.loads(lifecycle.path.read_bytes())
+    assert failed['state'] == 'failed' and failed['last_failure']['reason'] == 'io_error'
+    assert 'PRIVATE_CLEANUP' not in json.dumps(failed)
+    successor = NewsWorkerLifecycle(tmp_path)
+    with closing(NewsQueue(tmp_path, registry, lifecycle=successor)):
+        assert successor.record['last_failure'] == failed['last_failure']
+
+
+def test_cli_startup_failure_records_reason_and_releases_lock(config, tmp_path, monkeypatch):
+    from scripts import download_news_fulltext as cli
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, config)
+    original = NewsQueue.recover_acceptance
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EIO, 'PRIVATE_CLI_STARTUP')
+
+    monkeypatch.setattr(NewsQueue, 'recover_acceptance', fail)
+    with pytest.raises(OSError, match='PRIVATE_CLI_STARTUP'):
+        cli.main(['run', '--continuous', '--config', str(path), '--root', str(root), '--skip-local-ingest'])
+    failed = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    assert failed['state'] == 'failed'
+    assert failed['last_failure']['phase'] == 'acceptance_recovery'
+    assert failed['last_failure']['reason'] == 'local_io'
+    assert 'PRIVATE_CLI_STARTUP' not in json.dumps(failed)
+    monkeypatch.setattr(NewsQueue, 'recover_acceptance', original)
+    with closing(NewsQueue(root, PolicyRegistry(config, base=tmp_path))) as queue:
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+
+
+def test_cli_metric_exit_failure_closes_initialized_owner_before_reraise(config, tmp_path, monkeypatch):
+    from downloader.news_fulltext_metrics import NewsMetrics
+    from scripts import download_news_fulltext as cli
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, config)
+
+    class FailedOwnerMetric(NewsMetrics):
+        def measure(self, name, *args, **kwargs):
+            if name != 'owner_initialization':
+                return super().measure(name, *args, **kwargs)
+
+            @contextmanager
+            def fail_on_exit():
+                yield
+                raise RuntimeError('PRIVATE_METRIC_EXIT')
+            return fail_on_exit()
+
+    monkeypatch.setattr(cli, 'NewsMetrics', FailedOwnerMetric)
+    with pytest.raises(RuntimeError, match='PRIVATE_METRIC_EXIT'):
+        cli.main(['run', '--continuous', '--config', str(path), '--root', str(root), '--skip-local-ingest'])
+    failed = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    assert failed['state'] == 'failed' and failed['last_failure']['reason'] == 'unexpected'
+    assert 'PRIVATE_METRIC_EXIT' not in json.dumps(failed)
+    with closing(NewsQueue(root, PolicyRegistry(config, base=tmp_path))) as queue:
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+
+
+def test_cli_failure_then_new_owner_publishes_snapshot_with_prior_failure(config, tmp_path, monkeypatch, capsys):
+    from scripts import download_news_fulltext as cli
+    from test_news_fulltext import http_fixture
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, config)
+    original = NewsQueue.recover_acceptance
+
+    def fail(*args, **kwargs):
+        raise OSError(errno.EIO, 'PRIVATE_FIRST_OWNER')
+
+    monkeypatch.setattr(NewsQueue, 'recover_acceptance', fail)
+    args = ['run', '--continuous', '--config', str(path), '--root', str(root), '--skip-local-ingest']
+    with pytest.raises(OSError, match='PRIVATE_FIRST_OWNER'):
+        cli.main(args)
+    first = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    monkeypatch.setattr(NewsQueue, 'recover_acceptance', original)
+    http, session = http_fixture(config, tmp_path, {})
+    monkeypatch.setattr(cli, 'NewsHTTP', lambda *args: http)
+    captured = []
+
+    def service(queue, _http, _config, **_kwargs):
+        result = queue.status(activity='running')
+        observed = read_news_worker_lifecycle(root, snapshot_owner_id=queue.owner,
+                                              snapshot_at=None, now=datetime.now(UTC))
+        captured.append(observed)
+        return result
+
+    monkeypatch.setattr(cli, 'run_service', service)
+    assert cli.main(args) == 0
+    assert captured[0]['state'] == 'ready' and captured[0]['snapshot_owner_matches']
+    assert captured[0]['last_failure']['reason'] == 'local_io'
+    assert captured[0]['last_failure']['current_owner'] is False
+    last = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    assert last['state'] == 'closed' and last['last_failure'] == first['last_failure']
+    assert not session.calls
+    assert 'PRIVATE_FIRST_OWNER' not in json.dumps(last)
+    capsys.readouterr()
+
+
+@pytest.mark.parametrize('width', [320, 1280])
+def test_previous_failure_is_visible_as_history_without_exposing_error_text(tmp_path, browser, width):
+    from test_news_dashboard import _server
+    status = _seed(tmp_path, now=datetime.now(UTC) - timedelta(seconds=10))
+    status.update(owner_id='a' * 32, activity='stopped')
+    _save(tmp_path, status)
+    previous = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    previous.started('b' * 32)
+    previous.phase('acceptance_recovery', receipts_decoded=128)
+    previous.finish(failed=True, error=OSError(errno.EIO, 'PRIVATE_EXCEPTION_PATH'))
+    current = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    current.started('c' * 32)
+    current.phase('acceptance_recovery', receipts_decoded=64)
+    result = build_news_public_status(tmp_path)
+    assert result['health'] == 'initializing'
+    assert result['worker']['lifecycle']['last_failure']['current_owner'] is False
+    assert result['worker']['lifecycle']['last_failure']['receipts_decoded'] == 128
+    assert 'PRIVATE_EXCEPTION_PATH' not in json.dumps(result)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f'http://127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': width, 'height': 900})
+    remote, errors = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(origin) else None)
+    try:
+        page.goto(origin + '/news/', wait_until='domcontentloaded', timeout=15000)
+        page.locator('#news-health').get_by_text('啟動中').wait_for(timeout=10000)
+        freshness = page.locator('#news-freshness').text_content()
+        assert '上次失敗' in freshness and '收據恢復' in freshness and '本機 I/O' in freshness
+        assert 'PRIVATE_EXCEPTION_PATH' not in page.content()
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        current.snapshot_written()
+        status.update(owner_id='c' * 32, activity='running', updated_at_utc=datetime.now(UTC).isoformat())
+        _save(tmp_path, status)
+        page.evaluate('refresh()')
+        page.locator('#news-health').get_by_text('正在抓取').wait_for(timeout=10000)
+        assert '上次失敗' in page.locator('#news-freshness').text_content()
+        assert not remote and not errors
+    finally:
+        page.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_older_unrelated_owner_failure_is_not_shown_for_newer_snapshot(tmp_path, browser):
+    from test_news_dashboard import _server
+    status = _seed(tmp_path, now=datetime.now(UTC) - timedelta(seconds=10))
+    previous = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    previous.started('b' * 32)
+    previous.phase('acceptance_recovery')
+    previous.finish(failed=True, error=OSError(errno.EIO, 'PRIVATE_EXCEPTION_PATH'))
+    status.update(owner_id='a' * 32, activity='running',
+                  updated_at_utc=(datetime.now(UTC) + timedelta(seconds=1)).isoformat())
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path)
+    assert result['health'] == 'running'
+    assert not result['worker']['lifecycle']['supersedes_snapshot']
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    origin = f'http://127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 320, 'height': 900})
+    try:
+        page.goto(origin + '/news/', wait_until='domcontentloaded', timeout=15000)
+        page.locator('#news-health').get_by_text('正在抓取').wait_for(timeout=10000)
+        assert '失敗' not in page.locator('#news-freshness').text_content()
+        assert 'PRIVATE_EXCEPTION_PATH' not in page.content()
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+    finally:
+        page.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
 def test_actual_generation_proves_startup_without_promoting_old_counts_or_speed(tmp_path):
     old, lifecycle = seed(tmp_path)
     lifecycle.phase('acceptance_recovery', receipts_decoded=128)
@@ -70,6 +427,203 @@ def test_long_startup_is_progress_stale_not_stopped_or_live_forecast(tmp_path):
     assert result['health'] == 'initializing_stale' and result['worker']['lifecycle']['process_alive']
     assert result['acquisition']['stored_body_articles'] == 2
     assert result['acquisition']['eligible_eta_seconds'] is None
+
+
+@pytest.mark.parametrize('case,expected', [
+    ('waiting', 'waiting_local_database'),
+    ('stale_wait', 'waiting_local_database_stale'),
+    ('old_snapshot', 'waiting_local_database'),
+    ('finished', 'waiting_local_snapshot'),
+    ('dead', 'stopped'),
+    ('new_snapshot', 'running'),
+    ('superseding_owner', 'waiting_local_database'),
+    ('older_unrelated_owner', 'running'),
+])
+def test_local_sqlite_observation_does_not_promote_old_snapshot_or_wrong_owner(tmp_path, monkeypatch, case, expected):
+    now = datetime.now(UTC)
+    status = _seed(tmp_path, now=now - timedelta(seconds=300 if case == 'old_snapshot' else 1))
+    status.update(owner_id='a' * 32, activity='running')
+    _save(tmp_path, status)
+    lifecycle = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    lifecycle.started('b' * 32 if case in {'superseding_owner', 'older_unrelated_owner'} else 'a' * 32)
+    lifecycle.snapshot_written()
+    lifecycle.phase('local_sqlite_retry_finished' if case == 'finished' else 'waiting_local_sqlite')
+    if case == 'dead':
+        monkeypatch.setattr('stockagent.data.news_worker_lifecycle.process_owner_alive', lambda *a, **k: False)
+    if case in {'new_snapshot', 'older_unrelated_owner'}:
+        status['updated_at_utc'] = (datetime.fromisoformat(lifecycle.record['updated_at_utc'])
+                                    + timedelta(seconds=1)).isoformat()
+        _save(tmp_path, status)
+    observed = datetime.now(UTC) + timedelta(seconds=46 if case == 'stale_wait' else 0)
+    result = build_news_public_status(tmp_path, now=observed)
+    assert result['health'] == expected
+    assert result['worker']['local_sqlite_wait_max_age_seconds'] == 45
+    assert result['acquisition']['stored_body_articles'] == 2
+    if expected != 'running':
+        assert not result['worker']['fresh']
+        assert result['acquisition']['eligible_eta_seconds'] is None
+        assert all(row['conditional_eta_seconds'] is None for row in result['providers'])
+    if case == 'superseding_owner':
+        assert result['worker']['lifecycle']['supersedes_snapshot']
+        assert result['worker']['requests'] is None
+    if case == 'older_unrelated_owner':
+        assert not result['worker']['lifecycle']['supersedes_snapshot']
+
+
+@pytest.mark.parametrize('width', [1280, 320])
+def test_local_sqlite_wait_page_shows_observation_and_recovers_after_new_snapshot(tmp_path, browser, width):
+    from test_news_dashboard import _server
+    status = _seed(tmp_path, now=datetime.now(UTC) - timedelta(seconds=1))
+    status.update(owner_id='a' * 32, activity='running')
+    _save(tmp_path, status)
+    lifecycle = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    lifecycle.started('a' * 32)
+    lifecycle.snapshot_written()
+    lifecycle.phase('waiting_local_sqlite')
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': width, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+    try:
+        page.goto(base + '/news/', wait_until='domcontentloaded', timeout=15000)
+        page.locator('#news-health').get_by_text('等待本機資料庫寫入鎖').wait_for(timeout=10000)
+        assert '不是網站限流' in page.locator('#capture-next').text_content()
+        assert '數量沿用來源快照' in page.locator('#news-freshness').text_content()
+        assert page.locator('#eligible-eta').text_content() == '目前階段暫無有效估時'
+        assert page.locator('#capture-rate').text_content() == '等待有效量測'
+        assert page.evaluate('!currentSnapshot(state.latest) && !live(state.latest)')
+        assert page.evaluate('document.documentElement.scrollWidth <= innerWidth')
+        lifecycle.phase('local_sqlite_retry_finished')
+        page.evaluate('refresh()')
+        page.locator('#news-health').get_by_text('本機重試已結束，等待新快照').wait_for(timeout=10000)
+        assert '不能據此判定正文提交成功' in page.locator('#capture-next').text_content()
+        status['updated_at_utc'] = datetime.now(UTC).isoformat()
+        _save(tmp_path, status)
+        lifecycle.snapshot_written()
+        page.evaluate('refresh()')
+        page.locator('#news-health').get_by_text('正在抓取').wait_for(timeout=10000)
+        assert not remote and not errors
+    finally:
+        page.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_browser_withdraws_old_local_lock_observation_before_slow_refresh(tmp_path, browser):
+    from test_news_dashboard import _server
+    status = _seed(tmp_path, now=datetime.now(UTC) - timedelta(seconds=1))
+    status.update(owner_id='a' * 32, activity='running')
+    _save(tmp_path, status)
+    lifecycle = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    lifecycle.started('a' * 32)
+    lifecycle.snapshot_written()
+    lifecycle.phase('waiting_local_sqlite')
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 390, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+    try:
+        page.goto(base + '/news/', wait_until='domcontentloaded', timeout=15000)
+        page.locator('#news-health').get_by_text('等待本機資料庫寫入鎖').wait_for(timeout=10000)
+        page.evaluate('''() => {
+          state.latest.worker.lifecycle.observed_at_utc = new Date(Date.now() - 46000).toISOString();
+          window.fetch = () => new Promise(() => {});
+          refresh();
+        }''')
+        page.locator('#news-health').get_by_text('本機鎖定觀測已過期').wait_for(timeout=10000)
+        assert '現在是否仍在等待尚未確認' in page.locator('#capture-next').text_content()
+        assert page.locator('#eligible-eta').text_content() == '目前階段暫無有效估時'
+        assert not remote and not errors
+    finally:
+        page.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_browser_expires_local_lock_observation_during_slow_refresh(tmp_path, browser):
+    from test_news_dashboard import _server
+    status = _seed(tmp_path, now=datetime.now(UTC) - timedelta(seconds=1))
+    status.update(owner_id='a' * 32, activity='running')
+    _save(tmp_path, status)
+    lifecycle = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    lifecycle.started('a' * 32)
+    lifecycle.snapshot_written()
+    lifecycle.phase('waiting_local_sqlite')
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 390, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+    try:
+        page.goto(base + '/news/', wait_until='domcontentloaded', timeout=15000)
+        page.locator('#news-health').get_by_text('等待本機資料庫寫入鎖').wait_for(timeout=10000)
+        page.evaluate('''() => {
+          state.latest.worker.lifecycle.observed_at_utc = new Date(Date.now() - 44900).toISOString();
+          render(state.latest);
+          window.fetch = () => new Promise(() => {});
+          void refresh();
+        }''')
+        assert page.evaluate('state.inFlight')
+        page.locator('#news-health').get_by_text('本機鎖定觀測已過期').wait_for(timeout=2500)
+        assert '現在是否仍在等待尚未確認' in page.locator('#capture-next').text_content()
+        assert page.locator('#eligible-eta').text_content() == '目前階段暫無有效估時'
+        assert not remote and not errors
+    finally:
+        page.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_browser_local_lock_expiry_respects_new_snapshot_and_valid_server_ttl(tmp_path, browser):
+    from test_news_dashboard import _server
+    status = _seed(tmp_path, now=datetime.now(UTC) - timedelta(seconds=1))
+    status.update(owner_id='a' * 32, activity='running')
+    _save(tmp_path, status)
+    lifecycle = NewsWorkerLifecycle(tmp_path / 'data_news_fulltext')
+    lifecycle.started('a' * 32)
+    lifecycle.snapshot_written()
+    lifecycle.phase('waiting_local_sqlite')
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    page = browser.new_page(viewport={'width': 390, 'height': 900})
+    errors, remote = [], []
+    page.on('pageerror', lambda error: errors.append(str(error)))
+    page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+    try:
+        page.goto(base + '/news/', wait_until='domcontentloaded', timeout=15000)
+        page.locator('#news-health').get_by_text('等待本機資料庫寫入鎖').wait_for(timeout=10000)
+        page.evaluate('''() => {
+          const older = structuredClone(state.latest);
+          older.worker.lifecycle.observed_at_utc = new Date(Date.now() - 44900).toISOString();
+          render(older);
+          const newer = structuredClone(older);
+          newer.worker.lifecycle.observed_at_utc = new Date().toISOString();
+          render(newer);
+        }''')
+        page.wait_for_timeout(350)
+        assert page.evaluate('state.latest.health') == 'waiting_local_database'
+        assert page.evaluate('''() => {
+          const valid = structuredClone(state.latest);
+          return [null, 0, 3601, "45"].every(ttl => {
+            const invalid = structuredClone(valid);
+            invalid.worker.local_sqlite_wait_max_age_seconds = ttl;
+            return render(invalid).health === "waiting_local_database_stale";
+          });
+        }''')
+        assert not remote and not errors
+    finally:
+        page.close()
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
 
 
 def test_initialization_keeps_old_manifest_counts_but_never_its_forecast(tmp_path):
@@ -255,7 +809,9 @@ def test_metadata_feed_card_distinguishes_stopped_stale_and_running(tmp_path, br
                   updated_at_utc=(now - timedelta(seconds=181) if mode != 'running' else now).isoformat())
     status['providers']['ltn']['metadata_feed_progress'].update(
         last_check_at_utc=(now - timedelta(minutes=5)).isoformat(),
-        next_check_at_utc=(now - timedelta(seconds=1)).isoformat())
+        next_check_at_utc=(now - timedelta(seconds=1)).isoformat(),
+        checkpoint_contract_version=1, pending_recovery_feeds=1, pending_recovery_originals=2,
+        local_recovery_ready=False, next_local_recovery_at_utc=(now - timedelta(seconds=1)).isoformat())
     if mode == 'stopped':
         status['provider_next_attempt_utc']['ltn'] = (now + timedelta(minutes=30)).isoformat()
     observed = datetime.fromisoformat(status['updated_at_utc'])
@@ -301,6 +857,10 @@ def test_metadata_feed_card_distinguishes_stopped_stale_and_running(tmp_path, br
         card = required_provider_card(page, 'ltn')
         feed = card.locator('[data-news-metadata-feed]')
         expect(feed).to_have_count(1)
+        expect(feed).to_contain_text('本機待恢復 2 筆原件、1 個端點')
+        expect(feed).to_contain_text('已到恢復時間，等待下載器處理')
+        if mode != 'running':
+            expect(feed).to_contain_text('上次快照：本機待恢復')
         if mode == 'stopped':
             expect(card).to_contain_text('下載器已停止')
             expect(feed).to_contain_text('下載器顯示已停止，恢復服務後才會繼續')
@@ -452,3 +1012,144 @@ def test_cli_failure_marks_failed_and_releases_canonical_lock(config, tmp_path, 
     assert not session.calls
     with closing(NewsQueue(root, PolicyRegistry(config, base=tmp_path))) as queue:
         assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('secondary', ['status', 'http', 'queue', 'all'])
+def test_cli_preserves_primary_failure_when_reporting_or_cleanup_also_fails(config, tmp_path, monkeypatch, secondary):
+    import downloader.news_fulltext_metadata_legacy as metadata
+    from scripts import download_news_fulltext as cli
+    from test_news_fulltext import http_fixture
+
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, config)
+    http, session = http_fixture(config, tmp_path, {})
+    original_status = NewsQueue.status
+    failures = {'status', 'http', 'queue'} if secondary == 'all' else {secondary}
+
+    def fail_service(*args, **kwargs):
+        raise RuntimeError('PRIVATE_PRIMARY')
+
+    def status(queue, *args, **kwargs):
+        if kwargs.get('activity') == 'interrupted' and 'status' in failures:
+            raise OSError(errno.EIO, 'PRIVATE_STATUS')
+        return original_status(queue, *args, **kwargs)
+
+    def fail_http():
+        raise OSError(errno.EIO, 'PRIVATE_HTTP')
+
+    def fail_queue(_queue):
+        raise PermissionError('PRIVATE_QUEUE')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(cli, 'NewsHTTP', lambda *args: http)
+        patch.setattr(cli, 'run_service', fail_service)
+        patch.setattr(NewsQueue, 'status', status)
+        if 'http' in failures:
+            patch.setattr(http, 'close', fail_http)
+        if 'queue' in failures:
+            patch.setattr(metadata, 'close_scanner', fail_queue)
+        with pytest.raises(RuntimeError, match='PRIVATE_PRIMARY') as caught:
+            cli.main(['run', '--continuous', '--config', str(path), '--root', str(root), '--skip-local-ingest'])
+    notes = '\n'.join(getattr(caught.value, '__notes__', []))
+    for step in failures:
+        assert step in notes
+    assert 'PRIVATE_' not in notes
+    saved = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    assert saved['state'] == 'failed' and saved['last_failure']['reason'] == 'unexpected'
+    assert 'PRIVATE_' not in json.dumps(saved)
+    assert not session.calls
+    with closing(NewsQueue(root, PolicyRegistry(config, base=tmp_path))) as queue:
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+
+
+def test_cli_reports_cleanup_failure_on_otherwise_successful_service(config, tmp_path, monkeypatch, capsys):
+    from scripts import download_news_fulltext as cli
+    from test_news_fulltext import http_fixture
+
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, config)
+    http, session = http_fixture(config, tmp_path, {})
+
+    def fail_http():
+        raise OSError(errno.EIO, 'PRIVATE_HTTP_CLOSE')
+
+    monkeypatch.setattr(cli, 'NewsHTTP', lambda *args: http)
+    monkeypatch.setattr(http, 'close', fail_http)
+    monkeypatch.setattr(cli, 'run_service', lambda queue, *_args, **_kwargs: queue.status(activity='running'))
+    with pytest.raises(OSError, match='PRIVATE_HTTP_CLOSE'):
+        cli.main(['run', '--continuous', '--config', str(path), '--root', str(root), '--skip-local-ingest'])
+    saved = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    assert saved['state'] == 'failed' and saved['last_failure']['reason'] == 'io_error'
+    assert 'PRIVATE_HTTP_CLOSE' not in json.dumps(saved)
+    assert not session.calls
+    with closing(NewsQueue(root, PolicyRegistry(config, base=tmp_path))) as queue:
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+    capsys.readouterr()
+
+
+def test_cli_closes_resources_when_signal_restore_fails(config, tmp_path, monkeypatch, capsys):
+    import signal
+    from scripts import download_news_fulltext as cli
+    from test_news_fulltext import http_fixture
+
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, config)
+    http, session = http_fixture(config, tmp_path, {})
+    original_signal = signal.signal
+    original_handlers = {sig: signal.getsignal(sig) for sig in (signal.SIGTERM, signal.SIGINT)}
+    calls, closed = [], []
+
+    def fail_first_restore(sig, handler):
+        calls.append(sig)
+        prior = original_signal(sig, handler)
+        if len(calls) == 3:
+            raise OSError(errno.EIO, 'PRIVATE_SIGNAL_RESTORE')
+        return prior
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(cli, 'NewsHTTP', lambda *args: http)
+            patch.setattr(cli, 'run_service', lambda queue, *_args, **_kwargs: queue.status(activity='running'))
+            patch.setattr(http, 'close', lambda: closed.append(True))
+            patch.setattr(signal, 'signal', fail_first_restore)
+            with pytest.raises(OSError, match='PRIVATE_SIGNAL_RESTORE'):
+                cli.main(['run', '--continuous', '--config', str(path), '--root', str(root), '--skip-local-ingest'])
+        assert len(calls) == 4 and closed == [True]
+        assert all(signal.getsignal(sig) == handler for sig, handler in original_handlers.items())
+    finally:
+        for sig, handler in original_handlers.items():
+            original_signal(sig, handler)
+    saved = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    assert saved['state'] == 'failed' and saved['last_failure']['reason'] == 'io_error'
+    assert 'PRIVATE_SIGNAL_RESTORE' not in json.dumps(saved)
+    assert not session.calls
+    with closing(NewsQueue(root, PolicyRegistry(config, base=tmp_path))) as queue:
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+    capsys.readouterr()
+
+
+def test_cli_http_initialization_failure_releases_both_owner_locks(config, tmp_path, monkeypatch):
+    from downloader.news_fulltext_http import NewsHTTP
+    from scripts import download_news_fulltext as cli
+    from test_news_fulltext import FakeLimiter
+
+    exclusive = deepcopy(config)
+    exclusive['exclusive_http_owner'] = True
+    path, root = tmp_path / 'config.json', tmp_path / 'queue'
+    atomic_write_json(path, exclusive)
+
+    def fail_http_init(_http):
+        raise OSError(errno.EIO, 'PRIVATE_HTTP_INITIALIZATION')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(NewsHTTP, '_restore_robots_policy_pauses', fail_http_init)
+        with pytest.raises(OSError, match='PRIVATE_HTTP_INITIALIZATION') as caught:
+            cli.main(['run', '--continuous', '--config', str(path), '--root', str(root), '--skip-local-ingest'])
+    assert caught.traceback is not None
+    saved = json.loads((root / 'owner_lifecycle.json').read_bytes())
+    assert saved['state'] == 'failed' and saved['last_failure']['reason'] == 'io_error'
+    assert 'PRIVATE_HTTP_INITIALIZATION' not in json.dumps(saved)
+    registry = PolicyRegistry(exclusive, base=tmp_path)
+    with closing(NewsQueue(root, registry)):
+        successor = NewsHTTP(registry, exclusive, root, limiter_factory=FakeLimiter)
+        successor.close()

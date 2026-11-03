@@ -227,7 +227,8 @@ def test_actual_queue_final_page_failure_projects_until_success(queue, tmp_path)
 
 
 @pytest.mark.parametrize('state,failed,expected', [
-    ('waiting', 2, 'partial_page_waiting'), ('rechecking', 1, 'partial_page_rechecking'),
+    ('waiting', 2, 'partial_page_waiting'), ('waiting', 130, 'partial_page_waiting'),
+    ('rechecking', 1, 'partial_page_rechecking'),
     ('unknown', None, 'partial_page_scope_unknown'), ('none_observed', 0, 'recent_measured'),
 ])
 def test_partial_page_failure_is_projected_without_exposing_a_url(tmp_path, state, failed, expected):
@@ -239,6 +240,7 @@ def test_partial_page_failure_is_projected_without_exposing_a_url(tmp_path, stat
     result = cnyes(save(tmp_path, status))['manifest_phase_progress']
     assert result['forecast']['state'] == expected
     assert result['source_gate']['state'] == 'clear'
+    assert result['partial_page_gate']['failed_pages'] == failed
     if state != 'none_observed':
         assert result['forecast']['middle_finish_at_utc'] is None
     assert 'PRIVATE_PARTIAL_PAGE' not in str(result)
@@ -273,7 +275,8 @@ def test_malformed_partial_gate_never_becomes_a_ready_forecast(tmp_path, change)
     assert result['forecast']['middle_finish_at_utc'] is None
 
 
-def test_real_multi_page_failure_drives_public_status_without_hiding_healthy_work(queue, tmp_path):
+@pytest.mark.parametrize('error', ['cnyes_index_unverified_metadata', 'cnyes_index_original_receipt_unverified'])
+def test_real_multi_page_failure_drives_public_status_without_hiding_healthy_work(queue, tmp_path, error):
     from datetime import datetime, timezone
     from downloader.artifact_io import atomic_write_json
     from downloader.news_fulltext import fail_discovery
@@ -289,7 +292,7 @@ def test_real_multi_page_failure_drives_public_status_without_hiding_healthy_wor
     for number in range(1, 13):
         page(queue, number=number, total=450)
     failed, healthy = register(queue, page=13), register(queue, page=15)
-    fail_discovery(queue, failed, NewsError('cnyes_index_unverified_metadata', retry=True, delay=3600))
+    fail_discovery(queue, failed, NewsError(error, retry=True, delay=3600))
     source = queue.registry.sources['cnyes']
 
     def render(epoch):

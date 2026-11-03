@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 import pickle
 import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -106,6 +107,37 @@ def test_normal_append_indexes_only_new_lines(tmp_path, monkeypatch):
         stream.write(json.dumps({"session_date": DAY, "value": 2}) + "\n")
     assert [row["value"] for row in _read(path)] == [1, 2]
     assert scanned == [2]
+
+
+def test_slow_index_does_not_block_another_source_but_same_source_is_single_flight(tmp_path, monkeypatch):
+    slow, fast = tmp_path / "slow.jsonl", tmp_path / "fast.jsonl"
+    _write(slow, [{"session_date": DAY, "value": "slow"}])
+    _write(fast, [{"session_date": DAY, "value": "fast"}])
+    entered, release = threading.Event(), threading.Event()
+    original = dashboard._ledger_line_session_date
+    slow_scans = []
+
+    def controlled(line, **kwargs):
+        if json.loads(line).get("value") == "slow":
+            slow_scans.append(1)
+            entered.set()
+            if not release.wait(timeout=15):
+                raise TimeoutError("slow index test was not released")
+        return original(line, **kwargs)
+
+    monkeypatch.setattr(dashboard, "_ledger_line_session_date", controlled)
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        first = pool.submit(dashboard._ledger_session_index, slow)
+        try:
+            assert entered.wait(timeout=5)
+            independent = pool.submit(dashboard._ledger_session_index, fast)
+            follower = pool.submit(dashboard._ledger_session_index, slow)
+            assert DAY in independent.result(timeout=8).spans
+            assert not follower.done()
+        finally:
+            release.set()
+        assert first.result(timeout=8) is follower.result(timeout=8)
+    assert slow_scans == [1]
 
 
 def test_oversized_cache_entry_keeps_complete_rows_and_index_observation(tmp_path, monkeypatch):

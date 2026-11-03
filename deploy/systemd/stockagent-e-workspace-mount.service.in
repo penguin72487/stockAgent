@@ -1,0 +1,15 @@
+[Unit]
+Description=Attach E NVMe data workspace; C services and D cold authority remain unchanged
+After=local-fs.target
+Before=stockagent-storage-lifecycle.service stockagent-backup-transport-mount.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash -c 'source __REPO_ROOT__/scripts/runtime_env.sh && run_fintech_python __REPO_ROOT__/scripts/manage_workspace_volume.py mount'
+TimeoutStartSec=150
+# Never force-unmount an active data filesystem when this unit stops.
+
+[Install]
+WantedBy=multi-user.target

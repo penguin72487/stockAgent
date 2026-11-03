@@ -7,11 +7,13 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 
+from bs4 import BeautifulSoup
 import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_json, sha256_file
@@ -23,7 +25,31 @@ from scripts.benchmark_cnyes_acquisition import verify_batches
 from stockagent.data.news_source_catalog import configuration_paths
 
 
-CONTRACT_VERSION = 11
+CONTRACT_VERSION = 12
+
+
+def _legacy_globalvoices_direct_html(record, url):
+    """Identify old row-owned bytes without fabricating a transport URL.
+
+    This compatibility path is limited to the observed pre-reference HTML
+    schema. The normal committed-batch verifier still checks the receipt,
+    entire batch, body and original response before an audit is accepted.
+    """
+    if (record.get('provider') != 'globalvoices'
+            or record.get('extraction_method') != 'css:.post-container .entry'
+            or 'source_response_article_id' in record or 'source_request_url' in record
+            or record.get('requested_url') != url or record.get('final_url') != url
+            or record.get('article_id') != hashlib.sha256(url.encode()).hexdigest()):
+        raise ValueError('legacy_html_response_reference_unverified')
+    raw, digest = record.get('raw_response_body'), record.get('response_sha256')
+    if not isinstance(raw, bytes) or not raw or not isinstance(digest, str) or hashlib.sha256(raw).hexdigest() != digest:
+        raise ValueError('legacy_html_raw_digest_unverified')
+    soup = BeautifulSoup(raw, 'lxml')
+    canonical = [node.get('href') for node in soup.select('link[rel~="canonical"]')]
+    og_url = [node.get('content') for node in soup.select('meta[property="og:url"]')]
+    if canonical != [url] or og_url != [url]:
+        raise ValueError('legacy_html_publisher_identity_unverified')
+    return raw
 
 
 def _replay_feed_envelope(payload, request_url, registry, source, *, body_contract_version=1):
@@ -48,9 +74,11 @@ def _replay_feed_envelope(payload, request_url, registry, source, *, body_contra
     return indexed, {error.get('url') for error in errors}
 
 
-def audit(root: Path, urls: list[str], *, registry=None) -> dict:
+def audit(root: Path, urls: list[str], *, registry=None, include_retained_heads=False) -> dict:
     if not 1 <= len(urls) <= 16:
         raise ValueError("one to sixteen explicitly selected URLs required")
+    if type(include_retained_heads) is not bool:
+        raise ValueError("include_retained_heads must be a boolean")
     urls = list(dict.fromkeys(normalize_url(url) for url in urls))
     db = sqlite3.connect(f"file:{(root / 'queue.sqlite3').resolve()}?mode=ro", uri=True)
     db.row_factory = sqlite3.Row
@@ -60,11 +88,16 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                   "publish": False, "remote_training_export": False,
                   "all_history_complete": False, "scope": "explicit selected durable heads, not source history",
                   "current_source_replay_requested": registry is not None}
+        if include_retained_heads:
+            result.update(retained_audit_contract_version=1,
+                          scope="explicit selected retained body pointers and immutable batches; not current source identity or complete history")
         batches = defaultdict(list)
+        replay_errors = 0
         for url in urls:
-            row = db.execute("SELECT id,provider,state,body_sha256,parquet_path,captured_at_utc "
+            row = db.execute("SELECT id,provider,state,body_sha256,parquet_path,captured_at_utc,last_checked_at_utc "
                              "FROM articles WHERE url=?", (url,)).fetchone()
-            if row is None or row["state"] != "complete" or not row["body_sha256"]:
+            if (row is None or not row["body_sha256"]
+                    or (not include_retained_heads and row["state"] != "complete")):
                 result["errors"].append({"url": url, "error": "selected_body_not_complete",
                                          "state": row["state"] if row else "not_registered"})
                 continue
@@ -89,12 +122,20 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                             "published_time_basis", "modified_at_raw", "authors_json", "author_attribution_detail_json", "data_fingerprint",
                             "article_identity_basis", "declared_canonical_url", "extraction_method", "response_sha256", "license_verification_basis",
                             "per_article_license_verified", "declared_license_urls_json", *FEED_BODY_PROVENANCE_FIELDS)}}
+                    if include_retained_heads:
+                        item.update(head_last_checked_at_utc=row["last_checked_at_utc"],
+                                    current_head_state_is_complete=row["state"] == "complete")
                     if registry is not None:
                         try:
                             source = registry.require(record["final_url"])
                             if source.provider != row["provider"]:
                                 raise ValueError("selected_head_source_mismatch")
-                            payload = envelopes[record["source_response_article_id"]]
+                            if record.get('source_response_article_id') is None:
+                                payload = _legacy_globalvoices_direct_html(record, url)
+                                item.update(response_reference_basis='legacy_own_raw_publisher_identity_v1',
+                                            original_transport_request_verified=False)
+                            else:
+                                payload = envelopes[record['source_response_article_id']]
                             if record.get('extraction_method') == 'cnyes_api_content_v1':
                                 # The retained source is a publisher JSON page, not
                                 # HTML at final_url. Replay its registered parser;
@@ -140,8 +181,22 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                                     raise ValueError("canonical_resolution_source_replay_mismatch")
                                 item.update(canonical_resolution_source_replay_verified=True,
                                             canonical_resolution_evidence=evidence)
-                            if (any(replay.get(k) != record.get(k) for k in ("body_sha256", "title", "published_at_raw", "modified_at_raw", "declared_canonical_url", "source_title_declarations_json"))
-                                    or json.loads(replay["authors_json"]) != json.loads(record["authors_json"])):
+                            replay_mismatches = [k for k in ("body_sha256", "title", "published_at_raw", "modified_at_raw", "declared_canonical_url", "source_title_declarations_json")
+                                                 if replay.get(k) != record.get(k)]
+                            current_authors = json.loads(replay["authors_json"])
+                            retained_authors = json.loads(record["authors_json"])
+                            if current_authors != retained_authors:
+                                replay_mismatches.append("authors_json")
+                                if (item.get('response_reference_basis') == 'legacy_own_raw_publisher_identity_v1'
+                                        and type(current_authors) is list and type(retained_authors) is list
+                                        and all(isinstance(name, str) for name in current_authors + retained_authors)):
+                                    item['legacy_authors_match_after_ordered_deduplication'] = (
+                                        list(dict.fromkeys(retained_authors)) == list(dict.fromkeys(current_authors)))
+                            if replay_mismatches:
+                                # Preserve the exact-match contract. In particular,
+                                # a historical duplicate is a useful diagnostic,
+                                # not an exact replay and not a rewrite of bylines.
+                                item['current_source_replay_mismatch_fields'] = replay_mismatches
                                 raise ValueError("current_source_replay_changed_body_title_author_or_clock")
                             if replay.get('verified_article_notices_json') != record.get('verified_article_notices_json'):
                                 raise ValueError('current_source_replay_changed_verified_article_notices')
@@ -158,6 +213,7 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                                         capture_contract_matches_current_source=record.get("data_fingerprint") == source.data_fingerprint)
                         except (NewsError, ValueError, KeyError, TypeError) as error:
                             item["current_source_replay_verified"] = False
+                            replay_errors += 1
                             result["errors"].append({"url": url, "error": error.code if isinstance(error, NewsError) else str(error)[:160]})
                     result["articles"].append(item)
             except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
@@ -170,8 +226,26 @@ def audit(root: Path, urls: list[str], *, registry=None) -> dict:
                     head_ids={row["id"] for selected in batches.values() for _, row in selected})
             except (OSError, ValueError, KeyError, TypeError, IndexError) as error:
                 result["errors"].append({"error": "selected_batch_not_verified", "type": type(error).__name__})
-        result["accepted"] = (not result["errors"] and len(result["articles"]) == len(urls)
-                              and result.get("batch_proof", {}).get("accepted", False))
+        verified = (not result["errors"] and len(result["articles"]) == len(urls)
+                    and result.get("batch_proof", {}).get("accepted", False))
+        if include_retained_heads:
+            # Parser drift is a separate finding from immutable storage damage.
+            storage_verified = (len(result["errors"]) == replay_errors and len(result["articles"]) == len(urls)
+                                and result.get("batch_proof", {}).get("accepted", False))
+            result["retained_versions_verified"] = storage_verified
+            result["retained_current_parser_replay_verified"] = (None if registry is None else
+                storage_verified and replay_errors == 0 and all(
+                    item.get("current_source_replay_verified") is True for item in result["articles"]))
+            result["current_head_completion_verified"] = verified and all(
+                item["current_head_state_is_complete"] for item in result["articles"])
+            # Replaying a retained envelope, even with today's parser, is not a
+            # fresh publisher observation and cannot resolve a current failure.
+            result["current_source_identity_verified"] = False
+            # Keep the existing accepted contract: a non-complete head never
+            # becomes accepted merely because its older bytes remain valid.
+            result["accepted"] = result["current_head_completion_verified"]
+        else:
+            result["accepted"] = verified
         result["verified_at_utc"] = utc_now()
         return result
     finally:
@@ -183,17 +257,22 @@ def main(argv=None):
     parser.add_argument("--config", type=Path, default=Path("configs/news_fulltext.json"))
     parser.add_argument("--url", action="append", required=True)
     parser.add_argument("--reparse-current-source", action="store_true", help="Replay selected HTML/JSON/RSS/PDF source envelopes with their registered current parser; no HTTP or rewrite of historical capture fingerprints")
+    parser.add_argument("--include-retained-heads", action="store_true", help="Also verify retained body pointers for non-complete heads; does not resolve or accept the current head")
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     config, registry, repo = load_config(args.config)
-    result = audit(repo / config["root"], args.url, registry=registry if args.reparse_current_source else None)
+    result = audit(repo / config["root"], args.url, registry=registry if args.reparse_current_source else None,
+                   include_retained_heads=args.include_retained_heads)
     result["configuration_files_sha256"] = {str(p): sha256_file(p) for p in configuration_paths(args.config)}
     result["implementation_sha256"] = {str(p.relative_to(repo)): sha256_file(p) for p in [
         Path(__file__).resolve(), *(repo / "downloader").glob("news_fulltext*.py")]}
     args.output.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     atomic_write_json(args.output, result)
     print(json.dumps(result, ensure_ascii=False))
-    return 0 if result["accepted"] else 1
+    success = (result.get("retained_versions_verified") and
+               result.get("retained_current_parser_replay_verified") is not False
+               if args.include_retained_heads else result["accepted"])
+    return 0 if success else 1
 
 
 if __name__ == "__main__":

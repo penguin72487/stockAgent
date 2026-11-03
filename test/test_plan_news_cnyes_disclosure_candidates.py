@@ -62,6 +62,63 @@ def test_plans_only_new_heads_and_preserves_literal_source_evidence():
     assert result['historical_gaps_retired'] is False
 
 
+def test_request_scoped_worklist_keeps_equal_bytes_with_independent_clocks():
+    report, prior = _inputs()
+    report['contract'] = 'cnyes_finlab_issuer_overlap_v2'
+    path = 'quarantine/' + 'b' * 64 + '.parquet'
+    other = 'discovery_responses/by_request/aa/' + 'a' * 64 + '/' + 'b' * 64 + '.parquet'
+    for row in report['rows']:
+        row['selected_source_artifact_path'] = path
+        row['source_observations'] = [
+            {'source_response_sha256': 'b' * 64, 'source_artifact_path': path,
+             'source_artifact_kind': 'canonical_quarantine', 'source_observed_at_utc': '2026-10-01T00:00:00+00:00'},
+            {'source_response_sha256': 'b' * 64, 'source_artifact_path': other,
+             'source_artifact_kind': 'cnyes_history_source_envelope', 'source_observed_at_utc': '2026-10-02T00:00:00+00:00'},
+        ]
+    result = plan(report, prior)
+    assert result['contract'] == 'cnyes_43_1_incremental_candidates_v2'
+    item = result['groups'][0]['candidates'][0]
+    assert item['source_observations'] == report['rows'][1]['source_observations']
+    assert item['selected_source_artifact_path'] == path
+    altered = deepcopy(report)
+    altered['rows'][1]['selected_source_artifact_path'] = 'discovery_responses/not-observed.parquet'
+    with pytest.raises(ValueError, match='invalid_candidate_provenance'):
+        plan(altered, prior)
+    altered = deepcopy(report)
+    altered['rows'][1]['source_observations'][1]['source_observed_at_utc'] = '2026-10-02T00:00:00'
+    with pytest.raises(ValueError, match='invalid_candidate_provenance'):
+        plan(altered, prior)
+
+
+def test_accepted_batch_worklist_requires_exact_receipt_and_request():
+    report, prior = _inputs()
+    report['contract'] = 'cnyes_finlab_issuer_overlap_v3'
+    path, receipt = 'bodies/fixture.parquet', 'receipts/fixture.json'
+    for row in report['rows']:
+        row.update(selected_source_artifact_path=path, selected_source_receipt_path=receipt,
+                   selected_source_request_sha256='c' * 64, source_observations=[
+            {'source_response_sha256': 'b' * 64, 'source_artifact_path': path,
+             'source_artifact_kind': 'accepted_body_batch', 'source_receipt_path': receipt,
+             'source_request_sha256': digest, 'source_observed_at_utc': clock}
+            for digest, clock in [('c' * 64, '2026-10-01T00:00:00+00:00'),
+                                  ('d' * 64, '2026-10-02T00:00:00+00:00')]])
+    result = plan(report, prior)
+    assert result['contract'] == 'cnyes_43_1_incremental_candidates_v3'
+    row = result['groups'][0]['candidates'][0]
+    assert row['selected_source_request_sha256'] == 'c' * 64 and len(row['source_observations']) == 2
+    for field, value in [('selected_source_request_sha256', 'e' * 64),
+                         ('selected_source_receipt_path', None),
+                         ('selected_source_request_sha256', None)]:
+        changed = deepcopy(report)
+        changed['rows'][1][field] = value
+        with pytest.raises(ValueError, match='invalid_candidate_provenance'):
+            plan(changed, prior)
+    changed = deepcopy(report)
+    changed['rows'][1]['source_observations'][0]['source_receipt_path'] = '../other.json'
+    with pytest.raises(ValueError, match='invalid_candidate_provenance'):
+        plan(changed, prior)
+
+
 def test_readback_records_title_access_separately_from_body_access():
     report, _ = _inputs()
     report['finlab_receipt_sha256'] = 'f' * 64

@@ -9,9 +9,14 @@ this job only replays the paths already recorded by that publisher.
 from __future__ import annotations
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from datetime import UTC, datetime
+import fcntl
 import json
+import os
 from pathlib import Path
+import stat
 import subprocess
 import sys
 import time
@@ -35,6 +40,39 @@ MOUNT_CHECK = REPO_ROOT / "scripts/mount_packed_d_cold.sh"
 BACKUP_CONFIG = REPO_ROOT / "configs/data_sync/backup_stream.json"
 
 
+def backup_owner_busy(configuration: dict) -> bool:
+    """Observe the existing publication lock without changing its inode.
+
+    A migration may pause the paired folder while it holds this owner. Check
+    the lock before inspecting the folder so that an expected owner boundary
+    is not reported as a broken pairing. The real pairing is still checked by
+    the original owner whenever the lock becomes available.
+    """
+    root = configuration.get("state_root")
+    if root is None:
+        return False  # Keep the canonical configuration validation downstream.
+    if not isinstance(root, str) or not Path(root).is_absolute():
+        raise SnapshotError("invalid backup owner state root")
+    lock = Path(root) / "owner.lock"
+    try:
+        fd = os.open(lock, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return False
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid() or info.st_nlink != 1:
+            raise SnapshotError("backup owner lock is not owned regular metadata")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return True
+        else:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+            return False
+    finally:
+        os.close(fd)
+
+
 def retry_backup_transport() -> dict[str, object]:
     """Use the original queue/owner, independently of a full backup cycle.
 
@@ -52,6 +90,8 @@ def retry_backup_transport() -> dict[str, object]:
     timeout = configuration.get("scan_timeout_seconds", 30)
     if type(timeout) not in (int, float) or not 1 <= timeout <= 1800:
         raise SnapshotError("backup transport scan timeout must be bounded")
+    if backup_owner_busy(configuration):
+        return {"state": "existing_source_owner_busy", "NAS_backup_verified": False}
     # Do not modify the enrolled policy. This timer only has a short retry
     # budget; large hashes retain their pending dispatch for the next attempt.
     queue = BackupStream({**configuration, "scan_timeout_seconds": min(timeout, 30)})
@@ -59,12 +99,13 @@ def retry_backup_transport() -> dict[str, object]:
     status = request(base, key, "/rest/db/status", {"folder": folder_id},
                      timeout=min(timeout, 30))
     state = status.get("state") if isinstance(status, dict) else None
-    if state == "scanning" or not isinstance(state, str) or not state:
+    if not isinstance(state, str) or not state or state in {"scanning", "scan-waiting"}:
         # notify_transport is a durable owner transaction and recovers prepared
         # publications. Do not reread/rewrite its potentially large ledger just
         # to record another busy observation; no pending work was acknowledged.
         return {
-            "state": ("deferred_existing_folder_scan" if state == "scanning"
+            "state": ("deferred_existing_folder_scan" if isinstance(state, str)
+                      and state in {"scanning", "scan-waiting"}
                       else "deferred_invalid_folder_state"),
             "observed_folder_state": state, "batch_scan_receipts": [],
             "ledger_read": False, "ledger_written": False, "NAS_backup_verified": False,
@@ -127,7 +168,7 @@ def retry_one(
     else:
         dataset = pending[0]
     folder_state = scan_folder_state()
-    if folder_state == "scanning":
+    if folder_state in {"scanning", "scan-waiting"}:
         # A client timeout does not prove that Syncthing stopped its previous
         # scan. Leave every generation intact and let the original timer retry
         # after the current scan, rather than queueing another blocking POST.
@@ -141,7 +182,8 @@ def retry_one(
     try:
         acknowledged = scan_after_publish(
             SYNC_ROOT, dataset, retry_full=True,
-            **({"batch_object_paths": True} if batch_object_paths else {}),
+            **({"batch_object_paths": True, "request_timeout_seconds": 480}
+               if batch_object_paths else {}),
         )
     except FileNotFoundError:
         # Another retry may finish and atomically remove the same pending
@@ -191,31 +233,39 @@ def main(argv: list[str] | None = None) -> int:
         # A requested policy is not evidence that any pending work existed.
         "requested_scan_policy": {"batch_object_paths": args.batch_object_paths},
     }
+    if args.batch_object_paths:
+        receipt["requested_scan_policy"]["request_timeout_seconds"] = 480
     if args.backup_transport:
         receipt["scope"] = "one_pending_D_primary_scan_and_enrolled_NAS_notifications"
         receipt["requested_scan_policy"]["backup_transport"] = True
-    try:
-        receipt.update(retry_one(
-            args.dataset,
-            **({"batch_object_paths": True} if args.batch_object_paths else {}),
-        ))
-        exit_code = 0
-    except (OSError, ValueError, SnapshotError, subprocess.TimeoutExpired) as exc:
-        receipt.update({"status": "retry_failed", "error": f"{type(exc).__name__}: {exc}"})
-        exit_code = 1
-    if args.backup_transport:
-        # Neither folder's failure should starve the other folder's retry.
+    # These are different Syncthing folders with independent canonical owners.
+    # A slow D metadata scan must not delay an otherwise-ready NAS notification.
+    # The original per-folder locks, generations and acknowledgement rules stay
+    # unchanged; this does not start a second backup writer or prove delivery.
+    pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix="nas-scan-retry") if args.backup_transport else nullcontext()
+    with pool as executor:
+        backup_future = executor.submit(retry_backup_transport) if executor else None
         try:
-            notification = retry_backup_transport()
-            receipt["backup_transport"] = notification
-            if notification.get("error_type") or notification.get("state") == "retryable_scan_error":
-                exit_code = 1
-        except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
-            receipt["backup_transport"] = {
-                "state": "notification_retry_failed", "error_type": type(exc).__name__,
-                "NAS_backup_verified": False,
-            }
+            receipt.update(retry_one(
+                args.dataset,
+                **({"batch_object_paths": True} if args.batch_object_paths else {}),
+            ))
+            exit_code = 0
+        except (OSError, ValueError, SnapshotError, subprocess.TimeoutExpired) as exc:
+            receipt.update({"status": "retry_failed", "error": f"{type(exc).__name__}: {exc}"})
             exit_code = 1
+        if backup_future is not None:
+            try:
+                notification = backup_future.result()
+                receipt["backup_transport"] = notification
+                if notification.get("error_type") or notification.get("state") == "retryable_scan_error":
+                    exit_code = 1
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+                receipt["backup_transport"] = {
+                    "state": "notification_retry_failed", "error_type": type(exc).__name__,
+                    "NAS_backup_verified": False,
+                }
+                exit_code = 1
     receipt["elapsed_seconds"] = round(time.monotonic() - started, 6)
     atomic_write_json(args.receipt, receipt)
     print(json.dumps(receipt, ensure_ascii=False, sort_keys=True), flush=True)

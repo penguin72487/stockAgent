@@ -52,6 +52,14 @@ class LegacyQuarantineTransportPending(SnapshotError):
     """An owned resume stopped before unlink; release the common owner to wait."""
 
 
+class LegacyQuarantineAuditRequired(SnapshotError):
+    """An owned transaction moved both names but has not audited or unlinked them."""
+
+
+class LegacyQuarantineProofExpired(SnapshotError):
+    """An unchanged owned resume expired before unlink and needs a fresh audit."""
+
+
 def _idle_only_transport(proof: Mapping[str, Any]) -> bool:
     checks = proof.get("local_checks", {})
     expected = {
@@ -409,10 +417,21 @@ def plan_legacy_retirement(
 def apply_legacy_retirement(
     spec: LegacyArchiveSpec, *, expected_fingerprint: str,
     owned_verified_plan: Mapping[str, Any] | None = None,
-    defer_quarantine_transport: bool = False, **options: Any
+    defer_quarantine_transport: bool = False,
+    defer_owned_post_rename_audit: bool = False, **options: Any
 ) -> dict[str, Any]:
     if type(defer_quarantine_transport) is not bool:
         raise SnapshotError("quarantine transport deferral must be explicit")
+    if type(defer_owned_post_rename_audit) is not bool:
+        raise SnapshotError("post-rename audit deferral must be explicit")
+    if defer_owned_post_rename_audit and (
+        owned_verified_plan is None
+        or owned_verified_plan.get("quarantine_resume") is True
+        or options.get("manual_immediate") is not True
+        or owned_verified_plan.get("full_verification", {}).get("contract")
+            != "owned-legacy-full-verification-v1"
+    ):
+        raise SnapshotError("post-rename audit deferral requires the exact owned manual plan")
     if owned_verified_plan is not None and owned_verified_plan.get("quarantine_resume") is True:
         return _apply_quarantine_resume(spec, expected_fingerprint=expected_fingerprint,
             owned_verified_plan=owned_verified_plan,
@@ -497,6 +516,13 @@ def apply_legacy_retirement(
         if hot_tree.is_dir():
             os.replace(hot_tree, quarantine / "hot")
         os.replace(source, quarantine / "source")
+        if defer_owned_post_rename_audit:
+            # The durable retirement state and the exact source names are now
+            # in the existing quarantine. No byte audit or unlink has happened
+            # here. The cohort owner can release the shared mutation owner and
+            # run the ordinary complete quarantine-resume audit before applying.
+            raise LegacyQuarantineAuditRequired(
+                "owned quarantine needs a complete post-rename audit; no unlink started")
         archive = spec.stage_root / spec.dataset / "archive"
         verify_archive_directory(archive, quarantine / "source", spec=spec,
                                  manual_capture=plan["manual_capture"],
@@ -600,36 +626,54 @@ def _quarantine_resume_binding(spec: LegacyArchiveSpec, plan: Mapping[str, Any],
 
 
 def plan_legacy_quarantine_resume(spec: LegacyArchiveSpec, prior_plan: Mapping[str, Any],
+                                  *, progress: Callable[[dict[str, Any]], None] | None = None,
                                   **options: Any) -> dict[str, Any]:
     """Fresh full audit outside the common mutation owner; no rename or unlink."""
+    def report(step: str, **observation: Any) -> None:
+        if progress is not None:
+            progress({"audit_step": step, **observation})
+
+    report("bind-quarantine-and-current-generations")
     quarantine, binding = _quarantine_resume_binding(spec, prior_plan, **options)
+    report("check-initial-consumers-and-transport")
     _quarantine_audit_peer(spec, prior_plan, quarantine, **options)
     sync_root = Path(options["sync_root"])
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     archive = spec.stage_root/spec.dataset/"archive"
     workers = _d_stage_file_workers(spec, archive)
+    report("verify-packed-release-and-encoded-stage")
     verify_packed_snapshot(sync_root, resolved, materialized_path=archive,
-                           materialized_file_workers=workers, **_native_read_options(sync_root))
+                           materialized_file_workers=workers, **_native_read_options(sync_root),
+                           **({"progress": lambda item: report("verify-packed-release-and-encoded-stage", **item)}
+                              if progress is not None else {}))
+    report("verify-encoded-and-quarantined-originals")
     proof = verify_archive_directory(archive, quarantine/"source", spec=spec,
         manual_capture=prior_plan.get("manual_capture", False),
         artifact_root=Path(options["artifact_root"]), repo_root=Path(options["repo_root"]),
-        file_workers=workers)
+        file_workers=workers,
+        **({"progress": lambda item: report("verify-encoded-and-quarantined-originals", **item)}
+           if progress is not None else {}))
     inventory = [{"kind":"file", "path":r["path"], "size":r["source"]["size"],
                   "sha256":r["original_sha256"]} for r in proof["manifest"]["files"]]
+    report("verify-hot-mirror")
     _hot_mirror(quarantine/"source", quarantine/"hot", inventory)
+    report("verify-cold-resilience")
     cold = verify_cold_resilience(sync_root, resolved, Path(options["backup_config"]))
+    report("recheck-consumers-transport-and-generations")
     peer = _quarantine_audit_peer(spec, prior_plan, quarantine, **options)
     if _quarantine_resume_binding(spec, prior_plan, **options)[1] != binding:
         raise SnapshotError("interrupted legacy retirement changed during full audit")
     blockers = list(prior_plan.get("blockers", []))
     if peer.get("ok") is not True and "cold-peer-not-converged" not in blockers:
         blockers.append("cold-peer-not-converged")
-    return {**prior_plan, **cold, "quarantine_resume":True, "peer_proof":peer, "blockers":blockers,
+    result = {**prior_plan, **cold, "quarantine_resume":True, "peer_proof":peer, "blockers":blockers,
             "full_verification":{"contract":"owned-legacy-quarantine-resume-v2",
                 "binding":binding, "verified_at_epoch":time.time(),
                 "owner_process":migration_process_identity(),
                 "original_files":proof["files"], "original_bytes":proof["original_bytes"],
                 "verified_archive_manifest_sha256":sha256_file(archive/"legacy_archive_manifest.json")}}
+    report("full-audit-complete")
+    return result
 
 
 def _apply_quarantine_resume(spec: LegacyArchiveSpec, *, expected_fingerprint: str,
@@ -645,12 +689,13 @@ def _apply_quarantine_resume(spec: LegacyArchiveSpec, *, expected_fingerprint: s
             "dataset":spec.dataset, "hot":full.get("binding", {}).get("hot")}}
         if (plan.get("plan_fingerprint") != expected_fingerprint
                 or full.get("contract") != "owned-legacy-quarantine-resume-v2"
-                or full.get("owner_process") != migration_process_identity()
-                or not 0 <= time.time()-float(full.get("verified_at_epoch", 0)) <= 1500):
+                or full.get("owner_process") != migration_process_identity()):
             raise SnapshotError("interrupted legacy retirement full audit expired or differs")
         quarantine, binding = _quarantine_resume_binding(spec, original, **options)
         if binding != full["binding"]:
             raise SnapshotError("interrupted legacy retirement generation changed before unlink")
+        if not 0 <= time.time()-float(full.get("verified_at_epoch", 0)) <= 1500:
+            raise LegacyQuarantineProofExpired("unchanged quarantine full audit expired before final gates")
         archive = spec.stage_root/spec.dataset/"archive"
         # This transaction does not rename again. The same owned quarantine
         # was fully decoded/hashed immediately before acquiring the mutation
@@ -686,9 +731,10 @@ def _apply_quarantine_resume(spec: LegacyArchiveSpec, *, expected_fingerprint: s
                 # the complete binding/usage/cold/proof-age checks above.
                 raise LegacyQuarantineTransportPending(str(error)) from error
             raise
-        if (_quarantine_resume_binding(spec, original, **options)[1] != binding
-                or not 0 <= time.time()-float(full["verified_at_epoch"]) <= 1500):
-            raise SnapshotError("interrupted legacy retirement changed or expired after quarantine audit")
+        if _quarantine_resume_binding(spec, original, **options)[1] != binding:
+            raise SnapshotError("interrupted legacy retirement changed after quarantine audit")
+        if not 0 <= time.time()-float(full["verified_at_epoch"]) <= 1500:
+            raise LegacyQuarantineProofExpired("unchanged quarantine full audit expired during final gates")
         reclaimed = (_reclaimable_file_bytes(quarantine/"source", quarantine/"hot", allow_symlinks=True)
                      if _opaque_symlinks_enabled(spec)
                      else _reclaimable_file_bytes(quarantine/"source", quarantine/"hot"))

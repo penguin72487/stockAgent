@@ -9,6 +9,7 @@ import json
 import math
 import os
 import re
+import secrets
 import signal as signal_module
 import subprocess
 import sys
@@ -125,6 +126,7 @@ from stockagent.live.signal_engine import (
     clear_live_panel_memory_cache,
     completed_panel_source_fingerprint,
     generate_live_signal,
+    live_cuda_allocator_observation,
     live_panel_cache_epoch,
     finalize_live_signal_artifacts,
     prefetch_live_signal_prices,
@@ -136,19 +138,22 @@ from stockagent.live.service_notify import notify_systemd
 from stockagent.live.tw_public_source_guard import (
     TWPublicSourceUpdatePending,
     live_tw_public_source_read_guard,
+    read_maintenance_pending_from_child,
 )
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
 from stockagent.data.tw_current_trading_universe import TWTradingUniversePending
 from stockagent.live.stock_history import StockHistoryResult, load_stock_history
 from stockagent.live.time_display import DEFAULT_DISPLAY_TIMEZONE, display_timezone_label, format_display_time
 from services.discord_bot.source_watchdog import SourceOperationRegistry
+from stockagent.service_layout import service_path
 
 
 MIN_DISCORD_ROWS = 10
-STATE_PATH = ROOT / "artifacts" / "discord_bot" / "state.json"
-ERROR_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "errors.log"
-AUDIT_LOG_PATH = ROOT / "artifacts" / "discord_bot" / "audit_events.jsonl"
+STATE_PATH = service_path("state.json", area="discord_bot", root=ROOT)
+ERROR_LOG_PATH = service_path("errors.log", area="discord_bot", root=ROOT)
+AUDIT_LOG_PATH = service_path("audit_events.jsonl", area="discord_bot", root=ROOT)
 ARTIFACT_BACKFILL_STATUS_PATH = (
-    ROOT / "artifacts" / "discord_bot" / "artifact_backfill_status.json"
+    service_path("artifact_backfill_status.json", area="discord_bot", root=ROOT)
 )
 STARTUP_INFERENCE_WARMUP_STATUS_PATH = (
     ROOT / "artifacts" / "discord_bot" / "startup_inference_warmup.json"
@@ -162,6 +167,7 @@ _OPENING_SIGNAL_LATENCY_LOCK = threading.Lock()
 _PRE_SIGNAL_SUCCESS_LOCK = threading.Lock()
 _PRE_SIGNAL_RUN_LOCKS_LOCK = threading.Lock()
 _PREWARM_RUN_LOCKS_LOCK = threading.Lock()
+_PREOPEN_BACKGROUND_CONTEXT = threading.local()
 _PREOPEN_READINESS_LOCK = threading.Lock()
 _SERVICE_STATUS_LOCK = threading.Lock()
 _ARTIFACT_BACKFILL_STATUS_LOCK = threading.Lock()
@@ -300,20 +306,16 @@ def _opening_signal_latency_record(
         "model_inference_ms",
         "post_inference_format_ms",
     )
-    known_signal_ms = sum(
-        float(value)
-        for key in signal_stage_keys
-        if (value := live_latency.get(key)) is not None
-    )
-    signal_total_ms = live_latency.get("compute_before_publish_ms")
-    signal_other_ms = (
-        round(max(0.0, float(signal_total_ms) - known_signal_ms), 3)
-        if signal_total_ms is not None
-        else None
+    from stockagent.live.opening_execution_latency import residual_duration_ms
+    signal_other_ms = residual_duration_ms(
+        live_latency.get("compute_before_publish_ms"),
+        *(live_latency.get(key) for key in signal_stage_keys),
     )
     stages = {
         "scheduler_wake_ms": timing.get("scheduler_wake_ms"),
         "mode_dispatch_queue_ms": timing.get("mode_dispatch_queue_ms"),
+        "input_ready_from_open_ms": timing.get("input_ready_from_open_ms"),
+        "input_ready_dispatch_wait_ms": timing.get("input_ready_dispatch_wait_ms"),
         "preopen_catch_up_ms": timing.get("preopen_catch_up_ms"),
         "realtime_prepare_ms": timing.get("realtime_prepare_ms"),
         "realtime_prepare_wait_ms": timing.get("realtime_prepare_wait_ms"),
@@ -374,6 +376,8 @@ def _opening_signal_latency_record(
         "gate_at": gate_text,
         "scheduler_observed_at": timing.get("scheduler_observed_at"),
         "attempt_started_at": timing.get("attempt_started_at"),
+        "input_result_ready_at": timing.get("input_result_ready_at"),
+        "input_dispatch_clock_contract": timing.get("input_dispatch_clock_contract"),
         "attempt_finished_at": timing.get("attempt_finished_at"),
         "attempt_elapsed_ms": timing.get("attempt_elapsed_ms"),
         "first_scheduler_observed_at": timing.get("first_scheduler_observed_at"),
@@ -404,6 +408,17 @@ def _opening_signal_latency_record(
         "source_ready_from_open_ms": source_ready_from_open_ms,
         "source_ready_to_signal_ms": source_ready_to_signal_ms,
         "stages": stages,
+        # Nested wall-time breakdown of signal_post_inference_format_ms;
+        # absence in an older producer is unknown, not five zero-duration steps.
+        "post_inference_format_steps_ms": live_latency.get("post_inference_format_steps_ms"),
+        "post_inference_format_steps_contract": live_latency.get("post_inference_format_steps_contract"),
+        # Preserve the producer's existing nested spans; do not re-run or
+        # synchronize CUDA just to measure them. They explain host wall time,
+        # not independent GPU kernel time or additive end-to-end latency.
+        "pre_quote_local_prepare_steps_ms": live_latency.get("pre_quote_local_prepare_steps_ms"),
+        "post_quote_prepare_steps_ms": live_latency.get("post_quote_prepare_steps_ms"),
+        "factorized_input_transport": live_latency.get("factorized_input_transport"),
+        "dense_input_transport": live_latency.get("dense_input_transport"),
         "price_receipt_timing": receipt or None,
         "quote_transport": quote_transport,
         "input_preparation_stages_ms": timing.get("input_preparation_stages_ms"),
@@ -1598,11 +1613,32 @@ def _preopen_prepare_key(cfg: LiveMarketConfig, now: datetime) -> str | None:
         base_ready = _preopen_market_ready_for_session(cfg, session_date)
         final_armed = _preopen_market_final_armed_for_session(cfg, session_date)
         if now_minutes >= decision_minutes - final_arm_lead and base_ready:
+            late_lead = min(5, final_arm_lead)
+            late_window = not overnight and now_minutes >= decision_minutes - late_lead
+            arm_phase = ":late:preopen-final-arm" if late_window else ":preopen-final-arm"
             if not final_armed:
                 # A successful arm from an older invalidation epoch must not
                 # be suppressed by the scheduler's completed-key set.
                 return (f"{session_date}:{cfg.market}:epoch-{live_panel_cache_epoch()}"
-                        ":preopen-final-arm")
+                        f"{arm_phase}")
+            # A proof from 08:45 cannot establish that the final publication's
+            # inputs are resident at 09:00. Re-run the exact shared input path
+            # once in the last five minutes, not on every scheduler tick. This
+            # remains a warmup, never permission to reuse a changed source.
+            if late_window:
+                try:
+                    receipt = _preopen_readiness_payload()["markets"][str(cfg.market)]["final_arm"]
+                    completed = datetime.fromisoformat(str(receipt.get("completed_at", "")))
+                    recent = (completed.tzinfo is not None
+                              and completed <= now
+                              and completed.astimezone(now.tzinfo).date() == now.date()
+                              and completed.astimezone(now.tzinfo).hour * 60
+                                  + completed.astimezone(now.tzinfo).minute >= decision_minutes - late_lead)
+                except (KeyError, TypeError, ValueError):
+                    recent = False
+                if not recent:
+                    return (f"{session_date}:{cfg.market}:epoch-{live_panel_cache_epoch()}"
+                            ":late:preopen-final-arm")
             # Both phases are complete. Re-running the base phase would replace
             # the market receipt and could erase its final-arm proof.
             return None
@@ -1898,6 +1934,20 @@ def _begin_artifact_backfill(key: str, market: str) -> dict[str, Any]:
             "error_type": None,
             "error_message": None,
         }
+        if isinstance(previous, dict):
+            # Source waits are not failed inference attempts. Preserve real
+            # failures across waits without exponentially penalizing them.
+            job["failure_attempt"] = int(previous.get(
+                "failure_attempt", previous.get("attempt", 0)
+                if previous.get("status") == "failed" else 0,
+            ) or 0)
+            if isinstance(previous.get("last_failure"), dict):
+                job["last_failure"] = copy.deepcopy(previous["last_failure"])
+            elif previous.get("status") == "failed":
+                job["last_failure"] = {
+                    name: previous.get(name) for name in
+                    ("error_type", "error_message", "completed_at")
+                }
         if isinstance(previous, dict) and isinstance(previous.get("prior_ready_receipt"), dict):
             # Keep the disproven ready hint across begin/finish, not just for
             # the short interval between CAS invalidation and serial repair.
@@ -1940,6 +1990,8 @@ def _finish_artifact_backfill(
         )
         if status == "ready":
             job.pop("retry_delay_seconds", None)
+            job.pop("error_details", None)
+            job["failure_attempt"] = 0
             job.update(
                 {
                     "next_retry_at": None,
@@ -1948,7 +2000,21 @@ def _finish_artifact_backfill(
                 }
             )
         else:
-            delay = _artifact_backfill_retry_delay_seconds(attempt)
+            if status == "waiting_source" and isinstance(exc, (TWPublicSourceUpdatePending, CapacityDeferred)):
+                # The separate retry controller wakes once per minute. Keep a
+                # bounded delay without treating writer contention as failure.
+                delay = 60.0
+                job["error_details"] = dict(exc.details)
+            else:
+                failures = max(0, int(job.get("failure_attempt") or 0)) + 1
+                job["failure_attempt"] = failures
+                delay = _artifact_backfill_retry_delay_seconds(failures)
+                job.pop("error_details", None)
+                job["last_failure"] = {
+                    "error_type": type(exc).__name__ if exc is not None else "Error",
+                    "error_message": str(exc)[:2000] if exc is not None else "unknown",
+                    "completed_at": observed.isoformat(timespec="seconds"),
+                }
             job.update(
                 {
                     "next_retry_at": (
@@ -1987,17 +2053,23 @@ def _artifact_backfill_health_summary() -> dict[str, Any]:
     current = list(latest_by_market.values())
     failures = [row for row in current if row.get("status") == "failed"]
     running = [row for row in current if row.get("status") == "running"]
+    waiting = [row for row in current if row.get("status") == "waiting_source"]
     maintenance_run = payload.get("maintenance_run")
     maintenance_run = (
         dict(maintenance_run) if isinstance(maintenance_run, dict) else {}
     )
     worker_status = str(maintenance_run.get("status") or "")
-    if failures or worker_status == "degraded":
+    cache_run = payload.get("signal_cache_maintenance_run")
+    cache_run = dict(cache_run) if isinstance(cache_run, dict) else {}
+    cache_status = str(cache_run.get("status") or "")
+    if failures or "degraded" in {worker_status, cache_status}:
         aggregate_status = "degraded"
-    elif running or worker_status == "running":
+    elif running or "running" in {worker_status, cache_status}:
         aggregate_status = "running"
-    elif worker_status in {"waiting_source", "deferred"}:
-        aggregate_status = worker_status
+    elif waiting or "waiting_source" in {worker_status, cache_status}:
+        aggregate_status = "waiting_source"
+    elif "deferred" in {worker_status, cache_status}:
+        aggregate_status = "deferred"
     else:
         aggregate_status = "ready"
     return {
@@ -2010,6 +2082,9 @@ def _artifact_backfill_health_summary() -> dict[str, Any]:
         "worker_status": maintenance_run.get("status"),
         "worker_reason": maintenance_run.get("reason"),
         "worker_updated_at": maintenance_run.get("updated_at"),
+        "cache_worker_status": cache_run.get("status"),
+        "cache_worker_reason": cache_run.get("reason"),
+        "cache_worker_updated_at": cache_run.get("updated_at"),
     }
 
 
@@ -3279,6 +3354,10 @@ class StockAgentBot(discord.Client):
         self.channel_id = _env_int("DISCORD_CHANNEL_ID")
         self._last_scheduled_keys: set[str] = set()
         self._last_preopen_prepare_keys: set[str] = set()
+        # A slow source/update for one mode must not stop the scheduler from
+        # arming other modes. The underlying workers are still single-flight
+        # per market, and the existing source/model locks remain authoritative.
+        self._preopen_prepare_jobs: dict[str, asyncio.Task[None]] = {}
         self._last_daily_summary_keys: set[str] = set()
         self._last_artifact_backfill_keys: set[str] = set()
         self._scheduled_retry_after: dict[str, float] = {}
@@ -3294,6 +3373,8 @@ class StockAgentBot(discord.Client):
         self._signal_now_background_tasks: dict[str, asyncio.Task[None]] = {}
         self._signal_now_background_waiters: dict[str, set[int]] = {}
         self._opening_attempt_started_monotonic: float | None = None
+        self._service_heartbeat_last_started: float | None = None
+        self._service_heartbeat_timing: dict[str, Any] = {}
         self._opening_attempt_last_progress_monotonic: float | None = None
         self._opening_attempt_progress_message: str | None = None
         self._opening_attempt_market: str | None = None
@@ -4335,6 +4416,42 @@ def _warm_startup_markets(markets, rows, started_at, admit_source) -> None:
         )
 
 
+class _PreopenBackgroundOpeningPriority(RuntimeError):
+    """A background warmup must yield the model owner to the live opening."""
+
+
+def _preopen_background_yields_to_open(cfg: LiveMarketConfig, now: datetime) -> bool:
+    if not bool(getattr(cfg, "day_trade_simulation_enabled", False)):
+        return False
+    gate = _opening_gate_at(cfg, now.date().isoformat())
+    # The scheduled opening path owns required catch-up in this window. This
+    # is admission priority, not a CPU/GPU limit or a fabricated ready state.
+    return gate <= now < gate + timedelta(minutes=5)
+
+
+@contextmanager
+def _preopen_model_lock(cfg: LiveMarketConfig):
+    """Do not queue background warmups ahead of live opening inference."""
+    if not getattr(_PREOPEN_BACKGROUND_CONTEXT, "active", False):
+        with _MODEL_INFERENCE_LOCK:
+            yield
+        return
+    zone = ZoneInfo(cfg.timezone or "Asia/Taipei")
+    while True:
+        if _preopen_background_yields_to_open(cfg, datetime.now(zone)):
+            raise _PreopenBackgroundOpeningPriority("background preopen yielded to scheduled opening")
+        if not _MODEL_INFERENCE_LOCK.acquire(timeout=0.1):
+            continue
+        try:
+            # The gate may have passed while acquiring an uncontended lock.
+            if _preopen_background_yields_to_open(cfg, datetime.now(zone)):
+                raise _PreopenBackgroundOpeningPriority("background preopen yielded to scheduled opening")
+            yield
+        finally:
+            _MODEL_INFERENCE_LOCK.release()
+        return
+
+
 def _prewarm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
     """Single-flight one market/session prewarm across scheduler task loops."""
 
@@ -4424,7 +4541,7 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
                 ensure_previous_signal=False,
                 previous_signal_backfill_limit=0,
             )
-            with _MODEL_INFERENCE_LOCK:
+            with _preopen_model_lock(cfg):
                 result = generate_live_signal(**kwargs)
             result.summary["warm_contract"] = "overnight_13_20_model_cache"
             update_progress(progress_total, "overnight model cache ready")
@@ -4497,7 +4614,7 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
             previous_signal_backfill_limit=0,
             preopen_quote_priority=observed.hour < 9,
         )
-        with _MODEL_INFERENCE_LOCK:
+        with _preopen_model_lock(cfg):
             result = generate_live_signal(**kwargs)
         symbols = _day_trade_opening_quote_symbols(result.weights_rows)
         result.summary["opening_quote_priority"] = _publish_preopen_quote_priority(
@@ -4591,7 +4708,7 @@ def _final_arm_market_signal_sync(cfg: LiveMarketConfig) -> LiveSignalResult:
                 previous_signal_backfill_limit=0,
                 preopen_quote_priority=not overnight and observed.hour < 9,
             )
-            with _MODEL_INFERENCE_LOCK:
+            with _preopen_model_lock(cfg):
                 return generate_live_signal(**kwargs)
 
         result = run_once()
@@ -6184,6 +6301,42 @@ def _day_trade_schedule_state(
     return "pending_confirmation"
 
 
+def _discord_gateway_heartbeat_observation(*, connected: bool, latency_seconds: Any) -> dict[str, Any]:
+    """Report the library's last ACK round-trip without asserting freshness.
+
+    discord.py does not expose an ACK timestamp with ``Client.latency``.
+    A repeated value is therefore not evidence of a fresh heartbeat, network
+    fault, interaction latency, or opening end-to-end latency.
+    """
+
+    observation: dict[str, Any] = {
+        "status": "disconnected" if not connected else "unavailable",
+        "heartbeat_ack_rtt_ms": None,
+        "sample_contract": "last_library_ack_rtt_ack_timestamp_unavailable_v1",
+    }
+    if not connected:
+        return observation
+    try:
+        value = float(latency_seconds)
+    except (TypeError, ValueError, OverflowError):
+        return observation
+    value_ms = value * 1000
+    if value >= 0 and math.isfinite(value_ms):
+        observation.update(status="available", heartbeat_ack_rtt_ms=round(value_ms, 3))
+    return observation
+
+
+def _observe_service_heartbeat(previous: float | None, observed: float) -> dict[str, Any]:
+    """Monotonic callback spacing, not a network RTT or a causal stall diagnosis."""
+    interval = None if previous is None else (observed - previous) * 1000
+    valid = interval is not None and math.isfinite(interval) and interval >= 0
+    return {"sample_contract": "monotonic_service_heartbeat_callback_spacing_v1",
+            "status": "available" if valid else "unavailable",
+            "callback_interval_ms": round(interval, 3) if valid else None,
+            "excess_over_period_ms": round(max(0., interval - 1000.), 3) if valid else None,
+            "period_ms": 1000., "cause": "undetermined"}
+
+
 def _write_discord_service_status() -> dict[str, Any]:
     """Publish the bot's acknowledgement of the engine commit revision."""
 
@@ -6220,6 +6373,7 @@ def _write_discord_service_status() -> dict[str, Any]:
     overnight_modes = overnight_engine.get("modes") or {}
     engine = load_service_sync(_day_trade_state_dir()) or {}
     modes = engine.get("modes") or {}
+    discord_connected = bool(bot.is_ready())
     payload = {
         "schema_version": 1,
         "service": "stockagent-discord-bot",
@@ -6229,8 +6383,16 @@ def _write_discord_service_status() -> dict[str, Any]:
         # Sampled process-local generation, for the independent preopen gate.
         # It is a heartbeat observation, not an LRU-residency guarantee.
         "live_panel_cache_epoch": live_panel_cache_epoch(),
-        "discord_connected": bool(bot.is_ready()),
-        "core_health": "ready" if bot.is_ready() else "waiting",
+        # Process-local allocator evidence, not total board usage; sampling
+        # does not initialize CUDA or wait for the model-cache lock.
+        "cuda_allocator": live_cuda_allocator_observation(),
+        "discord_connected": discord_connected,
+        "core_health": "ready" if discord_connected else "waiting",
+        # Advisory last ACK RTT only: it is not an interaction or opening SLO.
+        "discord_gateway": _discord_gateway_heartbeat_observation(
+            connected=discord_connected, latency_seconds=getattr(bot, "latency", None)
+        ),
+        "service_heartbeat_timing": dict(getattr(bot, "_service_heartbeat_timing", {})),
         # This is the immutable startup admission, not a disk scan on every
         # heartbeat. A read-only observer compares it to its current code.
         "live_implementation_admission": dict(_LIVE_IMPLEMENTATION_ADMISSION),
@@ -7438,25 +7600,44 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
         flush=True,
     )
     timeout_seconds = _formal_history_timeout_seconds(cfg)
+    read_fd = write_fd = None
+    pending_token = secrets.token_hex(16)
     try:
+        child_env = {
+            **os.environ,
+            "PYTHONUNBUFFERED": "1",
+            "STOCKAGENT_COMPILE_CACHE_NAMESPACE": (
+                _formal_history_compile_cache_namespace()
+            ),
+        }
+        child_options: dict[str, Any] = {}
+        if os.name == "posix":
+            read_fd, write_fd = os.pipe()
+            child_env["STOCKAGENT_TW_SOURCE_PENDING_PIPE"] = str(write_fd)
+            child_env["STOCKAGENT_TW_SOURCE_PENDING_TOKEN"] = pending_token
+            child_options["pass_fds"] = (write_fd,)
         completed = subprocess.run(
             command,
             cwd=ROOT,
-            env={
-                **os.environ,
-                "PYTHONUNBUFFERED": "1",
-                "STOCKAGENT_COMPILE_CACHE_NAMESPACE": (
-                    _formal_history_compile_cache_namespace()
-                ),
-            },
+            env=child_env,
             timeout=timeout_seconds,
             check=False,
+            **child_options,
         )
+        if completed.returncode != 0 and read_fd is not None:
+            pending = read_maintenance_pending_from_child(read_fd, pending_token)
+            if pending is not None:
+                raise pending
     except subprocess.TimeoutExpired as exc:
         raise BotUserError(
             f"`{cfg.market}` formal history inference timed out after "
             f"{timeout_seconds}s"
         ) from exc
+    finally:
+        if write_fd is not None:
+            os.close(write_fd)
+        if read_fd is not None:
+            os.close(read_fd)
     if completed.returncode != 0:
         raise BotUserError(
             f"`{cfg.market}` formal history inference failed rc={completed.returncode}"
@@ -11891,6 +12072,10 @@ async def offhours_gpu_cache_release() -> None:
 async def service_heartbeat() -> None:
     """Keep a compact, source-backed Discord/engine synchronization receipt."""
 
+    observed = time.monotonic()
+    bot._service_heartbeat_timing = _observe_service_heartbeat(
+        bot._service_heartbeat_last_started, observed)
+    bot._service_heartbeat_last_started = observed
     notify_systemd("WATCHDOG=1")
     attempt_started = bot._opening_attempt_started_monotonic
     input_stage = _oldest_opening_input_stage(now_monotonic=time.monotonic()) if attempt_started is None else None
@@ -11965,54 +12150,112 @@ async def service_heartbeat() -> None:
         )
 
 
+def _run_background_preopen_sync(cfg: LiveMarketConfig, final_arm: bool) -> LiveSignalResult:
+    previous = getattr(_PREOPEN_BACKGROUND_CONTEXT, "active", False)
+    _PREOPEN_BACKGROUND_CONTEXT.active = True
+    try:
+        return (_final_arm_market_signal_sync if final_arm else _prewarm_market_signal_sync)(cfg)
+    finally:
+        _PREOPEN_BACKGROUND_CONTEXT.active = previous
+
+
+async def _run_preopen_prepare_job(cfg: LiveMarketConfig, key: str) -> None:
+    """Complete one mode independently without weakening its existing gates."""
+    market = str(cfg.market)
+    final_arm = key.endswith(":preopen-final-arm")
+    owner = asyncio.current_task()
+    # A task can be cancelled before its coroutine ever starts, in which case
+    # the finally block below cannot run. The scheduler's done callback uses
+    # this flag to distinguish that case from a detached live thread.
+    if owner is not None:
+        setattr(owner, "_stockagent_preopen_worker_started", True)
+    worker = asyncio.create_task(asyncio.to_thread(_run_background_preopen_sync, cfg, final_arm))
+    detached = False
+    try:
+        # Cancelling the async caller cannot cancel a running native/thread
+        # worker. Keep its admission slot until that worker actually finishes.
+        result = await asyncio.shield(worker)
+        bot._last_preopen_prepare_keys.add(key)
+        _clear_signal_retry(
+            bot._preopen_retry_after, bot._preopen_failure_counts, key,
+        )
+        print(
+            f"[preopen] market={market} "
+            f"phase={'final_arm' if final_arm else 'prepare'} status=ready "
+            f"panel={result.summary.get('panel_date')} "
+            f"latency={result.summary.get('live_latency')}",
+            flush=True,
+        )
+    except asyncio.CancelledError:
+        detached = True
+
+        def release_after_worker(done: asyncio.Task) -> None:
+            try:
+                done.result()
+            except asyncio.CancelledError:
+                pass
+            except Exception as exc:
+                _log_exception(f"preopen_prepare:{market}:detached", exc)
+            finally:
+                if bot._preopen_prepare_jobs.get(market) is owner:
+                    bot._preopen_prepare_jobs.pop(market, None)
+
+        worker.add_done_callback(release_after_worker)
+        raise
+    except _PreopenBackgroundOpeningPriority:
+        print(f"[preopen] market={market} status=deferred reason=scheduled_opening_priority", flush=True)
+    except Exception as exc:
+        _log_exception(f"preopen_prepare:{market}", exc)
+        retry_delay = _mark_signal_retry(
+            bot._preopen_retry_after,
+            bot._preopen_failure_counts,
+            key,
+            day_trade=bool(
+                getattr(cfg, "day_trade_simulation_enabled", False)
+                or getattr(cfg, "overnight_simulation_enabled", False)
+            ),
+        )
+        print(
+            f"[preopen] market={market} status=failed "
+            f"retry_seconds={retry_delay:.3f} "
+            f"error={type(exc).__name__}: {exc}",
+            flush=True,
+        )
+    finally:
+        if not detached and bot._preopen_prepare_jobs.get(market) is owner:
+            bot._preopen_prepare_jobs.pop(market, None)
+
+
 @tasks.loop(seconds=1)
 async def preopen_prepare() -> None:
     for market in _scheduled_markets():
         cfg = _resolve_market(market)
+        # Check before re-reading per-market readiness/ledger state. A key can
+        # change while its underlying non-cancellable worker is still active.
+        if str(cfg.market) in bot._preopen_prepare_jobs:
+            continue
         now = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
         key = _preopen_prepare_key(cfg, now)
         if key is None or key in bot._last_preopen_prepare_keys:
             continue
+        if _preopen_background_yields_to_open(cfg, now):
+            continue
         if not _scheduled_retry_allowed(bot._preopen_retry_after, key):
             continue
-        try:
-            final_arm = key.endswith(":preopen-final-arm")
-            result = await asyncio.to_thread(
-                _final_arm_market_signal_sync
-                if final_arm
-                else _prewarm_market_signal_sync,
-                cfg,
-            )
-            bot._last_preopen_prepare_keys.add(key)
-            _clear_signal_retry(
-                bot._preopen_retry_after,
-                bot._preopen_failure_counts,
-                key,
-            )
-            print(
-                f"[preopen] market={market} "
-                f"phase={'final_arm' if final_arm else 'prepare'} status=ready "
-                f"panel={result.summary.get('panel_date')} "
-                f"latency={result.summary.get('live_latency')}",
-                flush=True,
-            )
-        except Exception as exc:
-            _log_exception(f"preopen_prepare:{market}", exc)
-            retry_delay = _mark_signal_retry(
-                bot._preopen_retry_after,
-                bot._preopen_failure_counts,
-                key,
-                day_trade=bool(
-                    getattr(cfg, "day_trade_simulation_enabled", False)
-                    or getattr(cfg, "overnight_simulation_enabled", False)
-                ),
-            )
-            print(
-                f"[preopen] market={market} status=failed "
-                f"retry_seconds={retry_delay:.3f} "
-                f"error={type(exc).__name__}: {exc}",
-                flush=True,
-            )
+        market_key = str(cfg.market)
+        job = asyncio.create_task(
+            _run_preopen_prepare_job(cfg, key),
+            name=f"preopen:{cfg.market}",
+        )
+        bot._preopen_prepare_jobs[market_key] = job
+
+        def release_unstarted(done: asyncio.Task, *, market: str = market_key) -> None:
+            if (done.cancelled()
+                    and not getattr(done, "_stockagent_preopen_worker_started", False)
+                    and bot._preopen_prepare_jobs.get(market) is done):
+                bot._preopen_prepare_jobs.pop(market, None)
+
+        job.add_done_callback(release_unstarted)
 
 
 async def _prepare_scheduled_signal(cfg: LiveMarketConfig) -> tuple[Any, Exception | None, float]:
@@ -12123,6 +12366,42 @@ async def _scheduled_inputs_ready_order(due, preparations, *, poll_timeout=None,
                 await asyncio.gather(*remaining, return_exceptions=True)
 
 
+def _stamp_scheduled_input_ready(timing):
+    """Stamp the producer, not the later consumer of a completed input job."""
+    return {
+        **timing,
+        "input_result_ready_at": datetime.now().astimezone().isoformat(timespec="microseconds"),
+        "_input_result_ready_monotonic": time.monotonic(),
+    }
+
+
+def _scheduled_input_dispatch_timing(timing, *, gate, dispatched_at, dispatched_monotonic):
+    """Separate input readiness from serial consumer wait without mixing clocks.
+
+    The old mode_dispatch_queue_ms includes both input work and consumer wait.
+    Only same-process monotonic observations measure the latter; a legacy or
+    invalid observation remains unknown, never a fabricated zero queue.
+    """
+    from stockagent.live.opening_execution_latency import nonnegative_duration_ms
+
+    ready_at = timing.get("input_result_ready_at")
+    ready_from_open = nonnegative_duration_ms(_timestamp_delta_ms(ready_at, gate.isoformat()))
+    ready_before_dispatch = nonnegative_duration_ms(
+        _timestamp_delta_ms(dispatched_at.isoformat(), ready_at)
+    )
+    ready_mono = timing.get("_input_result_ready_monotonic")
+    wait_ms = None
+    if (isinstance(ready_mono, (int, float)) and not isinstance(ready_mono, bool)
+            and math.isfinite(ready_mono) and math.isfinite(dispatched_monotonic)):
+        wait_ms = nonnegative_duration_ms((dispatched_monotonic - ready_mono) * 1000.0)
+    return {
+        "input_result_ready_at": ready_at,
+        "input_ready_from_open_ms": ready_from_open if ready_before_dispatch is not None else None,
+        "input_ready_dispatch_wait_ms": None if wait_ms is None else round(wait_ms, 3),
+        "input_dispatch_clock_contract": "same_process_monotonic_ready_to_dispatch_v1",
+    }
+
+
 async def _prepare_scheduled_attempt_inputs(row, stage):
     """A single owned input job; slow catch-up never holds the retry scheduler.
 
@@ -12138,17 +12417,17 @@ async def _prepare_scheduled_attempt_inputs(row, stage):
         try:
             await asyncio.to_thread(_prewarm_market_signal_sync, cfg)
         except Exception as exc:
-            return None, exc, 0.0, None, {
+            return None, exc, 0.0, None, _stamp_scheduled_input_ready({
                 "signal_stage": "preopen_catch_up",
                 "preopen_catch_up_ms": round((time.perf_counter() - started) * 1000, 3),
-            }
+            })
         catch_up_ms = (time.perf_counter() - started) * 1000
     stage.update(phase="realtime_prepare", started_monotonic=time.monotonic())
     prepared, error, prepare_ms, quote, timing = await _prepare_scheduled_inputs(cfg)
-    return prepared, error, prepare_ms, quote, {
+    return prepared, error, prepare_ms, quote, _stamp_scheduled_input_ready({
         **timing, "preopen_catch_up_ms": round(catch_up_ms, 3),
         "input_owner_policy": "session_fenced_single_flight_bounded_poll_v1",
-    }
+    })
 
 
 def _scheduled_input_poll_jobs(due):
@@ -12198,7 +12477,31 @@ def _opening_source_repair_root(config_path: str, mtime_ns: int, size: int) -> s
     return str(Path(load_config(config_path).data.parquet_root).resolve())
 
 
-def _opening_source_repair_sync(root: str, session_date: str, attempt: int) -> dict[str, Any]:
+def _opening_source_repair_roots(configs) -> set[str]:
+    """Resolve distinct configs in one worker, retaining per-file retries.
+
+    All modes sharing a config use one result. A failed stat/load is not
+    memoized, so a second occurrence or the next observer cycle can retry it.
+    The fingerprinted config parser remains the single source of truth.
+    """
+    roots: set[str] = set()
+    resolved_paths: set[Path] = set()
+    for cfg in configs:
+        path = _resolve_repo_path(cfg.config_path)
+        if path is None or path in resolved_paths:
+            continue
+        try:
+            info = path.stat()
+            roots.add(_opening_source_repair_root(str(path), info.st_mtime_ns, info.st_size))
+            resolved_paths.add(path)
+        except Exception as exc:
+            _log_exception("opening_source_repair:config", exc)
+    return roots
+
+
+def _opening_source_repair_sync(root: str, session_date: str, attempt: int,
+                                dispatch_timing: dict[str, Any] | None = None,
+                                dispatched_at: float | None = None) -> dict[str, Any]:
     started = time.perf_counter()
     try:
         result = repair_tw_opening_snapshot_receipt(parquet_root=root, session_date=session_date)
@@ -12219,6 +12522,13 @@ def _opening_source_repair_sync(root: str, session_date: str, attempt: int) -> d
             result, attempt, datetime.now(ZoneInfo("Asia/Taipei")),
         ),
     })
+    if dispatch_timing is not None:
+        result["observer_dispatch_timing"] = {
+            **dispatch_timing,
+            "thread_queue_ms": round((started - dispatched_at) * 1000.0, 3)
+            if dispatched_at is not None else None,
+            "boundary": "same_process_durations_and_wall_gate_offset_not_exchange_clock",
+        }
     path = _day_trade_state_dir() / "opening_source_repair.json"
     _write_durable_json(path, result)
     # Retain each attempt, not just the latest successful timing.
@@ -12230,21 +12540,13 @@ def _opening_source_repair_sync(root: str, session_date: str, attempt: int) -> d
 
 
 def _opening_source_repair_must_defer(configs=()) -> bool:
-    """Keep the source owner live when inference only reads received facts.
+    """Source recovery cannot depend on an inference which may await prices.
 
-    The strict model path dispatches the shared fan-in itself. Provisional
-    models deliberately do not, so deferring their observer during inference
-    would leave the new-price path dependent on scheduling order at 09:00.
-    Provider single-flight/backoff remains with the existing shared fan-in.
+    Both strict and provisional models share the same fan-in, per-provider
+    in-flight sets and source cooldowns. No second broker login or alternate
+    collector is introduced by allowing the canonical observer to run.
     """
-    from stockagent.live.market_config import OPENING_PROVISIONAL_REFERENCE_POLICY
-    if any(getattr(cfg, "day_trade_opening_reference_policy", None)
-           == OPENING_PROVISIONAL_REFERENCE_POLICY for cfg in configs):
-        return False
-    return bool(
-        bot._opening_attempt_started_monotonic is not None
-        and bot._opening_attempt_stage not in {"preopen_catch_up", "realtime_prepare"}
-    )
+    return False
 
 
 def _opening_source_transport_prewarm_sync(root: str, session_date: str) -> dict[str, Any]:
@@ -12275,6 +12577,11 @@ def _opening_source_repair_delay(result: dict[str, Any], attempt: int, now: date
             or result.get("recovered_count", 0) > 0
             or (now.hour == 9 and now.minute == 0)):
         return 0.5
+    if result.get("status") == "awaiting_first_print":
+        # No-print is a temporary observation, not a completed open. Retry the
+        # missing scope during the session; each source still owns its own
+        # admission/cadence, including rate-limit and permission backoff.
+        return 1.0
     acquisition = result.get("opening_acquisition")
     providers = acquisition.get("opening_providers") if isinstance(acquisition, dict) else None
     if isinstance(providers, dict):
@@ -12303,6 +12610,7 @@ async def opening_source_repair() -> None:
     repairs only receipt gaps through the shared multi-source fan-in, off the
     event loop and completely separate from execution/ledger ownership.
     """
+    cycle_started = time.perf_counter()
     now = datetime.now(ZoneInfo("Asia/Taipei"))
     # Wake independently of model/source readiness at the opening gate. The
     # shared source owner still deduplicates every request and owns backoff.
@@ -12323,16 +12631,14 @@ async def opening_source_repair() -> None:
     # The fan-in still deduplicates provider calls and enforces source backoff.
     if _opening_source_repair_must_defer(configs):
         return
-    roots: set[str] = set()
-    for cfg in configs:
-        path = _resolve_repo_path(cfg.config_path)
-        if path is None:
-            continue
-        try:
-            info = path.stat()
-            roots.add(await asyncio.to_thread(_opening_source_repair_root, str(path), info.st_mtime_ns, info.st_size))
-        except Exception as exc:
-            _log_exception("opening_source_repair:config", exc)
+    if not configs:
+        return
+    configs_ready = time.perf_counter()
+    # Six serialized thread round trips delayed provider dispatch before the
+    # first request. Resolve the unique version-fenced configs together off
+    # the event loop; the shared fan-in still owns provider single-flight.
+    roots = await asyncio.to_thread(_opening_source_repair_roots, configs)
+    roots_ready = time.perf_counter()
     for root in sorted(roots):
         key = now.date().isoformat() + ":" + root
         if transport_warm_window:
@@ -12353,7 +12659,19 @@ async def opening_source_repair() -> None:
         attempt = bot._opening_source_repair_attempts.get(key, 0) + 1
         bot._opening_source_repair_attempts[key] = attempt
         try:
-            result = await asyncio.to_thread(_opening_source_repair_sync, root, now.date().isoformat(), attempt)
+            dispatched_at = time.perf_counter()
+            gate = now.replace(hour=9, minute=0, second=0, microsecond=0)
+            dispatch_timing = {
+                "contract": "opening_source_observer_dispatch_timing_v1",
+                "observer_observed_at": now.isoformat(timespec="microseconds"),
+                "wall_offset_from_open_ms": round((now - gate).total_seconds() * 1000.0, 3),
+                "cycle_to_configs_ms": round((configs_ready - cycle_started) * 1000.0, 3),
+                "root_resolution_ms": round((roots_ready - configs_ready) * 1000.0, 3),
+                "cycle_to_dispatch_ms": round((dispatched_at - cycle_started) * 1000.0, 3),
+                "config_count": len(configs), "root_count": len(roots),
+            }
+            result = await asyncio.to_thread(_opening_source_repair_sync, root, now.date().isoformat(),
+                                             attempt, dispatch_timing, dispatched_at)
             # Recalculate after durable receipt I/O. Reusing its earlier delay
             # would add fsync time on top of an absolute provider deadline.
             delay = _opening_source_repair_delay(result, attempt, datetime.now(ZoneInfo("Asia/Taipei")))
@@ -12639,6 +12957,7 @@ async def scheduled_signal() -> None:
         attempt_error: BaseException | None = None
         if day_trade_simulation:
             attempt_started = time.monotonic()
+            dispatched_at = datetime.now(ZoneInfo(cfg.timezone or bot.tz.key))
             gate = _opening_gate_at(cfg, now.date().isoformat())
             first_observed = bot._opening_first_observed_at.setdefault(key, now)
             attempt_timing.update(
@@ -12646,9 +12965,7 @@ async def scheduled_signal() -> None:
                     "scheduler_observed_at": now.isoformat(
                         timespec="microseconds"
                     ),
-                    "attempt_started_at": datetime.now(
-                        ZoneInfo(cfg.timezone or bot.tz.key)
-                    ).isoformat(timespec="microseconds"),
+                    "attempt_started_at": dispatched_at.isoformat(timespec="microseconds"),
                     "scheduler_wake_ms": round(
                         (first_observed - gate).total_seconds() * 1000.0,
                         3,
@@ -12658,7 +12975,7 @@ async def scheduled_signal() -> None:
                     "attempt_from_open_ms": round((now - gate).total_seconds() * 1000.0, 3),
                     "preopen_catch_up_ms": 0.0,
                     "mode_dispatch_queue_ms": round(
-                        (datetime.now(ZoneInfo(cfg.timezone or bot.tz.key)) - now).total_seconds() * 1000.0,
+                        (dispatched_at - now).total_seconds() * 1000.0,
                         3,
                     ),
                 }
@@ -12700,6 +13017,11 @@ async def scheduled_signal() -> None:
             else:
                 prepared, prepare_error, prepare_ms, prefetched_quote, input_timing = prepared_inputs
                 attempt_timing.update(input_timing)
+                if day_trade_simulation:
+                    attempt_timing.update(_scheduled_input_dispatch_timing(
+                        input_timing, gate=gate, dispatched_at=dispatched_at,
+                        dispatched_monotonic=attempt_started,
+                    ))
             attempt_timing["realtime_prepare_ms"] = round(prepare_ms, 3)
             attempt_timing["realtime_prepare_wait_ms"] = round(
                 (time.perf_counter() - prepare_started) * 1000.0, 3
@@ -13052,6 +13374,15 @@ async def artifact_backfill() -> None:
                     f"panel={result.summary.get('panel_date')} output={result.output_dir}",
                     flush=True,
                 )
+        except TWPublicSourceUpdatePending as exc:
+            waiting_job = _finish_artifact_backfill(
+                key, market, status="waiting_source", exc=exc,
+            )
+            print(
+                f"[artifact-backfill] market={market} status=waiting_source "
+                f"next_retry_at={waiting_job.get('next_retry_at')} "
+                f"reason={exc.details.get('reason')}", flush=True,
+            )
         except BotUserError as exc:
             failed_job = _finish_artifact_backfill(
                 key,

@@ -54,7 +54,7 @@ def test_runtime_enabled_market_is_protected(tmp_path):
 def test_live_signal_panel_default_is_protected_without_a_configured_cache_path(tmp_path, monkeypatch):
     monkeypatch.delenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", raising=False)
     _market(tmp_path, enabled=True, output_dir="artifacts/markets/live-model")
-    root = tmp_path / "artifacts/cache/live_signal_panels"
+    root = tmp_path / "service_data/cache/live_signal_panels"
     refs = artifact_service_references((root,), tmp_path)[str(root)]
     assert any("live_panel_disk_cache_root" in value for value in refs)
     _market(tmp_path, enabled=False, output_dir="artifacts/markets/live-model")
@@ -106,7 +106,7 @@ def test_panel_cache_resolver_preserves_writer_path_semantics(tmp_path, monkeypa
         monkeypatch.setenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", configured)
     value = str(configured or "").strip()
     expected = (Path(value).expanduser() if value else
-                tmp_path / "artifacts/cache/live_signal_panels")
+                tmp_path / "service_data/cache/live_signal_panels")
     if not expected.is_absolute():
         expected = working / expected
     assert live_panel_disk_cache_root(repo_root=tmp_path) == expected
@@ -245,15 +245,14 @@ def test_live_writer_compatibility_name_uses_the_same_canonical_resolver(monkeyp
 
     monkeypatch.delenv("STOCKAGENT_LIVE_PANEL_CACHE_ROOT", raising=False)
     assert signal_engine._live_panel_disk_cache_root is market_config.live_panel_disk_cache_root
-    assert market_config.live_panel_disk_cache_root() == (
-        Path(market_config.__file__).resolve().parents[2] / "artifacts/cache/live_signal_panels"
-    )
+    from stockagent.service_layout import service_path
+    assert market_config.live_panel_disk_cache_root() == service_path("live_signal_panels", area="cache")
 
 
 def test_dashboard_supervisor_default_cache_is_protected_without_inherited_env(tmp_path, monkeypatch):
     monkeypatch.delenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", raising=False)
     _market(tmp_path, enabled=True)
-    root = tmp_path / "artifacts/cache/tw_day_trade_dashboard_indexes"
+    root = tmp_path / "service_data/cache/tw_day_trade_dashboard_indexes"
     assert any("dashboard_index_cache_dir" in ref
                for ref in artifact_service_references((root,), tmp_path)[str(root)])
     _market(tmp_path, enabled=False)

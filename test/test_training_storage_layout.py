@@ -28,12 +28,22 @@ def test_new_cache_launch_copy_localizes_legacy_path_and_keeps_custom_path(tmp_p
     frozen = root / 'artifacts/code_releases/run/build-source'; frozen.mkdir(parents=True)
     legacy = root / 'artifacts/markets/run/runtime-cache/physical-source'
     alias = tmp_path / 'old-cache'; alias.symlink_to(legacy)
-    expected = root / 'artifacts/cache/run/runtime-cache/physical-source'
+    expected = root / 'service_data/cache/run/runtime-cache/physical-source'
     assert runtime_cache_path(legacy, frozen) == expected
     assert runtime_cache_path(alias, frozen) == expected
     custom = tmp_path / 'custom-cache'
     assert runtime_cache_path(custom, frozen) == custom
     assert not expected.exists() and not custom.exists()
+
+
+def test_cache_launch_path_uses_single_existing_owner_and_new_service_default(tmp_path):
+    legacy = tmp_path / 'artifacts/cache/run'
+    assert runtime_cache_path(legacy, tmp_path) == tmp_path / 'service_data/cache/run'
+    legacy.mkdir(parents=True)
+    assert runtime_cache_path(legacy, tmp_path) == legacy
+    (tmp_path / 'service_data/cache').mkdir(parents=True)
+    with pytest.raises(ValueError, match='independent service'):
+        runtime_cache_path(legacy, tmp_path)
 
 
 @pytest.mark.parametrize('alias', [False, True])

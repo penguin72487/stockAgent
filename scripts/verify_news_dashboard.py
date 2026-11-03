@@ -548,6 +548,7 @@ def verify(url: str, output: Path, *, required_providers: tuple[str, ...] = (),
                                 'verified': history['verified_list_scopes'],
                                 'waiting': history.get('waiting_list_scopes', history['current_source_contract_scope_states']['waiting_page_evidence']),
                                 'inconsistent': history.get('inconsistent_source_scopes'),
+                                'invalid_evidence': history.get('invalid_page_evidence_scopes'),
                                 'page_cap': history.get('page_cap_exceeded_scopes'),
                                 'gaps': history['unresolved_category_scopes'], 'retired': history['retired_gap_receipts']}
                             assert index['article_bodies_accepted_by_index'] == 0

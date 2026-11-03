@@ -4,6 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+import fcntl
+import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -55,6 +58,69 @@ def test_completed_fold_skips_inference_without_model_or_provider(completed_fold
         expected_latest_date="2026-10-14", last_data_date="2026-10-14", panel_date=None,
     ))
     assert not discord_bot._run_formal_history_backfill(cfg, status)
+
+
+@pytest.mark.parametrize("outcome", ["source_pending", "capacity_pending", "generic_failure", "forged_receipt"])
+def test_formal_history_reclassifies_only_a_typed_child_source_receipt(
+    tmp_path, monkeypatch, outcome,
+):
+    cfg = SimpleNamespace(market="fixture", config_path=str(tmp_path / "deployment.yaml"),
+                          fold_id=1, output_dir=None)
+    status = SimpleNamespace(data=SimpleNamespace(expected_latest_date="2026-10-29",
+                                                   last_data_date="2026-10-29", panel_date=None))
+    monkeypatch.setattr(discord_bot, "_formal_history_completed_date", lambda _: None)
+    monkeypatch.setattr(discord_bot, "_preflight_formal_history_calendar", lambda _: None)
+    monkeypatch.setattr(discord_bot, "_formal_history_timeout_seconds", lambda _: 30)
+    root = tmp_path / "live" / "data_tw_public"
+    stocks = root / "stocks"
+    stocks.mkdir(parents=True)
+    (root / "tw_corporate_action_reference.parquet").write_bytes(b"reference")
+    lock = root.parent / ".locks" / "tw-public-refresh.lock"
+    lock.parent.mkdir()
+    lock.touch()
+    original_run = subprocess.run
+    child_code = """
+import os, sys
+from pathlib import Path
+from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending, live_tw_public_source_read_guard
+import train
+outcome, stocks = sys.argv[1:]
+if outcome == 'generic_failure':
+    raise ValueError('real inference failure')
+if outcome == 'forged_receipt':
+    os.write(int(os.environ['STOCKAGENT_TW_SOURCE_PENDING_PIPE']), b'{"kind":"forged"}')
+    raise ValueError('real inference failure')
+def fail_under_lock():
+    if outcome == 'capacity_pending':
+        from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+        raise CapacityDeferred('physical_backing_headroom_unconfirmed', required_bytes_including_reserve=12345)
+    with live_tw_public_source_read_guard(Path(stocks)):
+        raise AssertionError('writer lock bypassed')
+train.main = fail_under_lock
+train._run_entrypoint()
+"""
+
+    def substitute_child(_command, **kwargs):
+        return original_run([sys.executable, "-c", child_code, outcome, str(stocks)],
+                            capture_output=True, **kwargs)
+
+    monkeypatch.setattr(discord_bot.subprocess, "run", substitute_child)
+    with lock.open("a+") as producer:
+        fcntl.flock(producer, fcntl.LOCK_EX)
+        expected = (discord_bot.TWPublicSourceUpdatePending if outcome == "source_pending" else
+                    discord_bot.CapacityDeferred if outcome == "capacity_pending" else discord_bot.BotUserError)
+        with pytest.raises(expected) as caught:
+            discord_bot._run_formal_history_backfill(cfg, status)
+    if outcome == "source_pending":
+        assert caught.value.details["producer_lock_held_at_child_observation"] is True
+        assert caught.value.details["current_lock_state"] == "unverified"
+    elif outcome == "capacity_pending":
+        assert caught.value.details["reason"] == "physical_backing_headroom_unconfirmed"
+        assert caught.value.details["required_bytes_including_reserve"] == 12345
+        assert caught.value.details["current_capacity_state"] == "unverified"
+        assert caught.value.details["allocation_admitted"] is False
+    else:
+        assert "formal history inference failed rc=" in str(caught.value)
 
 
 @pytest.mark.parametrize("change", [

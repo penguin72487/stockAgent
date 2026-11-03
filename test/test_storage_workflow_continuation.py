@@ -93,12 +93,35 @@ def test_only_catalog_lock_contention_is_a_normal_wait():
             sw.register_versions()
 
 
-def test_catalog_busy_wait_retries_without_exporting_unaccepted_data():
+def test_full_cold_volume_waits_without_publishing_a_snapshot():
+    with patch.object(sw.activity, 'heartbeat'), patch.object(sw, 'activity_lease', lambda: nullcontext()), \
+         patch.object(sw, 'configuration', lambda: {}), \
+         patch.object(sw, 'register', side_effect=sw.CatalogColdCapacity('full')):
+        assert sw.register_versions() == {'state': 'waiting_cold_physical_capacity', 'retry_after_seconds': 60}
+
+
+@pytest.mark.parametrize('cancelled,shutdown', [(False, False), (True, False), (False, True)])
+def test_version_activity_forwards_actual_temporal_stop_state(cancelled, shutdown):
+    def advance(_repo, configuration, *, stop_requested):
+        assert configuration == {'authority': 'original'}
+        assert stop_requested() is (cancelled or shutdown)
+        return {'state': 'processing'}
+    with patch.object(sw.activity, 'heartbeat'), patch.object(sw, 'activity_lease', lambda: nullcontext()), \
+         patch.object(sw, 'configuration', lambda: {'authority': 'original'}), \
+         patch.object(sw.activity, 'is_cancelled', lambda: cancelled), \
+         patch.object(sw.activity, 'is_worker_shutdown', lambda: shutdown), \
+         patch.object(sw, 'advance_catalog_versions', advance):
+        assert sw.advance_dataset_versions() == {'state': 'processing'}
+
+
+@pytest.mark.parametrize('wait_state,delay', [('waiting_catalog_owner', 15),
+                                               ('waiting_cold_physical_capacity', 60)])
+def test_catalog_busy_wait_retries_without_exporting_unaccepted_data(wait_state, delay):
     calls, sleeps = [], []
     async def execute(handler, *args, **options):
         calls.append((handler, options))
         if len(calls) == 1:
-            return {'state': 'waiting_catalog_owner', 'retry_after_seconds': 15}
+            return {'state': wait_state, 'retry_after_seconds': delay}
         raise Continued({'next_activity': handler.__name__})
     async def sleep(duration):
         sleeps.append(duration)
@@ -109,7 +132,7 @@ def test_catalog_busy_wait_retries_without_exporting_unaccepted_data():
             asyncio.run(sw.StorageLifecycle().run({'last_snapshot': 9}))
     assert continued.value.request == {'next_activity': 'register_versions'}
     assert [handler for handler, _ in calls] == [sw.register_versions, sw.register_versions]
-    assert sleeps == [timedelta(seconds=15)]
+    assert sleeps == [timedelta(seconds=delay)]
     assert calls[0][1]['start_to_close_timeout'] == timedelta(hours=24)
 
 

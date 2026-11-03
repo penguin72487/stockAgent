@@ -30,6 +30,7 @@ import torch
 from downloader.artifact_io import atomic_write_bytes
 from stockagent.data_sync.completed_forward_usage import note_successful_use
 from stockagent.data_sync.immutable_cache_files import link_immutable_payload, payload_info
+from stockagent.service_layout import canonical_service_path
 
 CONTRACT = "completed_tw_panel_forward_cpu_v3"
 # The five deployed models have 13--842 MiB of complete outputs. A 64 MiB
@@ -514,6 +515,9 @@ def cached_forward(
     *,
     validate_before_commit: Callable[[], None] | None = None,
 ) -> tuple[Any, dict[str, Any]]:
+    # Compatibility names and their registered service owner must share one
+    # lease, admission and durable cache. Never resolve arbitrary redirects.
+    root = canonical_service_path(root)
     # Own a canonical, immutable-by-caller snapshot. JSON tuples become lists
     # consistently on both write and read; a caller cannot relabel the result
     # by mutating its identity while a compute callback is running.

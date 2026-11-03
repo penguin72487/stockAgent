@@ -2,6 +2,14 @@
 
 /* A single acknowledged engine projection, not a historical ledger page. */
 (function installLivePaper(global) {
+  // This projection is restricted to committed open positions, not history.
+  let sharedSnapshot = null, sharedError = "";
+  function getSnapshot() { return {data: sharedSnapshot, error: sharedError}; }
+  function notify() {
+    if (typeof global.dispatchEvent === "function" && typeof global.CustomEvent === "function") {
+      global.dispatchEvent(new global.CustomEvent("stockagent:live-paper"));
+    }
+  }
   async function retryTransientRead(fetcher, url, options, pause = ms => new Promise(resolve => global.setTimeout(resolve, ms))) {
     const first = await fetcher(url, options);
     if (first.status !== 503 && first.status !== 504) return first;
@@ -85,14 +93,18 @@
     async function refresh() {
       try {
         const response = await retryTransientRead(fetchSnapshot, "api/live-snapshot", {cache: "no-store", headers: etag ? {"If-None-Match": etag} : {}});
-        if (response.status === 304 && current) { error = ""; render(); return; }
+        if (response.status === 304 && current) {
+          error = ""; sharedSnapshot = current; sharedError = error; render(); notify(); return;
+        }
         current = validate(await Dashboard.readJsonResponse(response, {expectedRoot: "object"}));
         etag = response.headers.get("etag") || "";
         error = "";
       } catch (_error) {
         error = current ? "更新失敗，保留上次已確認快照" : "模擬快照暫時無法核對，將自動重試";
       }
+      sharedSnapshot = current; sharedError = error;
       render();
+      notify();
     }
     $("live-paper-more").addEventListener("click", () => { visible += 50; render(); });
     const scheduler = Dashboard.scheduleRefresh(refresh, {
@@ -153,7 +165,7 @@
     });
     $("force-refresh")?.addEventListener("click", () => scheduler.run());
   }
-  global.StockAgentTwLivePaper = Object.freeze({validate, init, validateEvents, initEvents, retryTransientRead});
+  global.StockAgentTwLivePaper = Object.freeze({validate, init, validateEvents, initEvents, retryTransientRead, getSnapshot});
   init();
   initEvents();
 })(globalThis);

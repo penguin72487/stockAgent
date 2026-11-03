@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import socket
+import subprocess
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -18,6 +19,46 @@ from stockagent.data_sync.cache_capacity import (
     load_capacity_policy,
 )
 from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+# Concurrent host writes previously varied by about 18 GiB for reasons not yet
+# identified. Moving payloads to E does not establish that this risk ended.
+FUTURES_WORKSPACE_CONTROL_HEADROOM_BYTES = 24 * 1024**3
+
+
+def futures_workspace_dispatch_status(workspace: Path) -> dict:
+    """Check the actual E payload target and the remaining small C controls.
+
+    This admits only the separately bounded, serial futures-workspace mode;
+    it is a dispatch observation, not a reservation against other writers.
+    """
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    from stockagent.data_sync.workspace_volume import admit, check_finlab_futures
+
+    value = {"contract": "finlab_futures_workspace_dispatch_v1", "path": str(workspace),
+             "guard_kind": "finite_priority_preflight_not_write_reservation"}
+    try:
+        if workspace.resolve(strict=True) != (ROOT / "data_finlab").resolve(strict=True):
+            raise ValueError("futures workspace is limited to the canonical source root")
+        control = priority_dispatch_status(workspace,
+            additional_headroom_bytes=FUTURES_WORKSPACE_CONTROL_HEADROOM_BYTES)
+        if control.get("state") != "admitted":
+            return {**value, "state": "deferred", "reason": "control_capacity_unavailable",
+                    "control": control, "retryable": True}
+        mount = check_finlab_futures()
+        payload = admit()
+    except (SnapshotError, OSError, ValueError, KeyError, TypeError, RuntimeError,
+            subprocess.SubprocessError) as error:
+        return {**value, "state": "deferred", "reason": "workspace_unavailable",
+                "error_type": type(error).__name__, "retryable": True}
+    return {**value, "state": "admitted", "control": control,
+            "workspace": payload, "workspace_alias": mount["target"]}
+
+
+def check_futures_workspace_dispatch(workspace: Path, *, report_admitted: bool = False) -> int:
+    result = futures_workspace_dispatch_status(workspace)
+    if report_admitted or result["state"] != "admitted":
+        print(json.dumps(result), flush=True)
+    return 0 if result["state"] == "admitted" else 75
 
 
 def priority_dispatch_status(workspace: Path, *, additional_headroom_bytes: int = 0) -> dict:

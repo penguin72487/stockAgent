@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Install the source backup role without changing the canonical cold store.
+"""Manage the original sender without changing the D cold authority.
 
-Retains the verified small WSL deliveries, copies them to dedicated D: staging,
-then mounts that staging at the same Syncthing path. Private credentials and
-device identities are never copied, logged or modified.
+The legacy install/resume retains its D staging contract. The explicit E
+relocation copies and independently verifies that transport before handing
+over its existing Syncthing alias. Credentials and peer identities stay put.
 """
 from __future__ import annotations
 
@@ -126,7 +126,9 @@ def install(evidence: Path, config: dict, role: Path) -> dict:
                 raise ValueError("preserve any existing source backup environment")
             atomic_write_bytes(env_file, ("FINTECH_ENV_PATH=" + shlex.quote(str(role)) + "\n"
                 "STOCKAGENT_BACKUP_RUNTIME_LOCK=" + shlex.quote(str(state / "runtime-lock.json")) + "\n").encode(), mode=0o600)
-            for name in ("stockagent-backup-transport-mount.service", "stockagent-backup-stream.service", "stockagent-backup-stream.timer"):
+            for name in ("stockagent-backup-transport-mount.service", "stockagent-backup-stream.service", "stockagent-backup-stream.timer",
+                         "stockagent-backup-notify.service", "stockagent-backup-notify.timer",
+                         "stockagent-private-cold-backup.service", "stockagent-private-cold-backup.timer"):
                 target = Path("/etc/systemd/system") / name
                 if target.exists():
                     raise ValueError("preserve an existing source backup unit")
@@ -157,6 +159,9 @@ def install(evidence: Path, config: dict, role: Path) -> dict:
         receipts = configure_receipts(json.loads((ROOT / "configs/data_sync/backup_receipts.json").read_bytes()), "producer", "configure")
         private_json(evidence / "receipt-return-channel.json", receipts)
         execute(["systemctl", "enable", "--now", "stockagent-backup-stream.timer"])
+        execute(["systemctl", "enable", "--now", "stockagent-backup-notify.timer"])
+        if config.get('private_history_schedule') == 'independent_timer':
+            execute(["systemctl", "enable", "--now", "stockagent-private-cold-backup.timer"])
     native_after = runtime_identity()
     if validate_runtime_lock(native_before, native_after):
         raise ValueError("native source runtime changed during backup installation")
@@ -224,12 +229,38 @@ def resume(evidence: Path, config: dict, role: Path) -> dict:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs/data_sync/backup_stream.json")
-    parser.add_argument("--role-prefix", type=Path, required=True)
+    parser.add_argument("--role-prefix", type=Path)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--resume", action="store_true")
+    parser.add_argument("--relocate-to-workspace", action="store_true")
     args = parser.parse_args()
-    action = resume if args.resume else install
-    result = action(args.evidence, json.loads(args.config.read_bytes()), args.role_prefix)
+    if args.relocate_to_workspace:
+        if os.readlink('/proc/self/ns/mnt') != os.readlink('/proc/1/ns/mnt'):
+            os.execvp('nsenter',['nsenter','--mount=/proc/1/ns/mnt','--',sys.executable,str(Path(__file__).resolve()),*sys.argv[1:]])
+        from stockagent.data_sync.transport_relocation import advance
+        try:
+            result=advance(args.evidence)
+        except BlockingIOError as error:
+            result={'state':'waiting_for_original_owner_or_reader','retryable':True}
+            from downloader.artifact_io import atomic_write_json
+            atomic_write_json(args.evidence/'attempt.json', {
+                **result, 'observed_at_epoch': time.time(), 'reason_code': 'original_owner',
+                # Private evidence distinguishes a busy lock, namespace and
+                # process-reference wait. The public projection whitelists
+                # reason_code and never returns these error details.
+                'private_wait_error': {'type': type(error).__name__, 'errno': error.errno,
+                                       'message': str(error)[:4096]}})
+        except Exception as error:
+            from downloader.artifact_io import atomic_write_json
+            atomic_write_json(args.evidence/'attempt.json', {
+                'state': 'relocation_failed', 'reason_code': 'retirement_validation',
+                'exception_type': type(error).__name__, 'observed_at_epoch': time.time()})
+            raise
+    else:
+        if args.role_prefix is None:
+            parser.error('--role-prefix is required for the original install/resume')
+        action = resume if args.resume else install
+        result = action(args.evidence, json.loads(args.config.read_bytes()), args.role_prefix)
     print(json.dumps(result))
 
 

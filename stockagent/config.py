@@ -1801,6 +1801,9 @@ class TradingConfig:
     # ceiling.  This is an explicit semantic/checkpoint boundary, not an
     # observed auction-liquidity claim.
     tw_day_trade_terminal_liquidation_unlimited_capacity: bool = False
+    # User-selected research stress cost, assessed on source-capacity residual
+    # shorts at an official limit-up close, before any synthetic terminal fill.
+    tw_day_trade_short_limit_up_penalty_rate: float = 0.0
     tw_day_trade_entry_remainder_policy: str = "first_minute_only"
     # Legacy cash-equivalent rights valuation is retained only for replay.
     # New no-subscription experiments reject an affected held position instead
@@ -1915,6 +1918,14 @@ class TradingConfig:
     # Explicitly separates stock-decision days from receipt-backed account-only
     # events.  Disabled configurations preserve the historical checkpoint ABI.
     tw_futures_account_calendar_contract: str | None = None
+    # Optional, independently reviewed processing-day notices. This only
+    # supplies calendar evidence; valuations require their own admission.
+    tw_futures_holiday_account_dates_source: str | None = None
+    # Original C11/CB1 marks and their dated P08/PA8 definitions. Calendar
+    # evidence and final cash settlements retain their independent gates.
+    tw_futures_holiday_valuation_source: str | None = None
+    # Prior real stock-feature sessions only; never extend the account tape.
+    tw_futures_feature_history_contract: str | None = None
     tw_futures_portfolio_minute_data_path: str | None = None
     # Opt-in carrying-account clock. None retains the historical daily OPEN ABI.
     tw_futures_portfolio_decision_time: str | None = None
@@ -2732,6 +2743,9 @@ class TrainingConfig:
     target_vram_fraction: float = 0.85
     epochs: int = 10
     early_stopping_no_improve_ratio: float = 0.2
+    # Zero retains the historical coupling to epochs; a positive value keeps
+    # patience fixed when a longer maximum run is selected.
+    early_stopping_reference_epochs: int = 0
     early_stopping_min_delta: float = 0.0
     best_checkpoint_max_epoch: int = 0
     val_interval_epochs: int = 1
@@ -3239,6 +3253,9 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             "training.tw_continuous_gradient_horizon_rows must be zero or "
             "an exact multiple of tw_continuous_compile_chunk_rows"
         )
+    training["early_stopping_reference_epochs"] = int(training["early_stopping_reference_epochs"])
+    if training["early_stopping_reference_epochs"] < 0:
+        raise ValueError("training.early_stopping_reference_epochs must be nonnegative")
     training["best_checkpoint_max_epoch"] = max(
         0, int(training["best_checkpoint_max_epoch"])
     )
@@ -4603,6 +4620,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
     account_calendar = trading["tw_futures_account_calendar_contract"]
     if account_calendar not in (None, "dated_futures_account_calendar_v1"):
         raise ValueError("unsupported futures account calendar contract")
+    holiday_dates_source = trading["tw_futures_holiday_account_dates_source"]
+    if holiday_dates_source is not None and (
+            not isinstance(holiday_dates_source, str) or not holiday_dates_source.strip()
+            or account_calendar != "dated_futures_account_calendar_v1"):
+        raise ValueError("holiday account date evidence requires a path and the dated futures account calendar")
+    holiday_valuation_source = trading["tw_futures_holiday_valuation_source"]
+    if holiday_valuation_source is not None and (
+            not isinstance(holiday_valuation_source, str) or not holiday_valuation_source.strip()
+            or account_calendar != "dated_futures_account_calendar_v1"):
+        raise ValueError("holiday valuation evidence requires a path and the dated futures account calendar")
     if account_calendar is not None and (
             trading["execution_mode"] != "tw_stock_context_futures_portfolio"
             or holding_policy != "carry"
@@ -4612,6 +4639,16 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
             or not entry_clock_path
             or training["loss_type"] != "log_utility"):
         raise ValueError("dated futures account calendar requires receipt-bound chronological whole-contract margin log utility")
+    feature_history = trading["tw_futures_feature_history_contract"]
+    if feature_history not in (None, "futures_feature_only_history_v2"):
+        raise ValueError("unsupported futures feature history contract")
+    if feature_history is not None and (
+            account_calendar != "dated_futures_account_calendar_v1"
+            or walk_forward["lookback_context"] != "panel_history"
+            or walk_forward.get("split_start_year") is None
+            or not data["factorized_feature_manifest"]
+            or data["panel_start_date"] is None):
+        raise ValueError("futures feature history requires dated account, factorized features, an explicit source start and panel-history split")
     entry_capacity_policy = trading["tw_futures_portfolio_entry_capacity_policy"]
     if entry_capacity_policy not in {"previous_session", "single_contract_probe"}:
         raise ValueError("unsupported futures entry capacity policy")
@@ -5155,6 +5192,18 @@ def _merge_defaults(raw: dict[str, Any]) -> dict[str, Any]:
                 or training.get("day_trade_training_annual_episodes", False)):
             raise ValueError("frozen target entry sweep requires dense continuous physical "
                              "carry without annual account resets")
+    short_limit_up_penalty = trading["tw_day_trade_short_limit_up_penalty_rate"]
+    if (isinstance(short_limit_up_penalty, bool)
+            or not isinstance(short_limit_up_penalty, (int, float))
+            or not math.isfinite(short_limit_up_penalty)
+            or not 0 <= short_limit_up_penalty <= 1):
+        raise ValueError("tw_day_trade_short_limit_up_penalty_rate must be finite in [0, 1]")
+    if short_limit_up_penalty and (
+        trading["execution_mode"] != "tw_day_trade"
+        or not trading["tw_day_trade_unlimited_margin_conversion"]
+        or data["day_trade_minute_execution_root"] is None
+    ):
+        raise ValueError("short limit-up penalty requires the physical FIFO day-trade account")
     if bool(trading["tw_day_trade_terminal_liquidation_unlimited_capacity"]):
         if not bool(trading["tw_day_trade_unlimited_margin_conversion"]):
             raise ValueError(
@@ -6074,6 +6123,7 @@ def load_config(
             early_stopping_no_improve_ratio=training_raw[
                 "early_stopping_no_improve_ratio"
             ],
+            early_stopping_reference_epochs=training_raw["early_stopping_reference_epochs"],
             early_stopping_min_delta=training_raw["early_stopping_min_delta"],
             best_checkpoint_max_epoch=training_raw["best_checkpoint_max_epoch"],
             val_interval_epochs=training_raw["val_interval_epochs"],

@@ -1,0 +1,22 @@
+[Unit]
+Description=Stage sealed cold packs for private Vast computation
+Requires=stockagent-d-cold-mount.service
+Wants=network-online.target
+After=stockagent-d-cold-mount.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_lakehouse_control.sh python __REPO_ROOT__/scripts/manage_pack_compute_spool.py
+UMask=0077
+Nice=19
+CPUWeight=1
+IOWeight=1
+# Per-request SSH/compute deadlines and the bounded batch own progress limits.
+# A healthy batch of large HDD reads must not be killed by a wall-clock slice.
+TimeoutStartSec=infinity
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=no
+

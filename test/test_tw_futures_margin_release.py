@@ -52,6 +52,36 @@ def test_full_market_rows_keep_zero_print_product_and_no_synthetic_fills():
     assert daily['contract_multiplier'].null_count() == daily.height
 
 
+def test_explicit_catalog_only_scope_keeps_every_observed_day_and_no_fabricated_product():
+    source, raw, universe = source_rows()
+    extra = universe.head(1).with_columns(pl.lit('NEW').alias('product'))
+    catalog = pl.concat([universe, extra])
+    with pytest.raises(ValueError, match='physical history'):
+        materialize_margin_market_rows(source, raw, catalog)
+    baseline, baseline_slots = materialize_margin_market_rows(source, raw, universe)
+    actual, slots = materialize_margin_market_rows(
+        source, raw, catalog, allow_unobserved_catalog_products=True)
+    # Product IDs deliberately include the complete catalog; adding an earlier
+    # catalog code can renumber IDs even when all observed market rows agree.
+    assert actual.drop('taifex_product_id').equals(baseline.drop('taifex_product_id'))
+    assert actual.group_by('product').agg(pl.col('taifex_product_id').n_unique())[
+        'taifex_product_id'].to_list() == [1, 1]
+    assert slots.equals(baseline_slots)
+    assert 'NEW' not in set(actual['product'])
+
+    # Catalog-only is not permission to lose a source row or observed product.
+    missing_day = source.filter(~((pl.col('product') == 'ZZ1') & (pl.col('date') == date(2026, 1, 3))))
+    with pytest.raises(ValueError, match='drops requested observed contract-days'):
+        materialize_margin_market_rows(missing_day, raw, catalog, allow_unobserved_catalog_products=True)
+    missing_product = source.filter(pl.col('product') != 'ZZ1')
+    with pytest.raises(ValueError, match='drops requested observed contract-days'):
+        materialize_margin_market_rows(missing_product, raw, catalog, allow_unobserved_catalog_products=True)
+    unknown = source.with_columns(pl.when(pl.col('product') == 'ZZ1').then(pl.lit('BAD'))
+                                  .otherwise(pl.col('product')).alias('product'))
+    with pytest.raises(ValueError, match='physical history'):
+        materialize_margin_market_rows(unknown, raw, catalog, allow_unobserved_catalog_products=True)
+
+
 def test_scoped_materialization_keeps_parent_calendar_gaps_visible():
     source,raw,universe=source_rows()
     calendar=source.select('date').unique()

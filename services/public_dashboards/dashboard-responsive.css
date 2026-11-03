@@ -66,6 +66,12 @@ body .provider-breadcrumb a {
   font-weight: 750;
 }
 
+/* Native details are controls even in dense desktop source tables. Keep their
+ * hit area usable; tablet/touch rules below retain the larger 44px target. */
+body details > summary {
+  min-block-size: 24px;
+}
+
 @media (min-width: 1600px) {
   body > .public-nav,
   body > .site-header,

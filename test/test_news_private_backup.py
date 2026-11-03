@@ -71,6 +71,19 @@ def test_capture_includes_old_shared_parts_and_exact_source_snapshot(news):
     assert not plan["public_publish_allowed"] and not plan["live_database_copied"]
 
 
+def test_new_generation_schema_is_preserved_without_invalidating_existing_plan(news):
+    repo, root, manifest, policy = news
+    earlier = module.capture_plan(repo, policy, policy)
+    schema = root / manifest['generation'] / 'schema.json'
+    schema.write_text('{"articles": []}')
+    later = module.capture_plan(repo, policy, policy)
+    relative = f"data_news/{manifest['generation']}/schema.json"
+    assert relative not in {row['relative'] for row in earlier['source_files']}
+    assert relative in {row['relative'] for row in later['source_files']}
+    module.validate_plan(earlier, policy, policy)
+    module.validate_plan(later, policy, policy)
+
+
 @pytest.mark.parametrize("key,value", [("private_backup_authorized", False),
     ("public_publish_allowed", True), ("automatic_training_injection_allowed", True),
     ("source_licenses_changed", True), ("receiver_device_id", "another-peer"),

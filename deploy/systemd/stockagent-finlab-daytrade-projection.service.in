@@ -11,6 +11,8 @@ Group=@SERVICE_GROUP@
 WorkingDirectory=@REPO_ROOT@
 Environment="HOME=@SERVICE_HOME@"
 Environment="PYTHONUNBUFFERED=1"
+# This owner invokes the same protected day-trade projection producer.
+Environment="STOCKAGENT_TW_DAY_TRADE_PRIORITY_SOURCE=1"
 ExecStart=/usr/bin/bash "@REPO_ROOT@/scripts/run_finlab_daytrade_priority.sh" reconcile
 SuccessExitStatus=75
 Nice=-3

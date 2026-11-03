@@ -153,6 +153,7 @@ class PrefetchedLiveQuote:
     preparation_queue_ms: float | None = None
     request_template: dict[str, Any] | None = field(default=None, repr=False, compare=False)
     cache_only_refresh_ms: float | None = None
+    input_cache_observation: dict[str, Any] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -264,6 +265,25 @@ def _completed_panel_identity(config: ExperimentConfig, *, rule_data_dir=None) -
     return identity_digest({"source": source_fingerprint(config, rule_data_dir=rule_data_dir),
         "configuration": configuration_identity(config), "code": loaded_implementation_identity(),
         "torch": str(torch.__version__), "numpy": np.__version__})
+
+
+def _observe_completed_panel_identity(config_path: str | Path, fingerprint: str) -> bool:
+    """Invalidate changed known sources, not another mode's first observation.
+
+    Each panel/attachment already has its own complete source-bound key. The
+    first completed-session read for a different configuration therefore must
+    not evict the panels and device inputs prepared by earlier modes. A changed
+    identity for an observed configuration retains the global invalidation and
+    warmup epoch fence; final completed-source validation is also unchanged.
+    """
+    source_key = str(Path(config_path).resolve())
+    with _LIVE_PANEL_CACHE_LOCK:
+        previous = _LIVE_COMPLETED_SOURCE_IDENTITIES.get(source_key)
+        _LIVE_COMPLETED_SOURCE_IDENTITIES[source_key] = fingerprint
+    changed = previous is not None and previous != fingerprint
+    if changed:
+        clear_live_panel_memory_cache()
+    return changed
 
 
 def _env_enabled(name: str, default: bool = True) -> bool:
@@ -405,6 +425,34 @@ def _live_inference_cpu_cache_retained() -> bool:
                 and bool(_LIVE_RAW_TAIL_SOURCE_CACHE.stats()["entries"]))
 
 
+def live_cuda_allocator_observation() -> dict[str, Any]:
+    """Observe this process's PyTorch allocator without initializing CUDA.
+
+    These counters exclude non-PyTorch and other-process allocations. Cache
+    count is opportunistic so the heartbeat never waits for a model build.
+    """
+    observation: dict[str, Any] = {
+        "status": "uninitialized", "device": None, "allocated_bytes": None,
+        "reserved_bytes": None, "model_cache_entries": None,
+    }
+    if _LIVE_MODEL_CACHE_LOCK.acquire(blocking=False):
+        try:
+            observation["model_cache_entries"] = len(_LIVE_MODEL_CACHE)
+        finally:
+            _LIVE_MODEL_CACHE_LOCK.release()
+    try:
+        if torch.cuda.is_initialized():
+            device = torch.cuda.current_device()
+            stats = torch.cuda.memory_stats(device)
+            observation.update(status="available", device=device,
+                allocated_bytes=stats.get("allocated_bytes.all.current"),
+                reserved_bytes=stats.get("reserved_bytes.all.current"))
+    except Exception as exc:
+        # Observability is never a trading-signal or service-liveness gate.
+        observation.update(status="unavailable", error_type=type(exc).__name__)
+    return observation
+
+
 def release_idle_live_cuda_cache() -> bool:
     """Release retained inference models after the caller has excluded live work.
 
@@ -424,26 +472,36 @@ def release_idle_live_cuda_cache() -> bool:
     import gc
 
     gc.collect()
-    if cuda_release_pending and torch.cuda.is_initialized():
-        # cuBLAS owns allocations outside Python Tensor references. The
-        # documented clear hook releases them without changing GEMM workspace
-        # size, precision or kernel policy. Only the serialized idle owner may
-        # call this; ordinary live invalidation keeps its warm workspaces.
-        torch.cuda.synchronize()
-        clear_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
-        if clear_workspaces is not None:
-            clear_workspaces()
-        torch.cuda.empty_cache()
-        # The device allocator above does not return page-locked host buffers.
-        # The public API exists in our verified runtime; older runtimes retain
-        # their existing behavior rather than invoking an unguarded private API.
-        empty_host_cache = getattr(getattr(torch, "accelerator", None), "empty_host_cache", None)
-        if empty_host_cache is not None:
-            empty_host_cache()
     with _LIVE_MODEL_CACHE_LOCK:
-        # Do not erase this obligation if a release step raised. A later idle
-        # attempt may retry even when invalidation already emptied the models.
+        # Clearing input/panel caches above may create a CUDA obligation even
+        # when the initial model cache was empty. Claim it before flushing so
+        # a concurrent later invalidation can leave a new obligation pending.
+        cuda_release_pending |= _LIVE_CUDA_CACHE_RELEASE_PENDING
         _LIVE_CUDA_CACHE_RELEASE_PENDING = False
+    try:
+        if cuda_release_pending and torch.cuda.is_initialized():
+            # cuBLAS owns allocations outside Python Tensor references. The
+            # documented clear hook releases them without changing GEMM workspace
+            # size, precision or kernel policy. Only the serialized idle owner may
+            # call this; ordinary live invalidation keeps its warm workspaces.
+            torch.cuda.synchronize()
+            clear_workspaces = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+            if clear_workspaces is not None:
+                clear_workspaces()
+            torch.cuda.empty_cache()
+            # The device allocator above does not return page-locked host buffers.
+            # The public API exists in our verified runtime; older runtimes retain
+            # their existing behavior rather than invoking an unguarded private API.
+            empty_host_cache = getattr(getattr(torch, "accelerator", None), "empty_host_cache", None)
+            if empty_host_cache is not None:
+                empty_host_cache()
+    except BaseException:
+        if cuda_release_pending:
+            # Failed work remains retryable, including after cache references
+            # have already been dropped. Do not discard a concurrent request.
+            with _LIVE_MODEL_CACHE_LOCK:
+                _LIVE_CUDA_CACHE_RELEASE_PENDING = True
+        raise
     return True
 
 
@@ -1009,6 +1067,7 @@ def _build_panel(
     live_tail: bool = False,
     panel_end_date: str | None = None,
     progress_callback: Callable[[str, int, int], None] | None = None,
+    cache_observation: dict[str, Any] | None = None,
 ) -> tuple[PanelData, bool, str]:
     # Training-only factorized inputs must not become a six-column live panel,
     # including through a hot/disk cache made for a different checkpoint ABI.
@@ -1022,6 +1081,7 @@ def _build_panel(
         panel, hit, tier = _build_panel_from_stable_source(
             config, live_tail=live_tail, progress_callback=progress_callback,
             source_read_generation=source_read_generation,
+            **({"cache_observation": cache_observation} if cache_observation is not None else {}),
         )
         if str(panel_end_date or "").strip().lower() in {"", "latest", "last"}:
             panel_end_date = None
@@ -1029,7 +1089,8 @@ def _build_panel(
             # Cache the bounded attachment against the original base owner,
             # not a fresh slice object whose id changes on every retry.
             panel = _cached_factorized_live_panel(
-                panel, config, progress_callback, panel_end_date=panel_end_date)
+                panel, config, progress_callback, panel_end_date=panel_end_date,
+                **({"cache_observation": cache_observation} if cache_observation is not None else {}))
             return panel, hit, tier
         if panel_end_date is not None:
             # Historical opening inference needs only t-1. A newer daily base
@@ -1041,7 +1102,8 @@ def _build_panel(
         return panel, hit, tier
 
 
-def _cached_factorized_live_panel(panel, config, progress_callback=None, *, panel_end_date=None):
+def _cached_factorized_live_panel(panel, config, progress_callback=None, *, panel_end_date=None,
+                                  cache_observation=None):
     """Retain one verified attachment/cache across warmup and quote prefetch.
 
     The entire immutable-member identity belongs in the flight/cache key, not
@@ -1053,6 +1115,8 @@ def _cached_factorized_live_panel(panel, config, progress_callback=None, *, pane
     signatures = _factorized_member_signatures(path)
     key = (id(panel), str(path), config.data.factorized_host_cache_bytes,
            str(panel_end_date) if panel_end_date is not None else None, signatures)
+    if cache_observation is not None:
+        cache_observation["factorized_members_fingerprint"] = hashlib.sha256(repr(signatures).encode()).hexdigest()
 
     def build(progress):
         progress("factorized_attachment", 0, 1)
@@ -1074,6 +1138,8 @@ def _cached_factorized_live_panel(panel, config, progress_callback=None, *, pane
         key, build, progress_callback, cache=_LIVE_FACTORIZED_PANEL_CACHE,
         max_entries=2,
     )
+    if cache_observation is not None:
+        cache_observation.update(factorized_cache_hit=bool(_hit), factorized_cache_tier=_tier)
     return entry[1]
 
 
@@ -1136,6 +1202,7 @@ def _build_panel_from_stable_source(
     live_tail: bool = False,
     progress_callback: Callable[[str, int, int], None] | None = None,
     source_read_generation=None,
+    cache_observation: dict[str, Any] | None = None,
 ) -> tuple[PanelData, bool, str]:
     live_tail_rows = int(getattr(config.data, "live_tail_panel_rows", 0) or 0)
     external_kwargs = external_panel_data_kwargs(config.data)
@@ -1171,6 +1238,12 @@ def _build_panel_from_stable_source(
             panel_kwargs=panel_kwargs,
             source_read_generation=source_read_generation,
         )
+        if cache_observation is not None:
+            with _LIVE_PANEL_CACHE_LOCK:
+                cache_observation.update(contract="exact_live_panel_cache_observation_v1",
+                    base_cache_key=cache_key, panel_cache_epoch=_LIVE_PANEL_CACHE_EPOCH,
+                    resident_before=cache_key in _LIVE_PANEL_CACHE,
+                    resident_base_keys=list(_LIVE_PANEL_CACHE))
         panel, hit, tier = _shared_live_panel_build(
             cache_key,
             lambda progress: _load_live_tail_panel(
@@ -1179,6 +1252,10 @@ def _build_panel_from_stable_source(
             ),
             progress_callback,
         )
+        if cache_observation is not None:
+            with _LIVE_PANEL_CACHE_LOCK:
+                cache_observation.update(resident_after=cache_key in _LIVE_PANEL_CACHE,
+                    base_cache_hit=bool(hit), base_cache_tier=tier)
         return (
             slice_panel_start(panel, config.data.panel_start_date),
             hit,
@@ -3845,10 +3922,11 @@ def prefetch_live_signal_prices(
         report("checkpoint_load", 0)
         payload, checkpoint_key, _hit = _cached_checkpoint(checkpoint)
         report("panel_fingerprint", 0)
+        input_cache_observation: dict[str, Any] = {}
         panel, _hit, _tier = _build_panel(
             config, live_tail=True,
             panel_end_date=panel_date if config.data.factorized_feature_manifest else None,
-            progress_callback=report)
+            progress_callback=report, cache_observation=input_cache_observation)
         report("panel_alignment", 0)
         panel, _hit = _cached_aligned_panel(
             panel, checkpoint_key=checkpoint_key, checkpoint_payload=payload,
@@ -3893,6 +3971,7 @@ def prefetch_live_signal_prices(
             quote_started, quote_finished, requested, received,
             preparation_queue_ms=preparation_queue_ms,
             request_template=request,
+            input_cache_observation=input_cache_observation,
         )
         future.set_result(result)
         return result
@@ -4389,13 +4468,9 @@ def generate_live_signal(
         with live_tw_public_source_read_guard(config.data.parquet_root):
             completed_source_fingerprint = _completed_panel_identity(
                 config, rule_data_dir=day_trade_rule_data_dir)
-        source_key = str(Path(config_path).resolve())
-        with _LIVE_PANEL_CACHE_LOCK:
-            previous_source = _LIVE_COMPLETED_SOURCE_IDENTITIES.get(source_key)
-            _LIVE_COMPLETED_SOURCE_IDENTITIES[source_key] = completed_source_fingerprint
-        if previous_source != completed_source_fingerprint:
-            clear_live_panel_memory_cache()
+        _observe_completed_panel_identity(config_path, completed_source_fingerprint)
 
+    input_cache_observation: dict[str, Any] = {}
     if _panel_override is not None:
         panel = _panel_override
         panel_cache_hit = True
@@ -4405,6 +4480,7 @@ def generate_live_signal(
             config,
             live_tail=True,
             panel_end_date=panel_date if config.data.factorized_feature_manifest else None,
+            cache_observation=input_cache_observation,
             progress_callback=(
                 (lambda phase, done, total: _emit_progress(
                     progress_callback,
@@ -5185,6 +5261,8 @@ def generate_live_signal(
             raw_score_values = score_values.copy()
             raw_score_source = "centered_score_logits"
 
+    format_scores_finished = time.perf_counter()
+
     benchmark_simple = estimate_benchmark_return(
         panel.symbols,
         config.data.benchmark_name,
@@ -5239,6 +5317,7 @@ def generate_live_signal(
         if valid_scores.size:
             confidence_proxy = float(np.nanstd(valid_scores))
     _emit_progress(progress_callback, label=progress_name, step=14, total=progress_total, message="risk and explanations ready")
+    format_risk_finished = time.perf_counter()
 
     weights_rows: list[dict[str, Any]] = []
     raw_score_ranks = _abs_rank(raw_score_values, panel.num_symbols)
@@ -5374,6 +5453,7 @@ def generate_live_signal(
                 ),
             }
         )
+    format_weights_finished = time.perf_counter()
     top_positions = _top_position_rows_from_weights(weights_rows, top_n)
     weight_meta_by_symbol = {str(row.get("symbol") or ""): row for row in weights_rows}
     for row in rebalance_rows:
@@ -5416,6 +5496,7 @@ def generate_live_signal(
     actionable_decisions = [row for row in decision_rows if str(row.get("action") or "") != "HOLD"]
     decision_action_counts = _action_counts(decision_rows)
     _emit_progress(progress_callback, label=progress_name, step=15, total=progress_total, message="rows formatted")
+    format_decisions_finished = time.perf_counter()
 
     resolved_signal_id = signal_id or _make_signal_id(market_id, resolved_asof)
     price_timestamp = _daily_price_timestamp(
@@ -5433,6 +5514,16 @@ def generate_live_signal(
     )
     signal_ready = time.perf_counter()
     signal_ready_at_text = datetime.now(display_tz).isoformat(timespec="microseconds")
+    # These are sequential, nested wall-time spans within the existing
+    # post-inference total. They include callbacks and scheduling stalls and
+    # are not GPU-kernel time or independent additive end-to-end stages.
+    format_steps = {
+        "score_extract_and_progress": round((format_scores_finished - inference_finished) * 1000.0, 3),
+        "risk_and_explanations": round((format_risk_finished - format_scores_finished) * 1000.0, 3),
+        "weight_rows": round((format_weights_finished - format_risk_finished) * 1000.0, 3),
+        "decision_rows_and_progress": round((format_decisions_finished - format_weights_finished) * 1000.0, 3),
+        "price_and_signal_clock": round((signal_ready - format_decisions_finished) * 1000.0, 3),
+    }
     price_receipt_timing = (
         _opening_price_receipt_timing(
             price_snapshot=price_snapshot,
@@ -5575,6 +5666,9 @@ def generate_live_signal(
         ),
         "live_latency": {
             "schema_version": 2,
+            "input_cache_observation": input_cache_observation or None,
+            "prefetch_input_cache_observation": (
+                getattr(_prefetched_quote, "input_cache_observation", None) if quote_prefetched else None),
             "panel_cache_hit": bool(panel_cache_hit),
             "panel_cache_tier": str(panel_cache_tier),
             "checkpoint_cache_hit": bool(checkpoint_cache_hit),
@@ -5600,6 +5694,8 @@ def generate_live_signal(
             "post_inference_format_ms": round(
                 float((signal_ready - inference_finished) * 1000.0), 3
             ),
+            "post_inference_format_steps_ms": format_steps,
+            "post_inference_format_steps_contract": "sequential_nested_wall_time_v1",
             "compute_before_publish_ms": round(
                 float((signal_ready - signal_started) * 1000.0), 3
             ),

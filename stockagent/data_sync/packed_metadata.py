@@ -183,11 +183,13 @@ def retire_failed_metadata_scratch(plan: dict, receipt: Path) -> dict:
 
 class MetadataRows(Generic[T]):
     def __init__(self, encode: Callable[[T], dict], decode: Callable[[dict], T], *,
-                 memory_rows: int = DEFAULT_METADATA_MEMORY_ROWS):
+                 memory_rows: int = DEFAULT_METADATA_MEMORY_ROWS,
+                 memory_guard: Callable[[], bool] | None = None):
         if type(memory_rows) is not int or memory_rows < 1:
             raise ValueError("metadata memory bound must be positive")
         self._encode, self._decode = encode, decode
         self._limit = memory_rows
+        self._memory_guard = memory_guard
         self._rows: list[T] = []
         self._buckets: dict[str, int] = {}
         self._hints: dict[str, T] | None = None
@@ -266,6 +268,9 @@ class MetadataRows(Generic[T]):
             raise OSError("packed metadata scratch is below its 256 MiB reserve")
 
     def append(self, value: T):
+        if (self._db is None and self._memory_guard is not None
+                and self._count % 8192 == 0 and not self._memory_guard()):
+            self._spill()
         if self._db is None and len(self._rows) == self._limit:
             self._spill()
         if self._db is None:
@@ -310,8 +315,30 @@ class MetadataRows(Generic[T]):
         self._groups = self._objects = None
 
     def extend(self, values: Iterable[T]):
+        values = iter(values)
         for value in values:
             self.append(value)
+            if self._db is not None:
+                break
+        else:
+            return
+        # One cursor/SQLite call for the remaining stream. Keep incremental
+        # insertion semantics on a duplicate or encoder failure: successful
+        # preceding rows remain visible and the count matches those rows.
+        before = self._db.total_changes
+        start = self._count
+        def records():
+            for number, value in enumerate(values, start):
+                if number % 8192 == 0:
+                    self._check_space()
+                yield self._record(value)
+                self._count += 1
+        try:
+            with closing(self._db.cursor()) as cursor:
+                cursor.executemany("INSERT INTO entries VALUES (?,?,?,?,?,?)", records())
+        finally:
+            self._count = start + self._db.total_changes - before
+            self._groups = self._objects = None
 
     def sort(self, *, key):
         if self._db is None:

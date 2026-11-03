@@ -30,10 +30,10 @@ def _write_json(path, obj):
     path.write_text(json.dumps(obj), encoding='utf-8')
 
 
-def _table(path, *, volume=0, keep_old=True):
+def _table(path, *, volume=0, keep_old=True, series='202610'):
     path.parent.mkdir(parents=True, exist_ok=True)
     products = ['TXO', 'TGO'] if keep_old else ['TGO']
-    pq.write_table(pa.table({'option_id': products, 'contract_date': ['202610'] * len(products),
+    pq.write_table(pa.table({'option_id': products, 'contract_date': [series] * len(products),
                              'strike_price': [100.] * len(products), 'call_put': ['call'] * len(products),
                              'trading_session': ['position'] * len(products),
                              'volume': ([2, volume] if keep_old else [volume])}), path)
@@ -110,6 +110,12 @@ def test_exact_conflict_is_registered_without_provider_call_and_requires_repair(
     _table(refreshed, volume=3)
     receipt.update(parquet_size_bytes=refreshed.stat().st_size, sha256=_sha(refreshed))
     assert corrections._verified_receipt(root, task, request, 'sponsor', receipt)['verified_positive_volume_products'] == 2
+    _table(refreshed, volume=3, series='202610.0')
+    receipt.update(parquet_size_bytes=refreshed.stat().st_size, sha256=_sha(refreshed))
+    assert corrections._verified_receipt(root, task, request, 'sponsor', receipt)['verified_prior_daily_contract_keys'] == 2
+    _table(refreshed, volume=3, series='202610W1.0')
+    receipt.update(parquet_size_bytes=refreshed.stat().st_size, sha256=_sha(refreshed))
+    assert corrections._verified_receipt(root, task, request, 'sponsor', receipt) is None
     task['rows'] = _table(refreshed, volume=3, keep_old=False)
     receipt.update(rows=1, parquet_size_bytes=refreshed.stat().st_size, sha256=_sha(refreshed))
     assert corrections._verified_receipt(root, task, request, 'sponsor', receipt) is None

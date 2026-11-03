@@ -1,0 +1,16 @@
+[Unit]
+Description=Retry closed backup transport notifications without recapturing source history
+Requires=stockagent-backup-transport-mount.service stockagent-service-layout.service
+After=stockagent-backup-transport-mount.service stockagent-service-layout.service syncthing@root.service
+ConditionPathExists=__BACKUP_ENV_FILE__
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+Environment="STOCKAGENT_BACKUP_STREAM_ENV_FILE=__BACKUP_ENV_FILE__"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_backup_stream.sh notify-transport --idle-preflight --wait-for-owner
+# Join the original owner's kernel queue instead of missing every short handoff.
+SuccessExitStatus=75
+UMask=0077
+Nice=10
+TimeoutStartSec=infinity

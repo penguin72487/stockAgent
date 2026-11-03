@@ -725,6 +725,17 @@ def test_reference_negative_checks_preserve_sibling_boundary_and_inode_only_mode
     assert materialized_cache_module.process_references_many([], inode_keys={(99, 100)}) == []
 
 
+def test_inode_only_reference_checks_cwd_through_a_different_mount_name(tmp_path, monkeypatch):
+    source = tmp_path / 'original-directory'
+    source.mkdir()
+    alias = tmp_path / 'another-name'
+    alias.symlink_to(source, target_is_directory=True)
+    _reference_process(tmp_path, monkeypatch, maps_text='', cwd=alias)
+    info = source.stat()
+    assert materialized_cache_module.process_references_many(
+        [], inode_keys={(info.st_dev, info.st_ino)}) == [f'pid=123:cwd:{alias}']
+
+
 @pytest.mark.parametrize('code', [errno.EACCES, errno.EPERM])
 def test_reference_visibility_failure_never_becomes_negative_evidence(tmp_path, monkeypatch, code):
     process = _reference_process(tmp_path, monkeypatch, maps_text='')

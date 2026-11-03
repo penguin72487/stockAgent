@@ -1,5 +1,7 @@
 """I/O concurrency never becomes concurrent acceptance or skipped validation."""
 from contextlib import closing
+from collections import Counter
+import errno
 import json
 from pathlib import Path
 import threading
@@ -9,9 +11,192 @@ import pytest
 from downloader import news_fulltext_queue as queue_module
 from downloader import news_receipt_io as io_module
 from downloader.artifact_io import atomic_write_json
+from downloader.news_fulltext import fetch_article
+from downloader.news_fulltext_queue import NewsQueue
 from scripts.benchmark_news_acceptance_recovery import benchmark
 from stockagent.private_json import loads
-from test_news_acceptance_recovery import accepted_queue, config
+from test_news_acceptance_recovery import URL, accepted_queue, config
+from test_news_fulltext import FakeResponse, article_html, http_fixture
+
+
+@pytest.mark.parametrize('readers', [0, 1, 2])
+def test_transient_receipt_read_is_retried_in_order_without_rescanning(config, tmp_path, monkeypatch, readers):
+    queue, http = accepted_queue(config, tmp_path)
+    reads = Counter()
+    owner = threading.get_ident()
+    retry_threads = []
+    decoded = []
+    original_read = queue_module.read_acceptance_receipt_input
+    original_prefix = io_module._read_prefix
+    original_decode = queue_module.decode_private_json
+    try:
+        paths = []
+        for number in range(8):
+            relative = f'bodies/fixture-{number}.parquet'
+            receipt = f'receipts/fixture-{number}.json'
+            atomic_write_json(tmp_path / receipt, {'parquet_path': relative})
+            queue.db.execute('INSERT INTO accepted_batches VALUES (?,?)', (relative, receipt))
+            paths.append(tmp_path / receipt)
+        queue.db.commit()
+        target = paths[-2]
+
+        def read(path):
+            reads[path] += 1
+            retry_threads.append(threading.get_ident())
+            if not readers and path == target and reads[path] == 1:
+                raise OSError(errno.EIO, 'temporary fixture read')
+            return original_read(path)
+
+        def prefix(path, limit):
+            reads[path] += 1
+            if path == target and reads[path] == 1:
+                raise OSError(errno.EIO, 'temporary fixture read')
+            return original_prefix(path, limit)
+
+        def decode(data):
+            receipt = original_decode(data)
+            decoded.append(receipt['parquet_path'])
+            return receipt
+
+        monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', read)
+        monkeypatch.setattr(io_module, '_read_prefix', prefix)
+        monkeypatch.setattr(queue_module, 'decode_private_json', decode)
+        before = queue.db.total_changes
+        queue.recover_acceptance(receipt_paths=paths, read_ahead_workers=readers)
+        assert queue.db.total_changes == before
+        assert queue.acceptance_receipt_io['contract_version'] == 2
+        assert queue.acceptance_receipt_io['receipts_decoded'] == len(paths)
+        assert queue.acceptance_receipt_io['transient_read_retries'] == 1
+        assert queue.acceptance_receipt_io['transient_read_retry_successes'] == 1
+        assert all(reads[path] == (2 if path == target else 1) for path in paths)
+        assert all(thread == owner for thread in retry_threads)
+        assert decoded == [f'bodies/fixture-{number}.parquet' for number in range(8)]
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('readers', [0, 2])
+@pytest.mark.parametrize('code,attempts', [(errno.EIO, 2), (errno.EACCES, 1), (errno.ENOENT, 1)])
+def test_receipt_retry_is_bounded_and_preserves_permanent_error(config, tmp_path, monkeypatch, readers, code, attempts):
+    queue, http = accepted_queue(config, tmp_path)
+    target = next((tmp_path / 'receipts').glob('*.json'))
+    calls = []
+
+    def fail(path, *_args):
+        assert path == target
+        calls.append(path)
+        raise OSError(code, 'fixture read failure')
+
+    monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', fail)
+    monkeypatch.setattr(io_module, '_read_prefix', fail)
+    try:
+        with pytest.raises(OSError) as caught:
+            queue.recover_acceptance(receipt_paths=[target], read_ahead_workers=readers)
+        assert caught.value.errno == code
+        assert len(calls) == attempts
+        assert queue.acceptance_receipt_io['completed'] is False
+        assert queue.acceptance_receipt_io['receipts_decoded'] == 0
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('readers', [0, 2])
+@pytest.mark.parametrize('corrupt', [False, True])
+def test_transient_read_retry_preserves_orphan_validation(config, tmp_path, monkeypatch, readers, corrupt):
+    queue, http = accepted_queue(config, tmp_path)
+    try:
+        receipt = next((tmp_path / 'receipts').glob('*.json'))
+        value = json.loads(receipt.read_text())
+        if corrupt:
+            value['sha256'] = '0' * 64
+            receipt.write_text(json.dumps(value))
+        with queue.db:
+            queue.db.execute('DELETE FROM accepted_batches')
+        original_read = queue_module.read_acceptance_receipt_input
+        original_prefix = io_module._read_prefix
+        failed = []
+
+        def read(path):
+            if not readers and not failed:
+                failed.append(True)
+                raise OSError(errno.ESTALE, 'temporary fixture read')
+            return original_read(path)
+
+        def prefix(path, limit):
+            if not failed:
+                failed.append(True)
+                raise OSError(errno.ESTALE, 'temporary fixture read')
+            return original_prefix(path, limit)
+
+        monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', read)
+        monkeypatch.setattr(io_module, '_read_prefix', prefix)
+        if corrupt:
+            with pytest.raises(ValueError, match='news_acceptance_recovery_digest_mismatch'):
+                queue.recover_acceptance(receipt_paths=[receipt], read_ahead_workers=readers)
+            assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+        else:
+            queue.recover_acceptance(receipt_paths=[receipt], read_ahead_workers=readers)
+            assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+            assert queue.db.execute('SELECT state FROM articles').fetchone()[0] == 'complete'
+        assert failed == [True]
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_queue_startup_survives_one_transient_receipt_read(config, tmp_path, monkeypatch):
+    queue, http = accepted_queue(config, tmp_path)
+    queue.close()
+    original_read = queue_module.read_acceptance_receipt_input
+    attempts = []
+
+    def read(path):
+        attempts.append(path)
+        if len(attempts) == 1:
+            raise OSError(errno.EIO, 'temporary startup failure')
+        return original_read(path)
+
+    monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', read)
+    try:
+        queue = NewsQueue(tmp_path, http.registry)
+        try:
+            assert len(attempts) == 2
+            assert queue.acceptance_receipt_io['completed'] is True
+            assert queue.acceptance_receipt_io['receipts_decoded'] == 1
+            assert queue.acceptance_receipt_io['transient_read_retry_successes'] == 1
+            assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+        finally:
+            queue.close()
+    finally:
+        http.close()
+
+
+def test_queue_startup_persistent_read_error_releases_owner_for_next_attempt(config, tmp_path, monkeypatch):
+    queue, http = accepted_queue(config, tmp_path)
+    queue.close()
+    original_read = queue_module.read_acceptance_receipt_input
+    attempts = []
+
+    def fail(path):
+        attempts.append(path)
+        raise OSError(errno.EIO, 'persistent startup read failure')
+
+    try:
+        monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', fail)
+        with pytest.raises(OSError, match='persistent startup read failure'):
+            NewsQueue(tmp_path, http.registry)
+        assert len(attempts) == 2
+        monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input', original_read)
+        queue = NewsQueue(tmp_path, http.registry)
+        try:
+            assert queue.acceptance_receipt_io['completed'] is True
+            assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+        finally:
+            queue.close()
+    finally:
+        http.close()
 
 
 @pytest.mark.parametrize('readers', [1, 2])
@@ -95,11 +280,21 @@ def test_decode_sql_and_valid_orphan_commit_remain_on_owner_before_later_io_erro
 
 @pytest.mark.parametrize('corruption', ['', 'digest', 'rows', 'contract', 'json'])
 @pytest.mark.parametrize('readers', [1, 2])
-def test_canonical_orphan_validation_is_not_relaxed(config, tmp_path, corruption, readers):
-    queue, http = accepted_queue(config, tmp_path)
+def test_canonical_orphan_validation_is_not_relaxed(config, tmp_path, monkeypatch, corruption, readers):
+    http, _ = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        URL: FakeResponse(article_html())})
+    queue = NewsQueue(tmp_path, http.registry)
     try:
-        relative, receipt_relative = queue.db.execute('SELECT path,receipt_path FROM accepted_batches').fetchone()
-        path = tmp_path / receipt_relative
+        queue.add_articles([{'url': URL}])
+        record = fetch_article(http, queue.claim_url(URL, 300))
+        # Stop after the real body and receipt are durable, before their
+        # SQLite commit. Preserve the original lease for restart fencing.
+        with monkeypatch.context() as patch:
+            patch.setattr(queue, '_accept_records', lambda *a, **k: (_ for _ in ()).throw(OSError('simulated interruption')))
+            with pytest.raises(OSError, match='simulated interruption'):
+                queue.accept([record])
+        path = next((tmp_path / 'receipts').glob('*.json'))
         receipt = json.loads(path.read_text())
         if corruption == 'digest':
             receipt['sha256'] = '0' * 64
@@ -109,8 +304,7 @@ def test_canonical_orphan_validation_is_not_relaxed(config, tmp_path, corruption
             receipt['contract_version'] = -1
         path.write_text('{invalid}' if corruption == 'json' else json.dumps(receipt))
         with queue.db:
-            queue.db.execute('DELETE FROM accepted_batches')
-            queue.db.execute("UPDATE articles SET state='pending',body_sha256=NULL,body_bytes=NULL,parquet_path=NULL")
+            queue.db.execute(queue_module.ABANDONED_WORK_RECOVERY_SQL)
         if corruption:
             with pytest.raises(ValueError):
                 queue.recover_acceptance(read_ahead_workers=readers)

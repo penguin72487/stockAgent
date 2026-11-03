@@ -53,6 +53,24 @@ def test_row_reference_executes_only_frozen_definitions_with_shared_canonical_gl
     assert proof["other_benchmark_globals_shared"]
 
 
+def test_rebalance_reference_loads_only_one_function_with_canonical_globals(tmp_path):
+    import hashlib
+    from scripts import benchmark_opening_signal_pipeline as benchmark
+    path = tmp_path / "trusted-rebalance.py"
+    raw = ("raise RuntimeError('module startup must not execute')\n"
+           "def build_rebalance_rows():\n"
+           "    return classify_rebalance_action(0.0, 0.2)\n")
+    path.write_text(raw)
+    function, proof = benchmark._reference_rebalance_function(path)
+    assert function.__globals__ is vars(benchmark.portfolio_state)
+    assert function() == "BUY"
+    assert proof["sha256"] == hashlib.sha256(raw.encode()).hexdigest()
+    assert proof["other_benchmark_globals_shared"]
+    path.write_text("@unsafe\ndef build_rebalance_rows(): pass\n")
+    with pytest.raises(ValueError, match="undecorated"):
+        benchmark._reference_rebalance_function(path)
+
+
 def test_transport_reference_executes_only_selected_method_with_shared_globals(tmp_path):
     import hashlib
     from scripts import benchmark_opening_signal_pipeline as benchmark
@@ -654,6 +672,9 @@ def test_benchmark_manifest_binds_full_evidence_without_promoting_entry_rejectio
                 "cpu_clock_contract": "same_thread_cpu_or_unknown_v1",
                 "input_preparation_owner_thread_cpu_ms": {"panel_join": None, "quote": 1.5},
                 "stages": {"model_inference_ms": 2., "source_scope": ["keep-in-full-file"],
+                           "pre_quote_local_prepare_steps_ms": {"panel_source_and_alignment": 0.7},
+                           "post_quote_prepare_steps_ms": {"previous_account_projection": 0.3,
+                                                           "opening_input_coverage": None},
                            "factorized_input_transport": {"destination_policy": "owned_full_window_slices_v1",
                                                           "avoided_dense_copy_bytes": 1000}},
                 "input_reference_evidence": {"carried_reference_active_count": 1, "rows": [{"symbol": "A"}]},
@@ -677,7 +698,10 @@ def test_benchmark_manifest_binds_full_evidence_without_promoting_entry_rejectio
     market = sample["markets"][0]
     assert market["cpu_clock_contract"] == "same_thread_cpu_or_unknown_v1"
     assert market["input_preparation_owner_thread_cpu_ms"] == {"panel_join": None, "quote": 1.5}
-    assert market["stages"] == {"model_inference_ms": 2.}
+    assert market["stages"] == {"model_inference_ms": 2.,
+        "pre_quote_local_prepare_steps_ms": {"panel_source_and_alignment": 0.7},
+        "post_quote_prepare_steps_ms": {"previous_account_projection": 0.3,
+                                         "opening_input_coverage": None}}
     assert market["factorized_input_transport"] == {"destination_policy": "owned_full_window_slices_v1",
                                                     "avoided_dense_copy_bytes": 1000}
     assert market["input_reference_evidence"] == {"carried_reference_active_count": 1}

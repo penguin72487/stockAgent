@@ -182,6 +182,80 @@ def test_large_feature_join_preserves_extra_keys_and_first_column_wins() -> None
     )
 
 
+@pytest.mark.parametrize("overlap_only", [False, True])
+def test_large_feature_merge_matches_full_join_value_bits(overlap_only: bool) -> None:
+    count = 100_000
+    values = np.arange(count, dtype=np.float64)
+    values[:4] = [-0.0, float("nan"), float("inf"), float("-inf")]
+    # Retain a noncanonical NaN payload as well as signed zero.
+    values.view(np.uint64)[4] = 0x7FF8000000000042
+    first = pl.DataFrame({
+        "date": [date(2024, 1, 2)] * count,
+        "symbol": [f"{index:06d}" for index in range(count)],
+        "twpub_pe_raw": values,
+        "twpub_pb_raw": pl.Series([None] * count, dtype=pl.Float64),
+    })
+    second = pl.DataFrame({
+        "date": [date(2024, 1, 2)] * 4,
+        "symbol": ["000000", "000001", "000001", "900000"],
+        "twpub_pe_raw": [9.0, 8.0, None, 7.0],
+        "twpub_dividend_yield": [None, -0.0, None, float("nan")],
+    })
+    if overlap_only:
+        second = second.drop("twpub_dividend_yield")
+    third = pl.DataFrame({
+        "date": [date(2024, 1, 3), date(2024, 1, 2)],
+        "symbol": ["999999", "000004"],
+        "twpub_official_close_to_high": [None, -0.0],
+    })
+    frames = [first, second, third]
+    cleaned = [_finalize_feature_frame(frame) for frame in frames]
+    expected = cleaned[0]
+    for frame in cleaned[1:]:
+        expected = expected.join(frame, on=["date", "symbol"], how="full", coalesce=True)
+    expected = expected.select([
+        "date", "symbol", *[name for name in expected.columns if name in {
+            "twpub_pe_raw", "twpub_pb_raw", "twpub_dividend_yield", "twpub_official_close_to_high",
+        }],
+    ]).sort(["date", "symbol"])
+    actual = _merge_feature_frames(frames).sort(["date", "symbol"])
+    assert_frame_equal(actual, expected, check_exact=True)
+    for name in actual.columns[2:]:
+        valid = actual[name].is_not_null().to_numpy()
+        assert np.array_equal(
+            actual[name].to_numpy()[valid].view(np.uint64),
+            expected[name].to_numpy()[valid].view(np.uint64),
+        )
+    assert actual.filter(pl.col("symbol") == "900000")["twpub_pe_raw"].item() is None
+
+
+@pytest.mark.parametrize("all_duplicated", [False, True])
+def test_large_duplicate_feature_reduction_preserves_each_column_bits(all_duplicated: bool) -> None:
+    count = 100_000
+    base = pl.DataFrame({
+        "date": [date(2024, 1, 2)] * count,
+        "symbol": [f"{index:06d}" for index in range(count)],
+        "twpub_pe_raw": np.arange(count, dtype=np.float64),
+        "twpub_pb_raw": pl.Series([None] * count, dtype=pl.Float64),
+    })
+    revised = base if all_duplicated else pl.DataFrame({
+        "date": [date(2024, 1, 2)] * 5,
+        "symbol": ["000000", "000000", "000001", "000002", "000003"],
+        "twpub_pe_raw": [-0.0, None, float("nan"), None, 42.0],
+        "twpub_pb_raw": [None, -0.0, float("inf"), None, None],
+    })
+    frame = pl.concat([base, revised])
+    expected = frame.group_by(["date", "symbol"]).agg([
+        pl.col(name).drop_nulls().last().alias(name) for name in ("twpub_pe_raw", "twpub_pb_raw")
+    ]).sort(["date", "symbol"])
+    actual = _finalize_feature_frame(frame).sort(["date", "symbol"])
+    assert_frame_equal(actual, expected, check_exact=True)
+    for name in actual.columns[2:]:
+        valid = actual[name].is_not_null().to_numpy()
+        assert np.array_equal(actual[name].to_numpy()[valid].view(np.uint64),
+                              expected[name].to_numpy()[valid].view(np.uint64))
+
+
 def test_feature_writer_lock_uses_resolved_output_identity(tmp_path: Path) -> None:
     live = tmp_path / "live"
     live.mkdir()

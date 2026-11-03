@@ -304,13 +304,34 @@ def _refill_source(connection, dataset, source, anchor, closures, *, day_decisio
     from downloader.finmind_storage_objects import identity_clause, forward_identity_clause
     active = connection.execute("SELECT COUNT(*) FROM tasks WHERE dataset=? AND state IN ('pending','failed','inflight')",
                                 (dataset,)).fetchone()[0]
+    # Targeted repairs and the earlier query shape can leave more tasks than
+    # the nominal materialized history window. They must not prevent a whole-
+    # market object's forward cursor from admitting the next released day.
+    # A separate, transaction-bound workset counts only forward tasks whose
+    # attempt has not yet changed, without rewriting any original task.
+    object_forward = source.endpoint == 'storage_objects'
+    if object_forward:
+        connection.execute('CREATE TABLE IF NOT EXISTS finmind_object_forward_workset ('
+                           'dataset TEXT NOT NULL,data_id TEXT NOT NULL,partition TEXT NOT NULL,'
+                           'last_attempt_at_utc TEXT,PRIMARY KEY(dataset,data_id,partition))')
+        connection.execute(
+            'DELETE FROM finmind_object_forward_workset WHERE dataset=? AND NOT EXISTS ('
+            'SELECT 1 FROM tasks t WHERE t.dataset=finmind_object_forward_workset.dataset '
+            'AND t.data_id=finmind_object_forward_workset.data_id '
+            'AND t.partition=finmind_object_forward_workset.partition '
+            "AND t.state IN ('pending','inflight') "
+            'AND t.last_attempt_at_utc IS finmind_object_forward_workset.last_attempt_at_utc)',
+            (dataset,))
+        forward_active = connection.execute(
+            'SELECT COUNT(*) FROM finmind_object_forward_workset WHERE dataset=?', (dataset,)).fetchone()[0]
     visits = inserted_total = 0
     identity_filter = identity_clause(dataset) if source.universe == 'market' else ''
     # Forward periods retain precedence and at most one additional working
     # set. Bound cursor visits as well as pending/in-flight tasks.
     for direction in (1, -1):
-        room = (min(WORKING_SET, max(0, WORKING_SET * 2 - active)) if direction == 1
-                else max(0, WORKING_SET - active))
+        room = (max(0, WORKING_SET - forward_active) if direction == 1 and object_forward else
+                min(WORKING_SET, max(0, WORKING_SET * 2 - active)) if direction == 1 else
+                max(0, WORKING_SET - active))
         while room and visits < MAX_FRONTIER_VISITS:
             column = 'newer_than' if direction == 1 else 'older_than'
             condition = 'newer_than<?' if direction == 1 else 'older_than IS NOT NULL'
@@ -334,9 +355,17 @@ def _refill_source(connection, dataset, source, anchor, closures, *, day_decisio
                               history_floor(dataset, identifier))
                 if item_floor <= day <= anchor:
                     inserted = int(_insert(connection, dataset, identifier, day, source, day_decision=day_decision))
-                    room -= inserted
                     active += inserted
                     inserted_total += inserted
+                    if direction == 1 and object_forward:
+                        claimed = connection.execute(
+                            'INSERT OR IGNORE INTO finmind_object_forward_workset '
+                            'SELECT dataset,data_id,partition,last_attempt_at_utc FROM tasks '
+                            "WHERE dataset=? AND data_id=? AND partition=? AND state IN ('pending','inflight')",
+                            (dataset, identifier, day.isoformat())).rowcount
+                        room -= claimed
+                    else:
+                        room -= inserted
                 if direction == 1:
                     cursor = min(day, anchor).isoformat()
                 else:
@@ -476,6 +505,8 @@ def frontier_status(connection: sqlite3.Connection, now: datetime | None = None)
                            "calendar_basis": closures.scope(dataset).basis if dataset in closures.datasets else None,
                            "forward_cursor_min": newest, "materialized_working_set_limit": WORKING_SET * 2,
                            "materialized_history_limit": WORKING_SET, "materialized_forward_batch_limit": WORKING_SET,
+                           "materialized_working_set_limit_semantics": "scheduler_target_not_limit_on_targeted_or_legacy_tasks",
+                           "object_forward_workset_contract": "unattempted_object_forward_tasks_v1" if spec.endpoint == 'storage_objects' else None,
                            "query_shape": "whole_market_storage_object_day" if spec.endpoint == 'storage_objects' else None,
                            "coverage_complete": False, "catalog_contract_version": CONTRACT_VERSION}
         if spec.endpoint == 'storage_objects' and now is not None:

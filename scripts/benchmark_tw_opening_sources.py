@@ -1442,7 +1442,9 @@ def after_hours_probe(source, output, *, rounds=1, providers=None, mis_workers=4
                 raise
             result = quotes.fetch_tw_mis_last_prices(names, values, parquet_root=source["parquet_root"],
                 empty_chunk_retry_attempts=0, max_parallel_requests=worker_plan[round_id - 1],
-                request_timeout_seconds=4., on_progress=progress)
+                request_timeout_seconds=float(os.getenv("STOCKAGENT_TW_OPENING_REQUEST_TIMEOUT_SECONDS", "4") or "4"),
+                soft_retry_seconds=float(os.getenv("STOCKAGENT_TW_OPENING_MIS_SOFT_RETRY_SECONDS", "1") or "1"),
+                on_progress=progress)
             result.transport_timing = {**(result.transport_timing or {}), "diagnostic_connection_prewarm": proof,
                 "diagnostic_prewarm_and_sweep_ms": round((time.perf_counter() - began) * 1000, 6)}
             return result

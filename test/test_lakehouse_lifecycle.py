@@ -18,6 +18,75 @@ from stockagent.data_sync.immutable_replication import ACK, digest, seal
 from stockagent.runtime_identity import identity_sha256
 
 
+def test_closed_transport_summary_reuses_only_an_unchanged_exact_generation(tmp_path, monkeypatch):
+    path = tmp_path / 'cache-retirement-fixed.json'
+    value = dict(state='retired', reclaimed_bytes=7, primary_source_files_deleted=False,
+                 nas_archive_files_deleted=False, plan={'private': ['large audit payload']})
+    atomic_write_json(path, value)
+    expected = {k: v for k, v in value.items() if k != 'plan'}
+    assert cache.retirement_summary(path) == expected
+    original = os.open
+    def no_reparse(*a, **kw):
+        pytest.fail('unchanged completed audit must not be reopened')
+    monkeypatch.setattr(cache.os, 'open', no_reparse)
+    cached = cache.retirement_summary(path)
+    cached['reclaimed_bytes'] = 900  # A consumer cannot mutate the cached projection.
+    assert cache.retirement_summary(path) == expected
+    monkeypatch.setattr(cache.os, 'open', original)
+    stamp = path.stat()
+    value['reclaimed_bytes'] = 8
+    # Same inode/size/mtime is insufficient; ctime invalidates the cached value.
+    path.write_bytes(json.dumps(value, sort_keys=True, separators=(',', ':')).encode())
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
+    assert cache.retirement_summary(path)['reclaimed_bytes'] == 8
+    replacement = path.with_suffix('.new')
+    atomic_write_json(replacement, {**value, 'reclaimed_bytes': 9})
+    os.replace(replacement, path)
+    assert cache.retirement_summary(path)['reclaimed_bytes'] == 9
+    path.unlink()
+    assert cache.retirement_summary(path) is None
+
+
+def test_transport_summary_rejects_special_entries_and_changes_during_read(tmp_path, monkeypatch):
+    path = tmp_path / 'audit.json'
+    os.mkfifo(path)
+    with pytest.raises(ValueError, match='not a regular file'):
+        cache.retirement_summary(path)
+    path.unlink()
+    path.symlink_to(tmp_path / 'missing')
+    with pytest.raises(ValueError, match='not a regular file'):
+        cache.retirement_summary(path)
+    path.unlink()
+    atomic_write_json(path, dict(state='retired', reclaimed_bytes=1,
+                                primary_source_files_deleted=False, nas_archive_files_deleted=False))
+    original = cache.json.loads
+    def race(raw):
+        parsed = original(raw)
+        path.write_text('changed during the audit read')
+        return parsed
+    monkeypatch.setattr(cache.json, 'loads', race)
+    with pytest.raises(ValueError, match='changed during read'):
+        cache.retirement_summary(path)
+
+
+def test_transport_summary_does_not_cache_unfinished_work_and_bounds_closed_entries(tmp_path, monkeypatch):
+    from collections import OrderedDict
+    monkeypatch.setattr(cache, '_RETIREMENT_SUMMARIES', OrderedDict())
+    monkeypatch.setattr(cache, '_RETIREMENT_SUMMARIES_LIMIT', 2)
+    value = dict(state='deleting', reclaimed_bytes=1,
+                 primary_source_files_deleted=False, nas_archive_files_deleted=False)
+    pending = tmp_path / 'pending.json'
+    atomic_write_json(pending, value)
+    assert cache.retirement_summary(pending)['state'] == 'deleting'
+    assert not cache._RETIREMENT_SUMMARIES
+    for index in range(3):
+        path = tmp_path / f'closed-{index}.json'
+        atomic_write_json(path, {**value, 'state': 'retired'})
+        cache.retirement_summary(path)
+    assert len(cache._RETIREMENT_SUMMARIES) == 2
+    assert str(tmp_path / 'closed-0.json') not in cache._RETIREMENT_SUMMARIES
+
+
 @pytest.mark.parametrize('phase,expected', [
     ({'state': 'processing'}, 30),  # Existing persistent histories keep this timer.
     ({'state': 'processing', 'next_poll_seconds': 0}, 0),
@@ -47,6 +116,7 @@ def test_worker_identity_includes_loaded_packed_reader_and_manifest_contract(mon
     monkeypatch.setattr(worker, "digest", source_digest)
     baseline = worker.worker_code_identity()
     for relative in ("stockagent/data_sync/packed_snapshots.py",
+                     "stockagent/data_sync/work_progress.py",
                      "stockagent/data_sync/syncthing_scan.py",
                      "stockagent/data_sync/packed_metadata.py",
                      "stockagent/data_sync/packing_checkpoint.py",
@@ -152,6 +222,31 @@ def test_handoff_body_error_is_never_retried(tmp_path, monkeypatch):
             entries.append(True)
             raise BlockingIOError('body failed')
     assert entries == [True]
+
+
+def test_owner_wait_observation_has_no_partially_held_boundary(tmp_path, monkeypatch):
+    import fcntl
+    import time
+    from types import SimpleNamespace
+    from scripts import rollout_lakehouse_source_policy as rollout
+    locks = [tmp_path / name for name in ('version.lock', 'catalog.lock')]
+    held = locks[-1].open('a')
+    fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    observed = []
+    def observe(path):
+        observed.append(path)
+        with locks[0].open('a') as free:
+            fcntl.flock(free, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    def retry(argv, **kwargs):
+        assert float(argv[3]) <= 30
+        fcntl.flock(held, fcntl.LOCK_UN)
+        return SimpleNamespace(returncode=1)  # One wait interval, not final deadline.
+    monkeypatch.setattr(rollout.subprocess, 'run', retry)
+    try:
+        with rollout.publication_boundary(locks, time.monotonic() + 2, on_wait=observe):
+            assert observed == [locks[-1]]
+    finally:
+        held.close()
 
 
 @pytest.mark.parametrize('fault', [None, 'candidate_drift', 'lost_verified_release'])
@@ -458,6 +553,101 @@ def test_cache_plan_preserves_bytes_then_only_exact_transport_is_retired(deliver
     assert original.read_bytes() == before
     assert applied['primary_source_files_deleted'] == applied['nas_archive_files_deleted'] == 0
     assert lakehouse.acceptance(c, identity)['state'] == 'nas_archive_file_recovery_verified'
+
+
+def test_isolated_retirement_cannot_adopt_live_E_placement(delivery, monkeypatch):
+    from stockagent.data_sync import transport_placement
+    c, identity, batch, original, proof = delivery
+    def reject_live_volume_access(*args, **kwargs):
+        raise AssertionError('isolated retirement accessed the live transport volume')
+    monkeypatch.setattr(transport_placement, 'on_e', lambda: True)
+    monkeypatch.setattr(transport_placement, 'backing', reject_live_volume_access)
+    monkeypatch.setattr(transport_placement, 'check_transport', reject_live_volume_access)
+    result = cache.retire(c, identity, proof, apply=True)
+    assert result['state'] == 'retired' and original.is_file() and not batch.exists()
+    assert result['primary_source_files_deleted'] == result['nas_archive_files_deleted'] == 0
+
+
+def test_real_retirement_reports_exact_work_without_turning_progress_into_acceptance(delivery):
+    from stockagent.data_sync.work_progress import observe_work, work_pass
+    c, identity, batch, original, proof = delivery
+    events = []
+    with observe_work(events.append), work_pass('dry_run'):
+        cache.retire(c, identity, proof)
+    assert original.exists() and batch.exists()
+    assert any(event['phase'] == 'verify_primary_sources' and event['completed_items'] == event['total_items']
+               for event in events)
+    assert not any(event['phase'] == 'unlink_verified_transport' for event in events)
+    with observe_work(events.append), work_pass('apply'):
+        result = cache.retire(c, identity, proof, apply=True)
+    unlinks = [event for event in events if event['phase'] == 'unlink_verified_transport']
+    assert unlinks[-1]['completed_items'] == unlinks[-1]['total_items']
+    assert unlinks[-1]['completed_bytes'] == unlinks[-1]['total_bytes'] == result['reclaimed_bytes']
+    assert unlinks[-1]['work_pass'] == 'apply' and original.exists() and not batch.exists()
+
+
+def test_interrupted_cache_revalidates_ctime_with_full_sha_without_rewriting_original_proof(delivery, monkeypatch):
+    c, identity, batch, original, proof = delivery
+    old = cache.retire(c, identity, proof)
+    ack_path = Path(c['receipt_root'])/(batch.name+'.json')
+    original_ack = ack_path.read_bytes()
+    original.chmod(0o600 if original.stat().st_mode & 0o077 else 0o644)
+    real_digest = cache.digest
+    hashed = []
+    def observe_hash(path):
+        hashed.append(path)
+        return real_digest(path)
+    monkeypatch.setattr(cache, 'digest', observe_hash)
+    result = cache.retire(c, identity, proof, apply=True)
+    assert result['state'] == 'retired' and not batch.exists()
+    assert hashed.count(original) == 1  # Final generation check reuses this exact full-SHA pass.
+    assert result['primary_signatures'] == old['primary_signatures']
+    assert ack_path.read_bytes() == original_ack and original.read_bytes() == b'preserved authoritative bytes'
+    assert lakehouse.acceptance(c, identity)['state'] == 'nas_archive_file_recovery_verified'
+
+
+def test_ctime_recovery_rejects_changed_bytes_with_restored_mtime(delivery):
+    c, identity, batch, original, proof = delivery
+    cache.retire(c, identity, proof)
+    before = original.stat()
+    original.write_bytes(b'x'*before.st_size)
+    os.utime(original, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(ValueError, match='cannot reconstruct'):
+        cache.retire(c, identity, proof, apply=True)
+    assert batch.exists() and original.exists()
+
+
+def test_ctime_drift_between_listing_and_hash_uses_the_actual_full_read_generation(delivery, monkeypatch):
+    c, identity, batch, original, proof = delivery
+    cache.retire(c, identity, proof)
+    original.chmod(0o600 if original.stat().st_mode & 0o077 else 0o644)
+    actual_signature = cache.signature
+    observed = []
+    def drift_before_read(path):
+        if path == original:
+            observed.append(path)
+            if len(observed) == 2:
+                original.chmod(0o644 if original.stat().st_mode & 0o077 == 0 else 0o600)
+        return actual_signature(path)
+    monkeypatch.setattr(cache, 'signature', drift_before_read)
+    assert cache.retire(c, identity, proof, apply=True)['state'] == 'retired'
+    assert not batch.exists() and original.read_bytes() == b'preserved authoritative bytes'
+
+
+def test_ctime_recovery_rejects_a_generation_change_during_hash(delivery, monkeypatch):
+    c, identity, batch, original, proof = delivery
+    cache.retire(c, identity, proof)
+    original.chmod(0o600 if original.stat().st_mode & 0o077 else 0o644)
+    real_digest = cache.digest
+    def mutate_after_hash(path):
+        result = real_digest(path)
+        if path == original:
+            original.chmod(0o644 if original.stat().st_mode & 0o077 == 0 else 0o600)
+        return result
+    monkeypatch.setattr(cache, 'digest', mutate_after_hash)
+    with pytest.raises(ValueError, match='cannot reconstruct'):
+        cache.retire(c, identity, proof, apply=True)
+    assert batch.exists() and original.exists()
 
 
 def test_nas_archive_receipt_is_distinct_from_corrupted_local_transport_retirement(delivery):

@@ -89,6 +89,275 @@ def test_symlink_escape_is_rejected(setup, tmp_path):
         d.discard_target(p, p["targets"][0], **args, apply=True, expected_plan_identity=plan["identity_sha256"])
 
 
+def local_testing_policy(tmp_path, relative='benchmarks/closed-case', **changes):
+    body = dict(contract=d.LOCAL_TESTING_CONTRACT, authority_node_id='penguin', origin_node_id='penguin',
+                authorization='2026-11-02 user explicitly allows discarding performance work copies',
+                decision='discard_without_preservation', targets=[dict(base='artifact', relative=relative,
+                    kind='directory', reason='benchmark')])
+    body.update(changes)
+    path = tmp_path / 'local-testing-policy.json'
+    path.write_text(json.dumps({**body, 'identity_sha256': d.identity(body)}))
+    return d.load_policy(path)
+
+
+def test_local_performance_discard_unlinks_only_aliases_and_preserves_external_targets(setup, tmp_path):
+    _, _, args = setup
+    p = local_testing_policy(tmp_path)
+    target = p['targets'][0]
+    root = args['repo_root'] / 'artifacts' / target['relative']
+    root.mkdir(parents=True)
+    external = tmp_path / 'original-source'
+    external.mkdir()
+    (external / 'keep').write_bytes(b'canonical observation')
+    (root / 'copy').write_bytes(b'disposable benchmark')
+    (root / 'external-directory').symlink_to(external, target_is_directory=True)
+    (root / 'external-file').symlink_to(external / 'keep')
+    (root / 'dangling').symlink_to(tmp_path / 'absent')
+    (root / 'internal').symlink_to('copy')
+    dry = d.discard_target(p, target, **args)
+    assert not dry['blockers'] and dry['observed']['files'] == 1
+    result = d.discard_target(p, target, **args, apply=True, expected_plan_identity=dry['identity_sha256'])
+    assert result['deleted'] and not result['recovery_claimed'] and not root.exists()
+    assert (external / 'keep').read_bytes() == b'canonical observation'
+    assert not d.manifest_discarded({'metadata': {'source_relative_root': target['relative']}}, p)
+    with pytest.raises(SnapshotError, match='cannot discard cold'):
+        d.cold_discard_plan(args['cold_root'], p, materialized_root=args['materialized_root'])
+
+
+@pytest.mark.parametrize('gate', ['artifact_process_references', 'active_configuration_references',
+                                 'shared_inode_references'])
+def test_local_testing_discard_still_protects_active_work(setup, tmp_path, monkeypatch, gate):
+    _, _, args = setup
+    p = local_testing_policy(tmp_path)
+    target = p['targets'][0]
+    root = args['repo_root'] / 'artifacts' / target['relative']
+    root.mkdir(parents=True)
+    (root / 'copy').write_bytes(b'working measurement')
+    dry = d.discard_target(p, target, **args)
+    monkeypatch.setattr(d, gate, lambda *a: ['active'])
+    with pytest.raises(SnapshotError, match='protection applies'):
+        d.discard_target(p, target, **args, apply=True, expected_plan_identity=dry['identity_sha256'])
+    assert root.exists()
+
+
+def test_local_testing_discard_rejects_changed_alias_and_allows_unused_fifo(setup, tmp_path):
+    _, _, args = setup
+    p = local_testing_policy(tmp_path)
+    target = p['targets'][0]
+    root = args['repo_root'] / 'artifacts' / target['relative']
+    root.mkdir(parents=True)
+    (root / 'link').symlink_to(tmp_path / 'before')
+    dry = d.discard_target(p, target, **args)
+    (root / 'link').unlink()
+    (root / 'link').symlink_to(tmp_path / 'after')
+    with pytest.raises(SnapshotError, match='dry run changed'):
+        d.discard_target(p, target, **args, apply=True, expected_plan_identity=dry['identity_sha256'])
+    os.mkfifo(root / 'fifo')
+    assert 'unsupported-or-cross-filesystem-entry' not in d.discard_target(p, target, **args)['blockers']
+
+
+def test_only_explicit_local_testing_discard_may_remove_unused_fifos(setup, tmp_path, monkeypatch):
+    from scripts import discard_local_testing_artifacts as cleanup
+    _, _, args = setup
+    p = local_testing_policy(tmp_path)
+    target = p['targets'][0]
+    root = args['repo_root'] / 'artifacts' / target['relative']
+    root.mkdir(parents=True)
+    os.mkfifo(root / 'summary.json')
+    os.mkfifo(root / 'unused-pipe')
+    (root / 'copy').write_bytes(b'closed benchmark')
+    original = os.open
+    opaque_opens = []
+    def inspect_open(path, flags, *a, **kw):
+        if str(path).endswith(('summary.json', 'unused-pipe')):
+            assert flags & os.O_PATH, 'a disposable FIFO must never be opened as a byte stream'
+            opaque_opens.append(str(path))
+        return original(path, flags, *a, **kw)
+    monkeypatch.setattr(os, 'open', inspect_open)
+    cleanup.retain_small_receipts(root, tmp_path / 'retained')
+    dry = d.discard_target(p, target, **args)
+    assert not dry['blockers']
+    result = d.discard_target(p, target, **args, apply=True, expected_plan_identity=dry['identity_sha256'])
+    assert result['deleted'] and not root.exists() and len(opaque_opens) == 2
+
+
+def test_local_testing_discard_retains_bounded_fixture_and_control_receipts(tmp_path):
+    from scripts import discard_local_testing_artifacts as cleanup
+    root = tmp_path / 'benchmark'
+    root.mkdir()
+    names = ('fixture.json', 'immutable-inputs.json', 'current-all-file-actual-open-count-control.json')
+    for name in names:
+        (root / name).write_bytes(b'{"result":true}')
+    (root / 'large-payload').write_bytes(b'not a receipt')
+    retained = tmp_path / 'retained'
+    cleanup.retain_small_receipts(root, retained)
+    assert all((retained / name).read_bytes() == b'{"result":true}' for name in names)
+    assert not (retained / 'large-payload').exists()
+
+
+def test_general_discard_still_rejects_fifo_and_local_discard_rejects_devices(setup, tmp_path):
+    import stat
+    p, root, args = setup
+    os.mkfifo(root / 'fifo')
+    assert 'unsupported-or-cross-filesystem-entry' in d.discard_target(p, p['targets'][0], **args)['blockers']
+    observed = d._observed(root, 'directory')
+    observed['rows'][0]['kind'] = 'unsupported'
+    observed['rows'][0]['signature'][5] = stat.S_IFCHR | 0o600
+    assert 'unsupported-or-cross-filesystem-entry' in d._gates(root, observed, args['repo_root'],
+        args['materialized_root'], args['cold_root'], allow_opaque_symlinks=True)
+
+
+def test_disposable_posix_names_roundtrip_in_durable_discard_evidence(setup, tmp_path):
+    _, _, args = setup
+    p = local_testing_policy(tmp_path)
+    target = p['targets'][0]
+    root = args['repo_root'] / 'artifacts' / target['relative']
+    root.mkdir(parents=True)
+    raw_name = b'undecodable-\xff'
+    name = os.fsdecode(raw_name)
+    (root / name).write_bytes(b'disposable fixture')
+    os.mkfifo(root / (name + '-fifo'))
+    (root / (name + '-link')).symlink_to('absent')
+    dry = d.discard_target(p, target, **args)
+    receipt = tmp_path / 'dry.json'
+    d.write_discard_receipt(receipt, dry)
+    saved = json.loads(receipt.read_bytes())
+    assert saved == dry
+    assert os.fsencode(saved['observed']['rows'][0]['path']).startswith(raw_name)
+    result = d.discard_target(p, target, **args, apply=True, expected_plan_identity=dry['identity_sha256'])
+    assert result['deleted'] and not root.exists()
+    journal = args['state_root'] / (d.identity(target) + '.json')
+    assert json.loads(journal.read_bytes())['plan']['observed'] == saved['observed']
+
+
+@pytest.mark.parametrize('relative', ['benchmarks', 'operations', 'markets/formal', 'live/ledger',
+                                    'cache/service', '../benchmarks/closed', '/benchmarks/closed'])
+def test_local_testing_policy_rejects_sources_and_namespaces(tmp_path, relative):
+    with pytest.raises(SnapshotError):
+        local_testing_policy(tmp_path, relative)
+
+
+def test_local_testing_policy_does_not_claim_vast_origin(tmp_path):
+    with pytest.raises(SnapshotError):
+        local_testing_policy(tmp_path, origin_node_id='vastai1T')
+
+
+def test_local_cleanup_resumes_completed_counters_and_protects_recreated_output(setup, tmp_path, monkeypatch):
+    from scripts import discard_local_testing_artifacts as cleanup
+    _, _, args = setup
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    monkeypatch.setattr(d, '_pinned_snapshot_ids', lambda *a: set())
+    p = local_testing_policy(tmp_path)
+    policy_path = tmp_path / 'local-testing-policy.json'
+    root = args['repo_root'] / 'artifacts' / p['targets'][0]['relative']
+    root.mkdir(parents=True)
+    (root / 'data').write_bytes(b'closed performance copy')
+    state = tmp_path / 'cleanup-state'
+    first = cleanup.cycle(policy_path, state, apply=True, repo=args['repo_root'])
+    assert first['state'] == 'completed' and first['reclaimed_allocated_bytes'] > 0
+    # A restart must keep prior receipts even in its first progress write,
+    # before the loop has revisited previously completed targets.
+    publish = cleanup.atomic_write_json
+    observations = []
+    def record(path, value):
+        if path == state / 'status.json':
+            observations.append(value)
+        return publish(path, value)
+    monkeypatch.setattr(cleanup, 'atomic_write_json', record)
+    second = cleanup.cycle(policy_path, state, apply=True, repo=args['repo_root'])
+    assert second['reclaimed_allocated_bytes'] == first['reclaimed_allocated_bytes']
+    assert observations[0]['reclaimed_allocated_bytes'] == first['reclaimed_allocated_bytes']
+    assert observations[0]['targets_completed'] == 1
+    assert second['targets_completed'] == 1 and not root.exists()
+    root.mkdir()
+    (root / 'data').write_bytes(b'new generation')
+    recreated = cleanup.cycle(policy_path, state, apply=True, repo=args['repo_root'])
+    assert recreated['targets_blocked'] == 1
+    assert (root / 'data').read_bytes() == b'new generation'
+
+
+def test_local_cleanup_busy_owner_retains_target_without_consuming_error_retry(setup, tmp_path, monkeypatch):
+    import fcntl
+    from scripts import discard_local_testing_artifacts as cleanup
+    _, _, args = setup
+    lock = tmp_path / 'common.lock'
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', lock)
+    monkeypatch.setattr(d, '_pinned_snapshot_ids', lambda *a: set())
+    p = local_testing_policy(tmp_path)
+    root = args['repo_root'] / 'artifacts' / p['targets'][0]['relative']
+    root.mkdir(parents=True)
+    (root / 'data').write_bytes(b'closed copy')
+    with lock.open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX)
+        result = cleanup.cycle(tmp_path / 'local-testing-policy.json', tmp_path / 'cleanup-state',
+                               apply=True, repo=args['repo_root'])
+    assert result['targets_blocked'] == 1 and root.exists()
+    assert result['results'][0]['reason'] == 'canonical_owner_busy'
+    assert 'error_attempts' not in result['results'][0]
+
+
+def test_exhausted_cleanup_retries_only_after_code_repair_and_retains_failure(setup, tmp_path, monkeypatch):
+    from scripts import discard_local_testing_artifacts as cleanup
+    _, _, args = setup
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    monkeypatch.setattr(d, '_pinned_snapshot_ids', lambda *a: set())
+    p = local_testing_policy(tmp_path)
+    root = args['repo_root'] / 'artifacts' / p['targets'][0]['relative']
+    root.mkdir(parents=True)
+    (root / 'data').write_bytes(b'closed copy')
+    state = tmp_path / 'cleanup-state'
+    policy_path = tmp_path / 'local-testing-policy.json'
+    original = d.discard_target
+    failures = []
+    def fail(*a, **kw):
+        failures.append(True)
+        raise OSError('fixture encoding failed')
+    monkeypatch.setattr(d, 'discard_target', fail)
+    for _ in range(4):
+        failed = cleanup.cycle(policy_path, state, apply=True, repo=args['repo_root'])
+    assert len(failures) == 3 and failed['results'][0]['state'] == 'retry_exhausted'
+    monkeypatch.setattr(d, 'discard_target', original)
+    monkeypatch.setattr(cleanup, 'EXECUTION_SHA256', 'repaired-implementation')
+    fixed = cleanup.cycle(policy_path, state, apply=True, repo=args['repo_root'])
+    assert fixed['state'] == 'completed' and not root.exists()
+    receipt = json.loads((state / fixed['results'][0]['resumed_error_receipt']).read_bytes())
+    assert receipt['previous_error']['error_attempts'] == 3
+    assert receipt['previous_error']['detail'] == 'fixture encoding failed'
+    assert not fixed['recovery_claimed'] and not fixed['nas_objects_deleted']
+
+
+@pytest.mark.parametrize('changed', [False, True])
+def test_prepared_cross_mount_failure_rolls_back_only_unchanged_source(setup, tmp_path, monkeypatch, changed):
+    import errno
+    _, _, args = setup
+    p = local_testing_policy(tmp_path)
+    target = p['targets'][0]
+    root = args['repo_root'] / 'artifacts' / target['relative']
+    root.mkdir(parents=True)
+    (root / 'copy').write_bytes(b'closed comparison')
+    dry = d.discard_target(p, target, **args)
+    original = Path.rename
+    def cross_mount(self, destination):
+        if self == root:
+            # Local quarantine must be a sibling within this exact mount.
+            assert destination.parent.parent == root.parent
+            raise OSError(errno.EXDEV, 'controlled cross-mount failure')
+        return original(self, destination)
+    monkeypatch.setattr(Path, 'rename', cross_mount)
+    with pytest.raises(OSError, match='cross-mount'):
+        d.discard_target(p, target, **args, apply=True, expected_plan_identity=dry['identity_sha256'])
+    if changed:
+        (root / 'new').write_bytes(b'new producer generation')
+        with pytest.raises(SnapshotError, match='prepared testing quarantine changed'):
+            d.restore_unchanged_discard_quarantine(p, target, **args)
+    else:
+        assert d.restore_unchanged_discard_quarantine(p, target, **args)
+        monkeypatch.setattr(Path, 'rename', original)
+        new = d.discard_target(p, target, **args)
+        assert d.discard_target(p, target, **args, apply=True,
+                               expected_plan_identity=new['identity_sha256'])['deleted']
+
+
 @pytest.mark.parametrize("relative", ["smoke", "../source", "/source", "data_tw_futures/original"])
 def test_namespace_and_source_roots_cannot_be_discarded(tmp_path, relative):
     with pytest.raises(SnapshotError):

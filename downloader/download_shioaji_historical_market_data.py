@@ -70,18 +70,28 @@ INVENTORY_SCHEMA_VERSION = 2
 RECEIPT_SCHEMA_VERSION = 2
 SUMMARY_SCHEMA_VERSION = 2
 FOP_HISTORY_START = date(2020, 3, 22)
+# This is the requested lower bound for all-option source probes, not a
+# claim that the broker makes options data available back to 2011. The 2020
+# broker documentation specifically describes futures, not options.
+OPTION_RESEARCH_QUERY_START = date(2011, 1, 1)
 INDEX_HISTORY_START = date(2020, 3, 2)
 MAX_KBAR_QUERY_DAYS = 29
 CONNECTION_CAPACITY_EXIT = 79
 TRAFFIC_BUDGET_EXIT = 75
 MARKET_WINDOW_EXIT = 76
 WEEKLY_OPTION_ROOT_RE = re.compile(r"^TX(?:[1-5UVWXY])$")
+LEGACY_OPTION_SCOPE = "latest_txo"
+ALL_OPTION_SCOPE = "all_available"
+OPTION_SCOPE_VERSION = "shioaji-option-discovery-v1"
 COLLECTION_PRIORITY = {
     "latest_weekly_option": 0,
     "latest_monthly_option": 1,
     "exact_futures": 2,
     "indices": 3,
+    "all_options": 4,
 }
+DEFAULT_COLLECTIONS = ("latest_weekly_option", "latest_monthly_option", "exact_futures", "indices")
+ALL_OPTION_COLLECTIONS = ("all_options", "exact_futures", "indices")
 
 
 class HistoricalWindowReached(RuntimeError):
@@ -111,6 +121,10 @@ class HistoryContract:
     # In particular delivery_date can be later than last_trading_date.
     source_begin_date: date | None = None
     last_trading_date: date | None = None
+    underlying_kind: str = ""
+    underlying_code: str = ""
+    quote_ccy: str = ""
+    spec_kind: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,8 +176,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--collections",
-        default=",".join(COLLECTION_PRIORITY),
-        help="Comma-separated collection ids.",
+        default=None,
+        help="Comma-separated collection ids; defaults depend on --option-scope.",
+    )
+    parser.add_argument(
+        "--option-scope", choices=(LEGACY_OPTION_SCOPE, ALL_OPTION_SCOPE),
+        default=LEGACY_OPTION_SCOPE,
+        help="Current broker catalog: nearest TXO series or all available option roots and series.",
     )
     parser.add_argument(
         "--contract-codes",
@@ -223,7 +242,10 @@ def _info_dict(info: Any) -> dict[str, Any]:
         "strike_price",
         "option_right",
         "expiry_weekday",
+        "underlying_kind",
         "underlying_code",
+        "quote_ccy",
+        "spec_kind",
     )
     return {name: getattr(info, name, None) for name in names}
 
@@ -320,7 +342,10 @@ def _history_contract(
     else:
         source_begin = _date_value(values.get("begin_date"))
         last_trading = _date_value(values.get("last_trading_date"))
-        begin = max(source_begin or FOP_HISTORY_START, FOP_HISTORY_START)
+        query_floor = (OPTION_RESEARCH_QUERY_START
+                       if security_type == "OPT" and collection == "all_options"
+                       else FOP_HISTORY_START)
+        begin = max(source_begin or query_floor, query_floor)
         final = (
             last_trading
             or _date_value(values.get("delivery_date"))
@@ -355,40 +380,43 @@ def _history_contract(
         expiry_weekday=str(values.get("expiry_weekday") or ""),
         source_begin_date=_date_value(values.get("begin_date")),
         last_trading_date=_date_value(values.get("last_trading_date")),
+        underlying_kind=_enum_text(values.get("underlying_kind")),
+        underlying_code=_enum_text(values.get("underlying_code")),
+        quote_ccy=_enum_text(values.get("quote_ccy")),
+        spec_kind=_enum_text(values.get("spec_kind")),
     )
 
 
-def discover_contracts(api: Any, *, completed_session: date) -> list[HistoryContract]:
+def discover_contracts(
+    api: Any, *, completed_session: date, option_scope: str = LEGACY_OPTION_SCOPE
+) -> list[HistoryContract]:
+    if option_scope not in {LEGACY_OPTION_SCOPE, ALL_OPTION_SCOPE}:
+        raise ValueError(f"unknown option scope: {option_scope}")
     option_infos: list[Any] = []
     for root_item in api.contracts.option_roots():
         root = str(root_item[0] if isinstance(root_item, (tuple, list)) else root_item)
         root = root.strip().upper()
-        if root != "TXO" and not WEEKLY_OPTION_ROOT_RE.fullmatch(root):
+        if option_scope == LEGACY_OPTION_SCOPE and root != "TXO" and not WEEKLY_OPTION_ROOT_RE.fullmatch(root):
             continue
         try:
             option_infos.extend(api.contracts.options(root))
         except Exception as exc:
             raise RuntimeError(f'option catalog discovery failed for root {root}; inventory preserved') from exc
-    weekly, monthly = select_latest_option_infos(
-        option_infos, completed_session=completed_session
-    )
     rows: list[HistoryContract] = []
-    for info in weekly:
-        row = _history_contract(
-            info,
-            collection="latest_weekly_option",
-            completed_session=completed_session,
+    if option_scope == ALL_OPTION_SCOPE:
+        option_selections = (("all_options", option_infos),)
+    else:
+        weekly, monthly = select_latest_option_infos(
+            option_infos, completed_session=completed_session
         )
-        if row is not None:
-            rows.append(row)
-    for info in monthly:
-        row = _history_contract(
-            info,
-            collection="latest_monthly_option",
-            completed_session=completed_session,
-        )
-        if row is not None:
-            rows.append(row)
+        option_selections = (("latest_weekly_option", weekly), ("latest_monthly_option", monthly))
+    for collection, selected in option_selections:
+        for info in selected:
+            row = _history_contract(info, collection=collection, completed_session=completed_session)
+            if row is not None:
+                rows.append(row)
+    if option_scope == ALL_OPTION_SCOPE and not rows:
+        raise RuntimeError("empty all-option catalog; previous inventory preserved")
 
     futures: list[tuple[Any, dict[str, Any]]] = []
     for root_item in api.contracts.futures_roots():
@@ -438,7 +466,12 @@ def discover_contracts(api: Any, *, completed_session: date) -> list[HistoryCont
         )
         if row is not None:
             rows.append(row)
-    deduped = {(row.security_type, row.code): row for row in rows}
+    deduped: dict[tuple[str, str], HistoryContract] = {}
+    for row in rows:
+        key = row.security_type, row.code
+        if option_scope == ALL_OPTION_SCOPE and row.security_type == "OPT" and key in deduped and deduped[key] != row:
+            raise RuntimeError(f"conflicting contract catalog entries for {key}; inventory preserved")
+        deduped[key] = row
     return sorted(
         deduped.values(),
         key=lambda row: (
@@ -467,6 +500,10 @@ def _contract_record(row: HistoryContract, *, observed_at: str) -> dict[str, Any
         "has_completed_history": row.begin_date <= row.end_date,
         "source_begin_date": row.source_begin_date,
         "last_trading_date": row.last_trading_date,
+        "underlying_kind": row.underlying_kind,
+        "underlying_code": row.underlying_code,
+        "quote_ccy": row.quote_ccy,
+        "spec_kind": row.spec_kind,
         "delivery_date": row.delivery_date,
         "delivery_month": row.delivery_month,
         "tenor_rank": row.tenor_rank,
@@ -479,9 +516,35 @@ def _contract_record(row: HistoryContract, *, observed_at: str) -> dict[str, Any
     }
 
 
+def _scope_fingerprint(option_scope: str) -> str:
+    return hashlib.sha256(f"{OPTION_SCOPE_VERSION}:{option_scope}".encode()).hexdigest()
+
+
+def _validate_inventory_scope(root: Path, option_scope: str) -> None:
+    if option_scope not in {LEGACY_OPTION_SCOPE, ALL_OPTION_SCOPE}:
+        raise ValueError(f"unknown option scope: {option_scope}")
+    inventory = root / "inventory" / "contracts.parquet"
+    path = root / "inventory" / "manifest.json"
+    if not path.is_file():
+        if inventory.is_file():
+            raise RuntimeError("existing inventory has no scope manifest; inventory preserved")
+        return
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    existing_scope = manifest.get("option_scope", LEGACY_OPTION_SCOPE)
+    if existing_scope != option_scope:
+        raise ValueError(f"inventory option scope {existing_scope} is incompatible with {option_scope}")
+    fingerprint = manifest.get("option_scope_fingerprint")
+    if fingerprint is not None and fingerprint != _scope_fingerprint(option_scope):
+        raise ValueError("inventory option scope fingerprint is incompatible")
+    if option_scope == ALL_OPTION_SCOPE and fingerprint is None:
+        raise ValueError("all-available inventory is missing its scope fingerprint")
+
+
 def _write_inventory(
-    root: Path, rows: Sequence[HistoryContract], *, completed_session: date
+    root: Path, rows: Sequence[HistoryContract], *, completed_session: date,
+    option_scope: str = LEGACY_OPTION_SCOPE,
 ) -> dict[str, Any]:
+    _validate_inventory_scope(root, option_scope)
     inventory_dir = root / "inventory"
     inventory_dir.mkdir(parents=True, exist_ok=True)
     observed = datetime.now(UTC).isoformat().replace("+00:00", "Z")
@@ -537,11 +600,14 @@ def _write_inventory(
                 if row.collection == collection and row.delivery_date is not None
             }
         )
-        for collection in ("latest_weekly_option", "latest_monthly_option")
+        for collection in ("latest_weekly_option", "latest_monthly_option", "all_options")
     }
     manifest = {
         "schema_version": INVENTORY_SCHEMA_VERSION,
         "source": "shioaji_contract_v2",
+        "option_scope": option_scope,
+        "option_scope_version": OPTION_SCOPE_VERSION,
+        "option_scope_fingerprint": _scope_fingerprint(option_scope),
         "generated_at_utc": observed,
         "completed_session": completed_session.isoformat(),
         "current_contracts": len(rows),
@@ -567,6 +633,12 @@ def _write_inventory(
         "retention_contract": (
             "current Contract V2 selections are merged into a stable union; expired "
             "codes are never silently removed"
+        ),
+        "option_scope_contract": (
+            "all_available records every physical option contract returned by current broker roots; "
+            "catalog membership and quote currency are a current snapshot, not historical listing, "
+            "settlement currency, source coverage or executable-fill proof; its 2011 query floor "
+            "is a requested bound and not a promise of broker historical coverage"
         ),
     }
     _atomic_write_json(inventory_dir / "manifest.json", manifest)
@@ -596,6 +668,10 @@ def _row_from_record(item: dict[str, Any]) -> HistoryContract:
         active_selection=bool(item.get("active_selection")),
         source_begin_date=_date_value(item.get("source_begin_date")),
         last_trading_date=_date_value(item.get("last_trading_date")),
+        underlying_kind=str(item.get("underlying_kind") or ""),
+        underlying_code=str(item.get("underlying_code") or ""),
+        quote_ccy=str(item.get("quote_ccy") or ""),
+        spec_kind=str(item.get("spec_kind") or ""),
     )
 
 
@@ -1284,14 +1360,16 @@ def main() -> int:
         )
     if args.max_queries < 0 or args.timeout_ms < 1 or args.retries < 0:
         raise ValueError("query limits, timeout, and retries must be non-negative")
+    scope_collections = ALL_OPTION_COLLECTIONS if args.option_scope == ALL_OPTION_SCOPE else DEFAULT_COLLECTIONS
     collections = {
         value.strip()
-        for value in str(args.collections).split(",")
+        for value in str(args.collections or ",".join(scope_collections)).split(",")
         if value.strip()
     }
-    unknown = collections - set(COLLECTION_PRIORITY)
+    unknown = collections - set(scope_collections)
     if unknown:
-        raise ValueError(f"unknown collections: {sorted(unknown)}")
+        raise ValueError(f"collections incompatible with option scope: {sorted(unknown)}")
+    _validate_inventory_scope(args.output_dir, args.option_scope)
     selected_codes = {
         value.strip().upper()
         for value in str(args.contract_codes).split(",")
@@ -1312,7 +1390,7 @@ def main() -> int:
                                      end=max(row.end_date for row in rows))
 
     if args.summary_only:
-        if selected_codes or collections != set(COLLECTION_PRIORITY) or args.kbars_only or args.dry_run:
+        if selected_codes or collections != set(scope_collections) or args.kbars_only or args.dry_run:
             raise ValueError('--summary-only requires the full existing inventory and Tick scope')
         with (args.output_dir / 'download.lock').open('a+b') as summary_lock:
             fcntl.flock(summary_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
@@ -1376,15 +1454,19 @@ def main() -> int:
             args.taifex_calendar, args.twse_calendar
         )
         if not args.no_refresh_inventory:
-            inventory = discover_contracts(api, completed_session=completed_session)
+            inventory = discover_contracts(
+                api, completed_session=completed_session, option_scope=args.option_scope
+            )
             manifest = _write_inventory(
-                args.output_dir, inventory, completed_session=completed_session
+                args.output_dir, inventory, completed_session=completed_session,
+                option_scope=args.option_scope,
             )
             print(
                 "[shioaji-history] inventory "
                 f"current={manifest['current_contracts']} "
                 f"weekly={manifest['by_collection']['latest_weekly_option']} "
                 f"monthly={manifest['by_collection']['latest_monthly_option']} "
+                f"all_options={manifest['by_collection']['all_options']} "
                 f"exact_futures={manifest['by_collection']['exact_futures']} "
                 f"indices={manifest['by_collection']['indices']}",
                 flush=True,

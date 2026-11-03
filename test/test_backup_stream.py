@@ -10,6 +10,7 @@ import subprocess
 import threading
 import time
 from types import SimpleNamespace
+import zipfile
 
 import pytest
 
@@ -25,6 +26,112 @@ from stockagent.data_sync.backup_recovery import assemble_release
 from stockagent.data_sync.packed_snapshots import (
     fetch_packed_snapshot, initialize_packed_layout, publish_packed_snapshot, resolve_packed_snapshot_id,
 )
+
+
+def test_catalog_snapshot_reuses_exact_pins_and_preserves_original_file_clock(tmp_path):
+    catalog = {'contract': module.CATALOG, 'identity_sha256': 'a' * 64,
+               'files': [{'relative': 'objects/aa/file', 'signature': [1, 2, 3, 4, 5]}],
+               'observed_at_utc': '2026-11-03T00:00:00+00:00'}
+    first = module.save_catalog_snapshot(tmp_path, catalog)
+    path = tmp_path / 'catalog.json'
+    original, original_stat = path.read_bytes(), path.stat()
+    assert first['state'] == 'fresh_snapshot_written'
+    next_catalog = {**catalog, 'observed_at_utc': '2026-11-03T00:01:00+00:00'}
+    result = module.save_catalog_snapshot(tmp_path, next_catalog)
+    assert result == {'state': 'unchanged_snapshot_reused',
+                      'persisted_observed_at_utc': catalog['observed_at_utc']}
+    assert path.read_bytes() == original and path.stat().st_ino == original_stat.st_ino
+    marker = json.loads((tmp_path / 'catalog-observation.json').read_bytes())
+    assert marker['observed_at_utc'] == next_catalog['observed_at_utc']
+    assert marker['persisted_observed_at_utc'] == catalog['observed_at_utc']
+    assert marker['NAS_backup_verified'] is False
+
+
+@pytest.mark.parametrize('damage', ['identity', 'source_signature', 'snapshot_generation', 'marker'])
+def test_catalog_snapshot_never_reuses_changed_source_or_file(tmp_path, damage):
+    catalog = {'contract': module.CATALOG, 'identity_sha256': 'a' * 64,
+               'files': [{'relative': 'objects/aa/file', 'signature': [1, 2, 3, 4, 5]}],
+               'observed_at_utc': '2026-11-03T00:00:00+00:00'}
+    module.save_catalog_snapshot(tmp_path, catalog)
+    changed = deepcopy(catalog)
+    changed['observed_at_utc'] = '2026-11-03T00:01:00+00:00'
+    if damage == 'identity':
+        changed['identity_sha256'] = 'b' * 64
+    elif damage == 'source_signature':
+        changed['files'][0]['signature'][4] += 1
+    elif damage == 'snapshot_generation':
+        (tmp_path / 'catalog.json').write_bytes(b'tampered')
+    else:
+        (tmp_path / 'catalog-observation.json').write_text('{bad json')
+    result = module.save_catalog_snapshot(tmp_path, changed)
+    assert result['state'] == 'fresh_snapshot_written'
+    assert json.loads((tmp_path / 'catalog.json').read_bytes()) == changed
+
+
+def test_catalog_snapshot_optimization_failure_keeps_existing_full_write(tmp_path, monkeypatch):
+    catalog = {'identity_sha256': 'a' * 64, 'files': [{'relative': 'a', 'signature': [1, 2, 3, 4, 5]}],
+               'observed_at_utc': '2026-11-03T00:00:00+00:00'}
+    original = module.private_json
+    def write(path, value, **kwargs):
+        if path.name == 'catalog-observation.json':
+            raise OSError('synthetic observation failure')
+        return original(path, value, **kwargs)
+    monkeypatch.setattr(module, 'private_json', write)
+    result = module.save_catalog_snapshot(tmp_path, catalog)
+    assert result['state'] == 'fresh_snapshot_written_observation_unavailable'
+    assert json.loads((tmp_path / 'catalog.json').read_bytes()) == catalog
+    assert not (tmp_path / 'catalog-observation.json').exists()
+
+
+@pytest.mark.parametrize('schedule', ['inline', 'independent_timer'])
+def test_private_dispatch_can_run_independently_without_recapturing_or_losing_live_status(stream, monkeypatch, schedule):
+    queue, *_ = stream
+    queue.config['private_history_backup'] = {'enabled': True}
+    queue.config['private_history_schedule'] = schedule
+    dispatched, observations = [], []
+    monkeypatch.setattr(queue, 'private_history_cycle',
+                        lambda **kw: dispatched.append(kw) or {'state': 'inline_private_result'})
+    def public_cycle(**kwargs):
+        (queue.state / 'private-status.json').write_text(json.dumps({
+            'state': 'copying_current_private_wave', 'all_project_sources_NAS_verified': False}))
+        return {'state': 'public_cycle_finished'}
+    monkeypatch.setattr(queue, '_cycle', public_cycle)
+    monkeypatch.setattr(queue, '_publish_cycle_status', observations.append)
+    result = queue.cycle()
+    assert result['state'] == 'public_cycle_finished'
+    assert bool(dispatched) is (schedule == 'inline')
+    assert result['private_history_backup']['state'] == (
+        'inline_private_result' if schedule == 'inline' else 'copying_current_private_wave')
+    assert observations == [result]
+
+
+def test_unknown_private_schedule_does_not_change_the_original_queue(stream):
+    queue, *_ = stream
+    queue.config['private_history_schedule'] = 'typo'
+    with pytest.raises(SnapshotError, match='unknown private backup schedule'):
+        queue.cycle()
+
+
+@pytest.mark.parametrize(("keys", "missing", "expected"), [
+    ([], [], True),
+    (["a", "a"], [], True),
+    (("a", "b"), [], True),
+    (["a", "missing"], [], False),
+    (["a"], ["missing-object"], False),
+    (["a", 1], [], False),
+])
+def test_release_coverage_preserves_reference_and_missing_object_semantics(keys, missing, expected):
+    release = {"required_file_keys": keys, "missing_objects": missing}
+    assert module._release_file_covered(release, {"a", "b"}) is expected
+
+
+def test_release_coverage_still_rejects_late_unhashable_reference():
+    release = {"required_file_keys": ["missing", []], "missing_objects": []}
+    with pytest.raises(TypeError, match="unhashable"):
+        module._release_file_covered(release, {"a"})
+    # An incomplete release is never covered and does not inspect its keys.
+    release["missing_objects"] = ["missing-object"]
+    assert module._release_file_covered(release, {"a"}) is False
 
 
 @pytest.fixture
@@ -64,6 +171,153 @@ def readiness(queue, **changes):
     value = signed(value)
     atomic_public(queue.receipts / "readiness.json", value, replace=True)
     return value
+
+
+@pytest.mark.parametrize('age, expected', [(0, True), (120, True), (121, False),
+                                         (-5, True), (-6, False)])
+def test_transport_placement_hint_has_a_bounded_clock_and_requires_enrollment(tmp_path, age, expected):
+    config = {'transport_namespace_handoff_contract': 'stockagent.transport_namespace_handoff.v1'}
+    (tmp_path / 'attempt.json').write_text(json.dumps({
+        'state': 'waiting_for_original_owner_or_reader', 'observed_at_epoch': 1000 - age}))
+    assert module.transport_placement_pending(config, evidence=tmp_path, now=1000) is expected
+    assert module.transport_placement_pending({}, evidence=tmp_path, now=1000) is False
+
+
+@pytest.mark.parametrize('damage', ['absent', 'symlink', 'oversized', 'list', 'invalid', 'finished'])
+def test_transport_placement_hint_does_not_block_on_invalid_or_completed_metadata(tmp_path, damage):
+    config = {'transport_namespace_handoff_contract': 'stockagent.transport_namespace_handoff.v1'}
+    path = tmp_path / 'attempt.json'
+    if damage == 'symlink':
+        target = tmp_path / 'other.json'
+        target.write_text('{"state":"waiting_for_original_owner_or_reader","observed_at_epoch":1000}')
+        path.symlink_to(target)
+    elif damage == 'oversized':
+        path.write_bytes(b' ' * 16385)
+    elif damage == 'list':
+        path.write_text('[]')
+    elif damage == 'invalid':
+        path.write_text('{broken')
+    elif damage == 'finished':
+        path.write_text('{"state":"completed","observed_at_epoch":1000}')
+    assert module.transport_placement_pending(config, evidence=tmp_path, now=1000) is False
+
+
+def test_queued_placement_yields_catalog_after_receipt_ingestion_and_keeps_catalog_clock(stream, monkeypatch):
+    queue, *_ = stream
+    readiness(queue)
+    before = queue.cycle()
+    envelope, delivery = next(iter(queue.load_ledger()['deliveries'].items()))
+    acknowledge(queue, delivery)
+    monkeypatch.setattr(module, 'transport_placement_pending', lambda _: True)
+    monkeypatch.setattr(module, 'capture_catalog', lambda *a, **kw: pytest.fail('queued cutover recaptured history'))
+    queue.config['auxiliary'] = {'enabled_for_test': True}
+    monkeypatch.setattr(queue, 'stage_auxiliary', lambda *_: pytest.fail('queued cutover hashed the working tree'))
+    queue.config['cold_transport_cache'] = {'enabled': True}
+    retired = []
+
+    def retire(ledger, **kwargs):
+        assert ledger['deliveries'][envelope]['acceptance']
+        retired.append(envelope)
+        return {'retired_deliveries': 0, 'retired_logical_bytes': 0, 'errors': [], 'deferred': False}
+
+    monkeypatch.setattr(queue, 'retire_transport_cache', retire)
+    result = queue.cycle()
+    assert retired == [envelope]
+    assert queue.load_ledger()['deliveries'][envelope]['state'] == 'nas_file_restore_acknowledged'
+    assert result['state'] == 'waiting_for_transport_placement'
+    assert result['observed_at_utc'] == before['observed_at_utc']
+    assert result['activity_at_utc'] > before['observed_at_utc']
+    assert result['nas_covered_bytes'] == before['nas_covered_bytes']
+    assert result['catalog_identity_sha256'] == before['catalog_identity_sha256']
+    assert result['catalog_refresh']['state'] == 'deferred_transport_placement'
+    assert result['catalog_refresh']['coverage_recomputed'] is False
+    assert result['catalog_capture_started'] is False and result['prior_catalog_preserved'] is True
+    assert result['source_cleanup_authorized'] is False
+    assert json.loads((queue.state / 'status.json').read_bytes()) == result
+    assert json.loads((queue.transport / 'tools/source-status.json').read_bytes()) == result
+    # Returning the cycle also returns both original locks; no stale lease is removed.
+    for name in ('cycle.lock', 'owner.lock'):
+        with (queue.state / name).open('a') as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_capacity_wait_skips_catalog_but_ingests_ack_and_preserves_progress_clock(stream, monkeypatch):
+    queue, *_ = stream
+    readiness(queue)
+    before = queue.cycle()
+    ledger = queue.load_ledger()
+    envelope, delivery = next(iter(ledger['deliveries'].items()))
+    acknowledge(queue, delivery)
+    usage = module.shutil.disk_usage(queue.transport)
+    monkeypatch.setattr(module.shutil, 'disk_usage', lambda _: usage._replace(free=queue.config['reserve_bytes']))
+    monkeypatch.setattr(module, 'capture_catalog', lambda *a, **kw: pytest.fail('capacity wait recaptured history'))
+    queue.config['auxiliary'] = {'enabled_for_test': True}
+    monkeypatch.setattr(queue, 'stage_auxiliary', lambda *_: pytest.fail('capacity wait hashed the working tree'))
+    queue.config['cold_transport_cache'] = {'enabled': True}
+    retired = []
+    def retire(ledger, **kwargs):
+        assert ledger['deliveries'][envelope]['acceptance']
+        retired.append(envelope)
+        return {'retired_deliveries': 0, 'retired_logical_bytes': 0, 'errors': [], 'deferred': False}
+    monkeypatch.setattr(queue, 'retire_transport_cache', retire)
+    result = queue.cycle()
+    assert retired == [envelope]
+    assert queue.load_ledger()['deliveries'][envelope]['state'] == 'nas_file_restore_acknowledged'
+    assert result['state'] == 'backpressure'
+    assert result['observed_at_utc'] == before['observed_at_utc']
+    assert result['activity_at_utc'] > before['observed_at_utc']
+    assert result['nas_covered_bytes'] == before['nas_covered_bytes']  # Not recomputed from the ledger.
+    assert result['catalog_identity_sha256'] == before['catalog_identity_sha256']
+    refresh = result['catalog_refresh']
+    assert refresh['state'] == 'deferred_physical_capacity' and refresh['coverage_recomputed'] is False
+    assert refresh['source_available_bytes'] == 0
+    assert result['all_history_backup_verified'] is False and result['source_cleanup_authorized'] is False
+    assert result['auxiliary_attempts'] == 0 and result['auxiliary_deferred_reason'] == 'physical_capacity'
+
+
+def test_capacity_recheck_runs_after_retirement_and_recaptures_once_space_recovers(stream, monkeypatch):
+    queue, cold, source, *_ = stream
+    readiness(queue)
+    queue.cycle()
+    usage = module.shutil.disk_usage(queue.transport)
+    free = [queue.config['reserve_bytes']]
+    monkeypatch.setattr(module.shutil, 'disk_usage', lambda _: usage._replace(free=free[0]))
+    capture = module.capture_catalog
+    calls = []
+    def observed_capture(*args, **kwargs):
+        calls.append('captured')
+        return capture(*args, **kwargs)
+    monkeypatch.setattr(module, 'capture_catalog', observed_capture)
+    assert queue.cycle()['catalog_refresh']['coverage_recomputed'] is False
+    assert calls == []
+    (source/'new-generation.txt').write_text('new source, never borrowed from the old catalog')
+    publish_packed_snapshot(cold, 'prices', source, loose_file_threshold_bytes=1024, pack_buckets=2)
+    queue.config['cold_transport_cache'] = {'enabled': True}
+    def retire(*args, **kwargs):
+        free[0] = usage.free  # Model the original owner's committed reclamation.
+        return {'retired_deliveries': 0, 'retired_logical_bytes': 0, 'errors': [], 'deferred': False}
+    monkeypatch.setattr(queue, 'retire_transport_cache', retire)
+    resumed = queue.cycle()
+    assert calls == ['captured'] and 'catalog_refresh' not in resumed
+    assert resumed['retained_release_count'] == 3
+
+
+def test_bootstrap_capacity_wait_has_no_invented_counts_and_inspection_still_captures(stream, monkeypatch):
+    queue, *_ = stream
+    usage = module.shutil.disk_usage(queue.transport)
+    monkeypatch.setattr(module.shutil, 'disk_usage', lambda _: usage._replace(free=0))
+    capture = module.capture_catalog
+    calls = []
+    def observed_capture(*args, **kwargs):
+        calls.append('captured')
+        return capture(*args, **kwargs)
+    monkeypatch.setattr(module, 'capture_catalog', observed_capture)
+    result = queue.cycle()
+    assert result['state'] == 'backpressure' and result['observed_at_utc'] is None
+    assert result.get('nas_covered_bytes') is None and result.get('available_file_count') is None
+    assert not calls and not queue.load_ledger()['deliveries']
+    inspected = queue.cycle(publish=False)
+    assert calls == ['captured'] and inspected['retained_release_count'] == 2
 
 
 @pytest.mark.parametrize("operation", ["publish", "inspect", "notify"])
@@ -249,7 +503,8 @@ def test_redirected_transport_pairing_still_rejects_before_scan(stream, monkeypa
         queue.scan_transport(module.empty_ledger())
 
 
-def test_notify_only_resumes_scan_without_catalog_capture_or_reexport(stream, monkeypatch):
+@pytest.mark.parametrize('idle_preflight', [False, True])
+def test_notify_only_resumes_scan_without_catalog_capture_or_reexport(stream, monkeypatch, idle_preflight):
     queue = stream[0]
     readiness(queue)
     queue.cycle()
@@ -257,15 +512,180 @@ def test_notify_only_resumes_scan_without_catalog_capture_or_reexport(stream, mo
     calls = scan_api(queue, monkeypatch)
     monkeypatch.setattr(module, "capture_catalog", lambda *a, **kw: pytest.fail("notification cannot recapture history"))
     monkeypatch.setattr(module, "export_incremental_delivery", lambda *a, **kw: pytest.fail("notification cannot reexport payload"))
-    notification = queue.notify_transport()
+    notification = queue.notify_transport(idle_preflight=idle_preflight)
     assert notification["state"] == "scan_request_acknowledged"
     current = queue.load_ledger()["deliveries"]
     assert current.keys() == before.keys()
     for key, delivery in current.items():
         assert {name: value for name, value in delivery.items() if name != "transport_scan_notification"} == before[key]
         verify(queue.transport / delivery["dispatch"]["batch_relative"], key)
-    assert len(calls) == 2 + len(before)
+    assert len(calls) == 2 + len(before) + int(idle_preflight)
     assert json.loads((queue.state / "transport-scan-status.json").read_bytes()) == notification
+
+
+@pytest.mark.parametrize('state', ['scanning', None, ''])
+def test_notify_preflight_defers_without_loading_ledger_or_taking_publication_owner(stream, monkeypatch, state):
+    queue = stream[0]
+    calls = scan_api(queue, monkeypatch, state=state)
+    monkeypatch.setattr(queue, 'load_ledger', lambda: pytest.fail('busy scan cannot load the large ledger'))
+    monkeypatch.setattr(queue, '_save_ledger', lambda *a: pytest.fail('busy scan cannot rewrite the ledger'))
+    with (queue.state/'owner.lock').open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = queue.notify_transport(idle_preflight=True)
+    assert result['idle_preflight_only'] and result['pending_batch_scans'] is None
+    assert not result['tools_scan_requested'] and not result['NAS_backup_verified']
+    assert not result['batch_scan_receipts']
+    assert len(calls) == 1 and calls[0][0] == '/rest/db/status'
+
+
+def test_busy_notify_queues_one_exact_batch_without_holding_publication_owner(stream, monkeypatch):
+    from scripts import configure_artifact_ingress_syncthing as api
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    before = deepcopy(queue.load_ledger()['deliveries'])
+    scan_api(queue, monkeypatch, state='scanning')
+    queue.config['busy_scan_notification_enabled'] = True
+    posts = []
+
+    def request(base, key, path, query=None, **kwargs):
+        if path == '/rest/db/status':
+            return {'state': 'scanning'}
+        posts.append(query)
+        with (queue.state / 'owner.lock').open('a') as owner:
+            fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        intent = json.loads((queue.state / 'transport-busy-scan-intent.json').read_bytes())
+        assert intent['state'] == 'requesting' and not intent['NAS_backup_verified']
+        return None
+
+    monkeypatch.setattr(api, 'request', request)
+    result = queue.notify_transport(idle_preflight=True)
+    first = next(iter(before))
+    assert posts == [[('folder', 'backup-test'), ('sub', 'tools'),
+                      ('sub', before[first]['dispatch']['batch_relative'])]]
+    assert result['pending_batch_scans'] == len(before) - 1
+    assert len(result['batch_scan_receipts']) == 1 and not result['NAS_backup_verified']
+    after = queue.load_ledger()['deliveries']
+    assert set(after) == set(before) and not any(v.get('acceptance') for v in after.values())
+    assert after[first]['transport_scan_notification']['dispatch_identity_sha256'] == before[first]['dispatch']['identity_sha256']
+
+
+def test_busy_scan_timeout_survives_restart_without_flooding_and_resumes_after_idle(stream, monkeypatch):
+    from scripts import configure_artifact_ingress_syncthing as api
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    scan_api(queue, monkeypatch, state='scanning')
+    queue.config['busy_scan_notification_enabled'] = True
+    states, posts = ['scanning'], []
+
+    def request(base, key, path, query=None, **kwargs):
+        if path == '/rest/db/status':
+            return {'state': states[0]}
+        posts.append(query)
+        raise TimeoutError('the server may still execute this queued request')
+
+    monkeypatch.setattr(api, 'request', request)
+    result = queue.notify_transport(idle_preflight=True)
+    assert result['state'] == 'retryable_scan_error' and not result['batch_scan_receipts']
+    assert json.loads((queue.state / 'transport-busy-scan-intent.json').read_bytes())['state'] == 'waiting_idle'
+    restarted = BackupStream(queue.config)
+    monkeypatch.setattr(restarted, 'paired_transport', queue.paired_transport)
+    with monkeypatch.context() as m:
+        m.setattr(restarted, 'load_ledger', lambda: pytest.fail('uncertain busy request must use only its small intent'))
+        deferred = restarted.notify_transport(idle_preflight=True)
+    assert deferred['idle_preflight_only'] and len(posts) == 1
+    calls = scan_api(restarted, monkeypatch, state='idle')
+    retried = restarted.notify_transport(idle_preflight=True)
+    assert retried['state'] == 'scan_request_acknowledged'
+    assert all(v.get('transport_scan_notification') for v in restarted.load_ledger()['deliveries'].values())
+    assert not any(v.get('acceptance') for v in restarted.load_ledger()['deliveries'].values())
+    assert json.loads((queue.state / 'transport-busy-scan-intent.json').read_bytes())['state'] == 'idle_observed'
+    assert any(path == '/rest/db/scan' for path, *_ in calls)
+
+
+@pytest.mark.parametrize('state', ['scanning', '', None])
+def test_busy_notify_does_not_queue_empty_or_unknown_scope(stream, monkeypatch, state):
+    queue = stream[0]
+    calls = scan_api(queue, monkeypatch, state=state)
+    result = queue.scan_transport(module.empty_ledger(), queue_busy_scanner=True)
+    assert result['state'].startswith('deferred_') and not result['batch_scan_receipts']
+    assert [path for path, *_ in calls] == ['/rest/db/status']
+    assert not (queue.state / 'transport-busy-scan-intent.json').exists()
+
+
+def test_busy_scan_intent_is_single_flight_and_redirects_are_rejected(stream, monkeypatch, tmp_path):
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    calls = scan_api(queue, monkeypatch, state='scanning')
+    lock = queue.state / 'transport-busy-scan.lock'
+    with lock.open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = queue.scan_transport(ledger, queue_busy_scanner=True)
+    assert result['state'] == 'deferred_existing_folder_scan'
+    assert [path for path, *_ in calls] == ['/rest/db/status']
+    (queue.state / 'transport-busy-scan-intent.json').symlink_to(tmp_path / 'outside')
+    with pytest.raises(SnapshotError, match='intent is redirected'):
+        queue.scan_transport(ledger, queue_busy_scanner=True)
+    assert not any(path == '/rest/db/scan' for path, *_ in calls)
+
+
+@pytest.mark.parametrize('state', ['syncing', 'scan-waiting', 'error'])
+def test_uncertain_busy_scan_requires_actual_idle_before_retry(stream, monkeypatch, state):
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    ledger = queue.load_ledger()
+    calls = scan_api(queue, monkeypatch, state=state)
+    intent = {'contract': 'backup_busy_scan_intent_v1', 'state': 'requesting'}
+    module.private_json(queue.state / 'transport-busy-scan-intent.json', intent)
+    result = queue.scan_transport(ledger, queue_busy_scanner=True)
+    assert result['state'] == 'deferred_unconfirmed_scan_waiting_idle'
+    assert json.loads((queue.state / 'transport-busy-scan-intent.json').read_bytes()) == intent
+    assert [path for path, *_ in calls] == ['/rest/db/status']
+    assert not result['batch_scan_receipts'] and not result['NAS_backup_verified']
+
+
+def test_supervised_notifier_waits_for_original_owner_and_then_resumes(stream, monkeypatch):
+    queue = stream[0]
+    readiness(queue)
+    queue.cycle()
+    scan_api(queue, monkeypatch)
+    entered, loaded = threading.Event(), threading.Event()
+    original_write, original_load = module.private_json, queue.load_ledger
+    outcome = {}
+
+    def write(path, data, **kwargs):
+        original_write(path, data, **kwargs)
+        if data.get('state') == 'waiting_source_publication_owner':
+            entered.set()
+
+    def load():
+        loaded.set()
+        return original_load()
+
+    def notify():
+        try:
+            outcome['result'] = queue.notify_transport(wait_for_owner=True, idle_preflight=True)
+        except Exception as error:
+            outcome['error'] = error
+
+    monkeypatch.setattr(module, 'private_json', write)
+    monkeypatch.setattr(queue, 'load_ledger', load)
+    with (queue.state / 'owner.lock').open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        worker = threading.Thread(target=notify)
+        worker.start()
+        try:
+            assert entered.wait(3) and worker.is_alive() and not loaded.is_set()
+        finally:
+            fcntl.flock(owner, fcntl.LOCK_UN)
+            worker.join(timeout=8)
+    assert not worker.is_alive() and 'error' not in outcome
+    assert outcome['result']['state'] == 'scan_request_acknowledged'
+    assert not outcome['result']['NAS_backup_verified']
 
 
 def test_scan_budget_retains_exact_unnotified_batches_for_next_call(stream, monkeypatch):
@@ -519,8 +939,62 @@ def test_auxiliary_snapshot_failure_exposes_bounded_reason_and_keeps_sources(str
     result = queue.cycle(publish=False)
     assert result['auxiliary_error'] == 'SnapshotError'
     assert result['auxiliary_error_detail']['reason'] == 'retain failed staging; auxiliary capacity budget reached'
+    assert result['auxiliary_attempts'] == 1 and result['auxiliary_retry_reasons'] == []
     assert (source / '價格.txt').read_bytes() == original and cold.is_dir()
     assert not queue.load_ledger()['deliveries']
+
+
+def test_auxiliary_tree_race_retries_fresh_snapshot_without_discarding_failed_staging(stream, tmp_path, monkeypatch):
+    from stockagent.data_sync import backup_auxiliary
+
+    queue = stream[0]
+    auxiliary_inputs(queue, tmp_path)
+    root = Path(queue.config['auxiliary']['repository_root'])
+    target = root / 'README.md'
+    original_regular = backup_auxiliary._regular
+    changed = []
+
+    def change_once_before_copy(path):
+        if path == target and not changed:
+            target.write_text('new complete generation\n')
+            changed.append(True)
+        return original_regular(path)
+
+    monkeypatch.setattr(backup_auxiliary, '_regular', change_once_before_copy)
+    result = queue.cycle(publish=False)
+    assert changed and result['auxiliary_error'] is None
+    assert result['auxiliary_attempts'] == 2
+    assert result['auxiliary_retry_reasons'] == ['code changed during its frozen working-tree backup']
+    staging = list((queue.transport / '.staging').glob('auxiliary-*'))
+    assert len(staging) == 2
+    pending = queue.load_ledger()['auxiliary_pending']
+    ready = queue.transport / pending['staging_relative']
+    failed = next(path for path in staging if path != ready)
+    assert not (failed / 'READY').exists()
+    verify(ready, pending['export']['envelope_identity_sha256'])
+    with zipfile.ZipFile(ready / 'code/working-tree.zip') as archive:
+        assert archive.read('README.md') == b'new complete generation\n'
+
+
+@pytest.mark.parametrize('reason', [
+    'code changed during its frozen working-tree backup',
+    'working tree changed during backup; READY withheld',
+    'configuration changed during privacy classification',
+])
+def test_auxiliary_tree_race_retries_at_most_once_and_reports_failure(stream, monkeypatch, reason):
+    queue = stream[0]
+    queue.config['auxiliary'] = {'enabled': True}
+    calls = []
+
+    def fail(_):
+        calls.append(True)
+        raise SnapshotError(reason)
+
+    monkeypatch.setattr(queue, 'stage_auxiliary', fail)
+    result = queue.cycle(publish=False)
+    assert len(calls) == result['auxiliary_attempts'] == 2
+    assert result['auxiliary_retry_reasons'] == [reason]
+    assert result['auxiliary_error_detail']['reason'] == reason
 
 
 def test_delegated_cold_replication_ingests_old_ack_without_new_payload(stream):
@@ -753,6 +1227,33 @@ def test_pipeline_publishes_disjoint_waves_without_waiting_for_nas_ack(stream):
     assert len(observed) == len(set(observed))
 
 
+def test_pipeline_ingests_ack_before_admitting_next_wave(stream, monkeypatch):
+    queue = enable_pipeline(stream[0], waves=2)
+    queue.config["maximum_pending_deliveries"] = 1
+    readiness(queue)
+    real_publish = queue.publish_closed
+    acknowledged = []
+
+    def publish_and_ack(ledger, rows, staging, key, catalog_identity, kind, **kwargs):
+        real_publish(ledger, rows, staging, key, catalog_identity, kind, **kwargs)
+        if not acknowledged:
+            acknowledge(queue, ledger["deliveries"][key])
+            acknowledged.append(key)
+
+    monkeypatch.setattr(queue, "publish_closed", publish_and_ack)
+    result = queue.cycle()
+    ledger = queue.load_ledger()
+    first = acknowledged[0]
+    assert len(result["pipeline"]["published_waves"]) == 2
+    assert len(ledger["deliveries"]) == 2 and ledger["deliveries"][first]["acceptance"]
+    assert result["pending_delivery_count"] == 1
+    first_keys = {file_key(row) for row in ledger["deliveries"][first]["files"]}
+    second = next(key for key in ledger["deliveries"] if key != first)
+    second_keys = {file_key(row) for row in ledger["deliveries"][second]["files"]}
+    assert first_keys and second_keys and first_keys.isdisjoint(second_keys)
+    assert result["machine_acknowledged_files"] == len(first_keys)
+
+
 def test_pipeline_indexes_first_batch_while_exporting_second(stream, monkeypatch):
     queue = enable_pipeline(stream[0])
     readiness(queue)
@@ -911,6 +1412,50 @@ def test_parallel_catalog_preserves_complete_identity_and_does_overlap_leaf_stat
     assert entered
     assert {k:v for k,v in parallel.items() if k != 'observed_at_utc'} == {
         k:v for k,v in baseline.items() if k != 'observed_at_utc'}
+
+
+def test_parallel_catalog_overlaps_manifest_reads_and_keeps_serial_identity(stream, monkeypatch):
+    queue, cold, _, first, second = stream
+    policy = Path(queue.config['publication_catalog'])
+    baseline = capture_catalog(cold, policy, metadata_workers=1)
+    names = {first.manifest_path.name, second.manifest_path.name}
+    assert len(names) == 2
+    original_open = os.open
+    barrier = threading.Barrier(2, timeout=5)
+    entered = []
+    lock = threading.Lock()
+
+    def observed_open(path, flags, *args, **kwargs):
+        if path in names and kwargs.get('dir_fd') is not None:
+            with lock:
+                entered.append(path)
+                wait = len(entered) <= 2
+            if wait:
+                barrier.wait()
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, 'open', observed_open)
+    parallel = capture_catalog(cold, policy, metadata_workers=4)
+    assert set(entered) == names
+    assert {k: v for k, v in parallel.items() if k != 'observed_at_utc'} == {
+        k: v for k, v in baseline.items() if k != 'observed_at_utc'}
+
+
+@pytest.mark.parametrize('damage', ['invalid_json', 'symlink'])
+def test_parallel_catalog_preserves_manifest_error_evidence(stream, damage):
+    queue, cold, source, first, _ = stream
+    path = first.manifest_path
+    if damage == 'invalid_json':
+        path.write_text('{invalid')
+    else:
+        path.unlink()
+        path.symlink_to(source / 'shared.txt')
+    policy = Path(queue.config['publication_catalog'])
+    serial = capture_catalog(cold, policy, metadata_workers=1)
+    parallel = capture_catalog(cold, policy, metadata_workers=4)
+    assert serial['metadata_errors']
+    assert {k: v for k, v in parallel.items() if k != 'observed_at_utc'} == {
+        k: v for k, v in serial.items() if k != 'observed_at_utc'}
 
 
 def test_optional_unreferenced_cold_evidence_is_backed_without_inventing_release(stream):
@@ -1214,6 +1759,80 @@ def test_unchanged_auxiliary_avoids_capacity_census_and_keeps_retained_payload(s
     assert retained.read_bytes() == b'unknown failed copy; never discard'
     verify(queue.transport/ledger['deliveries'][key]['dispatch']['batch_relative'], key)
     assert len(ledger['deliveries']) == 1
+
+
+def test_auxiliary_ledger_records_exported_generation_when_inputs_change_after_preflight(stream, tmp_path, monkeypatch):
+    from stockagent.data_sync import backup_auxiliary
+
+    queue = stream[0]
+    auxiliary_inputs(queue, tmp_path)
+    ledger = queue.load_ledger()
+    root = Path(queue.config['auxiliary']['repository_root'])
+    receipt = Path(queue.config['auxiliary']['control_receipt'])
+    first_receipt = receipt.read_bytes()
+    original_export = backup_auxiliary.export_auxiliary
+
+    def change_inputs_then_export(*args, **kwargs):
+        (root / 'README.md').write_text('changed after preflight\n')
+        control = json.loads(receipt.read_bytes())
+        control['observed_at_utc'] = '2026-01-02T03:04:05+00:00'
+        receipt.write_text(json.dumps(control))
+        return original_export(*args, **kwargs)
+
+    monkeypatch.setattr(backup_auxiliary, 'export_auxiliary', change_inputs_then_export)
+    queue.stage_auxiliary(ledger)
+    pending = ledger['auxiliary_pending']
+    assert ledger['last_auxiliary_content_identity'] == pending['export']['content_identity_sha256']
+    assert ledger['auxiliary_source_control_receipt_sha256'] == hashlib.sha256(receipt.read_bytes()).hexdigest()
+    assert ledger['auxiliary_source_control_receipt_sha256'] == pending['export']['control_source_receipt_sha256']
+
+    # A later check of the same actual generation must not stage a duplicate.
+    del ledger['auxiliary_pending']
+    ledger['auxiliary_last_capture_epoch'] = 0
+    monkeypatch.setattr(queue, 'transport_usage', lambda: pytest.fail('unchanged export needs no capacity census'))
+    monkeypatch.setattr(backup_auxiliary, 'export_auxiliary', lambda *a, **kw: pytest.fail('duplicate export'))
+    queue.stage_auxiliary(ledger)
+
+    # Returning to the preflight receipt within the interval is a change from
+    # the exported receipt and must therefore create a new delivery.
+    receipt.write_bytes(first_receipt)
+    monkeypatch.undo()
+    queue.stage_auxiliary(ledger)
+    assert ledger['auxiliary_pending']['export']['control_source_receipt_sha256'] == hashlib.sha256(first_receipt).hexdigest()
+
+
+def test_unchanged_auxiliary_records_control_snapshot_used_after_preflight(stream, tmp_path, monkeypatch):
+    from stockagent.data_sync import backup_auxiliary
+
+    queue = stream[0]
+    auxiliary_inputs(queue, tmp_path)
+    ledger = queue.load_ledger()
+    receipt = Path(queue.config['auxiliary']['control_receipt'])
+    queue.stage_auxiliary(ledger)
+    del ledger['auxiliary_pending']
+    saved_receipt = receipt.read_bytes()
+    changed = json.loads(saved_receipt)
+    changed['observed_at_utc'] = '2026-01-02T03:04:05+00:00'
+    changed_receipt = json.dumps(changed).encode()
+    receipt.write_bytes(changed_receipt)
+    ledger['auxiliary_last_capture_epoch'] = 0
+    original_control_input = backup_auxiliary.control_input
+
+    def original_generation_after_preflight(path):
+        receipt.write_bytes(saved_receipt)
+        return original_control_input(path)
+
+    monkeypatch.setattr(backup_auxiliary, 'control_input', original_generation_after_preflight)
+    queue.stage_auxiliary(ledger)
+    assert not ledger.get('auxiliary_pending')
+    assert ledger['auxiliary_source_control_receipt_sha256'] == hashlib.sha256(saved_receipt).hexdigest()
+
+    # The previously probed generation returned after the unchanged check;
+    # it must not be hidden by the interval shortcut.
+    receipt.write_bytes(changed_receipt)
+    monkeypatch.setattr(backup_auxiliary, 'control_input', original_control_input)
+    queue.stage_auxiliary(ledger)
+    assert ledger['auxiliary_pending']['export']['control_source_receipt_sha256'] == hashlib.sha256(changed_receipt).hexdigest()
 
 
 @pytest.mark.parametrize("changed_input", ["code", "control_receipt"])

@@ -1,0 +1,3 @@
+[Service]
+# Separate fixed policy and journal; a recreated target is not discarded again.
+ExecStartPost=/usr/bin/bash -c 'if [[ -f "__REPO_ROOT__/configs/data_sync/local_testing_artifact_disposition_20261103.json" ]]; then source "__REPO_ROOT__/scripts/runtime_env.sh"; stockagent_discard_exit=0; run_fintech_python "__REPO_ROOT__/scripts/discard_local_testing_artifacts.py" --policy "__REPO_ROOT__/configs/data_sync/local_testing_artifact_disposition_20261103.json" --state "__REPO_ROOT__/service_data/storage-discard/performance-20261103" --apply || stockagent_discard_exit=$$?; if [[ "$$stockagent_discard_exit" != 75 ]]; then exit "$$stockagent_discard_exit"; fi; fi'

@@ -329,7 +329,12 @@ def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_p
     monkeypatch.setattr(complement.shutil,'disk_usage',lambda *_a:SimpleNamespace(free=10**12))
     monkeypatch.setattr(complement,'_populate',lambda *_a,**_k:pytest.fail('unrelated queue population'))
     monkeypatch.setattr(complement,'_claim_bulk_years',lambda *_a,**_k:pytest.fail('widened year claim'))
+    monkeypatch.setattr(complement,'_status',lambda *_a,**_k:pytest.fail('global status blocks finite request'))
     monkeypatch.setattr(finmind_integrity,'audit_completed_batch',lambda *_a,**_k:pytest.fail('unrelated receipt audit'))
+    previous = {'observed_at_utc': '2026-09-26T08:00:00+00:00',
+                'series': {'TaiwanStockDelisting': {'target': 2, 'complete': 0}},
+                'delegated_to_sponsor': ['TaiwanStockNews'], 'next_task': {'dataset': 'old'}}
+    (tmp_path/'status.json').write_text(json.dumps(previous))
     key=('TaiwanStockDelisting','','2025')
     with complement._db(tmp_path/'queue.sqlite3') as connection:
         complement._add_tasks(connection,[(*key,'year',4),('TaiwanStockDelisting','','2024','year',4)])
@@ -341,9 +346,67 @@ def test_finite_key_run_fetches_only_selected_year_and_preserves_neighbour(tmp_p
     monkeypatch.setattr(complement,'_request',request)
     result=complement.run_once(tmp_path,max_requests=1,required_keys=(key,),capacity_sampler=admitted_capacity)
     assert result['state']=='batch_complete' and requested==[key]
+    assert result['series']==previous['series']
+    assert result['source_status_observed_at_utc']==previous['observed_at_utc']
+    assert result['status_aggregate_state']=='carried_previous_snapshot'
+    assert result['delegated_to_sponsor']==previous['delegated_to_sponsor']
+    assert result['current_delegated_to_sponsor']==[] and result['next_task'] is None
+    assert json.loads((tmp_path/'status.json').read_text())['last_task']['partition']=='2025'
     with complement._db(tmp_path/'queue.sqlite3') as connection:
         assert connection.execute("SELECT state FROM tasks WHERE partition='2025'").fetchone()[0]=='complete'
         assert connection.execute("SELECT state FROM tasks WHERE partition='2024'").fetchone()[0]=='pending'
+
+
+def test_finite_key_without_ready_task_does_not_scan_other_history(tmp_path, monkeypatch, admitted_capacity) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setenv('FINMIND_TOKEN', 'test-only')
+    monkeypatch.setattr(complement, 'load_env_file', lambda *_a, **_k: None)
+    monkeypatch.setattr(complement, '_now', lambda: datetime(2026, 9, 27, 8, tzinfo=UTC))
+    monkeypatch.setattr(complement, 'verified_account', lambda *_a: {'tier': 'Free', 'official_requests_per_hour': 600})
+    monkeypatch.setattr(complement, 'rate_limiter', lambda *_a: object())
+    monkeypatch.setattr(complement, 'backfill_budget', lambda *_a, **_k: {'allowed': True, 'remaining': 2})
+    monkeypatch.setattr(complement, 'incremental_reservation', lambda *_a: {'reserve_requests': 0})
+    monkeypatch.setattr(complement.shutil, 'disk_usage', lambda *_a: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(complement, '_status', lambda *_a, **_k: pytest.fail('global status scan'))
+    monkeypatch.setattr(complement, 'first_unfinished_dataset', lambda *_a, **_k: pytest.fail('unrelated history scan'))
+    monkeypatch.setattr(complement.supplemental, 'frontier_status', lambda *_a, **_k: pytest.fail('frontier scan'))
+    result = complement.run_once(tmp_path, max_requests=1,
+        required_keys=(('TaiwanStockDelisting', '', '2025'),), capacity_sampler=admitted_capacity)
+    assert result['state'] == 'current_queue'
+    assert result['status_aggregate_state'] == 'unavailable'
+    assert result['source_status_observed_at_utc'] is None
+
+
+def test_finite_stream_failure_is_recorded_and_preserves_stream_retry(tmp_path, monkeypatch, admitted_capacity) -> None:
+    from types import SimpleNamespace
+    from downloader import finmind_option_stream as streaming
+
+    now = datetime(2026, 9, 27, 8, tzinfo=UTC)
+    monkeypatch.setenv('FINMIND_TOKEN', 'test-only')
+    monkeypatch.setattr(complement, 'load_env_file', lambda *_a, **_k: None)
+    monkeypatch.setattr(complement, '_now', lambda: now)
+    monkeypatch.setattr(complement, 'verified_account', lambda *_a: {'tier': 'Free', 'official_requests_per_hour': 600})
+    monkeypatch.setattr(complement, 'rate_limiter', lambda *_a: object())
+    monkeypatch.setattr(complement, 'backfill_budget', lambda *_a, **_k: {'allowed': True, 'remaining': 2})
+    monkeypatch.setattr(complement, 'incremental_reservation', lambda *_a: {'reserve_requests': 0})
+    monkeypatch.setattr(complement.shutil, 'disk_usage', lambda *_a: SimpleNamespace(free=10**12))
+    monkeypatch.setattr(complement.object_pipeline, 'run_batch', lambda *_a, **_k: None)
+    monkeypatch.setattr(complement.json_pipeline, 'run_batch', lambda *_a, **_k: None)
+    monkeypatch.setattr(streaming, 'fetch', lambda *_a, **_k: (_ for _ in ()).throw(
+        streaming.SourceError('object_disk_guard', retry_after=300)))
+    key = ('TaiwanOptionTick', 'TXO', '2026-09-24')
+    with complement._db(tmp_path/'queue.sqlite3') as conn:
+        complement._add_tasks(conn, [(*key, 'id_day', 0)])
+        conn.execute("UPDATE tasks SET state='failed',error_code='response_size_limit' WHERE dataset=? AND data_id=? AND partition=?", key)
+        conn.commit()
+    result = complement.run_once(tmp_path, max_requests=1, required_keys=(key,), capacity_sampler=admitted_capacity)
+    assert result['last_task']['status'] == 'failed'
+    assert result['last_task']['error_code'] == 'object_disk_guard'
+    with complement._db(tmp_path/'queue.sqlite3') as conn:
+        state, error = conn.execute('SELECT state,error_code FROM tasks WHERE dataset=? AND data_id=? AND partition=?', key).fetchone()
+        assert (state, error) == ('failed', 'object_disk_guard')
+        assert streaming.requires_stream(conn, complement.Task(*key, 'id_day', 0, state), error, now)
 
 
 def test_master_snapshot_expands_free_per_symbol_jobs(tmp_path: Path) -> None:

@@ -122,7 +122,7 @@ def test_superseded_heads_are_checkpointed_once_not_reparsed(cfg, tmp_path):
 def test_acceptance_failure_keeps_only_unaccepted_repairs_pending(cfg, tmp_path, monkeypatch):
     with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
         original = native_heads(queue, 8, repair_count=2)
-        def fail(_records):
+        def fail(_records, **_kwargs):
             raise OSError('injected acceptance failure')
         monkeypatch.setattr(queue, 'accept', fail)
         trace = []

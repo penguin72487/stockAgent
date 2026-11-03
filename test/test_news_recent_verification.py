@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import hashlib
+import json
+from pathlib import Path
+
+import pyarrow as pa
 import pytest
 
-from downloader.news_fulltext import fetch_article
+from downloader.news_fulltext import accept_discovery, fetch_article, fetch_discovery
 from downloader.news_fulltext_policy import PolicyRegistry
-from downloader.news_fulltext_queue import NewsQueue
+from downloader.news_fulltext_queue import NewsQueue, verify_bodies
 from scripts.verify_news_recent_batches import verify_recent_batches
 from scripts.audit_news_runtime import (baseline_progress_requirements, has_dispatchable_missing_body_work,
     active_request_scope_pauses, source_readiness_snapshot, heartbeat_clock, completion_owner_check, frontier_snapshot_counts,
@@ -12,7 +17,7 @@ from scripts.audit_news_runtime import (baseline_progress_requirements, has_disp
 from scripts.audit_news_selected_articles import audit as audit_selected
 from scripts.benchmark_cnyes_acquisition import verify_batches
 from types import SimpleNamespace
-from test_news_fulltext import FakeResponse, article_html, config as config, http_fixture
+from test_news_fulltext import FakeResponse, article_html, bulk_fixture, config as config, http_fixture
 from test_cnyes_news_bulk import cfg as cnyes_config
 
 
@@ -98,6 +103,9 @@ def test_recent_verification_is_read_only_and_can_run_with_active_writer(config,
         assert proof["accepted"] and proof["body_versions_verified"] == 1
         assert proof["batches_verified"] == 1
         assert proof["owner_id"] == queue.owner
+        assert proof['verification_contract_version'] == 6
+        assert proof['body_batch_verification_contract_version'] == 5
+        assert any(Path(path).name == 'news_fulltext_queue.py' for path in proof['implementation_sha256'])
         assert "not the whole lake" in proof["verification_scope"]
         assert proof["historical_completeness_verified"] is False
         assert tuple(queue.db.execute("SELECT key,value FROM queue_settings ORDER BY key")) == before
@@ -105,6 +113,130 @@ def test_recent_verification_is_read_only_and_can_run_with_active_writer(config,
         rejected = verify_recent_batches(tmp_path, 1)
         assert not rejected["accepted"]
         assert "receipt_mismatch" in rejected["errors"][0]["error"]
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('damage', [
+    'receipt_path', 'receipt_contract', 'receipt_text_bytes', 'receipt_raw_bytes',
+    'body_bytes', 'http_response_bytes', 'historical_point_in_time', 'publish',
+    'collection_purpose', 'training_injection_enabled', 'record_contract', 'requested_url', 'claim_witness',
+    'unleased_head_witness',
+])
+def test_recent_verification_never_accepts_contract_damage_full_audit_rejects(config, tmp_path, damage):
+    url = 'https://publisher.test/a'
+    http, _ = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(article_html())})
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{'url': url}])
+        record = fetch_article(http, queue.claim('publisher', 300))
+        assert record['capture_policy_version'] >= 2
+        if damage in {'body_bytes', 'http_response_bytes'}:
+            record[damage] += 1
+        elif damage in {'historical_point_in_time', 'publish', 'training_injection_enabled'}:
+            record[damage] = True
+        elif damage == 'collection_purpose':
+            record[damage] = 'unreviewed_other_purpose'
+        elif damage == 'record_contract':
+            record['contract_version'] = -1
+        elif damage == 'requested_url':
+            record['requested_url'] = 'https://publisher.test/not-the-accepted-article'
+        elif damage == 'claim_witness':
+            record['article_claim_witness_json'] = '{"not_a_claim_witness":true}'
+        elif damage == 'unleased_head_witness':
+            record['unleased_article_head_witness_json'] = '{"not_a_bulk_head_witness":true}'
+        queue.accept([record])
+        if damage.startswith('receipt_'):
+            receipt = next((tmp_path / 'receipts').glob('*.json'))
+            payload = json.loads(receipt.read_text())
+            if damage == 'receipt_path':
+                payload['parquet_path'] = 'bodies/different.parquet'
+            elif damage == 'receipt_contract':
+                payload['contract_version'] = -1
+            else:
+                key = 'raw_response_bytes' if damage == 'receipt_raw_bytes' else 'text_bytes'
+                payload[key] += 1
+            receipt.write_text(json.dumps(payload))
+        assert not verify_bodies(tmp_path)['accepted']
+        proof = verify_recent_batches(tmp_path, 1)
+        assert not proof['accepted'] and proof['errors']
+    finally:
+        queue.close()
+        http.close()
+
+
+@pytest.mark.parametrize('damage_last_record', [False, True])
+def test_recent_verifier_hashes_shared_raw_once_and_checks_every_row(config, tmp_path, monkeypatch,
+                                                                    damage_last_record):
+    queue, http, session, task, payload = bulk_fixture(config, tmp_path, count=20)
+    try:
+        response, links, records, errors = fetch_discovery(http, task)
+        assert len(records) == 20
+        if damage_last_record:
+            records[-1]['response_sha256'] = '0' * 64
+        assert accept_discovery(queue, task, response, links, records, errors) == 20
+        calls_before = len(session.calls)
+        original_sha256 = hashlib.sha256
+        raw_hashes = []
+
+        def tracked_sha256(data=b''):
+            if isinstance(data, bytes) and data == payload:
+                raw_hashes.append(len(data))
+            return original_sha256(data)
+
+        monkeypatch.setattr(hashlib, 'sha256', tracked_sha256)
+        proof = verify_recent_batches(tmp_path, 1)
+        assert len(session.calls) == calls_before
+        assert raw_hashes == [len(payload)]
+        if damage_last_record:
+            assert not proof['accepted']
+            assert 'raw_or_body_hash_mismatch' in proof['errors'][0]['error']
+        else:
+            assert proof['accepted'] and proof['body_versions_verified'] == 20
+            assert proof['raw_response_hash_operations'] == 1
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_recent_verifier_reports_parquet_runtime_errors_without_crashing(config, tmp_path, monkeypatch):
+    from downloader import news_fulltext_queue as queue_module
+    url = 'https://publisher.test/a'
+    http, _ = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(article_html())})
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{'url': url}])
+        queue.accept([fetch_article(http, queue.claim('publisher', 300))])
+
+        def fail_decode(*args, **kwargs):
+            raise pa.ArrowNotImplementedError('synthetic unsupported Parquet encoding')
+
+        monkeypatch.setattr(queue_module.pq, 'read_table', fail_decode)
+        proof = verify_recent_batches(tmp_path, 1)
+        assert not proof['accepted']
+        assert 'parquet_decode_error:ArrowNotImplementedError' in proof['errors'][0]['error']
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_batch_verification_rejects_duplicate_paths(config, tmp_path):
+    url = 'https://publisher.test/a'
+    http, _ = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(article_html())})
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{'url': url}])
+        queue.accept([fetch_article(http, queue.claim('publisher', 300))])
+        path = queue.db.execute('SELECT path FROM accepted_batches').fetchone()[0]
+        with pytest.raises(ValueError, match='duplicate_batch_paths'):
+            verify_batches(SimpleNamespace(root=tmp_path, db=queue.db), [path, path])
     finally:
         queue.close()
         http.close()
@@ -132,10 +264,13 @@ def test_recent_write_versions_are_not_all_current_heads_but_every_hash_is_verif
         original = fetch_article(http, queue.claim('publisher', 300))
         queue.accept([original])
         first_path = queue.db.execute('SELECT path FROM accepted_batches').fetchone()[0]
-        queue.accept([dict(original)])  # A legitimate later version with the same body SHA.
+        # A later request may produce the same body SHA under a new lease.
+        later = fetch_article(http, queue.claim_url(url, 300, refresh=True))
+        assert later['body_sha256'] == original['body_sha256']
+        queue.accept([later])
         settings = tuple(queue.db.execute('SELECT key,value FROM queue_settings ORDER BY key'))
         proof = verify_recent_batches(tmp_path, 2, batch_paths=[first_path] if fixed_old_cohort else None)
-        assert proof['verification_contract_version'] == 2
+        assert proof['verification_contract_version'] == 6
         assert proof['accepted'] and proof['body_versions_verified'] == (1 if fixed_old_cohort else 2)
         assert proof['superseded_body_versions_verified'] == 1
         assert proof['current_heads_verified'] == (0 if fixed_old_cohort else 1)
@@ -501,7 +636,7 @@ def test_selected_article_audit_never_fetches_or_takes_writer_lock(config, tmp_p
         queue.accept([fetch_article(http, queue.claim("publisher", 300))])
         before = tuple(queue.db.execute("SELECT key,value FROM queue_settings ORDER BY key"))
         result = audit_selected(tmp_path, ["https://publisher.test/a"])
-        assert result['contract_version'] == 11
+        assert result['contract_version'] == 12
         assert result["accepted"] and result["batch_proof"]["body_versions"] == 1
         assert result['articles'][0]['requested_url'] == result['articles'][0]['final_url'] == 'https://publisher.test/a'
         assert result["articles"][0]["body_characters"] > 100
@@ -659,6 +794,156 @@ def test_selected_old_batch_neighbour_can_have_a_newer_head_and_shared_batch_is_
         assert len(calls) == 2  # One projection read and one canonical immutable-batch verification.
         assert all(article["current_source_replay_verified"] for article in result["articles"])
         assert tuple(queue.db.execute("SELECT key,value FROM queue_settings ORDER BY key")) == before
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_selected_retained_body_proof_does_not_accept_a_later_identity_failure(config, tmp_path):
+    urls = ["https://publisher.test/a", "https://publisher.test/b"]
+    routes = {"https://publisher.test/robots.txt": FakeResponse(b"User-agent: *\nAllow: /")}
+    routes.update({url: FakeResponse(article_html()) for url in urls})
+    http, _ = http_fixture(config, tmp_path, routes)
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{"url": url} for url in urls])
+        queue.accept([fetch_article(http, queue.claim("publisher", 300)) for _ in urls])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state=?,error_code=?,last_checked_at_utc=? WHERE url=?",
+                             ("article_identity_not_verified", "article_identity_not_verified",
+                              "2026-10-30T01:00:00+00:00", urls[1]))
+        before = tuple(queue.db.execute("SELECT state,body_sha256,parquet_path,last_checked_at_utc FROM articles WHERE url=?", (urls[1],)).fetchone())
+        changes = queue.db.total_changes
+
+        default = audit_selected(tmp_path, urls)
+        assert not default["accepted"]
+        assert any(x["error"] == "selected_body_not_complete" and x["url"] == urls[1] for x in default["errors"])
+        result = audit_selected(tmp_path, urls, registry=http.registry, include_retained_heads=True)
+        assert result["retained_versions_verified"] and not result["accepted"]
+        assert not result["current_head_completion_verified"] and not result["current_source_identity_verified"]
+        assert result["batch_proof"]["current_heads_verified"] == 2
+        by_url = {item["url"]: item for item in result["articles"]}
+        assert by_url[urls[0]]["current_head_state_is_complete"]
+        assert not by_url[urls[1]]["current_head_state_is_complete"]
+        assert by_url[urls[1]]["state"] == "article_identity_not_verified"
+        assert by_url[urls[1]]["head_last_checked_at_utc"] == "2026-10-30T01:00:00+00:00"
+        assert by_url[urls[1]]["current_source_replay_verified"]  # Replays old bytes only.
+        assert queue.db.total_changes == changes
+        assert tuple(queue.db.execute("SELECT state,body_sha256,parquet_path,last_checked_at_utc FROM articles WHERE url=?", (urls[1],)).fetchone()) == before
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_selected_retained_body_proof_rejects_a_broken_head_pointer(config, tmp_path):
+    url = "https://publisher.test/a"
+    http, _ = http_fixture(config, tmp_path, {
+        "https://publisher.test/robots.txt": FakeResponse(b"User-agent: *\nAllow: /"),
+        url: FakeResponse(article_html()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{"url": url}])
+        queue.accept([fetch_article(http, queue.claim("publisher", 300))])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state=?,body_sha256=? WHERE url=?",
+                             ("article_identity_not_verified", "0" * 64, url))
+        changes = queue.db.total_changes
+        result = audit_selected(tmp_path, [url], include_retained_heads=True)
+        assert not result["retained_versions_verified"] and not result["accepted"]
+        assert not result["current_head_completion_verified"] and not result["current_source_identity_verified"]
+        assert any(x["error"] == "selected_head_record_mismatch" for x in result["errors"])
+        assert queue.db.total_changes == changes
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_selected_retained_storage_and_parser_replay_are_distinct(config, tmp_path, monkeypatch):
+    import scripts.audit_news_selected_articles as selected_module
+    url = "https://publisher.test/a"
+    http, _ = http_fixture(config, tmp_path, {
+        "https://publisher.test/robots.txt": FakeResponse(b"User-agent: *\nAllow: /"),
+        url: FakeResponse(article_html()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{"url": url}])
+        queue.accept([fetch_article(http, queue.claim("publisher", 300))])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state=? WHERE url=?", ("article_identity_not_verified", url))
+        original = selected_module.extract_article
+        monkeypatch.setattr(selected_module, "extract_article", lambda *a, **k: {
+            **original(*a, **k), "authors_json": '["不同的作者"]'})
+        changes = queue.db.total_changes
+        result = audit_selected(tmp_path, [url], registry=http.registry, include_retained_heads=True)
+        assert result["retained_versions_verified"]
+        assert not result["retained_current_parser_replay_verified"]
+        assert not result["current_source_identity_verified"] and not result["accepted"]
+        assert result["errors"][0]["error"] == "current_source_replay_changed_body_title_author_or_clock"
+        assert queue.db.total_changes == changes
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_selected_retained_body_proof_rejects_a_changed_receipt(config, tmp_path):
+    url = "https://publisher.test/a"
+    http, _ = http_fixture(config, tmp_path, {
+        "https://publisher.test/robots.txt": FakeResponse(b"User-agent: *\nAllow: /"),
+        url: FakeResponse(article_html()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{"url": url}])
+        queue.accept([fetch_article(http, queue.claim("publisher", 300))])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state=? WHERE url=?", ("article_identity_not_verified", url))
+        receipt_path = tmp_path / queue.db.execute(
+            "SELECT b.receipt_path FROM articles a JOIN accepted_batches b ON b.path=a.parquet_path WHERE a.url=?",
+            (url,)).fetchone()[0]
+        receipt = json.loads(receipt_path.read_text())
+        receipt["sha256"] = "0" * 64
+        receipt_path.write_text(json.dumps(receipt))
+        changes = queue.db.total_changes
+        result = audit_selected(tmp_path, [url], include_retained_heads=True)
+        assert not result["retained_versions_verified"] and not result["accepted"]
+        assert any(x["error"] == "selected_batch_not_verified" for x in result["errors"])
+        assert queue.db.total_changes == changes
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_selected_retained_scope_requires_explicit_boolean(tmp_path):
+    with pytest.raises(ValueError, match="must be a boolean"):
+        audit_selected(tmp_path, ["https://publisher.test/a"], include_retained_heads=1)
+
+
+def test_selected_retained_cli_reports_success_without_accepting_failed_head(config, tmp_path, monkeypatch, capsys):
+    import scripts.audit_news_selected_articles as selected_module
+    url = "https://publisher.test/a"
+    http, _ = http_fixture(config, tmp_path, {
+        "https://publisher.test/robots.txt": FakeResponse(b"User-agent: *\nAllow: /"),
+        url: FakeResponse(article_html()),
+    })
+    queue = NewsQueue(tmp_path, http.registry)
+    try:
+        queue.add_articles([{"url": url}])
+        queue.accept([fetch_article(http, queue.claim("publisher", 300))])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state=? WHERE url=?", ("article_identity_not_verified", url))
+        repo = Path(selected_module.__file__).resolve().parent.parent
+        monkeypatch.setattr(selected_module, "load_config", lambda _: ({"root": str(tmp_path)}, http.registry, repo))
+        monkeypatch.setattr(selected_module, "configuration_paths", lambda _: [])
+        monkeypatch.setattr(selected_module, "sha256_file", lambda _: "a" * 64)
+        output = tmp_path / "proof.json"
+        assert selected_module.main(["--url", url, "--include-retained-heads", "--output", str(output)]) == 0
+        result = json.loads(output.read_text())
+        assert result["retained_versions_verified"] and not result["accepted"]
+        assert selected_module.main(["--url", url, "--output", str(output)]) == 1
+        assert not json.loads(output.read_text())["accepted"]
+        capsys.readouterr()
     finally:
         queue.close()
         http.close()

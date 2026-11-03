@@ -28,7 +28,7 @@ from stockagent.data_sync.artifact_dedup import link_immutable_source
 TAIPEI = timezone(timedelta(hours=8))
 PRODUCTS = ("TX", "MTX")
 ROC_DATE = r"(\d{2,3})年(\d{1,2})月(\d{1,2})日"
-CORPORATE_TERMS_DERIVATION_VERSION = 10
+CORPORATE_TERMS_DERIVATION_VERSION = 11
 
 
 def stock_futures_preparation_scope(universe: pl.DataFrame) -> pl.DataFrame:
@@ -315,6 +315,35 @@ def subscription_right_value_twd(stock_close, subscription_price, entitlement_un
     return float((max(s-k,Decimal(0))*q).to_integral_value(rounding=ROUND_FLOOR))
 
 
+def validate_notice_declared_zero_rights(evidence: dict, *, product: str, published_date: str) -> None:
+    """Validate an inspected notice's prior, explicitly unvalued right.
+
+    Some notices declare a particular past entitlement is not valued because
+    its observed close is below the subscription price. No synthetic share
+    quantity or later closing price is needed for that source-stated zero.
+    """
+    from decimal import Decimal
+    try:
+        observed = date.fromisoformat(evidence['observation_date'])
+        published = date.fromisoformat(published_date)
+        close = Decimal(evidence['closing_price'])
+        strike = Decimal(evidence['subscription_price'])
+        derived = Decimal(evidence['derived_value_twd'])
+        text = unicodedata.normalize('NFKC', evidence['transcribed_formula'])
+        literal_date = rf'(?<!\d){observed.year - 1911}年0?{observed.month}月0?{observed.day}日'
+        amounts = [rf'(?<![\d.]){re.escape(str(v))}(?![\d.])' for v in (close, strike)]
+        if (evidence.get('valuation_kind') != 'notice_declared_out_of_money_zero_v1'
+                or evidence.get('product') != product or observed >= published
+                or not isinstance(evidence.get('page'), int) or isinstance(evidence['page'], bool)
+                or evidence['page'] < 1 or not all(v.is_finite() for v in (close, strike, derived))
+                or close < 0 or strike <= 0 or close >= strike or derived != 0
+                or not re.search(literal_date, text) or any(not re.search(p, text) for p in amounts)
+                or '低於' not in text or '不予計算' not in text):
+            raise ValueError('explicit zero differs from inspected prior notice')
+    except (KeyError, TypeError, ArithmeticError, ValueError) as exc:
+        raise ValueError('invalid source-bound notice-declared zero rights proof') from exc
+
+
 def corporate_subscription_rights_require_fixing(fact: dict) -> bool:
     """A source-reviewed full fixed benefit needs no second future fixing.
 
@@ -326,7 +355,19 @@ def corporate_subscription_rights_require_fixing(fact: dict) -> bool:
         return False
     evidence=fact.get('fixed_subscription_rights_evidence')
     amount=fact.get('fixed_subscription_rights_twd')
-    if not isinstance(evidence, dict) or amount is None or not evidence.get('rounding_evidence'):
+    if not isinstance(evidence, dict) or amount is None:
+        return True
+    if evidence.get('valuation_kind') == 'notice_declared_out_of_money_zero_v1':
+        if (not re.fullmatch(r'[a-f0-9]{64}', fact.get('visual_review_sha256') or '')
+                or fact.get('deliverable_cash_twd') != 0 or amount != 0):
+            raise ValueError('invalid source-bound notice-declared zero rights proof')
+        validate_notice_declared_zero_rights(evidence, product=fact['product'],
+                                             published_date=fact['published_date'])
+        complete = evidence.get('covers_all_subscription_components')
+        if complete is not None and not isinstance(complete, bool):
+            raise ValueError('invalid source-bound fixed subscription rights scope')
+        return complete is not True
+    if not evidence.get('rounding_evidence'):
         return True
     from decimal import Decimal, ROUND_FLOOR
     try:

@@ -23,12 +23,27 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from downloader.artifact_io import atomic_write_json
-from stockagent.data.tw_current_trading_universe import load_current_universe
+from stockagent.data.tw_current_trading_universe import load_recorded_universe
 from stockagent.live import quote_provider as quotes
 from stockagent.live.opening_price_journal import journal_absence_proof_ms, observation_values
 from stockagent.private_json import projected_object_values
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def _provider_job_diagnostic(row: dict, elapsed: float) -> dict:
+    """Closed, credential-free job evidence, not per-symbol failure claims."""
+    transport = row.get("transport_timing") or {}
+    fields = ("mis_request_count", "mis_failed_request_count", "mis_deferred_channel_count",
+        "mis_effective_chunk_size", "mis_next_transport_chunk_size", "mis_failure_phase_counts",
+        "mis_error_chain_types", "mis_http_error_statuses", "provider_row_quality",
+        "provider_payload_rows", "provider_response_reused", "http_request_to_validated_ms",
+        "snapshot_total_ms", "server_request_queue_ms", "client_total_ms")
+    return {"after_open_ms": elapsed, "job_id": row.get("job_id"),
+        **{key: row.get(key) for key in ("state", "requested_count", "response_count",
+            "valid_open_count", "no_print_count", "error_type", "http_status", "last_total_ms")},
+        "observation_states": (row.get("observation_quality") or {}).get("states"),
+        "transport": {key: transport[key] for key in fields if key in transport}}
 
 
 def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
@@ -66,6 +81,7 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
     latest = {cutoff: {} for cutoff in cutoffs}
     starts, failures, malformed, invalid_events, line_count, legacy_absence = {}, [], [], [], 0, 0
     outside_horizon = 0
+    provider_jobs = {}
     started = time.perf_counter()
 
     def observe(provider, job, elapsed, symbol, state, proof=None, details=None):
@@ -211,18 +227,32 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
                     for reason, rejected_symbols in rejected.items():
                         for symbol in rejected_symbols:
                             observe(provider, job, elapsed, symbol, "rejected:" + reason)
-                elif row.get("event") == "finished" and (
-                        row.get("state") in {"failed", "degraded"}
-                        or (row.get("transport_timing") or {}).get("mis_failed_request_count", 0)):
-                    from scripts.audit_tw_opening_latency import _source_failure_reasons
-                    failure = {"provider": provider, "job_id": job, "after_open_ms": elapsed,
-                        "_job_identity": key,
-                        "state": row.get("state"), "error_type": row.get("error_type"),
-                        "http_status": row.get("http_status"),
-                        "full_scope_verified": starts.get(key, {}).get("full_scope", False),
-                        "reasons": _source_failure_reasons({**row,
-                            "stage_timing": {"transport_timing": row.get("transport_timing") or {}}})}
-                    failures.append(failure)
+                elif row.get("event") == "finished":
+                    summary = provider_jobs.setdefault(provider, {"completed_jobs": 0,
+                        "job_states": Counter(), "request_shapes": Counter(), "first_jobs": []})
+                    summary["completed_jobs"] += 1
+                    summary["job_states"][str(row.get("state"))] += 1
+                    diagnostic = _provider_job_diagnostic(row, elapsed)
+                    summary["first_jobs"] = sorted([*summary["first_jobs"], diagnostic],
+                        key=lambda item: item["after_open_ms"])[:4]
+                    transport = row.get("transport_timing") or {}
+                    for request in transport.get("mis_requests", ()):
+                        # Batch size versus response outcome exposes repeated
+                        # failing request geometry without persisting payloads.
+                        shape = str(request.get("channel_count")) + ":" + str(
+                            request.get("error_type") or request.get("http_status") or "unknown")
+                        summary["request_shapes"][shape] += 1
+                    if (row.get("state") in {"failed", "degraded"}
+                            or transport.get("mis_failed_request_count", 0)):
+                        from scripts.audit_tw_opening_latency import _source_failure_reasons
+                        failure = {"provider": provider, "job_id": job, "after_open_ms": elapsed,
+                            "_job_identity": key,
+                            "state": row.get("state"), "error_type": row.get("error_type"),
+                            "http_status": row.get("http_status"),
+                            "full_scope_verified": starts.get(key, {}).get("full_scope", False),
+                            "reasons": _source_failure_reasons({**row,
+                                "stage_timing": {"transport_timing": transport}})}
+                        failures.append(failure)
             except (KeyError, TypeError, ValueError, AttributeError):
                 malformed.append(line_count)
                 invalid_events.append({"line": line_count, "reason": rejection_reason, **rejection_metrics})
@@ -231,6 +261,15 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
         and read_bytes == before.st_size and after.st_size >= before.st_size)
     for failure in failures:
         failure["full_scope_verified"] = starts.get(failure.pop("_job_identity"), {}).get("full_scope", False)
+    for provider, summary in provider_jobs.items():
+        summary["first_dispatch_after_open_ms"] = min(
+            (start["after_open_ms"] for key, start in starts.items() if key[0] == provider), default=None)
+        positive_clocks = sorted(value[provider] for value in first.values() if provider in value)
+        summary["unique_valid_open_count"] = len(positive_clocks)
+        summary["valid_open_coverage_ms"] = {str(percent): (
+            positive_clocks[int(np.ceil(len(symbols) * percent / 100)) - 1]
+            if len(positive_clocks) >= int(np.ceil(len(symbols) * percent / 100)) else None)
+            for percent in (1, 10, 25, 50, 75, 90, 95, 99, 100)}
     rows, counts = [], {cutoff: Counter() for cutoff in cutoffs}
     reference_rows = {str(cutoff): {} for cutoff in cutoffs} if include_reference_rows else None
     failure_counts = {cutoff: dict(Counter(reason for failure in failures
@@ -284,6 +323,8 @@ def journal_symbol_timeline(path: Path, payload: dict, universe: dict, *,
             "job_failure_reason_counts": failure_counts[cutoff]} for cutoff in cutoffs],
         **({"deadline_reference_rows": reference_rows} if include_reference_rows else {}),
         "legacy_absence_observations_without_proof_clock": legacy_absence,
+        "provider_jobs": provider_jobs,
+        "provider_jobs_boundary": "actual_jobs_and_official_axis_valid_opens_not_unique_failed_symbols_or_fills",
         "failure_jobs": failures, "symbols": rows,
         "read_and_analysis_ms": round((time.perf_counter() - started) * 1000, 3),
         "boundary": "source_event_availability_not_input_fsync_or_execution_or_browser_paint",
@@ -324,6 +365,15 @@ def journal_reference_receipt(payload: dict, timeline: dict, after_open_ms: int)
             "production_promotion_allowed": False, "limits_basis": "retained_engineering_metadata_not_L1_proof"}}
 
 
+class OpeningReceiptClockError(ValueError):
+    """Keep invalid retained observations inspectable, never admissible prices."""
+
+    def __init__(self, *, captured_at: str, observations: list[dict]):
+        super().__init__("opening receipt contains observations after its capture clock")
+        self.captured_at = captured_at
+        self.observations = observations
+
+
 def receipt_snapshot(payload: dict) -> tuple[list[str], quotes.PriceSnapshot]:
     """Reuse canonical masks; do not trust a saved missing-symbol count."""
     symbols = payload["requested_symbols"]
@@ -345,8 +395,14 @@ def receipt_snapshot(payload: dict) -> tuple[list[str], quotes.PriceSnapshot]:
     # Canonical v2 capture clocks are truncated to seconds. Respect that
     # declared precision interval, never relabel its fractional rows as future.
     capture_precision_ms = 1000 if "." not in payload["captured_at_taipei"] else 1
-    if any(np.any(stamps >= captured_ms + capture_precision_ms) for stamps in (received, market, opened, absence)):
-        raise ValueError("opening receipt contains observations after its capture clock")
+    invalid_clocks = [{"symbol": symbols[index], "field": field,
+        "timestamp_ms": int(stamps[index]),
+        "capture_interval_end_exclusive_ms": captured_ms + capture_precision_ms}
+        for field, stamps in (("timestamp_ms", received), ("exchange_timestamp_ms", market),
+                              ("open_timestamp_ms", opened), ("no_open_print_observed_ms", absence))
+        for index in np.flatnonzero(stamps >= captured_ms + capture_precision_ms)]
+    if invalid_clocks:
+        raise OpeningReceiptClockError(captured_at=payload["captured_at_taipei"], observations=invalid_clocks)
     # An observation inside a declared whole-second precision interval supplies
     # the more precise lower bound. Do not mark a valid .240 row as future.
     snapshot_clock_ms = max(captured_ms, *(int(stamps.max(initial=0)) for stamps in (received, market, opened, absence)))
@@ -428,6 +484,29 @@ def classify_symbols(payload: dict, universe: dict, *, comparison: dict | None =
         "no_first_print_max_age_seconds": quotes._TW_OPENING_NO_PRINT_PROOF_TTL_SECONDS}
 
 
+def classify_retained_symbols(payload: dict, universe: dict, *, comparison: dict | None = None) -> dict:
+    """Diagnose a bad retained snapshot without suppressing independent journals.
+
+    A clock violation still rejects the WHOLE snapshot for price admission. It
+    must not prevent the append-only journal from explaining other symbols, or
+    be silently converted into zero missing prices or a successful assessment.
+    Membership/schema errors remain fatal: there is no safe axis for joining.
+    """
+    try:
+        return {**classify_symbols(payload, universe, comparison=comparison), "state": "observed"}
+    except OpeningReceiptClockError as exc:
+        return {"contract": "opening_symbol_membership_and_source_evidence_v1",
+            "state": "invalid_snapshot_clock", "session_date": payload["session_date"],
+            "source_captured_at": payload["captured_at_taipei"],
+            "official_observed_at": universe["observed_at_taipei"],
+            "official_fingerprint": universe["fingerprint"],
+            "snapshot_error": {"error_type": type(exc).__name__,
+                "source_captured_at": exc.captured_at, "invalid_observations": exc.observations},
+            "source_quality": None, "unknown_count": None, "unknown_official_status_counts": None,
+            "unknown_symbols": [], "observed_no_first_print_symbols": [],
+            "boundary": "invalid_snapshot_rejected_journal_analysis_is_independent_not_execution"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--receipt", type=Path, required=True)
@@ -462,10 +541,11 @@ def main() -> int:
         parser.error("output receipt must be new")
     raw_source = args.receipt.read_bytes()
     payload = json.loads(raw_source)
-    universe = load_current_universe(payload["session_date"])
+    universe = load_recorded_universe(payload["session_date"],
+        expected_fingerprint=payload.get("official_trading_universe", {}).get("fingerprint", ""))
     raw_comparison = args.compare_receipt.read_bytes() if args.compare_receipt else None
     comparison = json.loads(raw_comparison) if raw_comparison is not None else None
-    report = classify_symbols(payload, universe, comparison=comparison)
+    report = classify_retained_symbols(payload, universe, comparison=comparison)
     from scripts.audit_tw_opening_latency import opening_session_context
     from stockagent.live.market_config import load_market_configs
     configured_modes = [cfg for cfg in load_market_configs(args.markets_dir).values()
@@ -486,7 +566,7 @@ def main() -> int:
         if args.journal_decoder_abba_blocks:
             report["journal_decoder_benchmark"] = benchmark_journal_decoders(args.journal, payload, universe,
                 blocks=args.journal_decoder_abba_blocks)
-    refresh_enabled = bool(args.refresh_unknown_mis
+    refresh_enabled = bool(args.refresh_unknown_mis and report["state"] == "observed"
         and report["session_applicability"]["native_opening_latency_sample_eligible"] is not False)
     report.update(observed_at_taipei=datetime.now(TAIPEI).isoformat(),
         source_sha256=hashlib.sha256(raw_source).hexdigest(),
@@ -494,7 +574,8 @@ def main() -> int:
         provider_requests_enabled=refresh_enabled, broker_orders=0,
         production_ledger_modified=False, extra_shioaji_login=False)
     if args.refresh_unknown_mis and not refresh_enabled:
-        report["fresh_mis"] = {"state": "skipped_verified_calendar_closed", "provider_requests": 0}
+        report["fresh_mis"] = {"state": "skipped_invalid_snapshot" if report["state"] != "observed"
+            else "skipped_verified_calendar_closed", "provider_requests": 0}
     if raw_comparison is not None:
         report["comparison_sha256"] = hashlib.sha256(raw_comparison).hexdigest()
         report["comparison_captured_at"] = comparison["captured_at_taipei"]

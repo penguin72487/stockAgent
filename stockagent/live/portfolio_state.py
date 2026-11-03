@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import numpy as np
 
@@ -125,23 +126,28 @@ def build_rebalance_rows(
             delta_weight=float(delta[idx]),
             position_eps=position_eps,
         )
-        base_price = float(base[idx]) if np.isfinite(base[idx]) else float("nan")
-        current_price = float(prices[idx]) if np.isfinite(prices[idx]) else float("nan")
+        # These are scalars, not arrays: avoid invoking NumPy's ufunc machinery
+        # several times per symbol while preserving the exact float64 contract.
+        base_value = float(base[idx])
+        current_value = float(prices[idx])
+        base_price = base_value if math.isfinite(base_value) else float("nan")
+        current_price = current_value if math.isfinite(current_value) else float("nan")
         simple_return = (
             current_price / base_price - 1.0
-            if np.isfinite(base_price) and np.isfinite(current_price) and base_price > 0.0
+            if math.isfinite(base_price) and math.isfinite(current_price) and base_price > 0.0
             else float("nan")
         )
+        finite_return = math.isfinite(simple_return)
         stock_return = (
             0.0
-            if np.isfinite(simple_return) and abs(current_weight) < 1e-12
+            if finite_return and abs(current_weight) < 1e-12
             else simple_return
-            if np.isfinite(simple_return) and current_weight > 0.0
+            if finite_return and current_weight > 0.0
             else -simple_return
-            if np.isfinite(simple_return) and current_weight < 0.0
+            if finite_return and current_weight < 0.0
             else float("nan")
         )
-        portfolio_contribution = current_weight * simple_return if np.isfinite(simple_return) else float("nan")
+        portfolio_contribution = current_weight * simple_return if finite_return else float("nan")
         rows.append(
             {
                 "symbol": str(symbol),

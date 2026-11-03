@@ -1,5 +1,43 @@
 # TEJ 全流程操作加速與開機恢復（2026-10-09）
 
+## 2026-10-30 維護期間的開機設定讀回
+
+使用者確認 TEJ 可繼續運作。核對時 Windows 既有開機及登入工作均已
+啟用，但 WSL 的 `stockagent-tej-history.service` 與
+`stockagent-tej-api-trial.timer` 分別正在執行、開機設定卻為 disabled；
+這與原本要求兩者在 WSL 啟動後自動執行的配置不一致。
+以 `systemctl enable` 只恢復這兩個單元的開機連結；
+[操作前後讀回](../artifacts/operations/agent-workflow/runs/tej-boot-registration-20261030-20261029T164404-f18eede8/run.log)
+顯示下載程序 PID 均為 2214，timer 仍在等待；新聞 service／timer
+維持停止，沒有重啟正在進行的 TEJ 工作。
+
+[既有驗證器](../artifacts/data_quality/news_offline_inventory_20261029/tej_boot_registration_20261030.json)
+於 00:44（臺北時間）獨立讀回 Windows 兩個已啟用工作、互動 relay
+及兩個已啟用且運行中的 systemd 單元，未送 TEJ 查詢或桌面動作。
+這是設定與目前 relay 的證據，不是一次實體冷開機驗收；Smart Wizard
+仍需要 Windows 使用者登入與既有授權。同期排程器回報持續完成工作，
+但這次沒有逐筆獨立驗收新收據，不能據此宣稱全歷史完成。
+
+## 2026-10-30 選擇權大型目錄的待解限制
+
+00:42 的 [來源目錄樣本](../data_tej/raw/3d98462ae0c3c0b9dbf94790-f037f4d2f3224c14b00aa33d85f92aec.json.company-axis-sample.json)
+顯示 `TEJ Derivatives / Option (ALL) / Option` 的公司／契約選單有
+510,823 個標籤，超過一般讀取器 150,000 個的已驗證界線。
+這是目錄數量，不是已取得資料筆數或可交易契約數；該次在 Preview 前
+即失敗，並未產生可採用的來源資料。原任務第 10 次連續失敗的
+[重試證據](../data_tej/diagnostics/3d98462ae0c3c0b9dbf94790-f037f4d2f3224c14b00aa33d85f92aec-metadata_retry-a840b2189507490fb785b8641fdfb4f4.json)
+記錄下次檢查為 00:57:31（臺北時間）；它已包含在既有選擇權優先工作中。
+排程器同時仍在處理其他工作，不能把這一筆失敗等同整個 TEJ 服務停滯。
+
+既有大型目錄流程可以受控讀取來源選單，但不會單憑目錄樣本宣稱歷史資料完整。
+00:48:26 的[實體空間讀回](../artifacts/operations/agent-workflow/runs/tej-large-axis-capacity-readback-20261029T164814-72a20f67/run.log)
+為 41,257,402,368 bytes，而當時的派送保留門檻為 52,613,349,376 bytes；
+另計完整擷取最高工作量預算 268,435,456 bytes，合計相差約 10.83 GiB。
+這是當時的准入估算，不是空間預留或已實際寫入量，因此沒有新增擷取 intent
+或等待器。既有的 `Delisted Option(2010~2013)` 等待器屬於不同資料表，
+不能把它的目錄結果當成此表證據。後續仍需重新量測空間，並驗證此表的
+來源目錄、有限查詢範圍與資料收據；僅靠定時重試不代表問題已修復。
+
 ## 驗收範圍
 
 本輪使用既有 TEJ Smart Wizard 下載器，測量操作、來源回覆、完整讀值、驗證、

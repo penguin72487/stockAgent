@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import closing
 from copy import deepcopy
 import hashlib
 import json
@@ -439,6 +440,1359 @@ def test_full_acceptance_shared_raw_and_print_alias_no_second_request(cfg, tmp_p
         queue.close()
 
 
+@pytest.mark.parametrize('newer', [False, True])
+def test_print_alias_with_terminal_path_state_recovers_a_durable_bulk_receipt(cfg, tmp_path, monkeypatch, newer):
+    reg, http = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, reg)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    alias = 'https://news.cnyes.com/news/print/1'
+    try:
+        with queue.db:
+            queue.add_articles([{'url': alias}])
+            queue.db.execute("UPDATE articles SET state='unsupported_article_path',error_code='unsupported_article_path',"
+                             "last_checked_at_utc='2000-01-01T00:00:00+00:00' WHERE url=?", (alias,))
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery').fetchone())
+        raw = response(payload(ids=(1,)), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        task['_discovery_request_started_at_utc'] = records[0]['captured_at_utc']
+        links = [(item['requested_url'], item['title'], item['metadata_date_raw']) for item in records]
+        monkeypatch.setattr(queue, '_accept_records',
+                            lambda *_a, **_k: (_ for _ in ()).throw(OSError('simulated commit interruption')))
+        with pytest.raises(OSError, match='simulated commit interruption'):
+            accept_discovery(queue, task, raw, links, records, errors)
+        assert len(list((tmp_path / 'receipts').glob('*.json'))) == 1
+        if newer:
+            with queue.db:
+                queue.db.execute("UPDATE articles SET state='source_not_found',error_code='source_not_found',"
+                                 "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (alias,))
+    finally:
+        queue.close()
+    with closing(NewsQueue(tmp_path, reg)) as restored:
+        head = restored.db.execute('SELECT state,body_sha256 FROM articles WHERE url=?', (alias,)).fetchone()
+        if newer:
+            assert tuple(head) == ('source_not_found', None)
+        else:
+            assert head['state'] == 'complete' and head['body_sha256'] == records[0]['body_sha256']
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def test_bulk_superseded_first_alias_keeps_its_committed_original_and_newer_head(cfg, tmp_path, monkeypatch):
+    reg, http = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, reg)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    alias = 'https://news.cnyes.com/news/print/1'
+    deadline = time.time() + 3600
+    original = queue._accept_records
+    try:
+        with queue.db:
+            queue.add_articles([{'url': alias}])
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery').fetchone())
+        raw = response(payload(), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(item['requested_url'], item['title'], item['metadata_date_raw']) for item in records]
+        def newer_cooldown(rows, relative, receipt, **kwargs):
+            with queue.db:
+                queue.db.execute("UPDATE articles SET state='retry_cooldown',due=?,error_code='http_429' WHERE url=?",
+                                 (deadline, alias))
+            return original(rows, relative, receipt, **kwargs)
+        monkeypatch.setattr(queue, '_accept_records', newer_cooldown)
+        assert accept_discovery(queue, task, raw, links, records, errors) == 3
+        head = queue.db.execute('SELECT state,due,error_code,body_sha256 FROM articles WHERE url=?', (alias,)).fetchone()
+        assert tuple(head) == ('retry_cooldown', deadline, 'http_429', None)
+        counts = queue.metrics.snapshot()['providers']['cnyes']['counts']
+        assert counts['durably_accepted_versions'] == 3 and counts['durably_accepted_new_url_heads'] == 2
+        observation = queue.db.execute('SELECT observation_json FROM cnyes_history_page_observations').fetchone()
+        assert json.loads(observation[0])['artifact']['kind'] == 'accepted_body_batch'
+        assert verify_bodies(tmp_path)['accepted']
+    finally:
+        queue.close()
+
+
+@pytest.mark.parametrize('crash_point', ['body_commit', 'history_commit'])
+def test_retained_bulk_page_resumes_its_listing_checkpoint_without_a_second_request(
+        cfg, tmp_path, monkeypatch, crash_point):
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, reg)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    next_url = cnyes_url(BASE, page=2, start=1388505600, end=1391212799)
+    try:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        raw = response(payload(ids=tuple(range(1, 31)), total=31), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(item['requested_url'], item['title'], item['metadata_date_raw']) for item in records]
+        with monkeypatch.context() as patch:
+            def interrupted(*_args, **_kwargs):
+                raise OSError('simulated crash between body and listing commits')
+            patch.setattr(queue if crash_point == 'body_commit' else history,
+                          '_accept_records' if crash_point == 'body_commit' else 'record_page', interrupted)
+            with pytest.raises(OSError, match='simulated crash'):
+                accept_discovery(queue, task, raw, links, records, errors)
+        assert len(list((tmp_path / 'receipts').glob('*.json'))) == 1
+    finally:
+        queue.close()
+    with closing(NewsQueue(tmp_path, reg)) as resumed:
+        assert recover(resumed, limit=16, max_seconds=10)['outcomes'] == ['recovered']
+        assert recover(resumed, limit=16, max_seconds=10)['outcomes'] == []
+        page = resumed.db.execute('SELECT * FROM cnyes_history_page_heads WHERE scope_url=? AND page=1',
+                                  (cnyes_scope(url),)).fetchone()
+        assert page is not None
+        observation = resumed.db.execute('SELECT * FROM cnyes_history_page_observations WHERE scope_url=? AND page=1',
+                                         (cnyes_scope(url),)).fetchone()
+        validated = history._checked_page_observation(observation, reg.sources['cnyes'])
+        assert validated['origin'] == 'retained_interrupted_page'
+        assert validated['source_observed_at_utc'] == records[0]['captured_at_utc']
+        assert resumed.db.execute('SELECT 1 FROM discovery WHERE url=?', (next_url,)).fetchone()
+        original = resumed.db.execute('SELECT response_sha256,last_checked_at_utc FROM discovery WHERE url=?',
+                                      (url,)).fetchone()
+        assert original['response_sha256'] == hashlib.sha256(raw.body).hexdigest()
+        assert original['last_checked_at_utc'] == records[0]['captured_at_utc']
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def _leave_interrupted_history_page(queue, http, monkeypatch, *, page=1, first_id=1):
+    from downloader import news_fulltext_cnyes_history as history
+
+    url = cnyes_url(BASE, page=page, start=1388505600, end=1391212799)
+    with queue.db:
+        queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+    task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+    raw = response(payload(ids=tuple(range(first_id, first_id + 30)), page=page, total=61), url)
+    records, errors = cnyes_records(raw, http, queue.registry.sources['cnyes'])
+    links = [(item['requested_url'], item['title'], item['metadata_date_raw']) for item in records]
+    with monkeypatch.context() as patch:
+        patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('crash')))
+        with pytest.raises(RuntimeError, match='crash'):
+            accept_discovery(queue, task, raw, links, records, errors)
+    return url, records[0]['captured_at_utc']
+
+
+@pytest.mark.parametrize('page_kind', ['empty', 'metadata_only', 'already_complete'])
+def test_retained_page_without_new_bodies_resumes_without_another_request(cfg, tmp_path, monkeypatch, page_kind):
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    queue = NewsQueue(tmp_path, reg)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    data = payload(ids=() if page_kind == 'empty' else (1,), total=0 if page_kind == 'empty' else 1)
+    if page_kind == 'metadata_only':
+        data['items']['data'][0].pop('content')
+    raw = response(data, url)
+    records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+    links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+    links.extend((e['url'], e.get('title', ''), e.get('metadata_date_raw', '')) for e in errors
+                 if e['url'] and e['error'] not in {'bulk_post_not_public', 'bulk_exact_duplicate_row'})
+    try:
+        if page_kind == 'already_complete':
+            queue.add_articles([{'url': r['requested_url'], 'title': r['title']} for r in records])
+            records[0]['raw_response_body'] = raw.body
+            records[0]['source_response_article_id'] = records[0]['article_id']
+            queue.accept(records)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('simulated interruption')))
+            with pytest.raises(RuntimeError, match='simulated interruption'):
+                accept_discovery(queue, task, raw, links, records, errors)
+        assert queue.db.execute('SELECT count(*) FROM cnyes_interrupted_page_checkpoints WHERE state=\'pending\'').fetchone()[0] == 1
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == (1 if page_kind == 'already_complete' else 0)
+    finally:
+        queue.close()
+    with closing(NewsQueue(tmp_path, reg)) as resumed:
+        assert recover(resumed, limit=16, max_seconds=10)['outcomes'] == ['recovered']
+        assert recover(resumed, limit=16, max_seconds=10)['outcomes'] == []
+        assert resumed.db.execute('SELECT response_sha256 FROM discovery WHERE url=?', (url,)).fetchone()[0] == hashlib.sha256(raw.body).hexdigest()
+        assert resumed.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+        assert resumed.db.execute('SELECT count(*) FROM bulk_item_errors WHERE request_url=?', (url,)).fetchone()[0] == len(errors)
+        assert resumed.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == (1 if page_kind == 'already_complete' else 0)
+        if page_kind == 'metadata_only':
+            assert resumed.db.execute('SELECT state FROM cached_bulk_replays').fetchone()[0] == 'no_replayable_body'
+            assert resumed.db.execute("SELECT state FROM articles WHERE url='https://news.cnyes.com/news/id/1'").fetchone()[0] == 'pending'
+
+
+def _leave_interrupted_empty_page(queue, http, monkeypatch):
+    from downloader import news_fulltext_cnyes_history as history
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    raw = response(payload(ids=(), total=0), url)
+    with queue.db:
+        queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+    task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+    with monkeypatch.context() as patch:
+        patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('interrupted')))
+        with pytest.raises(RuntimeError, match='interrupted'):
+            accept_discovery(queue, task, raw, [], [], [])
+    return url, raw, dict(queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints').fetchone())
+
+
+def test_no_body_metadata_page_keeps_html_fallbacks_and_next_page(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        next_url = cnyes_url(BASE, page=2, start=1388505600, end=1391212799)
+        data = payload(ids=tuple(range(1, 31)), total=31)
+        for post in data['items']['data']:
+            post.pop('content')
+        raw = response(data, url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(e['url'], e['title'], e['metadata_date_raw']) for e in errors]
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('interrupted')))
+            with pytest.raises(RuntimeError, match='interrupted'):
+                accept_discovery(queue, task, raw, links, records, errors)
+        assert recover(queue, max_seconds=10)['outcomes'] == ['recovered']
+        assert queue.db.execute("SELECT count(*) FROM articles WHERE state='pending' AND body_sha256 IS NULL").fetchone()[0] == 30
+        assert queue.db.execute('SELECT count(*) FROM bulk_item_errors WHERE request_url=?', (url,)).fetchone()[0] == 30
+        assert queue.db.execute('SELECT 1 FROM discovery WHERE url=?', (next_url,)).fetchone()
+        assert queue.db.execute('SELECT state FROM cached_bulk_replays').fetchone()[0] == 'no_replayable_body'
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+
+
+def test_no_body_metadata_page_recovers_if_registration_is_interrupted(cfg, tmp_path, monkeypatch):
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        data = payload(ids=(1, 2), total=2)
+        for post in data['items']['data']:
+            post.pop('content')
+        raw = response(data, url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(e['url'], e['title'], e['metadata_date_raw']) for e in errors]
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(queue, 'add_articles', lambda *a, **k: (_ for _ in ()).throw(OSError('registration interrupted')))
+            with pytest.raises(OSError, match='registration interrupted'):
+                accept_discovery(queue, task, raw, links, records, errors)
+        assert queue.db.execute("SELECT count(*) FROM cnyes_interrupted_page_checkpoints WHERE state='pending'").fetchone()[0] == 1
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+        assert recover(queue, max_seconds=10)['outcomes'] == ['recovered']
+        assert queue.db.execute("SELECT count(*) FROM articles WHERE state='pending' AND body_sha256 IS NULL").fetchone()[0] == 2
+        assert queue.db.execute('SELECT count(*) FROM bulk_item_errors WHERE request_url=?', (url,)).fetchone()[0] == 2
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+
+
+def test_no_body_metadata_replay_rolls_back_and_keeps_newer_article_head(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        data = payload(ids=(1, 2), total=2)
+        for post in data['items']['data']:
+            post.pop('content')
+        raw = response(data, url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(e['url'], e['title'], e['metadata_date_raw']) for e in errors]
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(queue, 'add_articles', lambda *a, **k: (_ for _ in ()).throw(OSError('interrupted')))
+            with pytest.raises(OSError, match='interrupted'):
+                accept_discovery(queue, task, raw, links, records, errors)
+        with queue.db:
+            queue.add_articles([{'url': links[0][0], 'title': 'newer title'}])
+            queue.db.execute("UPDATE articles SET state='retry_cooldown',error_code='http_429',due=? WHERE url=?",
+                             (time.time() + 7200, links[0][0]))
+        before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (links[0][0],)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('second interruption')))
+            with pytest.raises(RuntimeError, match='second interruption'):
+                recover(queue, max_seconds=10)
+        assert queue.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 1
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+        assert recover(queue, max_seconds=10)['outcomes'] == ['recovered']
+        assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (links[0][0],)).fetchone()) == before
+        assert queue.db.execute("SELECT state FROM articles WHERE url=?", (links[1][0],)).fetchone()[0] == 'pending'
+
+
+@pytest.mark.parametrize('page_kind', ['empty', 'public_body'])
+@pytest.mark.parametrize('newer_kind', ['rate_limit', 'partition'])
+def test_successful_page_commit_keeps_a_newer_discovery_head(cfg, tmp_path, monkeypatch, page_kind, newer_kind):
+    from downloader import news_fulltext_cnyes_history as history
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=() if page_kind == 'empty' else (1,),
+                               total=0 if page_kind == 'empty' else 1), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        original_retain = history.retain_response
+        observed = {}
+        def newer_source_head(*args, **kwargs):
+            observed['artifact'] = original_retain(*args, **kwargs)
+            with queue.db:
+                if newer_kind == 'rate_limit':
+                    queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=3,due=?,"
+                                     "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                                     (time.time() + 7200, url))
+                else:
+                    queue.db.execute('UPDATE discovery SET superseded_by_windows_json=? WHERE url=?',
+                                     (json.dumps(['newer-child']), url))
+                queue.db.execute('INSERT INTO bulk_api_coverage VALUES (?,?,?,?,?)',
+                                 (cnyes_scope(url), 'cnyes', 99, 4, '2099-01-01T00:00:00+00:00'))
+                observed['head'] = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+                observed['coverage'] = tuple(queue.db.execute('SELECT * FROM bulk_api_coverage').fetchone())
+            return observed['artifact']
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'retain_response', newer_source_head)
+            assert accept_discovery(queue, task, raw, links, records, errors) == (0 if page_kind == 'empty' else 1)
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == observed['head']
+        assert tuple(queue.db.execute('SELECT * FROM bulk_api_coverage').fetchone()) == observed['coverage']
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+        assert queue.db.execute('SELECT state,outcome FROM cnyes_interrupted_page_checkpoints').fetchone()[:] == ('skipped', 'head_superseded')
+        assert (tmp_path / observed['artifact']['parquet_path']).is_file()
+        assert (tmp_path / observed['artifact']['receipt_path']).is_file()
+        if page_kind == 'public_body':
+            assert verify_bodies(tmp_path)['accepted']
+            assert queue.db.execute("SELECT state FROM articles WHERE url='https://news.cnyes.com/news/id/1'").fetchone()[0] == 'complete'
+
+
+def test_concurrent_historical_split_keeps_late_page_bodies_without_reopening_parent(cfg, tmp_path, monkeypatch):
+    import threading
+    import downloader.news_fulltext as module
+
+    cfg['workers'] = 2
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    first = cnyes_url(BASE, page=1, start=1388505600, end=1391212799)
+    second = cnyes_url(BASE, page=2, start=1388505600, end=1391212799)
+    first_raw = response(payload(ids=tuple(range(1, 31)), page=1, total=930), first)
+    second_raw = response(payload(ids=tuple(range(31, 61)), page=2, total=930), second)
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        first: FakeResponse(first_raw.body, headers=first_raw.headers),
+        second: FakeResponse(second_raw.body, headers=second_raw.headers),
+    })
+    http.parallelism['cnyes'] = 2
+    second_started, partitioned = threading.Event(), threading.Event()
+    original_get = session.get
+    def ordered_get(url, **kwargs):
+        if url == first:
+            assert second_started.wait(5), 'second page was not dispatched in parallel'
+        if url == second:
+            second_started.set()
+            assert partitioned.wait(5), 'first page did not partition the old scope'
+        return original_get(url, **kwargs)
+    session.get = ordered_get
+    with closing(http), closing(NewsQueue(tmp_path, http.registry)) as queue:
+        original_partition = queue.partition_cnyes_window
+        def signal_partition(*args, **kwargs):
+            result = original_partition(*args, **kwargs)
+            if result:
+                partitioned.set()
+            return result
+        monkeypatch.setattr(queue, 'partition_cnyes_window', signal_partition)
+        with queue.db:
+            queue.db.executemany("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')",
+                                 [(first,), (second,)])
+        run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=2)
+        assert second_started.is_set() and partitioned.is_set()
+        assert [url for url, _ in session.calls].count(first) == 1
+        assert [url for url, _ in session.calls].count(second) == 1
+        assert queue.db.execute("SELECT count(*) FROM articles WHERE state='complete'").fetchone()[0] == 60
+        late = queue.db.execute('SELECT * FROM discovery WHERE url=?', (second,)).fetchone()
+        assert late['superseded_by_windows_json'] is not None and late['last_checked_at_utc'] is None
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads WHERE page=2').fetchone()[0] == 0
+        assert queue.db.execute("SELECT count(*) FROM cnyes_interrupted_page_checkpoints WHERE outcome='head_superseded'").fetchone()[0] == 1
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def test_superseded_page_preserves_newer_errors_and_article_checks_but_keeps_older_body(cfg, tmp_path):
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        data = payload(ids=(1, 2), total=2)
+        data['items']['data'][1].pop('content')
+        raw = response(data, url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        links.extend((e['url'], e.get('title', ''), e.get('metadata_date_raw', '')) for e in errors)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        old_article = records[0]['requested_url']
+        with queue.db:
+            queue.add_articles([{'url': old_article, 'title': 'newer title'}])
+            queue.db.execute("UPDATE articles SET state='retry',error_code='http_429',attempts=3,"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (old_article,))
+            queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=3,due=?,"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (time.time() + 7200, url))
+            queue.db.execute('INSERT INTO bulk_item_errors VALUES (?,?,?,?,?,?)',
+                             (url, 0, 'cnyes', old_article, 'newer_item_error', '2099-01-01T00:00:00+00:00'))
+        before_source = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        before_article = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (old_article,)).fetchone())
+        before_errors = [tuple(row) for row in queue.db.execute('SELECT * FROM bulk_item_errors WHERE request_url=?', (url,))]
+        assert accept_discovery(queue, task, raw, links, records, errors) == 1
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before_source
+        assert [tuple(row) for row in queue.db.execute('SELECT * FROM bulk_item_errors WHERE request_url=?', (url,))] == before_errors
+        article = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (old_article,)).fetchone())
+        for key in ('state', 'error_code', 'attempts', 'last_checked_at_utc', 'title', 'last_seen_utc'):
+            assert article[key] == before_article[key]
+        assert article['body_sha256'] == records[0]['body_sha256']
+        assert queue.db.execute("SELECT state FROM articles WHERE url='https://news.cnyes.com/news/id/2'").fetchone()[0] == 'pending'
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+        assert verify_bodies(tmp_path)['accepted']
+
+
+@pytest.mark.parametrize('page_kind', ['new_body', 'same_body', 'metadata_only', 'unusable_body'])
+def test_older_page_does_not_replace_newer_article_metadata_with_current_source_head(cfg, tmp_path, page_kind):
+    from downloader.news_fulltext_policy import NewsError
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        data = payload(ids=(1,), total=1)
+        if page_kind == 'metadata_only':
+            data['items']['data'][0].pop('content')
+        elif page_kind == 'unusable_body':
+            data['items']['data'][0]['content'] = data['items']['data'][0]['title']
+        raw = response(data, url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        article_url = 'https://news.cnyes.com/news/id/1'
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            queue.add_articles([{'url': article_url, 'title': '較新的標題', 'date': '2099-01-01'}])
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        if page_kind == 'same_body':
+            records[0]['raw_response_body'] = raw.body
+            records[0]['source_response_article_id'] = records[0]['article_id']
+            queue.accept(records)
+            records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state='retry',error_code='http_429',attempts=3,"
+                             "last_seen_utc='2099-01-01T00:00:01+00:00',"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (article_url,))
+        before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        links.extend((e['url'], e.get('title', ''), e.get('metadata_date_raw', '')) for e in errors)
+        if page_kind == 'unusable_body':
+            with pytest.raises(NewsError, match='bulk_all_items_unusable'):
+                accept_discovery(queue, task, raw, links, records, errors)
+        else:
+            accept_discovery(queue, task, raw, links, records, errors)
+        current = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        for key in ('title', 'metadata_date_raw', 'metadata_order_day', 'last_seen_utc',
+                    'state', 'error_code', 'attempts', 'last_checked_at_utc'):
+            assert current[key] == before[key]
+        if page_kind == 'new_body':
+            assert current['body_sha256'] == records[0]['body_sha256']
+            assert verify_bodies(tmp_path)['accepted']
+
+
+def test_newer_page_can_update_older_article_metadata(cfg, tmp_path):
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=(1,), total=1), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            queue.add_articles([{'url': records[0]['requested_url'], 'title': '舊標題'}])
+            queue.db.execute("UPDATE articles SET last_checked_at_utc='2000-01-01T00:00:00+00:00',"
+                             "last_seen_utc='2000-01-01T00:00:00+00:00' WHERE url=?",
+                             (records[0]['requested_url'],))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        task['_discovery_request_started_at_utc'] = records[0]['captured_at_utc']
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        assert accept_discovery(queue, task, raw, links, records, errors) == 1
+        assert queue.db.execute('SELECT title FROM articles WHERE url=?', (records[0]['requested_url'],)).fetchone()[0] == '測試標題'
+
+
+def test_article_updated_during_cnyes_request_keeps_its_newer_title(cfg, tmp_path):
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=(1,), total=1), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        records[0]['captured_at_utc'] = '2026-01-03T00:00:00+00:00'
+        article_url = records[0]['requested_url']
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            queue.add_articles([{'url': article_url, 'title': 'independent article title'}])
+            queue.db.execute("UPDATE articles SET last_seen_utc='2026-01-02T00:00:00+00:00' WHERE url=?", (article_url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        task['_discovery_request_started_at_utc'] = '2026-01-01T00:00:00+00:00'
+        task['_discovery_response_observed_at_utc'] = '2026-01-03T00:00:00+00:00'
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        accept_discovery(queue, task, raw, links, records, errors)
+        article = queue.db.execute('SELECT title,last_seen_utc FROM articles WHERE url=?', (article_url,)).fetchone()
+        assert tuple(article) == ('independent article title', '2026-01-02T00:00:00+00:00')
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def test_live_metadata_only_page_can_update_older_article_without_changing_parser_contract(cfg, tmp_path):
+    from downloader.news_fulltext_metrics import NewsMetrics
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        data = payload(ids=(1,), total=1)
+        data['items']['data'][0].pop('content')
+        raw = response(data, url)
+        assert 'captured_at_utc' not in cnyes_records(raw, http, reg.sources['cnyes'])[1][0]
+        http.get = lambda *args, **kwargs: raw
+        http.metrics = NewsMetrics()
+        article_url = 'https://news.cnyes.com/news/id/1'
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            queue.add_articles([{'url': article_url, 'title': '舊標題'}])
+            queue.db.execute("UPDATE articles SET last_checked_at_utc='2000-01-01T00:00:00+00:00',"
+                             "last_seen_utc='2000-01-01T00:00:00+00:00' WHERE url=?", (article_url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        observed, links, records, errors = fetch_discovery(http, task)
+        assert errors[0]['captured_at_utc'].endswith('+00:00')
+        assert accept_discovery(queue, task, observed, links, records, errors) == 0
+        assert queue.db.execute('SELECT title FROM articles WHERE url=?', (article_url,)).fetchone()[0] == '測試標題'
+
+
+def test_superseded_unusable_page_does_not_overwrite_existing_article_metadata(cfg, tmp_path):
+    from downloader.news_fulltext_policy import NewsError
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        data = payload(ids=(1,), total=1)
+        data['items']['data'][0]['content'] = data['items']['data'][0]['title']
+        raw = response(data, url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        article_url = errors[0]['url']
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            queue.add_articles([{'url': article_url, 'title': '較新的標題'}])
+            queue.db.execute("UPDATE articles SET last_seen_utc='2000-01-01T00:00:00+00:00' WHERE url=?", (article_url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with queue.db:
+            queue.db.execute("UPDATE discovery SET error_code='http_429',due=? WHERE url=?", (time.time() + 7200, url))
+        before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        links = [(e['url'], e['title'], e['metadata_date_raw']) for e in errors]
+        with pytest.raises(NewsError, match='bulk_all_items_unusable'):
+            accept_discovery(queue, task, raw, links, records, errors)
+        assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone()) == before
+
+
+@pytest.mark.parametrize(('observed', 'last_seen', 'body_sha', 'body_clock', 'allowed'), [
+    ('2001-01-01T00:00:00+00:00', '2001-01-01T00:00:00+00:00', None, None, False),
+    ('bad clock', '2000-01-01T00:00:00+00:00', None, None, False),
+    ('2001-01-01T00:00:00', '2000-01-01T00:00:00+00:00', None, None, False),
+    ('2001-01-01T00:00:00+00:00', 'bad clock', None, None, False),
+    ('2001-01-01T00:00:00+00:00', '2000-01-01T00:00:00+00:00', 'legacy', None, False),
+    ('2001-01-01T00:00:00+00:00', '2000-01-01T00:00:00+00:00', None, None, True),
+])
+def test_page_metadata_requires_orderable_observation_clocks(cfg, tmp_path, observed, last_seen, body_sha, body_clock, allowed):
+    from downloader.news_fulltext import _cnyes_discovery_head_fields, _cnyes_fresh_article_links
+
+    reg, _ = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        article_url = 'https://news.cnyes.com/news/id/1'
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            queue.add_articles([{'url': article_url, 'title': '現有標題'}])
+            queue.db.execute('UPDATE articles SET last_seen_utc=?,body_sha256=?,captured_at_utc=? WHERE url=?',
+                             (last_seen, body_sha, body_clock, article_url))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        task['_discovery_request_started_at_utc'] = observed
+        links = [(article_url, '頁面標題', '')]
+        records = [{'requested_url': article_url, 'captured_at_utc': observed}]
+        with queue.db:
+            result = _cnyes_fresh_article_links(queue, task, _cnyes_discovery_head_fields(task), links, records, [])
+        assert result == (links if allowed else [])
+
+
+@pytest.mark.parametrize('newer_check', [False, True])
+def test_bulk_same_body_revalidation_uses_source_check_clock(cfg, tmp_path, newer_check):
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=(1,), total=1), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        article_url = records[0]['requested_url']
+        queue.add_articles([{'url': article_url, 'title': 'newer title'}])
+        records[0]['raw_response_body'] = raw.body
+        records[0]['source_response_article_id'] = records[0]['article_id']
+        queue.accept(records)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        task['_discovery_request_started_at_utc'] = records[0]['captured_at_utc']
+        with queue.db:
+            queue.db.execute("UPDATE articles SET state='retry',error_code='http_429',attempts=3,"
+                             "last_checked_at_utc=? WHERE url=?",
+                             ('2099-01-01T00:00:00+00:00' if newer_check else '2000-01-01T00:00:00+00:00', article_url))
+            if newer_check:
+                queue.db.execute("UPDATE discovery SET error_code='http_429',due=? WHERE url=?", (time.time() + 7200, url))
+        before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        assert accept_discovery(queue, task, raw, links, records, errors) == 0
+        current = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+        if newer_check:
+            assert current == before
+        else:
+            assert current['state'] == 'complete' and current['error_code'] is None
+            assert current['last_checked_at_utc'] == records[0]['captured_at_utc']
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('response_kind', ['not_modified', 'restricted'])
+def test_superseded_conditional_or_restricted_page_preserves_newer_head(cfg, tmp_path, response_kind):
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with queue.db:
+            queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=2,due=?,"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (time.time() + 7200, url))
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        if response_kind == 'not_modified':
+            raw, records, errors = Response(url, 304, {}, b''), [], []
+        else:
+            raw = response(payload(ids=(1,), payment=1), url)
+            records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        assert accept_discovery(queue, task, raw, [], records, errors) == 0
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM bulk_item_errors').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+        assert not list((tmp_path / 'quarantine').glob('*.parquet'))
+
+
+def test_live_source_failure_keeps_a_newer_cnyes_discovery_head(cfg, tmp_path, monkeypatch):
+    import downloader.news_fulltext as module
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(status=500),
+    })
+    with closing(http), closing(NewsQueue(tmp_path, http.registry)) as queue:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        original = module.fail_discovery
+        observed = {}
+        def newer_head_before_failure(queue, task, error, **kwargs):
+            with queue.db:
+                queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=5,due=?,"
+                                 "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                                 (time.time() + 7200, url))
+                observed['head'] = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+            return original(queue, task, error, **kwargs)
+        monkeypatch.setattr(module, 'fail_discovery', newer_head_before_failure)
+        run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=1)
+        assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == observed['head']
+        assert queue.db.execute("SELECT value FROM counters WHERE key='discovery_failure_superseded'").fetchone()[0] == 1
+
+
+def test_stale_unsent_cnyes_deferral_does_not_extend_a_newer_head(cfg, tmp_path):
+    from downloader.news_fulltext import fail_discovery
+    from downloader.news_fulltext_cnyes_checkpoint import HEAD_FIELDS
+
+    reg, _ = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with queue.db:
+            queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=5,due=?,"
+                             "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?", (time.time() + 5, url))
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        fail_discovery(queue, task, NewsError('provider_cooldown', retry=True, delay=3600, request_deferred=True),
+                       expected_head_fields=HEAD_FIELDS)
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+
+
+def test_no_body_recovery_reuses_an_older_exact_accepted_batch_with_new_check_witness(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=(1,), total=1), url)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        first = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        assert accept_discovery(queue, first, raw, links, records, errors) == 1
+        original = queue.db.execute('SELECT * FROM cnyes_history_page_observations').fetchone()
+        observation = history._checked_page_observation(original, reg.sources['cnyes'])
+        assert observation['artifact']['kind'] == 'accepted_body_batch'
+        with queue.db:
+            queue.db.execute('UPDATE discovery SET due=0 WHERE url=?', (url,))
+        second = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(r['requested_url'], r['title'], r['metadata_date_raw']) for r in records]
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('interrupted')))
+            with pytest.raises(RuntimeError, match='interrupted'):
+                accept_discovery(queue, second, raw, links, records, errors)
+        marker = queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints').fetchone()
+        new_check = json.loads(marker['witness_json'])['captured_at_utc']
+        assert new_check > observation['source_observed_at_utc']
+        assert recover(queue, max_seconds=10)['outcomes'] == ['recovered']
+        assert queue.db.execute('SELECT last_checked_at_utc FROM discovery WHERE url=?', (url,)).fetchone()[0] == new_check
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_observations').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize(('field', 'value'), [('raw_response_bytes', -1), ('article_bodies_accepted', True)])
+def test_no_body_recovery_rejects_contradictory_original_receipt(cfg, tmp_path, monkeypatch, field, value):
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=(), total=0), url)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert accept_discovery(queue, task, raw, [], [], []) == 0
+        observation = history._checked_page_observation(
+            queue.db.execute('SELECT * FROM cnyes_history_page_observations').fetchone(), reg.sources['cnyes'])
+        receipt_path = tmp_path / observation['artifact']['receipt_path']
+        original_path = tmp_path / observation['artifact']['parquet_path']
+        with queue.db:
+            queue.db.execute('UPDATE discovery SET due=0 WHERE url=?', (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('interrupted')))
+            with pytest.raises(RuntimeError, match='interrupted'):
+                accept_discovery(queue, task, raw, [], [], [])
+        receipt = json.loads(receipt_path.read_text())
+        receipt[field] = value
+        receipt_path.write_text(json.dumps(receipt))
+        evidence = original_path.read_bytes(), receipt_path.read_bytes()
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert recover(queue, max_seconds=10)['outcomes'] == ['invalid_original']
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert (original_path.read_bytes(), receipt_path.read_bytes()) == evidence
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+
+
+def test_no_body_recovery_uses_a_verified_prior_nonstandard_envelope(cfg, tmp_path, monkeypatch):
+    import shutil
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=(), total=0), url)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert accept_discovery(queue, task, raw, [], [], []) == 0
+        row = queue.db.execute('SELECT * FROM cnyes_history_page_observations').fetchone()
+        observation = history._checked_page_observation(row, reg.sources['cnyes'])
+        original = tmp_path / observation['artifact']['parquet_path']
+        original_receipt = tmp_path / observation['artifact']['receipt_path']
+        alternate = tmp_path / 'previous_layout' / 'raw.parquet'
+        alternate.parent.mkdir()
+        shutil.copyfile(original, alternate)
+        receipt = json.loads(original_receipt.read_text())
+        receipt['parquet_path'] = str(alternate.relative_to(tmp_path))
+        alternate_receipt = alternate.with_suffix('.parquet.receipt.json')
+        alternate_receipt.write_text(json.dumps(receipt))
+        observation['artifact'] = {'kind': 'cnyes_history_source_envelope',
+                                   'parquet_path': str(alternate.relative_to(tmp_path)),
+                                   'receipt_path': str(alternate_receipt.relative_to(tmp_path))}
+        with queue.db:
+            queue.db.execute('UPDATE cnyes_history_page_observations SET observation_json=?,observation_sha256=?',
+                             (json.dumps(observation), history.digest(observation)))
+            queue.db.execute('UPDATE discovery SET due=0 WHERE url=?', (url,))
+        original.unlink()
+        original_receipt.unlink()
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('interrupted')))
+            with pytest.raises(RuntimeError, match='interrupted'):
+                accept_discovery(queue, task, raw, [], [], [])
+        assert recover(queue, max_seconds=10)['outcomes'] == ['recovered']
+        assert queue.db.execute('SELECT response_sha256 FROM discovery WHERE url=?', (url,)).fetchone()[0] == hashlib.sha256(raw.body).hexdigest()
+        assert alternate.is_file() and alternate_receipt.is_file()
+
+
+def test_no_body_recovery_rejects_identical_bytes_from_a_different_request(cfg, tmp_path, monkeypatch):
+    import shutil
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        first_url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        second_url = cnyes_url(BASE, start=1391212800, end=1393631999)
+        raw = response(payload(ids=(), total=0), first_url)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (first_url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (first_url,)).fetchone())
+        accept_discovery(queue, task, raw, [], [], [])
+        row = queue.db.execute('SELECT * FROM cnyes_history_page_observations').fetchone()
+        artifact = history._checked_page_observation(row, reg.sources['cnyes'])['artifact']
+        legacy = tmp_path / 'quarantine' / (hashlib.sha256(raw.body).hexdigest() + '.parquet')
+        legacy.parent.mkdir(exist_ok=True)
+        shutil.copyfile(tmp_path / artifact['parquet_path'], legacy)
+        receipt = json.loads((tmp_path / artifact['receipt_path']).read_text())
+        receipt['parquet_path'] = str(legacy.relative_to(tmp_path))
+        legacy.with_suffix('.parquet.receipt.json').write_text(json.dumps(receipt))
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (second_url,))
+        second_task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (second_url,)).fetchone())
+        second_raw = response(payload(ids=(), total=0), second_url)
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'retain_response', lambda *a, **k: (_ for _ in ()).throw(OSError('before second original')))
+            with pytest.raises(OSError, match='before second original'):
+                accept_discovery(queue, second_task, second_raw, [], [], [])
+        assert recover(queue, max_seconds=10)['outcomes'] == ['invalid_original']
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (second_url,)).fetchone()) == second_task
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+
+
+@pytest.mark.parametrize('crash_point', ['before_witness', 'before_original'])
+def test_no_body_missing_local_evidence_releases_page_after_bounded_retries(cfg, tmp_path, monkeypatch, crash_point):
+    import downloader.news_fulltext as module
+    from downloader import artifact_io, news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    raw = response(payload(ids=(), total=0), url)
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(raw.body, headers=raw.headers),
+    })
+    with closing(NewsQueue(tmp_path, http.registry)) as queue:
+        try:
+            with queue.db:
+                queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+            with monkeypatch.context() as patch:
+                if crash_point == 'before_witness':
+                    original_write = artifact_io.atomic_write_text
+                    def fail_witness(path, *args, **kwargs):
+                        if path.parent.name == 'cnyes_page_intents':
+                            raise OSError('temporary local failure before witness')
+                        return original_write(path, *args, **kwargs)
+                    patch.setattr(artifact_io, 'atomic_write_text', fail_witness)
+                else:
+                    patch.setattr(history, 'retain_response', lambda *a, **k: (_ for _ in ()).throw(OSError('temporary local failure before original')))
+                run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=1)
+            marker = queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints').fetchone()
+            assert marker['outcome'] == 'live_commit_OSError'
+            assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+            assert recover(queue, max_seconds=10)['outcomes'] == ['local_io_retry']
+            with queue.db:
+                queue.db.execute("UPDATE cnyes_interrupted_page_checkpoints SET attempts=4,not_before=0 WHERE state='pending'")
+            assert recover(queue, max_seconds=10)['outcomes'] == ['original_missing']
+            assert queue.db.execute('SELECT state FROM cnyes_interrupted_page_checkpoints').fetchone()[0] == 'skipped'
+            assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+            assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+            assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+        finally:
+            http.close()
+
+
+@pytest.mark.parametrize('conflict', ['witness', 'raw', 'receipt', 'missing_witness', 'missing_raw', 'policy', 'newer_head'])
+def test_no_body_recovery_never_advances_unproven_page(cfg, tmp_path, monkeypatch, conflict):
+    from dataclasses import replace
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, raw, marker = _leave_interrupted_empty_page(queue, http, monkeypatch)
+        source = reg.sources['cnyes']
+        original = next(path for path, _ in history._retained_envelopes(
+            tmp_path, hashlib.sha256(raw.body).hexdigest(), url, source.authorization_fingerprint) if path.exists())
+        receipt = original.with_suffix('.parquet.receipt.json')
+        if conflict == 'witness':
+            (tmp_path / marker['parquet_path']).write_text('{}')
+        elif conflict == 'raw':
+            with original.open('ab') as stream:
+                stream.write(b'changed')
+        elif conflict == 'receipt':
+            saved = json.loads(receipt.read_text())
+            saved['sha256'] = '0' * 64
+            receipt.write_text(json.dumps(saved))
+        elif conflict == 'missing_witness':
+            (tmp_path / marker['parquet_path']).unlink()
+        elif conflict == 'missing_raw':
+            original.unlink()
+        elif conflict == 'policy':
+            reg.sources['cnyes'] = replace(source, allowed=False)
+        else:
+            with queue.db:
+                queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=3,due=? WHERE url=?",
+                                 (time.time() + 7200, url))
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        expected = ('local_io_retry' if conflict in {'missing_witness', 'missing_raw'} else
+                    'policy_changed' if conflict == 'policy' else
+                    'head_superseded' if conflict == 'newer_head' else 'invalid_original')
+        assert recover(queue, max_seconds=10)['outcomes'] == [expected]
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('crash_point', ['original_retained', 'page_commit'])
+def test_no_body_live_io_failure_recovers_using_existing_http_response(cfg, tmp_path, monkeypatch, crash_point):
+    import downloader.news_fulltext as module
+    from downloader import news_fulltext_cnyes_history as history
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    raw = response(payload(ids=(), total=0), url)
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(raw.body, headers=raw.headers),
+    })
+    with closing(NewsQueue(tmp_path, http.registry)) as queue:
+        try:
+            with queue.db:
+                queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+            original_retain = history.retain_response
+            def retain_then_fail(*args, **kwargs):
+                original_retain(*args, **kwargs)
+                raise OSError('temporary local failure')
+            with monkeypatch.context() as patch:
+                if crash_point == 'original_retained':
+                    patch.setattr(history, 'retain_response', retain_then_fail)
+                else:
+                    patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(OSError('temporary local failure')))
+                run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=1)
+            assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+            marker = queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints').fetchone()
+            assert marker['outcome'] == 'live_commit_OSError'
+            assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+            run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=0)
+            assert queue.db.execute('SELECT response_sha256 FROM discovery WHERE url=?', (url,)).fetchone()[0] == hashlib.sha256(raw.body).hexdigest()
+            assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+            assert not (tmp_path / marker['parquet_path']).exists()
+            assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+        finally:
+            http.close()
+
+
+def test_restricted_page_never_creates_a_no_body_raw_recovery_intent(cfg, tmp_path):
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        raw = response(payload(ids=(1,), payment=1), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert accept_discovery(queue, task, raw, [], records, errors) == 0
+        assert queue.db.execute('SELECT count(*) FROM cnyes_interrupted_page_checkpoints').fetchone()[0] == 0
+        assert not list((tmp_path / 'cnyes_page_intents').glob('*'))
+        assert not list((tmp_path / 'quarantine').glob('*.parquet'))
+
+
+def test_interrupted_page_preserves_a_newer_source_failure_and_deadline(cfg, tmp_path, monkeypatch):
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, _ = _leave_interrupted_history_page(queue, http, monkeypatch)
+        deadline = time.time() + 7200
+        with queue.db:
+            queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=4,due=?,"
+                             "last_checked_at_utc='2026-10-28T00:00:00+00:00' WHERE url=?", (deadline, url))
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert recover(queue, max_seconds=10)['outcomes'] == ['head_superseded']
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+        assert queue.db.execute("SELECT outcome FROM cnyes_interrupted_page_checkpoints").fetchone()[0] == 'head_superseded'
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def test_interrupted_page_recovery_rolls_back_and_resumes_again(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_cnyes_history as history
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, stamp = _leave_interrupted_history_page(queue, http, monkeypatch)
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(RuntimeError('second crash')))
+            with pytest.raises(RuntimeError, match='second crash'):
+                recover(queue, max_seconds=10)
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT count(*) FROM bulk_page_evidence').fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM cnyes_interrupted_page_checkpoints WHERE state=\'pending\'').fetchone()[0] == 1
+        assert recover(queue, max_seconds=10)['outcomes'] == ['recovered']
+        assert queue.db.execute('SELECT last_checked_at_utc FROM discovery WHERE url=?', (url,)).fetchone()[0] == stamp
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+        assert recover(queue, max_seconds=10)['outcomes'] == []
+
+
+def test_interrupted_page_rejects_changed_witness_without_losing_raw(cfg, tmp_path, monkeypatch):
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, _ = _leave_interrupted_history_page(queue, http, monkeypatch)
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        marker = queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints').fetchone()
+        forged = json.loads(marker['witness_json'])
+        forged['headers']['etag'] = 'different-unverified-validator'
+        with queue.db:
+            queue.db.execute('UPDATE cnyes_interrupted_page_checkpoints SET witness_json=? WHERE parquet_path=?',
+                             (json.dumps(forged), marker['parquet_path']))
+        assert recover(queue, max_seconds=10)['outcomes'] == ['invalid_original']
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+        assert verify_bodies(tmp_path)['accepted']
+
+
+def test_interrupted_page_io_retry_does_not_block_other_pages(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_cnyes_checkpoint as checkpoint
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        first, _ = _leave_interrupted_history_page(queue, http, monkeypatch, page=1, first_id=1)
+        second, _ = _leave_interrupted_history_page(queue, http, monkeypatch, page=2, first_id=31)
+        original = checkpoint._read_original
+        def sometimes_unreadable(queue_, row, value, source):
+            if row['request_url'] == first:
+                raise OSError('temporary local I/O failure')
+            return original(queue_, row, value, source)
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoint, '_read_original', sometimes_unreadable)
+            result = checkpoint.recover(queue, limit=4, max_seconds=10)
+        assert sorted(result['outcomes']) == ['local_io_retry', 'recovered']
+        marker = queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints WHERE request_url=?', (first,)).fetchone()
+        assert marker['state'] == 'pending' and marker['attempts'] == 1 and marker['not_before'] > time.time()
+        assert queue.db.execute('SELECT response_sha256 FROM discovery WHERE url=?', (second,)).fetchone()[0]
+        clause, params = queue.discovery_dispatch_filter(reg.sources['cnyes'])
+        eligible = {row[0] for row in queue.db.execute('SELECT url FROM discovery WHERE ' + clause, params)}
+        assert first not in eligible and second in eligible
+        with queue.db:
+            queue.db.execute('UPDATE discovery SET due=? WHERE url!=?', (time.time() + 7200, first))
+        assert 0 < queue.next_wake_delay({}, maximum=30) <= 3
+        with queue.db:
+            queue.db.execute('UPDATE cnyes_interrupted_page_checkpoints SET not_before=0 WHERE request_url=?', (first,))
+        # Page 2 was observed more recently for this scope: do not overwrite it.
+        assert checkpoint.recover(queue, max_seconds=10)['outcomes'] == ['newer_scope_observation']
+
+
+@pytest.mark.parametrize('failure,expected', [('missing', 'original_missing'), ('unreadable', 'local_io_exhausted')])
+def test_interrupted_page_local_io_exhaustion_releases_only_its_existing_schedule(
+        cfg, tmp_path, monkeypatch, failure, expected):
+    from downloader import news_fulltext_cnyes_checkpoint as checkpoint
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, _ = _leave_interrupted_history_page(queue, http, monkeypatch)
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with queue.db:
+            queue.db.execute('UPDATE cnyes_interrupted_page_checkpoints SET attempts=?,not_before=0',
+                             (checkpoint.MAX_LOCAL_IO_ATTEMPTS - 1,))
+        error = FileNotFoundError('temporarily absent') if failure == 'missing' else OSError('unreadable')
+        with monkeypatch.context() as patch:
+            patch.setattr(checkpoint, '_read_original', lambda *a, **k: (_ for _ in ()).throw(error))
+            assert checkpoint.recover(queue, max_seconds=10)['outcomes'] == [expected]
+        row = queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints').fetchone()
+        assert row['state'] == 'skipped' and row['outcome'] == expected
+        assert row['attempts'] == checkpoint.MAX_LOCAL_IO_ATTEMPTS
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        clause, params = queue.discovery_dispatch_filter(reg.sources['cnyes'])
+        assert url in {row[0] for row in queue.db.execute('SELECT url FROM discovery WHERE ' + clause, params)}
+
+
+def test_interrupted_page_recovery_respects_changed_policy(cfg, tmp_path, monkeypatch):
+    from dataclasses import replace
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, _ = _leave_interrupted_history_page(queue, http, monkeypatch)
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        reg.sources['cnyes'] = replace(reg.sources['cnyes'], allowed=False)
+        assert recover(queue, max_seconds=10)['outcomes'] == ['policy_changed']
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+
+
+@pytest.mark.parametrize('clock_conflict', ['future_due', 'same_prior_check'])
+def test_interrupted_page_requires_a_proven_source_check_order(cfg, tmp_path, clock_conflict):
+    from downloader.news_fulltext import discovery_fingerprint
+    from downloader.news_fulltext_cnyes_checkpoint import parse_witness, witness
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        raw = response(payload(), url)
+        records, _ = cnyes_records(raw, http, reg.sources['cnyes'])
+        stamp = records[0]['captured_at_utc']
+        fingerprint = discovery_fingerprint(reg.sources['cnyes'], kind='cnyes_news')
+        valid = json.loads(witness(task, raw, reg.sources['cnyes'], stamp, fingerprint))
+        if clock_conflict == 'future_due':
+            task['due'] = time.time() + 3600
+        else:
+            task['last_checked_at_utc'] = stamp
+        assert witness(task, raw, reg.sources['cnyes'], stamp, fingerprint) is None
+        valid['head'] = task
+        with pytest.raises(ValueError, match='unproven_cnyes_checkpoint_order'):
+            parse_witness(json.dumps(valid))
+
+
+def test_cycle_recovers_interrupted_page_without_http(cfg, tmp_path, monkeypatch):
+    import downloader.news_fulltext as module
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    http, session = http_fixture(cfg, tmp_path, {})
+    with closing(NewsQueue(tmp_path, http.registry)) as queue:
+        try:
+            url, stamp = _leave_interrupted_history_page(queue, http, monkeypatch)
+            result = run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=0)
+            assert session.calls == []
+            assert result['cycle']['http_requests'].get('cnyes', 0) == 0
+            assert queue.db.execute('SELECT last_checked_at_utc FROM discovery WHERE url=?', (url,)).fetchone()[0] == stamp
+            assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+        finally:
+            http.close()
+
+
+@pytest.mark.parametrize('crash_point', ['body_commit', 'history_commit'])
+def test_cycle_preserves_committed_page_for_local_recovery_after_live_io_failure(cfg, tmp_path, monkeypatch, crash_point):
+    import downloader.news_fulltext as module
+    from downloader import news_fulltext_cnyes_history as history
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    raw = response(payload(ids=tuple(range(1, 31)), total=31), url)
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(raw.body, headers=raw.headers),
+    })
+    with closing(NewsQueue(tmp_path, http.registry)) as queue:
+        try:
+            with queue.db:
+                queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+            with monkeypatch.context() as patch:
+                patch.setattr(queue if crash_point == 'body_commit' else history,
+                              '_accept_records' if crash_point == 'body_commit' else 'record_page',
+                              lambda *a, **k: (_ for _ in ()).throw(OSError('temporary I/O')))
+                run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=1)
+            assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+            marker = queue.db.execute("SELECT state,outcome FROM cnyes_interrupted_page_checkpoints").fetchone()
+            assert tuple(marker) == ('pending', 'live_commit_OSError')
+            assert queue.db.execute("SELECT value FROM counters WHERE key='cnyes_page_live_commit_io_failures'").fetchone()[0] == 1
+            assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == (0 if crash_point == 'body_commit' else 1)
+            assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+            run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=0)
+            assert queue.db.execute('SELECT response_sha256 FROM discovery WHERE url=?', (url,)).fetchone()[0] == hashlib.sha256(raw.body).hexdigest()
+            assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 1
+            assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+            incident = queue.db.execute('SELECT phase,observations,last_error_type FROM cnyes_page_local_io_incidents').fetchone()
+            assert tuple(incident) == ('live_commit', 1, 'OSError')
+            assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+            assert verify_bodies(tmp_path)['accepted']
+        finally:
+            http.close()
+
+
+@pytest.mark.parametrize('conflict', ['response', 'head', 'policy', 'not_io', 'not_committed'])
+def test_live_page_io_recovery_rejects_unproven_or_superseded_evidence(cfg, tmp_path, monkeypatch, conflict):
+    from dataclasses import replace
+    from downloader.news_fulltext_cnyes_checkpoint import defer_live_io_failure
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, _ = _leave_interrupted_history_page(queue, http, monkeypatch)
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        raw = response(payload(ids=tuple(range(1, 31)), page=1, total=61), url)
+        error = OSError('temporary I/O')
+        if conflict == 'response':
+            raw = response(payload(ids=tuple(range(2, 32)), page=1, total=61), url)
+        elif conflict == 'head':
+            with queue.db:
+                queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=1,due=? WHERE url=?",
+                                 (time.time() + 7200, url))
+        elif conflict == 'policy':
+            reg.sources['cnyes'] = replace(reg.sources['cnyes'], allowed=False)
+        elif conflict == 'not_io':
+            error = RuntimeError('unexpected error')
+        else:
+            with queue.db:
+                queue.db.execute('DELETE FROM accepted_batches')
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        assert not defer_live_io_failure(queue, task, raw, error)
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT outcome FROM cnyes_interrupted_page_checkpoints').fetchone()[0] is None
+
+
+def test_cycle_keeps_uncommitted_local_error_as_failure(cfg, tmp_path, monkeypatch):
+    import downloader.news_fulltext as module
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    raw = response(payload(), url)
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(raw.body, headers=raw.headers),
+    })
+    with closing(NewsQueue(tmp_path, http.registry)) as queue:
+        try:
+            with queue.db:
+                queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            with monkeypatch.context() as patch:
+                patch.setattr(queue, 'accept', lambda *a, **k: (_ for _ in ()).throw(OSError('not committed')))
+                run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=1)
+            head = queue.db.execute('SELECT error_code,attempts FROM discovery WHERE url=?', (url,)).fetchone()
+            assert tuple(head) == ('worker_OSError', 1)
+            assert queue.db.execute('SELECT count(*) FROM cnyes_interrupted_page_checkpoints').fetchone()[0] == 0
+            assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+        finally:
+            http.close()
+
+
+def test_cycle_local_commit_error_does_not_overwrite_a_newer_source_head(cfg, tmp_path, monkeypatch):
+    import downloader.news_fulltext as module
+    from downloader import news_fulltext_cnyes_history as history
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    raw = response(payload(), url)
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(raw.body, headers=raw.headers),
+    })
+    with closing(NewsQueue(tmp_path, http.registry)) as queue:
+        try:
+            with queue.db:
+                queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+            original = module.accept_discovery
+            deadline = time.time() + 7200
+            def concurrent_newer_source(*args, **kwargs):
+                try:
+                    return original(*args, **kwargs)
+                except OSError:
+                    with queue.db:
+                        queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=4,due=?,"
+                                         "last_checked_at_utc='2026-10-29T00:00:00+00:00' WHERE url=?", (deadline, url))
+                    raise
+            with monkeypatch.context() as patch:
+                patch.setattr(module, 'accept_discovery', concurrent_newer_source)
+                patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(OSError('temporary I/O')))
+                run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=1)
+            head = queue.db.execute('SELECT error_code,attempts,due,last_checked_at_utc FROM discovery WHERE url=?', (url,)).fetchone()
+            assert tuple(head) == ('http_429', 4, deadline, '2026-10-29T00:00:00+00:00')
+            assert queue.db.execute("SELECT value FROM counters WHERE key='discovery_failure_superseded'").fetchone()[0] == 1
+            from downloader.news_fulltext_cnyes_checkpoint import recover
+            assert recover(queue, max_seconds=10)['outcomes'] == ['head_superseded']
+            assert tuple(queue.db.execute('SELECT error_code,attempts,due,last_checked_at_utc FROM discovery WHERE url=?',
+                                          (url,)).fetchone()) == tuple(head)
+            assert [u for u, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+        finally:
+            http.close()
+
+
+def test_persistent_page_commit_io_failure_retries_locally_then_releases_original_schedule(cfg, tmp_path, monkeypatch):
+    from downloader import news_fulltext_cnyes_checkpoint as checkpoint
+    from downloader import news_fulltext_cnyes_history as history
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url, _ = _leave_interrupted_history_page(queue, http, monkeypatch)
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        with monkeypatch.context() as patch:
+            patch.setattr(history, 'record_page', lambda *a, **k: (_ for _ in ()).throw(OSError('persistent I/O')))
+            for attempt in range(1, checkpoint.MAX_LOCAL_IO_ATTEMPTS + 1):
+                with queue.db:
+                    queue.db.execute('UPDATE cnyes_interrupted_page_checkpoints SET not_before=0 WHERE request_url=?', (url,))
+                result = checkpoint.recover(queue, max_seconds=10)
+                expected = 'local_io_exhausted' if attempt == checkpoint.MAX_LOCAL_IO_ATTEMPTS else 'local_io_retry'
+                assert result['outcomes'] == [expected]
+                assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        row = queue.db.execute('SELECT state,attempts,outcome FROM cnyes_interrupted_page_checkpoints').fetchone()
+        assert tuple(row) == ('skipped', checkpoint.MAX_LOCAL_IO_ATTEMPTS, 'local_io_exhausted')
+        incident = queue.db.execute('SELECT phase,observations,last_error_type FROM cnyes_page_local_io_incidents').fetchone()
+        assert tuple(incident) == ('local_replay', checkpoint.MAX_LOCAL_IO_ATTEMPTS, 'OSError')
+        clause, params = queue.discovery_dispatch_filter(reg.sources['cnyes'])
+        assert url in {row[0] for row in queue.db.execute('SELECT url FROM discovery WHERE ' + clause, params)}
+        assert verify_bodies(tmp_path)['accepted']
+
+
+@pytest.mark.parametrize('conflict', ['receipt', 'parquet', 'missing', 'newer_source_failure'])
+def test_uncommitted_receipt_is_checked_before_adoption_or_page_advance(cfg, tmp_path, monkeypatch, conflict):
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    reg, http = registry_http(cfg, tmp_path)
+    with closing(NewsQueue(tmp_path, reg)) as queue:
+        url = cnyes_url(BASE, start=1388505600, end=1391212799)
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        task = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        raw = response(payload(), url)
+        records, errors = cnyes_records(raw, http, reg.sources['cnyes'])
+        links = [(item['requested_url'], item['title'], item['metadata_date_raw']) for item in records]
+        with monkeypatch.context() as patch:
+            patch.setattr(queue, '_accept_records', lambda *a, **k: (_ for _ in ()).throw(OSError('commit unavailable')))
+            with pytest.raises(OSError):
+                accept_discovery(queue, task, raw, links, records, errors)
+        marker = queue.db.execute('SELECT * FROM cnyes_interrupted_page_checkpoints').fetchone()
+        assert marker['outcome'] == 'acceptance_receipt_pending'
+        receipt_path = tmp_path / marker['receipt_path']
+        parquet_path = tmp_path / marker['parquet_path']
+        if conflict == 'receipt':
+            receipt = json.loads(receipt_path.read_text())
+            receipt['sha256'] = '0' * 64
+            receipt_path.write_text(json.dumps(receipt))
+        elif conflict == 'parquet':
+            with parquet_path.open('ab') as f:
+                f.write(b'changed')
+        elif conflict == 'missing':
+            parquet_path.unlink()
+        else:
+            with queue.db:
+                queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=1,due=? WHERE url=?",
+                                 (time.time() + 7200, url))
+        before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone())
+        expected = {'receipt': 'invalid_original', 'parquet': 'invalid_original',
+                    'missing': 'local_io_retry', 'newer_source_failure': 'head_superseded'}[conflict]
+        assert recover(queue, max_seconds=10)['outcomes'] == [expected]
+        assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (url,)).fetchone()) == before
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 0
+        assert queue.db.execute("SELECT count(*) FROM articles WHERE state='complete'").fetchone()[0] == 0
+        assert queue.db.execute('SELECT count(*) FROM cnyes_history_page_heads').fetchone()[0] == 0
+
+
 def test_next_page_is_checkpointed_only_after_durable_acceptance(cfg, tmp_path, monkeypatch):
     reg, http = registry_http(cfg, tmp_path)
     queue = NewsQueue(tmp_path, reg)
@@ -451,7 +1805,7 @@ def test_next_page_is_checkpointed_only_after_durable_acceptance(cfg, tmp_path, 
         records, errors = cnyes_records(r, http, reg.sources["cnyes"])
         links = [(x["requested_url"], x["title"], x["metadata_date_raw"]) for x in records]
         original = queue.accept
-        monkeypatch.setattr(queue, "accept", lambda _: (_ for _ in ()).throw(OSError("fsync failed")))
+        monkeypatch.setattr(queue, "accept", lambda *_, **_kwargs: (_ for _ in ()).throw(OSError("fsync failed")))
         with pytest.raises(OSError):
             accept_discovery(queue, task, r, links, records, errors)
         assert queue.db.execute("SELECT count(*) FROM discovery").fetchone()[0] == 1
@@ -461,6 +1815,7 @@ def test_next_page_is_checkpointed_only_after_durable_acceptance(cfg, tmp_path, 
         assert accept_discovery(queue, task, r, links, records, errors) == 30
         next_url = cnyes_url(BASE, page=2, start=1388505600, end=1391212799)
         assert queue.db.execute("SELECT kind FROM discovery WHERE url=?", (next_url,)).fetchone()[0] == "cnyes_news"
+        assert queue.db.execute('SELECT count(*) FROM cnyes_interrupted_page_checkpoints').fetchone()[0] == 0
         assert verify_bodies(tmp_path)["accepted"]
         # A repeated ID page claiming a different page is not forward progress.
         second = dict(queue.db.execute("SELECT * FROM discovery WHERE url=?", (next_url,)).fetchone())

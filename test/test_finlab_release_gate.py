@@ -423,6 +423,68 @@ if kind == 'tw_minute':
     assert order == expected_order
 
 
+@pytest.mark.parametrize('general_state', ['partial', 'pass_complete'])
+def test_finite_general_pass_keeps_owner_and_does_not_enter_optional_work(tmp_path, general_state):
+    """Exercise the real wrapper's finite branch with the provider replaced."""
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    _write(tmp_path / 'data_finlab/runs/latest.json', {'state': general_state})
+    (scripts / 'runtime_env.sh').write_text(f'''
+resolve_fintech_python() {{ printf '%s\\n' '{sys.executable}'; }}
+date() {{ if [[ "$*" == "+%H%M%S" ]]; then printf '120000\\n'; else /bin/date "$@"; fi; }}
+run_fintech_python() {{
+  case "$1" in
+    */check_acquisition_capacity.py) echo capacity >> work-order;;
+    */finlab_refresh_policy.py) printf '%s\\n' '{{"minute_partitions_per_pass":1,"maximum_intraday_passes":1,"catalog_current":true,"history_floor_mb":50,"general_batch_size":1,"processing_threads":1,"tick_partitions_per_pass":1}}';;
+    -c) '{sys.executable}' "$@";;
+    *) echo unexpected >> work-order; return 97;;
+  esac
+}}
+''')
+    (scripts / 'download_finlab_history.py').write_text(
+        "from pathlib import Path\nwith Path('work-order').open('a') as log: log.write('general\\n')\n")
+    env = {**os.environ, 'FINLAB_REPO_ROOT': str(tmp_path), 'FINLAB_FINITE_GENERAL_ONLY': '1',
+           'FINLAB_SYNC_MAX_BATCHES': '1', 'FINLAB_SYNC_BATCH_SIZE': '2'}
+    result = subprocess.run(['bash', str(root / 'scripts/run_finlab_refresh.sh')], cwd=tmp_path,
+                            env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert (tmp_path / 'work-order').read_text().splitlines() == ['capacity', 'general']
+    assert (tmp_path / 'data_finlab/.sync.lock').is_file()
+    assert 'remaining work and timer state are unchanged' in result.stdout
+
+
+@pytest.mark.parametrize(('batches', 'batch_size'), [('9', '1'), ('1', '17'), ('0', '1')])
+def test_finite_general_pass_rejects_unbounded_scope_before_sync(tmp_path, batches, batch_size):
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    (scripts / 'runtime_env.sh').write_text(f'''
+resolve_fintech_python() {{ printf '%s\\n' '{sys.executable}'; }}
+run_fintech_python() {{
+  case "$1" in
+    */check_acquisition_capacity.py) return 0;;
+    */finlab_refresh_policy.py) printf '%s\\n' '{{"minute_partitions_per_pass":1,"maximum_intraday_passes":1,"catalog_current":true,"history_floor_mb":50,"general_batch_size":1,"processing_threads":1,"tick_partitions_per_pass":1}}';;
+    -c) '{sys.executable}' "$@";;
+    *) touch unexpected; return 97;;
+  esac
+}}
+''')
+    env = {**os.environ, 'FINLAB_REPO_ROOT': str(tmp_path), 'FINLAB_FINITE_GENERAL_ONLY': '1',
+           'FINLAB_SYNC_MAX_BATCHES': batches, 'FINLAB_SYNC_BATCH_SIZE': batch_size}
+    result = subprocess.run(['bash', str(root / 'scripts/run_finlab_refresh.sh')], cwd=tmp_path,
+                            env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == 2
+    assert not (tmp_path / 'unexpected').exists()
+    assert not (tmp_path / 'data_finlab/.sync.lock').exists()
+
+
 @pytest.mark.parametrize('capacity_exit', [75, 2])
 def test_finlab_capacity_denial_stops_before_sdk_or_source_setup(tmp_path, capacity_exit):
     """A real Bash pass must propagate deferral/error before any downloader."""

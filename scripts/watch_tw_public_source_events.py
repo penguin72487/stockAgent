@@ -167,6 +167,18 @@ class ProbeResult:
     error: str | None = None
     fallback_used: bool = False
     primary_error: str | None = None
+    response_content_type: str | None = None
+    response_bytes: int | None = None
+    response_sha256: str | None = None
+    error_kind: str | None = None
+
+
+class SourceProbeError(RuntimeError):
+    """Keep failed-response evidence separate from the last accepted version."""
+
+    def __init__(self, message: str, *, evidence: Mapping[str, Any]) -> None:
+        super().__init__(message)
+        self.evidence = dict(evidence)
 
 
 def parse_args() -> argparse.Namespace:
@@ -498,7 +510,11 @@ def _request(
         headers["If-Modified-Since"] = str(previous["last_modified"])
 
     last_error: Exception | None = None
+    evidence: dict[str, Any] = {}
     for attempt in range(int(args.retries) + 1):
+        # Do not attribute a prior response to a subsequent connection timeout.
+        evidence = {"error_kind": "request_error"}
+        response = None
         limiter.wait()
         try:
             try:
@@ -523,6 +539,12 @@ def _request(
                     timeout=(int(args.timeout), int(args.timeout)),
                     allow_redirects=True,
                     verify=False,
+            )
+            evidence.update(
+                http_status=int(response.status_code),
+                response_content_type=response.headers.get("content-type"),
+                response_bytes=len(response.content),
+                error_kind="http_error",
             )
             if response.status_code == 304:
                 prior_version = previous.get("version") or previous.get(
@@ -549,6 +571,7 @@ def _request(
             last_modified = response.headers.get("last-modified")
             content_length = response.headers.get("content-length")
             content_disposition = response.headers.get("content-disposition")
+            evidence["error_kind"] = "invalid_source_payload"
             body_hash = _response_body_sha256(
                 response.content,
                 expected_json=expected_json,
@@ -574,11 +597,20 @@ def _request(
                 "content": response.content,
             }
         except (requests.RequestException, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            if response is not None:
+                evidence["response_sha256"] = hashlib.sha256(response.content).hexdigest()
             last_error = exc
             if attempt >= int(args.retries):
                 break
             time.sleep(min(8.0, 0.5 * (2**attempt)))
-    raise RuntimeError(str(last_error or "HTTP probe failed"))
+    detail = str(last_error or "HTTP probe failed")
+    if evidence.get("error_kind") == "invalid_source_payload":
+        detail = (
+            f"invalid source payload: HTTP {evidence['http_status']}; "
+            f"content-type={evidence['response_content_type'] or 'unknown'}; "
+            f"bytes={evidence['response_bytes']}; {detail}"
+        )
+    raise SourceProbeError(detail, evidence=evidence) from last_error
 
 
 def _probe_data_gov(
@@ -743,6 +775,7 @@ def _probe_one(
                 timespec="seconds"
             ),
             error=str(exc),
+            **(exc.evidence if isinstance(exc, SourceProbeError) else {}),
         )
 
 
@@ -904,6 +937,14 @@ def _apply_probe_results(
                 "primary_probe_status": "failed" if result.primary_error else result.status,
                 "primary_probe_error": result.primary_error,
                 "official_fallback_used": result.fallback_used,
+                # Existing http_status/body_sha256 describe the last accepted
+                # representation. Never replace its fingerprint with an HTML
+                # error page, or display its old 304 as this failed response.
+                "last_probe_http_status": result.http_status,
+                "last_probe_response_content_type": result.response_content_type,
+                "last_probe_response_bytes": result.response_bytes,
+                "last_probe_response_sha256": result.response_sha256,
+                "last_probe_error_kind": result.error_kind,
             }
         )
         if result.status == "ok" and result.version:

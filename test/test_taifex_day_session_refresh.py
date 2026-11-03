@@ -8,6 +8,37 @@ import pytest
 from scripts import download_tw_index_futures_day_session as daily
 
 
+def test_priority_day_reuses_lock_and_retains_exact_source_without_touching_manifest(tmp_path, monkeypatch):
+    day = date(2020, 10, 28)
+    raw = ("交易日期,契約,到期月份(週別),交易時段,成交量,收盤價,結算價\n"
+           "2020/10/28,TX,202011,一般,1,100,100\n").encode("cp950")
+    (tmp_path / "manifest.json").write_text("original")
+    monkeypatch.setattr(daily, "acquisition_dispatch_status", lambda root: {"state": "admitted"})
+    calls = []
+    def download(payload, target, **_kwargs):
+        calls.append(payload)
+        target.write_bytes(raw)
+        return target
+    monkeypatch.setattr(daily, "_download", download)
+    result = daily._priority_day_source(tmp_path, day, attempts=1, request_interval=0)
+    assert result["source_rows"] == result["source_product_count"] == 1
+    assert result["sha256"] == hashlib.sha256(raw).hexdigest()
+    assert daily._priority_day_source(tmp_path, day, attempts=1, request_interval=0) == result
+    assert len(calls) == 1
+    assert (tmp_path / "manifest.json").read_text() == "original"
+    Path(result["path"]).write_bytes(raw + b"tampered")
+    with pytest.raises(ValueError, match="receipt or payload changed"):
+        daily._priority_day_source(tmp_path, day, attempts=1, request_interval=0)
+
+
+def test_priority_day_does_not_download_below_capacity_reserve(tmp_path, monkeypatch):
+    monkeypatch.setattr(daily, "acquisition_dispatch_status",
+                        lambda root: {"state": "deferred", "reason": "physical_backing_reserve"})
+    monkeypatch.setattr(daily, "_download", lambda *args, **kwargs: pytest.fail("unexpected download"))
+    with pytest.raises(RuntimeError, match="physical_backing_reserve"):
+        daily._priority_day_source(tmp_path, date(2020, 10, 28), attempts=1, request_interval=0)
+
+
 def test_preclose_raw_range_must_be_refetched_after_all_futures_close(tmp_path: Path) -> None:
     target = tmp_path / "2026-09-01_2026-09-17_all.csv"
     target.write_bytes(b"early source")

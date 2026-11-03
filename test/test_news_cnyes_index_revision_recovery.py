@@ -2,6 +2,8 @@
 from datetime import datetime
 import time
 
+import pytest
+
 from downloader.news_fulltext import accept_discovery
 from downloader.news_fulltext_bulk import cnyes_scope
 from downloader.news_fulltext_cnyes_index import progress, request_url
@@ -54,6 +56,126 @@ def test_earlier_inflight_result_cannot_confirm_new_revision(queue):
     assert tuple(queue.db.execute('SELECT * FROM cnyes_public_index_heads WHERE page=2').fetchone()) == old_head
     assert job(queue, 2)['due'] <= time.time()
     assert progress(queue.db, source)['dates_reconciling_page_membership'] == 1
+
+
+def test_stale_index_page_keeps_newer_article_metadata_and_registers_missing_ids(queue):
+    import hashlib
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+    from downloader.news_fulltext_cnyes_index import parse_index
+
+    complete(queue)
+    source = queue.registry.sources['cnyes']
+    task = register(queue, 2)
+    prepare_dispatch(queue, task)
+    old_head = tuple(queue.db.execute('SELECT * FROM cnyes_public_index_heads WHERE page=2').fetchone())
+    accept(queue, index_payload(ids=range(2, 32), total=61))
+    article_url = 'https://news.cnyes.com/news/id/31'
+    with queue.db:
+        queue.db.execute("UPDATE articles SET title='較新的文章標題',last_seen_utc='2099-01-01T00:00:00+00:00' "
+                         "WHERE url=?", (article_url,))
+    before_article = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+    before_job = job(queue, 2)
+    stale = response(index_payload(ids=[*range(31, 60), 999], page=2, total=61), task['url'])
+    assert accept_discovery(queue, task, stale, parse_index(stale, source)[2], [], []) == 0
+    assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone()) == before_article
+    assert queue.db.execute("SELECT state FROM articles WHERE url='https://news.cnyes.com/news/id/999'").fetchone()[0] == 'pending'
+    assert tuple(queue.db.execute('SELECT * FROM cnyes_public_index_heads WHERE page=2').fetchone()) == old_head
+    assert job(queue, 2) == before_job
+    observation = queue.db.execute('SELECT evidence_path FROM cnyes_public_index_observations '
+        'WHERE scope_url=? AND page=2 AND response_sha256=?',
+        (cnyes_scope(task['url']), hashlib.sha256(stale.body).hexdigest())).fetchone()
+    assert observation and (queue.root / observation['evidence_path']).is_file()
+    assert (queue.root / (observation['evidence_path'] + '.receipt.json')).is_file()
+
+
+@pytest.mark.parametrize('observation', ['older', 'newer', 'missing', 'in_flight'])
+def test_current_index_page_respects_independent_article_clock(queue, observation):
+    from downloader.news_fulltext_cnyes_index import parse_index
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+
+    accept(queue, index_payload(ids=(1, 2), total=2))
+    task = register(queue, 1)
+    prepare_dispatch(queue, task)
+    url = 'https://news.cnyes.com/news/id/1'
+    with queue.db:
+        queue.db.execute('UPDATE articles SET title=?,last_seen_utc=? WHERE url=?',
+                         ('independent article title', '2000-01-01T00:00:00+00:00' if observation == 'newer'
+                          else '2026-01-02T00:00:00+00:00' if observation == 'in_flight'
+                          else '2099-01-01T00:00:00+00:00', url))
+    if observation != 'missing':
+        task['_discovery_request_started_at_utc'] = '2026-01-01T00:00:00+00:00'
+        task['_discovery_response_observed_at_utc'] = '2026-01-03T00:00:00+00:00'
+    raw = response(index_payload(ids=(1, 3), total=2), task['url'])
+    links = parse_index(raw, queue.registry.sources['cnyes'])[2]
+    accept_discovery(queue, task, raw, links, [], [])
+    article = queue.db.execute('SELECT title,last_seen_utc FROM articles WHERE url=?', (url,)).fetchone()
+    assert article['title'] == (links[0][1] if observation == 'newer' else 'independent article title')
+    if observation != 'newer':
+        assert article['last_seen_utc'] == ('2026-01-02T00:00:00+00:00' if observation == 'in_flight'
+                                            else '2099-01-01T00:00:00+00:00')
+    assert queue.db.execute("SELECT 1 FROM articles WHERE url='https://news.cnyes.com/news/id/3'").fetchone()
+
+
+@pytest.mark.parametrize('status', [200, 304])
+def test_index_response_cannot_overwrite_newer_discovery_failure(queue, status):
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+    from downloader.news_fulltext_cnyes_index import parse_index
+    from downloader.news_fulltext_http import Response
+
+    accept(queue, index_payload(ids=(1, 2), total=2))
+    source = queue.registry.sources['cnyes']
+    task = register(queue, 1)
+    prepare_dispatch(queue, task)
+    article_url = 'https://news.cnyes.com/news/id/1'
+    with queue.db:
+        queue.db.execute("UPDATE discovery SET due=?,attempts=4,error_code='discovery_http_429',"
+                         "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                         (time.time() + 7200, task['url']))
+        queue.db.execute("UPDATE articles SET title='較新的文章標題',last_seen_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                         (article_url,))
+    before_job = job(queue, 1)
+    before_article = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone())
+    before_head = tuple(queue.db.execute('SELECT * FROM cnyes_public_index_heads WHERE page=1').fetchone())
+    if status == 200:
+        raw = response(index_payload(ids=(1, 3), total=2), task['url'])
+        links = parse_index(raw, source)[2]
+    else:
+        raw, links = Response(task['url'], 304, {}, b''), []
+    assert accept_discovery(queue, task, raw, links, [], []) == 0
+    assert job(queue, 1) == before_job
+    assert tuple(queue.db.execute('SELECT * FROM cnyes_public_index_heads WHERE page=1').fetchone()) == before_head
+    assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (article_url,)).fetchone()) == before_article
+    if status == 200:
+        assert queue.db.execute("SELECT state FROM articles WHERE url='https://news.cnyes.com/news/id/3'").fetchone()[0] == 'pending'
+
+
+def test_index_live_failure_cannot_overwrite_a_newer_head(cfg, tmp_path, monkeypatch):
+    from contextlib import closing
+    import downloader.news_fulltext as module
+    from downloader.news_fulltext_queue import NewsQueue
+    from test_news_fulltext import FakeResponse, http_fixture
+
+    monkeypatch.setattr(module, 'seed_discovery', lambda _: None)
+    http, session = http_fixture(cfg, tmp_path, {})
+    url = request_url(http.registry.sources['cnyes'], DAY)
+    session.routes = {'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+                      url: FakeResponse(status=500)}
+    with closing(http), closing(NewsQueue(tmp_path, http.registry)) as queue:
+        with queue.db:
+            queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'index','cnyes')", (url,))
+        original = module.fail_discovery
+        observed = {}
+        def newer_head_before_failure(queue, task, error, **kwargs):
+            with queue.db:
+                queue.db.execute("UPDATE discovery SET error_code='http_429',attempts=5,due=?,"
+                                 "last_checked_at_utc='2099-01-01T00:00:00+00:00' WHERE url=?",
+                                 (time.time() + 7200, url))
+                observed['head'] = job(queue, 1)
+            return original(queue, task, error, **kwargs)
+        monkeypatch.setattr(module, 'fail_discovery', newer_head_before_failure)
+        module.run_cycle(queue, http, cfg, max_articles=0, max_discovery_requests=1)
+        assert [called for called, _ in session.calls] == ['https://api.cnyes.com/robots.txt', url]
+        assert job(queue, 1) == observed['head']
 
 
 def test_later_page_change_rechecks_first_before_other_pages(queue):

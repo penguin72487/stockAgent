@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import fcntl
 from pathlib import Path
 import sys
+from threading import Event
 
 import pytest
 
@@ -105,7 +107,39 @@ def test_backup_owner_busy_is_deferred_without_wait_or_new_writer(tmp_path, monk
     assert result == {'state': 'existing_source_owner_busy', 'NAS_backup_verified': False}
 
 
-@pytest.mark.parametrize('status', [{'state': 'scanning'}, {'state': ''}, {}, None])
+def test_held_backup_owner_defers_before_checking_temporarily_paused_folder(tmp_path, monkeypatch):
+    from stockagent.data_sync import backup_stream
+
+    root = tmp_path / 'owner'
+    root.mkdir()
+    lock = root / 'owner.lock'
+    lock.touch(mode=0o600)
+    path = tmp_path / 'backup.json'
+    path.write_text(json.dumps({'state_root': str(root)}))
+    monkeypatch.setattr(retry, 'BACKUP_CONFIG', path)
+    monkeypatch.setattr(backup_stream, 'BackupStream', lambda _: pytest.fail('do not inspect pairing while owner is active'))
+    with lock.open('r') as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert retry.retry_backup_transport() == {'state': 'existing_source_owner_busy', 'NAS_backup_verified': False}
+    assert retry.backup_owner_busy({'state_root': str(root)}) is False
+
+
+def test_backup_owner_observation_refuses_redirected_or_nonregular_lock(tmp_path):
+    root = tmp_path / 'owner'
+    root.mkdir()
+    target = root / 'target'
+    target.touch()
+    (root / 'owner.lock').symlink_to(target)
+    with pytest.raises(OSError):
+        retry.backup_owner_busy({'state_root': str(root)})
+    (root / 'owner.lock').unlink()
+    (root / 'owner.lock').mkdir()
+    with pytest.raises(SnapshotError, match='owned regular'):
+        retry.backup_owner_busy({'state_root': str(root)})
+
+
+@pytest.mark.parametrize('status', [{'state': 'scanning'}, {'state': 'scan-waiting'}, {'state': ''},
+                                   {'state': []}, {'state': {}}, {}, None])
 def test_busy_or_unknown_backup_folder_never_reads_or_writes_original_ledger(
     tmp_path, monkeypatch, status,
 ):
@@ -189,6 +223,26 @@ def test_opted_in_backup_retry_runs_even_when_packed_folder_fails(
     assert result['backup_transport']['NAS_backup_verified'] is False
 
 
+def test_backup_notification_runs_while_independent_packed_scan_is_waiting(tmp_path, monkeypatch):
+    _, receipt = _setup(tmp_path, monkeypatch)
+    backup_started = Event()
+
+    def packed(*args, **kwargs):
+        assert backup_started.wait(timeout=5), 'NAS notification was blocked by packed scan'
+        return {'status': 'idle_no_pending'}
+
+    def backup():
+        backup_started.set()
+        return {'state': 'deferred_existing_folder_scan', 'NAS_backup_verified': False}
+
+    monkeypatch.setattr(retry, 'retry_one', packed)
+    monkeypatch.setattr(retry, 'retry_backup_transport', backup)
+    assert retry.main(['--backup-transport']) == 0
+    result = json.loads(receipt.read_bytes())
+    assert result['status'] == 'idle_no_pending'
+    assert result['backup_transport']['NAS_backup_verified'] is False
+
+
 def test_backup_failure_keeps_packed_retry_receipt_and_has_no_false_ack(tmp_path, monkeypatch):
     _, receipt = _setup(tmp_path, monkeypatch)
 
@@ -228,12 +282,13 @@ def test_original_notification_error_marks_service_failed_without_dropping_evide
     assert captured['backup_transport'] == result
 
 
-def test_active_folder_scan_defers_without_clearing_or_reposting(tmp_path, monkeypatch):
+@pytest.mark.parametrize('folder_state', ['scanning', 'scan-waiting'])
+def test_active_folder_scan_defers_without_clearing_or_reposting(tmp_path, monkeypatch, folder_state):
     pending, receipt_path = _setup(tmp_path, monkeypatch)
     source = pending / 'dataset.json'
     raw = b'{"generation":"preserve-original"}\n'
     source.write_bytes(raw)
-    monkeypatch.setattr(retry, 'scan_folder_state', lambda: 'scanning')
+    monkeypatch.setattr(retry, 'scan_folder_state', lambda: folder_state)
     monkeypatch.setattr(retry, 'scan_after_publish', lambda *a, **kw: pytest.fail('already scanning'))
     assert retry.main() == 0
     result = json.loads(receipt_path.read_bytes())
@@ -444,9 +499,10 @@ def test_batch_cli_is_explicit_and_preserves_dataset_scope(tmp_path, monkeypatch
     assert retry.main([
         "--dataset", "bybit", "--receipt", str(result_path), "--batch-object-paths",
     ]) == 0
-    assert calls == [(retry.SYNC_ROOT, "bybit", {"retry_full": True, "batch_object_paths": True})]
+    assert calls == [(retry.SYNC_ROOT, "bybit", {"retry_full": True, "batch_object_paths": True,
+                                                "request_timeout_seconds": 480})]
     result = json.loads(result_path.read_text())
-    assert result["requested_scan_policy"] == {"batch_object_paths": True}
+    assert result["requested_scan_policy"] == {"batch_object_paths": True, "request_timeout_seconds": 480}
     assert result["status"] == "scan_request_acknowledged"
     assert result["peer_convergence"] == result["release_verification"] == "not_checked"
     assert other.is_file()
@@ -457,7 +513,7 @@ def test_batch_policy_is_not_scan_execution_when_no_pending(tmp_path, monkeypatc
     monkeypatch.setattr(retry, "scan_after_publish", lambda *a, **kw: pytest.fail("no pending"))
     assert retry.main(["--dataset", "bybit", "--batch-object-paths"]) == 0
     result = json.loads(receipt_path.read_text())
-    assert result["requested_scan_policy"] == {"batch_object_paths": True}
+    assert result["requested_scan_policy"] == {"batch_object_paths": True, "request_timeout_seconds": 480}
     assert result["status"] == "idle_no_pending"
     assert result["peer_convergence"] == result["release_verification"] == "not_checked"
 
@@ -468,13 +524,13 @@ def test_batch_failure_records_requested_policy_and_keeps_pending(tmp_path, monk
     target.write_text("{}")
 
     def failed(_root, _dataset, **kwargs):
-        assert kwargs == {"retry_full": True, "batch_object_paths": True}
+        assert kwargs == {"retry_full": True, "batch_object_paths": True, "request_timeout_seconds": 480}
         raise SnapshotError("mock scan failed")
 
     monkeypatch.setattr(retry, "scan_after_publish", failed)
     assert retry.main(["--dataset", "bybit", "--batch-object-paths"]) == 1
     result = json.loads(receipt_path.read_text())
-    assert result["requested_scan_policy"] == {"batch_object_paths": True}
+    assert result["requested_scan_policy"] == {"batch_object_paths": True, "request_timeout_seconds": 480}
     assert result["status"] == "retry_failed"
     assert target.is_file()
 

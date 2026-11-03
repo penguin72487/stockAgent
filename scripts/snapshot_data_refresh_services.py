@@ -101,21 +101,26 @@ def parse_args() -> argparse.Namespace:
 def _atomic_json(
     path: Path, payload: dict[str, object], *, compact: bool = False,
     strict_json: bool = False, sort_keys: bool = True,
-    max_bytes: int | None = None,
+    max_bytes: int | None = None, private_compact: bool = False,
 ) -> None:
+    if private_compact and (not compact or strict_json or not sort_keys or max_bytes is not None):
+        raise ValueError("private compact encoding requires the legacy compact cache contract")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + f".tmp.{uuid.uuid4().hex}")
     try:
-        encoded = (
-            json.dumps(
-                payload, ensure_ascii=False, indent=None if compact else 2,
-                separators=(",", ":") if compact else None,
-                sort_keys=sort_keys, allow_nan=not strict_json,
-            ) + "\n"
-        )
-        if max_bytes is not None and len(encoded.encode("utf-8")) > max_bytes:
-            raise ValueError("atomic JSON exceeds bounded projection size")
-        temporary.write_text(encoded, encoding="utf-8")
+        if private_compact:
+            temporary.write_bytes(private_json.compact_sorted_bytes(payload) + b"\n")
+        else:
+            encoded = (
+                json.dumps(
+                    payload, ensure_ascii=False, indent=None if compact else 2,
+                    separators=(",", ":") if compact else None,
+                    sort_keys=sort_keys, allow_nan=not strict_json,
+                ) + "\n"
+            )
+            if max_bytes is not None and len(encoded.encode("utf-8")) > max_bytes:
+                raise ValueError("atomic JSON exceeds bounded projection size")
+            temporary.write_text(encoded, encoding="utf-8")
         os.replace(temporary, path)
     finally:
         temporary.unlink(missing_ok=True)
@@ -543,7 +548,7 @@ def _catalog_snapshot(public_status_output, *, name, builder, observed, audit_se
         inventory, current = builder(REPO_ROOT, previous=previous, now=observed,
                                      audit_seconds=audit_seconds, **kwargs)
         if current != previous:
-            _atomic_json(cache_path, current, compact=True)
+            _atomic_json(cache_path, current, compact=True, private_compact=name == "bar")
         return inventory
 
 

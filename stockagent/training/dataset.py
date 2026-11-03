@@ -162,6 +162,16 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         self._futures_account_source = futures_account_source
         if futures_account_source is not None and self.execution_mode != "tw_stock_context_futures_portfolio":
             raise ValueError("dated futures source requires stock-context futures execution")
+        history = getattr(panel, "feature_history", None)
+        self.feature_row_offset = 0
+        if history is not None:
+            from stockagent.data.futures_feature_history import FuturesFeatureHistory
+            if (not isinstance(history, FuturesFeatureHistory)
+                    or futures_account_source is None
+                    or self.execution_mode != "tw_stock_context_futures_portfolio"):
+                raise ValueError("feature history requires its bound dated futures account source")
+            history.verify(panel)
+            self.feature_row_offset = history.prefix_rows
         self.day_trade_unlimited_margin_conversion = bool(
             day_trade_unlimited_margin_conversion
         )
@@ -880,7 +890,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
                 # Targets, returns, masks, ledger state, and metrics still begin
                 # at the split boundary. Only the causal feature window may read
                 # earlier global panel rows.
-                min_valid_idx = self.lookback - 1 + feature_lag
+                min_valid_idx = self.lookback - 1 + feature_lag - self.feature_row_offset
             else:
                 fold_start_idx = int(self.date_indices[0])
                 min_valid_idx = fold_start_idx + self.lookback - 1 + feature_lag
@@ -1309,10 +1319,11 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
             force_short_cover = np.zeros_like(tradable, dtype=bool)
         # build_panel sanitizes feature NaN/inf values before caching.  Re-running
         # torch.nan_to_num here would duplicate the full panel for every split.
-        if getattr(panel.features, "_stockagent_factorized_features", False):
-            self.features_t = panel.features.as_torch()
+        feature_source = panel.features if history is None else history.features
+        if getattr(feature_source, "_stockagent_factorized_features", False):
+            self.features_t = feature_source.as_torch()
         else:
-            features = panel.features.astype(np.float32, copy=False)
+            features = feature_source.astype(np.float32, copy=False)
             if not features.flags.c_contiguous:
                 features = np.ascontiguousarray(features)
             self.features_t = torch.from_numpy(features)
@@ -1491,7 +1502,7 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
 
     def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         date_idx = int(self.valid_indices[index])
-        feature_end = date_idx + 1 - execution_feature_lag(self.execution_mode)
+        feature_end = date_idx + self.feature_row_offset + 1 - execution_feature_lag(self.execution_mode)
         start_idx = feature_end - self.lookback
         sample = {
             "x": self.features_t[start_idx:feature_end],

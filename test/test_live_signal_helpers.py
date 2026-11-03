@@ -63,6 +63,42 @@ def test_post_quote_prepare_clock_separates_local_work_without_hiding_quote_age(
     assert result["prepare_clock_contract"] == "quote_age_split_local_input_work_v1"
 
 
+def test_first_completed_source_observations_do_not_evict_other_prepared_modes(monkeypatch, tmp_path):
+    monkeypatch.setattr(signal_engine, "_LIVE_COMPLETED_SOURCE_IDENTITIES", {})
+    retained_panel = object()
+    monkeypatch.setattr(signal_engine, "_LIVE_PANEL_CACHE", {"source-bound-panel": retained_panel})
+    epoch = signal_engine.live_panel_cache_epoch()
+    clears = []
+    monkeypatch.setattr(signal_engine, "clear_live_panel_memory_cache", lambda: clears.append(True))
+    for index in range(6):
+        path = tmp_path / f"mode-{index}.yaml"
+        assert signal_engine._observe_completed_panel_identity(path, f"source-{index}") is False
+        assert signal_engine._observe_completed_panel_identity(path, f"source-{index}") is False
+    assert clears == []
+    assert signal_engine._LIVE_PANEL_CACHE["source-bound-panel"] is retained_panel
+    assert signal_engine.live_panel_cache_epoch() == epoch
+
+
+def test_changed_completed_source_retains_global_invalidation_and_epoch_fence(monkeypatch, tmp_path):
+    monkeypatch.setattr(signal_engine, "_LIVE_COMPLETED_SOURCE_IDENTITIES", {})
+    path = tmp_path / "mode.yaml"
+    signal_engine.clear_live_panel_memory_cache()
+    try:
+        epoch = signal_engine.live_panel_cache_epoch()
+        assert signal_engine._observe_completed_panel_identity(path, "original") is False
+        assert signal_engine.live_panel_cache_epoch() == epoch
+        signal_engine._LIVE_PANEL_CACHE["old-panel"] = object()
+        assert signal_engine._observe_completed_panel_identity(path, "corrected") is True
+        assert signal_engine.live_panel_cache_epoch() == epoch + 1
+        assert signal_engine._LIVE_PANEL_CACHE == {}
+        assert signal_engine._observe_completed_panel_identity(path, "corrected") is False
+        assert signal_engine.live_panel_cache_epoch() == epoch + 1
+        assert signal_engine._observe_completed_panel_identity(path, "original") is True
+        assert signal_engine.live_panel_cache_epoch() == epoch + 2
+    finally:
+        signal_engine.clear_live_panel_memory_cache()
+
+
 def test_live_panel_workers_are_bounded_by_host_capacity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -900,15 +936,25 @@ def test_live_tail_panel_disk_cache_survives_process_memory_clear(
     monkeypatch.setattr(signal_engine.os, "cpu_count", lambda: 16)
     signal_engine.clear_live_panel_memory_cache()
 
+    cold_observation, hot_observation, disk_observation = {}, {}, {}
     first, first_hit, first_tier = signal_engine._build_panel(
         config,
         live_tail=True,
+        cache_observation=cold_observation,
     )
+    signal_engine._build_panel(config, live_tail=True, cache_observation=hot_observation)
+    assert hot_observation["base_cache_key"] == cold_observation["base_cache_key"]
+    assert cold_observation["resident_before"] is False and cold_observation["resident_after"] is True
+    assert hot_observation["resident_before"] is True and hot_observation["base_cache_hit"] is True
     signal_engine.clear_live_panel_memory_cache()
     second, second_hit, second_tier = signal_engine._build_panel(
         config,
         live_tail=True,
+        cache_observation=disk_observation,
     )
+    assert disk_observation["base_cache_key"] == cold_observation["base_cache_key"]
+    assert disk_observation["panel_cache_epoch"] > cold_observation["panel_cache_epoch"]
+    assert disk_observation["base_cache_tier"] == "disk" and disk_observation["resident_before"] is False
 
     assert first.num_dates == 1
     assert str(first.dates[0]) == "2026-09-02"
@@ -1153,6 +1199,33 @@ def test_build_rebalance_rows_sorts_by_absolute_delta() -> None:
     assert rows[0]["delta_weight"] == -0.3
     assert rows[0]["trade_price"] == 20.0
     assert rows[0]["price_return"] == 1.0
+
+
+def test_rebalance_rows_preserve_missing_price_and_signed_return_semantics() -> None:
+    rows = build_rebalance_rows(
+        ["long", "short", "cash", "missing", "invalid", "inf"],
+        np.array([0.1, -0.2, 0.0, 0.3, -0.1, 0.4]),
+        np.array([0.2, 0.0, 0.0, 0.3, -0.1, 0.4]),
+        np.array([110.0, 80.0, 12.0, np.nan, 10.0, np.inf]),
+        np.array([100.0, 100.0, 10.0, 5.0, 0.0, 7.0]),
+        symbol_names={"short": "Short"},
+    )
+    by_symbol = {row["symbol"]: row for row in rows}
+    assert by_symbol["short"]["name"] == "Short"
+    assert by_symbol["short"]["action"] == "EXIT"
+    assert np.isclose(by_symbol["long"]["price_return"], 0.1)
+    assert np.isclose(by_symbol["long"]["portfolio_contribution"], 0.01)
+    assert np.isclose(by_symbol["short"]["price_return"], -0.2)
+    assert np.isclose(by_symbol["short"]["stock_return"], 0.2)
+    assert np.isclose(by_symbol["short"]["portfolio_contribution"], 0.04)
+    assert by_symbol["cash"]["action"] == "HOLD"
+    assert by_symbol["cash"]["stock_return"] == 0.0
+    for symbol in ("missing", "invalid", "inf"):
+        assert np.isnan(by_symbol[symbol]["price_return"])
+        assert np.isnan(by_symbol[symbol]["stock_return"])
+        assert np.isnan(by_symbol[symbol]["portfolio_contribution"])
+    assert np.isnan(by_symbol["missing"]["current_price"])
+    assert np.isnan(by_symbol["inf"]["current_price"])
 
 
 def test_holdings_record_sort_key_uses_absolute_holding_ratio() -> None:

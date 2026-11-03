@@ -131,14 +131,26 @@ def inspect_sources(
 ) -> tuple[dict[str, Any], list[str]]:
     audit_bytes = audit_path.read_bytes()
     opening = json.loads(audit_bytes)
-    if (opening.get("contract") != "daily_opening_original_clock_deadline_v1"
+    audit_contract = opening.get("contract")
+    if (audit_contract not in {
+            "daily_opening_original_clock_deadline_v1", "daily_native_opening_latency_audit_v1"}
             or opening.get("session_date") != day.isoformat()):
         raise ValueError("opening audit is not the requested session's original-clock receipt")
     expected = set(opening.get("expected_markets") or [])
     by_market = {spec.market: spec for spec in specs}
     if not expected or expected != set(by_market):
         raise ValueError("current enabled modes differ from the audited opening roster")
-    published = (opening.get("publication") or {}).get("modes") or {}
+    publication = opening.get(
+        "opening_publication_slo" if audit_contract == "daily_native_opening_latency_audit_v1"
+        else "publication"
+    ) or {}
+    if audit_contract == "daily_native_opening_latency_audit_v1" and (
+        publication.get("contract") != "all_enabled_mode_immutable_publication_stages_v1"
+        or publication.get("expected_mode_count") != len(expected)
+        or set(publication.get("modes") or {}) != expected
+    ):
+        raise ValueError("native opening publication contract or roster differs")
+    published = publication.get("modes") or {}
     registrations, event_digest = _registered_events(state_dir, day)
     state = read_paper_state(state_dir / "state.json")
     if state.get("simulation_only") is not True or state.get("production_order_possible") is not False:
@@ -232,6 +244,8 @@ def inspect_sources(
         "status": "source_inventory_only_not_a_replay_or_deployment_acceptance",
         "simulation_only": True, "production_order_possible": False, "ledger_modified": False,
         "opening_audit_path": str(audit_path.resolve()), "opening_audit_sha256": hashlib.sha256(audit_bytes).hexdigest(),
+        "opening_audit_contract": audit_contract,
+        "opening_audit_evidence_errors": opening.get("evidence_errors") or [],
         "logical_event_journal_sha256": event_digest, "modes": result,
         "first_signal_missing_distinct_symbols": len(missing_symbols),
         "local_0901_rows_found": len(books), "local_rows_are_not_fill_or_receipt_verification": True,

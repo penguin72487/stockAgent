@@ -219,7 +219,8 @@ def test_only_proven_entry_bracket_cancellations_are_terminal(change):
 @pytest.mark.parametrize("change", [None, "working", "other_status", "wrong_signal", "wrong_session",
                                     "wrong_market", "wrong_symbol", "missing_settlement", "early_settlement",
                                     "future_settlement", "naive_settlement", "pending_total", "unknown_size",
-                                    "negative_remaining", "open_position"])
+                                    "negative_remaining", "open_position", "prior_consumed_signal",
+                                    "malformed_consumed_ids", "consumed_wrong_session"])
 def test_only_settled_exit_priority_entry_cancellation_is_terminal(change):
     state, bot, sync = receipts()
     mode = state["modes"]["tw_day_trade_100m"]
@@ -261,13 +262,81 @@ def test_only_settled_exit_priority_entry_cancellation_is_terminal(change):
         order["remaining_shares"] = -1
     elif change == "open_position":
         mode["positions"] = {"2330": {"signed_shares": 1000}}
-    if change is None:
+    elif change == "prior_consumed_signal":
+        mode["processed_signal_ids"] = ["immutable", "post-close-cache"]
+        mode["signal_id"] = bot["mode_signal_ids"]["tw_day_trade_100m"] = "post-close-cache"
+        sync["modes"]["tw_day_trade_100m"]["signal_id"] = "post-close-cache"
+    elif change == "malformed_consumed_ids":
+        order["position"]["signal_id"] = "prior"
+        mode["processed_signal_ids"] = {"prior": True}
+    elif change == "consumed_wrong_session":
+        order["position"]["signal_id"] = "prior"
+        order["position"]["session_date"] = "2026-10-14"
+        mode["processed_signal_ids"] = ["prior"]
+    if change in (None, "prior_consumed_signal"):
         plan = reload.reload_plan(state, bot, sync, now=closed, engine_only=True)
         assert plan["pending_orders"] == plan["nonflat_count"] == 0
         assert plan["retained_terminal_orders"] == 1
     else:
         with pytest.raises(ValueError, match="nonflat|pending orders"):
             reload.reload_plan(state, bot, sync, now=closed, engine_only=True)
+
+
+@pytest.mark.parametrize("change", [None, "same_day", "wrong_status", "missing_evidence",
+    "missing_pending_reductions", "pending_reductions", "pending_auction", "unresolved_exit",
+    "missing_position_quantity", "open_position", "missing_settlement", "wrong_session",
+    "unconsumed_signal", "matching_but_unconsumed"])
+def test_previous_session_cancelled_entry_survives_overnight_readiness_status(change):
+    state, bot, sync = receipts()
+    mode = state["modes"]["tw_day_trade_100m"]
+    prior = NOW.date().isoformat()
+    mode.update(positions={"cohort": {"signed_shares": 0}}, session_date=prior,
+                engine_status="waiting_09_00_signal", pending_entry_shares=0,
+                pending_reduction_shares=0, closing_auction_pending_count=0,
+                unresolved_exit_count=0, execution_evidence_complete=True,
+                closing_auction_settled_at=NOW.replace(hour=13, minute=30).isoformat(),
+                processed_signal_ids=["immutable"])
+    order = {"status": "cancelled_exit_priority", "sizing_pending": False,
+             "remaining_shares": 2000,
+             "position": {"signal_id": "immutable", "session_date": prior,
+                          "market": "tw_day_trade_100m", "symbol": "2330"}}
+    mode["pending_entry_orders"] = {"2330": order}
+    mode["pending_reduction_orders"] = {}
+    observed = (NOW + timedelta(days=1)).replace(hour=0, minute=15)
+    if change == "same_day":
+        observed = NOW.replace(hour=14)
+    elif change == "wrong_status":
+        mode["engine_status"] = "waiting_signal"
+    elif change == "missing_evidence":
+        mode["execution_evidence_complete"] = False
+    elif change == "missing_pending_reductions":
+        mode.pop("pending_reduction_shares")
+    elif change == "pending_reductions":
+        mode["pending_reduction_shares"] = 1000
+    elif change == "pending_auction":
+        mode["closing_auction_pending_count"] = 1
+    elif change == "unresolved_exit":
+        mode["unresolved_exit_count"] = 1
+    elif change == "missing_position_quantity":
+        mode["positions"]["cohort"] = {}
+    elif change == "open_position":
+        mode["positions"]["cohort"]["signed_shares"] = 1000
+    elif change == "missing_settlement":
+        mode.pop("closing_auction_settled_at")
+    elif change == "wrong_session":
+        order["position"]["session_date"] = "2026-10-14"
+    elif change == "unconsumed_signal":
+        order["position"]["signal_id"] = "unknown"
+    elif change == "matching_but_unconsumed":
+        mode["processed_signal_ids"] = []
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = observed.isoformat()
+    if change is None:
+        plan = reload.reload_plan(state, bot, sync, now=observed, engine_only=True)
+        assert plan["pending_orders"] == plan["nonflat_count"] == 0
+        assert plan["retained_terminal_orders"] == 1
+    else:
+        with pytest.raises(ValueError, match="nonflat|pending orders|unknown position quantity"):
+            reload.reload_plan(state, bot, sync, now=observed, engine_only=True)
 
 
 @pytest.mark.parametrize("change", ["in_session", "position", "pending_entry", "pending_reduction"])

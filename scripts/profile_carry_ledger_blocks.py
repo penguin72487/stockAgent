@@ -63,6 +63,7 @@ def main():
         subscription_right_policy=cfg.trading.tw_day_trade_subscription_right_policy,
         entry_remainder_policy=cfg.trading.tw_day_trade_entry_remainder_policy,
         terminal_liquidation_unlimited_capacity=cfg.trading.tw_day_trade_terminal_liquidation_unlimited_capacity,
+        short_limit_up_penalty_rate=cfg.trading.tw_day_trade_short_limit_up_penalty_rate,
         sparse_event_slots=None)
     with np.load(a.actions, allow_pickle=False) as data:
         symbols = tuple(str(s) for s in data['carry_universe'])

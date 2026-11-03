@@ -234,6 +234,58 @@ def test_official_original_union_requires_complete_daily_book(tmp_path):
     assert bars['volume'].sum() == 1
 
 
+def test_official_supplement_repairs_only_full_book_verified_gaps(tmp_path):
+    import zipfile
+    from scripts.prepare_tw_futures_decision_clocks import supplement_official_recent, paired_entries
+
+    bound, _ = _bound_source()
+    day = bound['date'][0]
+    source = pl.concat([bound.with_columns(pl.lit(month).alias('contract'),
+                        pl.lit('TGF:' + month).alias('physical_contract'),
+                        pl.lit(None, dtype=pl.Date).alias('official_expiry'),
+                        pl.lit(100.5).alias('high'), pl.lit(100.5).alias('low'),
+                        pl.lit(100.5).alias('close'), pl.lit(100.5).alias('observed_open'),
+                        pl.lit(volume).alias('outright_volume'), pl.lit(0).alias('block_volume'),
+                        pl.lit(True).alias('executable'), pl.lit(month).alias('symbol'))
+                        for month, volume in [('202602', 2), ('202603', 3), ('202604', 1)]])
+    raw = pl.DataFrame(dict(date=[f'{day} 08:47:01'] * 3, futures_id=['TGF'] * 3,
+        contract_date=['202602', '202603', '202604'], price=[100.5] * 3, volume=[2] * 3))
+    minutes, coverage, trades = normalize_bulk_stock_ticks(raw, day=day, expected=source,
+        source_sha256='b' * 64, asset_scope='all_twd')
+    assert coverage.sort('contract')['verified'].to_list() == [False, False, True]
+    archive = tmp_path / 'Daily_2026_01_05.zip'
+    with zipfile.ZipFile(archive, 'w') as zipped:
+        zipped.writestr('Daily_2026_01_05.csv',
+            'date,product,month,time,price,quantity,near,far,opening\n'
+            '20260105,TGF,202602,084701,100.5,2,-,-,*\n'
+            '20260105,TGF,202602,123000,100.5,2,-,-,\n'
+            '20260105,TGF,202603,084701,100.5,2,-,-,*\n'
+            '20260105,TGF,202603,123000,100.5,2,-,-,\n'
+            '20260105,TGF,202604,084701,100.5,2,-,-,*\n')
+    receipt = tmp_path / 'manifest.json'
+    record = dict(kind='futures', trading_date=str(day), path=str(archive), bytes=archive.stat().st_size,
+        sha256=sha256_file(archive), url='https://www.taifex.com.tw/file/taifex/Dailydownload/'
+        'DailydownloadCSV/Daily_2026_01_05.zip')
+    receipt.write_text(json.dumps(dict(dataset='taifex_recent_tx_txo_trade_by_trade',
+                                       status='complete', raw_downloads=[record])))
+    # The block quantities come from the source coverage, as in the builder.
+    rebuilt, verified, updated, events, proof = supplement_official_recent(
+        receipt, source.drop('block_volume'), minutes, coverage, trades,
+        progress=lambda **_: None, workers=1, window_minutes=300)
+    assert updated.sort('contract')['verified'].to_list() == [True, False, True]
+    assert updated.sort('contract')['source_file_sha256'].to_list() == [sha256_file(archive), 'b' * 64, 'b' * 64]
+    assert proof['accepted_contract_days'] == 1 and proof['fill_verified'] is False
+    assert set(verified['physical_contract']) == {'TGF:202602', 'TGF:202604'}
+    assert set(events['source_sha256']) == {sha256_file(archive), 'b' * 64}
+    entries = paired_entries(source, rebuilt, verified, asset_scope='all_twd', window_minutes=300)
+    assert entries['08:45'].sort('physical_contract')['status'].to_list() == [
+        'observed_minute', 'missing_source', 'observed_minute']
+    archive.write_bytes(archive.read_bytes() + b'x')
+    with pytest.raises(ValueError, match='SHA|size'):
+        supplement_official_recent(receipt, source.drop('block_volume'), minutes, coverage, trades,
+                                  progress=lambda **_: None, workers=1, window_minutes=300)
+
+
 @pytest.mark.parametrize('price', [49.99, 50.05])
 def test_bound_etf_specification_controls_grid_after_legacy_registry_window(price):
     day = date(2026, 10, 6)

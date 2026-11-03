@@ -83,6 +83,303 @@ def test_candidate_trigger_tracks_new_body_without_changing_mobile_observations(
         assert queue.db.execute('SELECT cnyes_known_body_candidate FROM articles WHERE id=?', (row['id'],)).fetchone()[0] == 0
 
 
+def test_primary_provider_change_updates_hints_and_metrics_transactionally(queue):
+    primary = 'https://news.cnyes.com/news/id/1'
+    variants = ('https://m.cnyes.com/news/id/1', primary + '?exp=a')
+    with queue.db:
+        queue.add_articles([{'url': primary}, *({'url': url, 'title': 'retained title'} for url in variants)])
+        queue.db.execute('UPDATE articles SET state=\'complete\',body_sha256=? WHERE url=?', ('a' * 64, primary))
+        queue.db.execute("UPDATE articles SET state='retry_cooldown',due=?,error_code='http_403' WHERE url=?",
+                         (time.time() + 3600, variants[0]))
+    before = [dict(r) for r in queue.db.execute('SELECT * FROM articles WHERE url IN (?,?) ORDER BY url', variants)]
+    assert [r['cnyes_known_body_candidate'] for r in before] == [1, 1]
+    metrics = assert_work_metrics(queue)
+    with pytest.raises(RuntimeError), queue.db:
+        queue.db.execute('UPDATE articles SET provider=? WHERE url=?', ('unregistered:changed', primary))
+        assert assert_work_metrics(queue)['existing_primary_body_candidates'] == 0
+        raise RuntimeError('rollback primary reassignment and hints')
+    assert assert_work_metrics(queue) == metrics
+    with queue.db:
+        queue.db.execute('UPDATE articles SET provider=? WHERE url=?', ('unregistered:changed', primary))
+    after = [dict(r) for r in queue.db.execute('SELECT * FROM articles WHERE url IN (?,?) ORDER BY url', variants)]
+    assert [r['cnyes_known_body_candidate'] for r in after] == [0, 0]
+    assert all(all(old[key] == new[key] for key in old if key != 'cnyes_known_body_candidate')
+               for old, new in zip(before, after))
+    assert assert_work_metrics(queue)['no_known_primary_body_urls'] == 2
+    with queue.db:
+        queue.db.execute('UPDATE articles SET provider=? WHERE url=?', ('cnyes', primary))
+    assert assert_work_metrics(queue)['existing_primary_body_candidates'] == 2
+
+
+@pytest.mark.parametrize('old_provider,old_body,new_provider,new_body,expected', [
+    ('unregistered:changed', None, 'cnyes', 'a' * 64, 1),
+    ('cnyes', 'a' * 64, 'unregistered:changed', None, 0),
+    ('unregistered:changed', 'a' * 64, 'cnyes', None, 0),
+    ('cnyes', None, 'unregistered:changed', 'a' * 64, 0),
+])
+def test_provider_and_body_change_together_have_current_hint(queue, old_provider, old_body,
+                                                            new_provider, new_body, expected):
+    primary = 'https://news.cnyes.com/news/id/1'
+    mobile = 'https://m.cnyes.com/news/id/1'
+    with queue.db:
+        queue.add_articles([{'url': primary}, {'url': mobile}])
+        queue.db.execute("UPDATE articles SET state='complete',provider=?,body_sha256=? WHERE url=?",
+                         (old_provider, old_body, primary))
+        queue.db.execute('UPDATE articles SET provider=?,body_sha256=? WHERE url=?',
+                         (new_provider, new_body, primary))
+    row = queue.db.execute('SELECT body_sha256,cnyes_known_body_candidate FROM articles WHERE url=?', (mobile,)).fetchone()
+    assert row['body_sha256'] is None and row['cnyes_known_body_candidate'] == expected
+    assert assert_work_metrics(queue)['existing_primary_body_candidates'] == expected
+
+
+@pytest.mark.parametrize('stale_positive', [False, True])
+@pytest.mark.parametrize('through_owner', [False, True])
+def test_dispatch_heals_preexisting_hint_before_selecting_a_lane(queue, stale_positive, through_owner):
+    from downloader.news_fulltext_cnyes_work import candidate
+    primary = 'https://news.cnyes.com/news/id/1'
+    variant = 'https://m.cnyes.com/news/id/1'
+    alternative_primary = 'https://news.cnyes.com/news/id/2'
+    alternative = 'https://m.cnyes.com/news/id/2' if stale_positive else alternative_primary
+    with queue.db:
+        queue.add_articles([{'url': primary}, {'url': variant, 'date': '2026-10-20'},
+                            {'url': alternative_primary, 'date': '2014-01-01'}])
+        if stale_positive:
+            queue.db.execute('UPDATE articles SET state=\'complete\',body_sha256=? WHERE url=?',
+                             ('b' * 64, alternative_primary))
+            queue.add_articles([{'url': alternative, 'date': '2014-01-01'}])
+        else:
+            queue.db.execute('UPDATE articles SET state=\'complete\',body_sha256=? WHERE url=?', ('a' * 64, primary))
+        # Reproduce a hint left by older code without rewriting observations.
+        queue.db.execute('UPDATE articles SET cnyes_known_body_candidate=? WHERE url=?', (int(stale_positive), variant))
+        before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (variant,)).fetchone())
+        if through_owner:
+            queue._cnyes_primary_body_burst = 8 if stale_positive else 0
+            selected = queue.claim('cnyes', 300)
+        else:
+            selected = candidate(queue, 'pending', time.time(), prefer_known=stale_positive)
+        after = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (variant,)).fetchone())
+    assert selected['url'] == alternative
+    assert after['cnyes_known_body_candidate'] == int(not stale_positive)
+    assert all(before[key] == after[key] for key in before if key != 'cnyes_known_body_candidate')
+    assert_work_metrics(queue)
+
+
+def test_owner_repairs_large_stale_frontier_in_bounded_slices_without_stalling(queue):
+    with queue.db:
+        for number in range(1, 13):
+            primary = f'https://news.cnyes.com/news/id/{number}'
+            variant = f'https://m.cnyes.com/news/id/{number}'
+            queue.add_articles([{'url': primary}, {'url': variant, 'date': '2026-10-20'}])
+            queue.db.execute("UPDATE articles SET state='complete',body_sha256=? WHERE url=?", ('a' * 64, primary))
+            queue.db.execute('UPDATE articles SET cnyes_known_body_candidate=0 WHERE url=?', (variant,))
+        missing = 'https://news.cnyes.com/news/id/99'
+        queue.add_articles([{'url': missing, 'date': '2014-01-01'}])
+    first = queue.claim('cnyes', 300)
+    assert first and first['host'] == 'm.cnyes.com'
+    assert queue.db.execute("SELECT count(*) FROM articles WHERE host='m.cnyes.com' AND cnyes_known_body_candidate=1").fetchone()[0] == 8
+    assert queue.claim('cnyes', 300)['url'] == missing
+    assert_work_metrics(queue)
+
+
+@pytest.mark.parametrize('primary_has_body', [False, True])
+def test_unchanged_variant_hint_recheck_uses_index_and_does_not_write(queue, primary_has_body):
+    from downloader.news_fulltext_cnyes_work import candidate
+    primary = 'https://news.cnyes.com/news/id/1'
+    variant = 'https://m.cnyes.com/news/id/1'
+    with queue.db:
+        queue.add_articles([{'url': primary}, {'url': variant}])
+        queue.db.execute("UPDATE articles SET state='complete',body_sha256=? WHERE url=?",
+                         ('a' * 64 if primary_has_body else None, primary))
+        before = queue.db.total_changes
+        queries = []
+        queue.db.set_trace_callback(queries.append)
+        selected = candidate(queue, 'pending', time.time(), prefer_known=primary_has_body)
+        queue.db.set_trace_callback(None)
+        assert selected['url'] == variant
+        assert queue.db.total_changes == before
+        assert not any(query.lstrip().upper().startswith('UPDATE ARTICLES') for query in queries)
+        plan = [row['detail'] for row in queue.db.execute(
+            "EXPLAIN QUERY PLAN SELECT body_sha256 FROM articles WHERE id=? AND provider='cnyes'",
+            (canonical_candidate_id(variant),))]
+        assert any('SEARCH articles USING INDEX' in item for item in plan)
+        assert not any('SCAN articles' in item for item in plan)
+
+
+def test_unsupported_import_classification_does_not_issue_a_database_update(queue):
+    from downloader.news_fulltext_cnyes_work import classify
+    url = 'https://m.cnyes.com/news/id/1?exp=c'
+    with queue.db:
+        queue.add_articles([{'url': url}])
+        row = queue.db.execute('SELECT id,url,provider FROM articles WHERE url=?', (url,)).fetchone()
+        queries = []
+        queue.db.set_trace_callback(queries.append)
+        assert not classify(queue, row)
+        queue.db.set_trace_callback(None)
+    assert not any(query.lstrip().upper().startswith('UPDATE ARTICLES') for query in queries)
+
+
+def test_dispatch_clears_unsupported_stale_hint_and_still_serves_work(queue):
+    from downloader.news_fulltext_cnyes_work import candidate
+    primary = 'https://news.cnyes.com/news/id/1'
+    with queue.db:
+        queue.add_articles([{'url': primary}])
+        queue.db.execute('UPDATE articles SET cnyes_known_body_candidate=1,cnyes_canonical_candidate_id=? WHERE url=?',
+                         (b'x' * 32, primary))
+        selected = candidate(queue, 'pending', time.time(), prefer_known=True)
+    assert selected['url'] == primary
+    assert selected['cnyes_known_body_candidate'] == 0
+    assert selected['cnyes_canonical_candidate_id'] is None
+    assert_work_metrics(queue)
+
+
+@pytest.mark.parametrize('case', ['unsupported', 'mobile_missing_body', 'mobile_known_body'])
+@pytest.mark.parametrize('through_owner', [False, True])
+def test_dispatch_returns_repaired_target_even_when_priority_lane_is_unchanged(queue, case, through_owner):
+    from downloader.news_fulltext_cnyes_work import candidate
+
+    primary = 'https://news.cnyes.com/news/id/1'
+    variant = primary if case == 'unsupported' else 'https://m.cnyes.com/news/id/1'
+    known = case == 'mobile_known_body'
+    with queue.db:
+        queue.add_articles([{'url': primary}])
+        if case != 'unsupported':
+            queue.db.execute("UPDATE articles SET state='complete',body_sha256=? WHERE url=?",
+                             ('a' * 64 if known else None, primary))
+            queue.add_articles([{'url': variant}])
+        queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=?,cnyes_known_body_candidate=? WHERE url=?',
+                         (b'\xa5' * 32, int(known), variant))
+        original = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (variant,)).fetchone())
+
+    selected = queue.claim('cnyes', 300) if through_owner else candidate(queue, 'pending', time.time(), prefer_known=known)
+    current = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (variant,)).fetchone())
+    expected = canonical_candidate_id(variant)
+    assert selected['id'] == current['id'] == original['id']
+    assert selected['cnyes_canonical_candidate_id'] == current['cnyes_canonical_candidate_id'] == expected
+    assert selected['cnyes_known_body_candidate'] == current['cnyes_known_body_candidate'] == int(known)
+    assert all(current[key] == original[key] for key in ('url', 'provider', 'due', 'error_code',
+        'body_sha256', 'parquet_path', 'title', 'metadata_order_day'))
+    assert_work_metrics(queue)
+
+
+@pytest.mark.parametrize('lane', ['retry', 'undated', 'stored'])
+def test_nonregular_claim_repairs_stale_cnyes_hint_before_returning(queue, lane):
+    primary = 'https://news.cnyes.com/news/id/1'
+    variant = 'https://m.cnyes.com/news/id/1'
+    with queue.db:
+        queue.add_articles([{'url': primary}])
+        queue.db.execute("UPDATE articles SET state='complete',body_sha256=? WHERE url=?", ('a' * 64, primary))
+        queue.add_articles([{'url': variant, **({} if lane == 'undated' else {'date': '2026-10-09'})}])
+        queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=?,cnyes_known_body_candidate=0 WHERE url=?',
+                         (b'\xa5' * 32, variant))
+        if lane in {'retry', 'stored'}:
+            queue.db.execute("UPDATE articles SET state='retry',error_code='transport_error',due=0,body_sha256=? WHERE url=?",
+                             ('b' * 64 if lane == 'stored' else None, variant))
+        original = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (variant,)).fetchone())
+    if lane == 'retry':
+        queue._pending_body_dispatch_bursts = {'cnyes': 8}
+    elif lane == 'undated':
+        queue._dated_body_dispatch_bursts = {'cnyes': 8}
+    else:
+        queue._missing_body_dispatch_bursts = {'cnyes': 8}
+
+    selected = queue.claim('cnyes', 300)
+    current = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (variant,)).fetchone())
+    assert selected['id'] == current['id'] == original['id']
+    assert selected['cnyes_canonical_candidate_id'] == current['cnyes_canonical_candidate_id'] == canonical_candidate_id(variant)
+    assert selected['cnyes_known_body_candidate'] == current['cnyes_known_body_candidate'] == 1
+    assert all(current[key] == original[key] for key in ('url', 'provider', 'due', 'error_code',
+        'body_sha256', 'parquet_path', 'title', 'metadata_order_day'))
+    if lane != 'stored':
+        counts = queue.metrics.snapshot()['providers']['cnyes']['counts']
+        assert counts['frontier_existing_body_candidate_dispatches'] == 1
+    assert_work_metrics(queue)
+
+
+def test_nonregular_claim_does_not_use_a_changed_head_after_hint_repair(queue, monkeypatch):
+    from downloader import news_fulltext_cnyes_work as work
+
+    primary = 'https://news.cnyes.com/news/id/1'
+    variant = 'https://m.cnyes.com/news/id/1'
+    with queue.db:
+        queue.add_articles([{'url': primary}, {'url': variant}])
+        queue.db.execute("UPDATE articles SET state='complete',body_sha256=? WHERE url=?", ('a' * 64, primary))
+        queue.db.execute("UPDATE articles SET state='retry',error_code='transport_error',due=0,"
+                         'cnyes_canonical_candidate_id=?,cnyes_known_body_candidate=0 WHERE url=?', (b'\xa5' * 32, variant))
+    queue._pending_body_dispatch_bursts = {'cnyes': 8}
+    original = work.classify
+
+    def change_after_repair(owner, row, **kwargs):
+        result = original(owner, row, **kwargs)
+        if row['url'] == variant and result is None:
+            owner.db.execute("UPDATE articles SET state='complete',body_sha256=? WHERE id=?", ('b' * 64, row['id']))
+        return result
+
+    monkeypatch.setattr(work, 'classify', change_after_repair)
+    assert queue.claim('cnyes', 300) is None
+    row = queue.db.execute('SELECT state,body_sha256,lease_owner FROM articles WHERE url=?', (variant,)).fetchone()
+    assert tuple(row) == ('complete', 'b' * 64, None)
+    assert_work_metrics(queue)
+
+
+@pytest.mark.parametrize('variant', ['https://m.cnyes.com/news/id/1', 'https://news.cnyes.com/news/id/1'])
+def test_hint_repair_does_not_write_if_snapshot_provider_has_changed(queue, variant):
+    from downloader.news_fulltext_cnyes_work import classify
+
+    with queue.db:
+        queue.add_articles([{'url': variant}])
+        queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=? WHERE url=?', (b'\xa5' * 32, variant))
+        old = queue.db.execute('SELECT * FROM articles WHERE url=?', (variant,)).fetchone()
+        queue.db.execute("UPDATE articles SET provider='unregistered:changed' WHERE url=?", (variant,))
+        before = queue.db.total_changes
+        assert classify(queue, old, current_fields_trusted=True, signal_stale=True) is None
+        assert queue.db.total_changes == before
+    after = queue.db.execute('SELECT provider,cnyes_canonical_candidate_id FROM articles WHERE url=?', (variant,)).fetchone()
+    assert tuple(after) == ('unregistered:changed', b'\xa5' * 32)
+
+
+def test_existing_queue_installs_provider_hint_trigger_on_restart(queue, tmp_path):
+    primary = 'https://news.cnyes.com/news/id/1'
+    mobile = 'https://m.cnyes.com/news/id/1'
+    with queue.db:
+        queue.add_articles([{'url': primary}, {'url': mobile}])
+        queue.db.execute('UPDATE articles SET state=\'complete\',body_sha256=? WHERE url=?', ('a' * 64, primary))
+        queue.db.execute('DROP TRIGGER cnyes_candidate_body_provider_update')
+    registry = queue.registry
+    queue.close()
+    reopened = NewsQueue(tmp_path, registry)
+    try:
+        with reopened.db:
+            reopened.db.execute('UPDATE articles SET provider=? WHERE url=?', ('unregistered:changed', primary))
+        assert reopened.db.execute('SELECT cnyes_known_body_candidate FROM articles WHERE url=?', (mobile,)).fetchone()[0] == 0
+        assert_work_metrics(reopened)
+    finally:
+        reopened.close()
+
+
+def test_restarted_owner_policy_reconciliation_updates_primary_provider_hint(queue, config, tmp_path):
+    from copy import deepcopy
+    primary = 'https://news.cnyes.com/news/id/1'
+    mobile = 'https://m.cnyes.com/news/id/1'
+    with queue.db:
+        queue.add_articles([{'url': primary}, {'url': mobile, 'title': 'original metadata'}])
+        queue.db.execute("UPDATE articles SET state='complete',body_sha256=? WHERE url=?", ('a' * 64, primary))
+    assert queue.db.execute('SELECT cnyes_known_body_candidate FROM articles WHERE url=?', (mobile,)).fetchone()[0] == 1
+    queue.close()
+    changed = deepcopy(config)
+    changed['providers'][0]['domains'] = ['m.cnyes.com', 'api.cnyes.com']
+    reopened = NewsQueue(tmp_path, PolicyRegistry(changed, base=tmp_path))
+    try:
+        source = reopened.db.execute('SELECT provider,body_sha256 FROM articles WHERE url=?', (primary,)).fetchone()
+        view = reopened.db.execute('SELECT provider,body_sha256,title,cnyes_known_body_candidate FROM articles WHERE url=?',
+                                   (mobile,)).fetchone()
+        assert source['provider'] == 'unregistered:news.cnyes.com' and source['body_sha256'] == 'a' * 64
+        assert view['provider'] == 'cnyes' and view['body_sha256'] is None and view['title'] == 'original metadata'
+        assert view['cnyes_known_body_candidate'] == 0
+        assert_work_metrics(reopened)
+    finally:
+        reopened.close()
+
+
 def test_future_retries_refusals_and_other_worker_leases_are_never_reset(queue):
     seed(queue)
     deadline = time.time() + 3600
@@ -419,6 +716,136 @@ def test_exhausted_and_stopped_backfill_do_not_write_a_checkpoint(queue):
     assert backfill(queue, stop=stopped)['checked_heads'] == 0
     assert queue.db.total_changes == before
     assert maintenance_delay({'checked_heads': 1}) == 0.25
+
+
+def test_slow_checkpoint_seek_eventually_classifies_later_state_without_source_request(queue, monkeypatch):
+    from types import SimpleNamespace
+    from downloader import news_fulltext_cnyes_work as work, news_fulltext_urls as urls
+
+    mobile = 'https://m.cnyes.com/news/id/4123456'
+    with queue.db:
+        queue.add_articles([{'url': mobile}])
+        queue.db.execute("UPDATE articles SET state='retry',error_code='transport_error',due=?,"
+                         "cnyes_canonical_candidate_id=NULL,cnyes_known_body_candidate=0 WHERE url=?",
+                         (1234567890, mobile))
+    before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (mobile,)).fetchone())
+    clock = [0.0]
+    read = urls._read_checkpoint
+    def slow(*args, **kwargs):
+        result = read(*args, **kwargs)
+        clock[0] += 1.0
+        return result
+    monkeypatch.setattr(work, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(urls, '_read_checkpoint', slow)
+    monkeypatch.setattr('downloader.news_fulltext_http.NewsHTTP.__init__',
+                        lambda *args, **kwargs: pytest.fail('local backfill must not request a publisher'))
+    results = [backfill(queue, max_seconds=.04) for _ in range(12)]
+    assert sum(result['checked_heads'] for result in results) == 1
+    after = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (mobile,)).fetchone())
+    assert after['cnyes_canonical_candidate_id'] == canonical_candidate_id(mobile)
+    assert all(after[key] == before[key] for key in before if not key.startswith('cnyes_'))
+    assert all(result['publisher_requests'] == 0 and not result['source_observations_merged'] for result in results)
+
+
+def test_slow_empty_seek_sweeps_each_state_once_then_returns_to_idle(queue, monkeypatch):
+    from types import SimpleNamespace
+    from downloader import news_fulltext_cnyes_work as work, news_fulltext_urls as urls
+
+    clock = [0.0]
+    read = urls._read_checkpoint
+    def slow(*args, **kwargs):
+        result = read(*args, **kwargs)
+        clock[0] += 1.0
+        return result
+    monkeypatch.setattr(work, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+    monkeypatch.setattr(urls, '_read_checkpoint', slow)
+    before = queue.db.total_changes
+    results = [backfill(queue, max_seconds=.04) for _ in range(9)]
+    assert all(result['checked_heads'] == 0 for result in results)
+    assert [work.maintenance_delay(result) for result in results] == [.25] * 8 + [5.0]
+    assert queue.db.total_changes == before
+
+
+def test_stopped_candidate_backfill_never_spends_a_slow_seek_turn(queue, monkeypatch):
+    from downloader import news_fulltext_urls as urls
+
+    stopped = threading.Event()
+    stopped.set()
+    monkeypatch.setattr(urls, '_read_checkpoint',
+                        lambda *args, **kwargs: pytest.fail('a stopped owner must not seek'))
+    before = queue.db.total_changes
+    assert backfill(queue, stop=stopped)['checked_heads'] == 0
+    assert queue.db.total_changes == before
+
+
+def test_slow_seek_resumes_after_restart_from_durable_candidate_cursors(config, tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from downloader import news_fulltext_cnyes_work as work, news_fulltext_urls as urls
+
+    owner = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
+    mobile = 'https://m.cnyes.com/news/id/4789012'
+    try:
+        with owner.db:
+            owner.add_articles([{'url': mobile}])
+            owner.db.execute("UPDATE articles SET state='retry',cnyes_canonical_candidate_id=NULL WHERE url=?", (mobile,))
+        clock = [0.0]
+        read = urls._read_checkpoint
+        def slow(*args, **kwargs):
+            result = read(*args, **kwargs)
+            clock[0] += 1.0
+            return result
+        monkeypatch.setattr(work, 'time', SimpleNamespace(monotonic=lambda: clock[0]))
+        monkeypatch.setattr(urls, '_read_checkpoint', slow)
+        assert backfill(owner, max_seconds=.04)['checked_heads'] == 0
+        registry = owner.registry
+        owner.close()
+        owner = NewsQueue(tmp_path, registry)
+        results = [backfill(owner, max_seconds=.04) for _ in range(9)]
+        assert sum(result['checked_heads'] for result in results) == 1
+        row = owner.db.execute('SELECT cnyes_canonical_candidate_id,state FROM articles WHERE url=?', (mobile,)).fetchone()
+        assert row[0] == canonical_candidate_id(mobile) and row[1] == 'retry'
+    finally:
+        owner.close()
+
+
+def test_candidate_backfill_rolls_back_cursor_and_turn_when_classification_fails(queue, monkeypatch):
+    from downloader import news_fulltext_cnyes_work as work
+
+    mobile = 'https://m.cnyes.com/news/id/4567890'
+    with queue.db:
+        queue.add_articles([{'url': mobile}])
+        queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=NULL WHERE url=?', (mobile,))
+    queue._cnyes_candidate_seek_turn = 3  # mobile pending
+    before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (mobile,)).fetchone())
+    real = work.classify
+    def interrupted(*args):
+        real(*args)
+        raise OSError('interrupted local classification')
+    monkeypatch.setattr(work, 'classify', interrupted)
+    with pytest.raises(OSError, match='interrupted local classification'):
+        backfill(queue, limit=1)
+    assert dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (mobile,)).fetchone()) == before
+    assert queue._cnyes_candidate_seek_turn == 3
+    assert not queue.db.execute('SELECT 1 FROM queue_settings WHERE key=?', (work.CURSOR,)).fetchone()
+    monkeypatch.setattr(work, 'classify', real)
+    assert backfill(queue, limit=1)['checked_heads'] == 1
+    assert queue.db.execute('SELECT cnyes_canonical_candidate_id FROM articles WHERE url=?', (mobile,)).fetchone()[0] == canonical_candidate_id(mobile)
+
+
+def test_candidate_backfill_does_not_starve_retry_behind_busy_pending(queue):
+    pending = [f'https://m.cnyes.com/news/id/{i}' for i in range(300, 320)]
+    retry = 'https://m.cnyes.com/news/id/1234567'
+    with queue.db:
+        queue.add_articles([{'url': url} for url in pending + [retry]])
+        queue.db.execute('UPDATE articles SET cnyes_canonical_candidate_id=NULL WHERE host=?', ('m.cnyes.com',))
+        queue.db.execute("UPDATE articles SET state='retry',error_code='transport_error',due=? WHERE url=?",
+                         (1234567890, retry))
+    before = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (retry,)).fetchone())
+    first, second = (backfill(queue, limit=1) for _ in range(2))
+    assert first['checked_heads'] == second['checked_heads'] == 1
+    after = dict(queue.db.execute('SELECT * FROM articles WHERE url=?', (retry,)).fetchone())
+    assert after['cnyes_canonical_candidate_id'] == canonical_candidate_id(retry)
+    assert all(after[key] == before[key] for key in before if not key.startswith('cnyes_'))
 
 
 def test_idle_backfill_does_not_delay_new_import_or_changed_state_claim(queue):

@@ -323,6 +323,10 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
     complement = _read_json(root / "complement" / "status.json")
     complement_stamp = _stamp(complement.get("observed_at_utc"))
     complement_age = max(0, (observed - complement_stamp).total_seconds()) if complement_stamp else None
+    summary_stamp = complement.get("source_status_observed_at_utc", complement.get("observed_at_utc"))
+    summary_state = complement.get("status_aggregate_state", (
+        "carried_previous_snapshot" if "source_status_observed_at_utc" in complement and summary_stamp else
+        "full_snapshot" if summary_stamp else "unavailable"))
     companion_series = complement.get("series") if isinstance(complement.get("series"), Mapping) else {}
     delegated = set(complement.get("delegated_to_sponsor", [])) if isinstance(complement.get("delegated_to_sponsor"), list) else set()
     companion_total = companion_complete = companion_empty = companion_failed = companion_blocked = companion_invalid = companion_exhausted = 0
@@ -375,6 +379,8 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
                  "backfilling" if complete or empty or failed or blocked else "pending")
         datasets.append({
             "id": dataset, "label": '全市場相關新聞' if dataset == 'TaiwanStockNews' else dataset, "kind": kind, "state": state,
+            "summary_observed_at_utc": summary_stamp,
+            "summary_state": summary_state,
             "target_partitions": total + unseeded or None,
             "materialized_partitions": total,
             "target_is_calendar_candidate_estimate": bool(unseeded),
@@ -620,6 +626,8 @@ def build_finmind_public_status(repo_root: Path, *, now: datetime | None = None)
             "sponsor_last_task": _public_task(sponsor.get("last_task")),
             "complement_observed_at_utc": complement.get("observed_at_utc"),
             "complement_status_age_seconds": round(complement_age) if complement_age is not None else None,
+            "complement_summary_observed_at_utc": summary_stamp,
+            "complement_summary_state": summary_state,
             "complement_active_task": {
                 key: complement.get("active_task", {}).get(key)
                 for key in ("dataset", "data_id", "partition")

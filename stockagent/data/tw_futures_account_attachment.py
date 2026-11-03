@@ -37,16 +37,38 @@ _KNOWN_BROKER_HOLIDAY_ACCOUNT_DATES = (
 )
 
 
-def _reject_unreviewed_early_holiday_calendars(dates: np.ndarray) -> None:
+def _reject_unreviewed_early_holiday_calendars(
+    dates: np.ndarray, *, source=None, days: pl.DataFrame | None = None,
+) -> tuple[str, ...]:
     """A market calendar does not establish 2011/2012 broker processing."""
     first, last = str(dates[0]), str(dates[-1])
+    admitted_days: list[str] = []
     for before, after in (("2011-01-28", "2011-02-08"),
                           ("2012-01-18", "2012-01-30")):
         if first <= before and last >= after:
-            raise ValueError(
-                f"futures broker holiday account calendar {before} to {after} "
-                "requires source-bound 2011/2012 processing and valuation review"
-            )
+            from stockagent.data.tw_futures_holiday_account_dates import HolidayAccountDatesSource
+            if not isinstance(source, HolidayAccountDatesSource) or days is None:
+                raise ValueError(
+                    f"futures broker holiday account calendar {before} to {after} "
+                    "requires source-bound 2011/2012 processing and valuation review"
+                )
+            source.verify()
+            matching = [period for period in source.periods
+                        if str(period[0]) == before and str(period[1]) == after]
+            if len(matching) != 1:
+                raise ValueError(
+                    f"futures broker holiday account calendar {before} to {after} "
+                    "requires source-bound 2011/2012 processing and valuation review"
+                )
+            if (not {"date", "accounting_only_date"} <= set(days.columns)
+                    or days["date"].is_duplicated().any()):
+                raise ValueError("early holiday requires an unambiguous source account calendar")
+            records = {str(row["date"]): row["accounting_only_date"] for row in days.to_dicts()}
+            expected = [str(day) for day in matching[0][2]]
+            if not expected or any(records.get(day) is not True for day in expected):
+                raise ValueError("reviewed early holiday processing dates are absent or not account-only")
+            admitted_days.extend(expected)
+    return tuple(admitted_days)
 
 
 def _reject_missing_holiday_account_dates(days: pl.DataFrame, dates: np.ndarray) -> None:
@@ -65,7 +87,10 @@ def _reject_missing_holiday_account_dates(days: pl.DataFrame, dates: np.ndarray)
         )
 
 
-def _reject_unreviewed_holiday_valuations(path: Path, dates: np.ndarray) -> None:
+def _reject_unreviewed_holiday_valuations(
+    path: Path, dates: np.ndarray, *, extra_holiday_dates: tuple[str, ...] = (),
+    source=None,
+) -> None:
     """Keep known exception dates out until their complete source is admitted.
 
     Night closes are only one rule: exempt and day-only products also need
@@ -79,16 +104,24 @@ def _reject_unreviewed_holiday_valuations(path: Path, dates: np.ndarray) -> None
     if not required <= set(schema.names()):
         raise ValueError("account calendar source lacks the holiday valuation scope")
     first, last = str(dates[0]), str(dates[-1])
-    holidays = [day for day in _KNOWN_BROKER_HOLIDAY_ACCOUNT_DATES if first <= day <= last]
+    holidays = [day for day in (*_KNOWN_BROKER_HOLIDAY_ACCOUNT_DATES, *extra_holiday_dates)
+                if first <= day <= last]
     if not holidays:
         return
-    potential = (frame.filter(
+    potential = frame.filter(
         pl.col("accounting_only_date")
         & pl.col("date").cast(pl.String).is_in(holidays)
         & ~pl.col("cash_settlement").fill_null(False)
-    ).select("date", "product").limit(1).collect())
-    if potential.height:
-        raise ValueError("holiday nonterminal valuations require complete source-bound account review")
+    )
+    if source is None:
+        if potential.select("date", "product").limit(1).collect().height:
+            raise ValueError("holiday nonterminal valuations require complete source-bound account review")
+    else:
+        from stockagent.data.tw_futures_holiday_c11 import require_complete_holiday_c11
+        required = ["date", "product", "contract", "physical_instance", "valuation_price"]
+        if not set(required) <= set(schema.names()):
+            raise ValueError("holiday financial scope lacks unambiguous physical identities")
+        require_complete_holiday_c11(path, potential.select(required).unique().collect(), source)
 
 
 @dataclass(slots=True)
@@ -119,13 +152,28 @@ def attach_configured_futures_account_calendar(panel: PanelData, config) -> Pane
     clock = json.loads(clock_path.with_name("manifest.json").read_text())
     if not len(dates) or str(dates[0]) != clock.get("start_date") or str(dates[-1]) != clock.get("end_date"):
         raise ValueError("dual account panel must first be clipped to the verified clock horizon")
-    _reject_unreviewed_early_holiday_calendars(dates)
     daily_path = Path(trading.tw_futures_portfolio_data_path)
+    holiday_source = None
+    holiday_path = getattr(trading, "tw_futures_holiday_account_dates_source", None)
+    if holiday_path is None:
+        # Preserve the original failure boundary without reading a source that
+        # cannot establish the early processing dates.
+        _reject_unreviewed_early_holiday_calendars(dates)
+    else:
+        from stockagent.data.tw_futures_holiday_account_dates import load_holiday_account_dates
+        holiday_source = load_holiday_account_dates(Path(holiday_path), workspace=Path.cwd())
     days = pl.scan_parquet(daily_path).select("date", "accounting_only_date").unique().sort("date").collect()
     if days["date"].is_duplicated().any() or days["accounting_only_date"].null_count():
         raise ValueError("futures source calendar has ambiguous account-only classification")
+    early_holidays = _reject_unreviewed_early_holiday_calendars(dates, source=holiday_source, days=days)
     _reject_missing_holiday_account_dates(days, dates)
-    _reject_unreviewed_holiday_valuations(daily_path, dates)
+    valuation_source = None
+    valuation_path = getattr(trading, "tw_futures_holiday_valuation_source", None)
+    if valuation_path is not None:
+        from stockagent.data.tw_futures_holiday_c11 import load_holiday_c11
+        valuation_source = load_holiday_c11(Path(valuation_path), workspace=Path.cwd())
+    _reject_unreviewed_holiday_valuations(
+        daily_path, dates, extra_holiday_dates=early_holidays, source=valuation_source)
     calendar = build_futures_account_calendar(
         dates, days["date"].to_numpy(), days["accounting_only_date"].to_numpy(),
     )
@@ -133,6 +181,10 @@ def attach_configured_futures_account_calendar(panel: PanelData, config) -> Pane
     attached = attach_configured_stock_context_futures_portfolio(
         axes, config, futures_account_calendar=calendar,
     )
+    if holiday_source is not None:
+        holiday_source.verify()
+    if valuation_source is not None:
+        valuation_source.verify()
     if not np.array_equal(attached.dates, calendar.dates):
         raise ValueError("configured clock unexpectedly changed the dual account horizon")
     daily = attached.stock_context_futures_portfolio_daily

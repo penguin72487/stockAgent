@@ -177,6 +177,111 @@ def test_native_news_migration_requires_bound_complete_acceptance_receipt(layout
     assert result["source_payload_reads"] == result["source_payload_writes"] == 0
 
 
+@pytest.fixture
+def news_layout_repo(tmp_path):
+    """Isolate this news behavior from unrelated host data-root enrollments."""
+    root = tmp_path / 'news-checkout'
+    (root / 'configs').mkdir(parents=True)
+    (root / 'data_news').mkdir()
+    document = json.loads((REPO / 'configs/columnar_storage.json').read_text())
+    roots = document['source_versioning']['roots']
+    document['source_versioning']['roots'] = {'data_news': roots['data_news']}
+    (root / 'configs/columnar_storage.json').write_text(json.dumps(document))
+    return root
+
+
+@pytest.mark.parametrize('pinned_valid', [True, False])
+def test_news_acceptance_uses_the_committed_generations_proof(news_layout_repo, pinned_valid):
+    root = news_layout_repo / 'data_news'
+    manifest = {'contract_version': 2, 'storage_layout': 'news_incremental_parts_v2', 'state': 'ready',
+                'generation': 'versions/committed', 'row_counts': {'articles': 7},
+                'parts': [{'bytes': 23, 'rows': 7}]}
+    (root / 'manifest.json').write_text(json.dumps(manifest))
+    generation = root / manifest['generation']
+    generation.mkdir(parents=True)
+    valid = {'state': 'verified', 'generation': manifest['generation'], 'row_counts': manifest['row_counts'],
+             'parts_verified': 1, 'bytes_verified': 23, 'document_hashes_verified': True,
+             'quality': {'state': 'verified'}, 'verified_at_utc': '2026-10-17T00:00:00Z',
+             'manifest_content_sha256': hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()}
+    invalid = {**valid, 'generation': 'versions/uncommitted'}
+    (generation / 'verification.json').write_text(json.dumps(valid if pinned_valid else invalid))
+    (root / 'verification.json').write_text(json.dumps(invalid if pinned_valid else valid))
+    entries = [{'dataset': 'news-training-local', 'source': 'data_news', 'publish': False}]
+    result = inventory_version_layout(news_layout_repo, entries)
+    row = next(item for item in result['roots'] if item['root'] == 'data_news')
+    assert row['native_workspace_migrated'] is pinned_valid
+    assert row['native_acceptance']['verification_source'] == 'generation'
+    assert result['source_payload_reads'] == result['source_payload_writes'] == 0
+
+
+def test_news_acceptance_fails_closed_on_generation_proof_path_escape(news_layout_repo):
+    root = news_layout_repo / 'data_news'
+    manifest = {'contract_version': 2, 'storage_layout': 'news_incremental_parts_v2', 'state': 'ready',
+                'generation': '../outside', 'row_counts': {}, 'parts': []}
+    (root / 'manifest.json').write_text(json.dumps(manifest))
+    entries = [{'dataset': 'news-training-local', 'source': 'data_news', 'publish': False}]
+    result = inventory_version_layout(news_layout_repo, entries)
+    row = next(item for item in result['roots'] if item['root'] == 'data_news')
+    assert row['native_workspace_migrated'] is False
+    assert row['native_acceptance']['state'] == 'acceptance_pending'
+
+
+@pytest.mark.parametrize('mode', ['legacy_root', 'missing', 'corrupt_generation', 'escaped_symlink'])
+def test_news_acceptance_preserves_legacy_and_rejects_invalid_pinned_proofs(news_layout_repo, tmp_path, mode):
+    root = news_layout_repo / 'data_news'
+    manifest = {'contract_version': 2, 'storage_layout': 'news_incremental_parts_v2', 'state': 'ready',
+                'generation': 'versions/committed', 'row_counts': {'articles': 7},
+                'parts': [{'bytes': 23, 'rows': 7}]}
+    (root / 'manifest.json').write_text(json.dumps(manifest))
+    generation = root / manifest['generation']
+    generation.mkdir(parents=True)
+    proof = {'state': 'verified', 'generation': manifest['generation'], 'row_counts': manifest['row_counts'],
+             'parts_verified': 1, 'bytes_verified': 23, 'document_hashes_verified': True,
+             'quality': {'state': 'verified'}, 'verified_at_utc': '2026-10-17T00:00:00Z',
+             'manifest_content_sha256': hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()}
+    if mode != 'missing':
+        (root / 'verification.json').write_text(json.dumps(proof))
+    if mode == 'corrupt_generation':
+        (generation / 'verification.json').write_text('{broken')
+    elif mode == 'escaped_symlink':
+        external = tmp_path / 'outside.json'
+        external.write_text(json.dumps(proof))
+        (generation / 'verification.json').symlink_to(external)
+    entries = [{'dataset': 'news-training-local', 'source': 'data_news', 'publish': False}]
+    result = inventory_version_layout(news_layout_repo, entries)
+    row = next(item for item in result['roots'] if item['root'] == 'data_news')
+    assert row['native_workspace_migrated'] is (mode == 'legacy_root')
+    assert row['native_acceptance']['verification_source'] == (
+        'legacy_root' if mode == 'legacy_root' else 'missing' if mode == 'missing' else 'invalid')
+
+
+def test_news_acceptance_rechecks_the_current_pointer_after_reading_proof(news_layout_repo, monkeypatch):
+    import stockagent.data_sync.dataset_version_layout as layout
+    root = news_layout_repo / 'data_news'
+    manifest = {'contract_version': 2, 'storage_layout': 'news_incremental_parts_v2', 'state': 'ready',
+                'generation': 'versions/committed', 'row_counts': {'articles': 7},
+                'parts': [{'bytes': 23, 'rows': 7}]}
+    (root / 'manifest.json').write_text(json.dumps(manifest))
+    generation = root / manifest['generation']
+    generation.mkdir(parents=True)
+    proof = {'state': 'verified', 'generation': manifest['generation'], 'row_counts': manifest['row_counts'],
+             'parts_verified': 1, 'bytes_verified': 23, 'document_hashes_verified': True,
+             'quality': {'state': 'verified'}, 'verified_at_utc': '2026-10-17T00:00:00Z',
+             'manifest_content_sha256': hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()}
+    (generation / 'verification.json').write_text(json.dumps(proof))
+    original = layout._news_generation_verification
+    def publish_another_version(root_path, pinned):
+        value = original(root_path, pinned)
+        (root_path / 'manifest.json').write_text(json.dumps({**manifest, 'generation': 'versions/new'}))
+        return value
+    monkeypatch.setattr(layout, '_news_generation_verification', publish_another_version)
+    entries = [{'dataset': 'news-training-local', 'source': 'data_news', 'publish': False}]
+    result = inventory_version_layout(news_layout_repo, entries)
+    row = next(item for item in result['roots'] if item['root'] == 'data_news')
+    assert row['native_workspace_migrated'] is False
+    assert row['native_acceptance']['verification_error_type'] == 'manifest_changed_during_inventory'
+
+
 def test_unknown_new_data_root_is_not_silently_left_out(tmp_path):
     (tmp_path / "configs").mkdir()
     document = json.loads((REPO / "configs/columnar_storage.json").read_text())

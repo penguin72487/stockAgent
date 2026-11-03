@@ -27,7 +27,10 @@ from stockagent.data_sync.desync_snapshots import (  # noqa: E402
     _utc_iso_from_ns,
     atomic_write_json,
 )
-from stockagent.data_sync.legacy_artifact_archive import load_legacy_specs  # noqa: E402
+from stockagent.data_sync.legacy_artifact_archive import (  # noqa: E402
+    apply_archive_stage_prune, load_legacy_specs, plan_archive_stage_prune,
+    recover_archive_stage_quarantine, reviewed_retired_stage,
+)
 from stockagent.data_sync.legacy_artifact_retirement import (  # noqa: E402
     apply_legacy_retirement,
     plan_legacy_retirement,
@@ -106,9 +109,99 @@ def _active_lease_deferred_row(
     }
 
 
+def prune_retired_stages(specs, sync_root, *, artifact_root, state_root, apply):
+    """Continue only individually pinned, already retired encoding workspaces.
+
+    These ignored workspaces are not transport. Their original complete cold
+    recovery, retirement/process/pin and quarantine gates own every unlink.
+    A busy transport observer must not strand these disposable encodings.
+    """
+    from scripts.retire_local_offline_artifacts import stage_prune_progress
+    from stockagent.data_sync.desync_snapshots import sha256_file
+
+    rows = []
+    for spec in specs:
+        binding = reviewed_retired_stage(spec)
+        if binding is None:
+            continue
+        target = state_root / 'stage-pruning' / spec.dataset
+        target.mkdir(parents=True, exist_ok=True)
+        stage = spec.stage_root / spec.dataset
+        retired_path = state_root / 'retirements' / (spec.dataset + '.json')
+        retry_path = target / 'retry.json'
+        retry = json.loads(retry_path.read_text()) if retry_path.exists() else {}
+        if retry.get('binding') != binding:
+            retry = {'binding': binding, 'attempts': 0}
+        if retry.get('attempts', 0) >= 3 or retry.get('next_retry_epoch', 0) > time.time():
+            rows.append({'dataset': spec.dataset, 'action': 'deferred',
+                         'blockers': ['stage-prune-retry-limit' if retry.get('attempts', 0) >= 3
+                                      else 'stage-prune-retry-wait'],
+                         'next_retry_epoch': retry.get('next_retry_epoch')})
+            continue
+        try:
+            if retired_path.is_symlink() or sha256_file(retired_path) != binding['retirement_receipt_sha256']:
+                raise SnapshotError('fixed encoding-stage retirement receipt differs')
+            original = json.loads(retired_path.read_text())
+            if (original.get('state') != 'cold-only' or original.get('dataset') != spec.dataset
+                    or original.get('relative_root') != spec.relative_root
+                    or original.get('snapshot_id') != binding['snapshot_id']):
+                raise SnapshotError('fixed encoding-stage retirement identity differs')
+            result_path = target / 'stage-pruned.json'
+            if not stage.exists() and not stage.is_symlink() and result_path.exists():
+                result = json.loads(result_path.read_text())
+                if (result.get('pruned') is not True or result.get('dataset') != spec.dataset
+                        or result.get('snapshot_id') != binding['snapshot_id']
+                        or result.get('manifest_sha256') != binding['manifest_sha256']
+                        or (artifact_root / spec.relative_root).exists()
+                        or (artifact_root / spec.relative_root).is_symlink()):
+                    raise SnapshotError('completed encoding-stage receipt or source differs')
+                rows.append({'dataset': spec.dataset, 'action': 'already-pruned', 'deleted': False})
+                continue
+            # Persist the fixed enrollment separately from progress, never
+            # renew an old verification's time on a timer observation.
+            atomic_write_json(target / 'binding.json', {'dataset': spec.dataset, **binding})
+            with stage_prune_progress(spec, target, binding) as report:
+                plan_path = target / 'stage-prune-plan.json'
+                if not stage.exists() and not stage.is_symlink() and plan_path.exists():
+                    if not apply:
+                        raise SnapshotError('interrupted stage quarantine requires original owner recovery')
+                    recover_archive_stage_quarantine(spec, sync_root, artifact_root=artifact_root,
+                        state_root=state_root, owned_failed_plan=json.loads(plan_path.read_text()),
+                        journal=target / ('quarantine-recovery-' + str(time.time_ns()) + '.json'))
+                plan = plan_archive_stage_prune(spec, sync_root, artifact_root=artifact_root,
+                                                state_root=state_root, progress=report)
+                atomic_write_json(plan_path, plan)
+                row = {'dataset': spec.dataset, 'action': 'stage-prune-eligible', 'deleted': False,
+                       'reclaimable_allocated_file_bytes': plan['reclaimable_allocated_file_bytes']}
+                if apply:
+                    result = apply_archive_stage_prune(spec, sync_root, artifact_root=artifact_root,
+                        state_root=state_root, expected_fingerprint=plan['stage_fingerprint'],
+                        owned_verified_plan=plan, progress=report)
+                    atomic_write_json(result_path, result)
+                    row.update(action='encoding-stage-pruned', deleted=True,
+                        reclaimed_allocated_file_bytes=result['reclaimed_allocated_file_bytes'])
+                atomic_write_json(target / 'result.json', {**row, 'checked_at_epoch': time.time(),
+                    'snapshot_id': binding['snapshot_id'], 'manifest_sha256': binding['manifest_sha256'],
+                    'prune_receipt_sha256': sha256_file(result_path) if apply else None,
+                    'cold_objects_deleted': 0, 'nas_snapshots_deleted': 0})
+                rows.append(row)
+            atomic_write_json(retry_path, {'binding': binding, 'attempts': 0})
+        except (OSError, ValueError, SnapshotError) as error:
+            retry.update(attempts=retry.get('attempts', 0) + 1, next_retry_epoch=time.time() + 300,
+                         error_type=type(error).__name__, error=str(error), checked_at_epoch=time.time())
+            atomic_write_json(retry_path, retry)
+            atomic_write_json(target / ('failure-' + str(time.time_ns()) + '.json'), retry)
+            rows.append({'dataset': spec.dataset, 'action': 'deferred',
+                         'blockers': ['encoding-stage-proof-failed'], 'deleted': False,
+                         'error': str(error), 'attempts': retry['attempts']})
+    return rows
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--apply", action="store_true")
+    parser.add_argument('--prune-retired-stages', action='store_true',
+                        help='also verify/prune the separately pinned retired D encoding workspaces')
     parser.add_argument(
         "--manual-immediate", action="store_true",
         help="explicit one-shot lease-age bypass; automatic timers never use this flag",
@@ -173,9 +266,13 @@ def main() -> int:
                     "current_dataset": dataset, "phase": phase, "rows": rows,
                     "checked_at": _utc_iso_from_ns(time.time_ns()),
                 })
+        if args.prune_retired_stages:
+            rows.extend(prune_retired_stages(legacy_specs, cfg.sync_root,
+                artifact_root=args.artifact_root, state_root=args.legacy_state_root, apply=args.apply))
         peer_proof = transport_probe()
         if peer_proof.get("ok") is not True:
-            print(json.dumps({"state": "deferred", "reason": "cold-peer-not-converged", "peer": peer_proof}))
+            print(json.dumps({"state": "deferred", "reason": "cold-peer-not-converged", "peer": peer_proof,
+                              "rows": rows}))
             return 0
         for spec in specs:
             state_path = args.state_root / "retirements" / f"{spec.dataset}.json"

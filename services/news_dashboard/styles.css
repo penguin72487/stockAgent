@@ -1,4 +1,5 @@
 .news-search{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin:16px 0}
+#corpus-quality{overflow-wrap:anywhere}
 .news-search input,.news-search select{min-height:44px;min-width:0;border:1px solid var(--line);border-radius:8px;background:var(--dashboard-surface);color:var(--ink);padding:10px;font:inherit}
 .news-search input{flex:1 1 240px;max-width:540px}
 .news-pagination{display:flex;gap:16px;align-items:center;justify-content:center;flex-wrap:wrap;margin-top:18px}
@@ -20,6 +21,8 @@
 #alert-details>summary{min-height:44px;box-sizing:border-box;padding:12px 0;cursor:pointer}
 #alert-details>summary:focus-visible{outline:2px solid var(--cyan);outline-offset:3px;border-radius:4px}
 #alert-source-copy{white-space:pre-line;overflow-wrap:anywhere}
+/* The shared summary can mount after an initial status failure. */
+body.news-snapshot-unavailable #acq-overview{display:none}
 .news-provider-list>dl{margin-top:4px}
 .news-traffic-table td:last-child{white-space:pre-line}
 body[data-acquisition-page="news"] .table-scroll caption{text-align:left;font-size:12px;color:var(--muted);line-height:1.7;padding:10px 12px;overflow-wrap:anywhere}

@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "contract": "reviewed_retired_legacy_d_encoding_v1",
+  "authority_node_id": "penguin",
+  "stage_root": "/srv/stockagent-d-volume/stockagent-legacy-archive-stage",
+  "datasets": {
+    "legacy-artifact-markets-crypto": {
+      "relative_root": "markets/crypto",
+      "snapshot_id": "legacy-artifact-markets-crypto-20260925T032650303217098Z-l0-penguin-a800ae30d6514bde",
+      "manifest_sha256": "977cbd31129e669127ecbbd24285aec684da1e6db0885021594b75d42943b981",
+      "retirement_receipt_sha256": "9380a2c0fceaff24c0ea152f0fd47d9a470aaa146d32de3c8cdc0d9dfe0e845e"
+    },
+    "legacy-artifact-markets-us": {
+      "relative_root": "markets/us",
+      "snapshot_id": "legacy-artifact-markets-us-20261001T101733338869894Z-l0-penguin-05f3c6701de61b23",
+      "manifest_sha256": "5ee819cbd57621876f9c19376caa4dfdfc0d62fbddfb881f854b5ade5746af57",
+      "retirement_receipt_sha256": "0d5577db4bb8f7b59c9a68998962247ac7338e653e78d5999be3df9b06523ce9"
+    }
+  }
+}

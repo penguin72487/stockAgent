@@ -19,14 +19,16 @@ description: "操作 StockAgent 四節點架構：penguin authority、D immutabl
 
 | 節點／位置 | 保存與工作責任 |
 | --- | --- |
-| penguin WSL ext4／SSD | 增量下載暫存、可變來源狀態、PostgreSQL／下單 ledger、網站和正式服務必要 projection／模型；舊 raw 歷史在 canonical writer／reader 切換與 D 完整還原驗證前仍保護，不代表已遷移 |
+| penguin C WSL ext4／SSD | 程式、正式服務、PostgreSQL／下單 ledger、控制索引、網站必要 projection／模型；舊 raw 在正式切換及還原驗收前仍保護，不代表已遷移 |
+| penguin E NVMe 原生 ext4 工作卷 | 進 D 冷庫前的下載、增量、封裝、驗證、還原及傳輸暫存；核對原生 volume GUID、VHD 登錄、ext4 UUID、實體與 guest 空間，不回退 C |
 | penguin D HDD，packed 及 guarded immutable lake | 唯一本機主冷庫；不可變 CAS／packs／manifests／heads、Parquet/ZSTD registry 與封閉版本；mutable PG 放 SSD |
 | lab203 | Receive Only 封閉 ingress、中繼 NAS、獨立驗證及回傳機器收據；不承接網站或訓練 |
 | NAS | immutable archive 保存 lake/source 版本；Restic 保存 code/config/SQL 與原歷史；保留／prune 是獨立政策 |
 | Vastai1T | 非持久訓練節點；cold index、當期 exact source、遠端生成的工作集／cache、尚未驗證回傳的結果 |
 
-2026-10-25 使用者指定 D 為唯一本機 immutable raw history 正本；C/WSL 只留
-增量、可變控制及必要工作集。沿用原 owner 逐項遷移，不以角色表或 symlink
+2026-10-25 使用者指定 D 為唯一本機 immutable raw history 正本；2026-11-02
+補充 C 留服務／控制，進冷庫前的工作資料使用 E，實作與已完成範圍見
+`docs/storage_c_e_d_layout_2026-11-02.md`。沿用原 owner 逐項遷移，不以角色表或 symlink
 代替 reader／writer、完整恢復及退休驗收。增量／穩定冷區保持同一 CAS 位元組與路徑，
 每日有界透明壓縮，不產生第二套正本；實作與目前未解範圍見
 `docs/storage_roles_and_tiers_2026-10-25.md`。

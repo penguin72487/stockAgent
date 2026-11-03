@@ -6,10 +6,24 @@ import pytest
 
 from stockagent.live.opening_execution_latency import (
     OpeningExecutionObserver, execution_quantities, opening_execution_slo,
+    nonnegative_duration_ms, residual_duration_ms,
 )
 
 
 GATE = datetime.fromisoformat("2026-10-14T09:00:00+08:00")
+
+
+@pytest.mark.parametrize("value", [None, True, False, "broken", float("nan"), float("inf"), -0.01])
+def test_duration_rejects_unknown_or_invalid_as_not_zero(value):
+    assert nonnegative_duration_ms(value) is None
+
+
+def test_duration_residual_requires_every_valid_nonoverlapping_span():
+    assert nonnegative_duration_ms(0) == 0.0
+    assert residual_duration_ms(300, 0, 250, 0, 40, 0) == 10.0
+    assert residual_duration_ms(300, None, 250, 40) is None
+    assert residual_duration_ms(40, 20, 30) is None
+    assert residual_duration_ms(1.0, 0.5005, 0.5) == 0.0
 
 
 def test_phase_timer_never_subtracts_cpu_clocks_from_different_threads(monkeypatch):

@@ -215,6 +215,113 @@ def test_parallel_tree_scan_preserves_complete_ordered_fingerprints(tmp_path: Pa
     assert scan_tree(root, file_workers=4) == scan_tree(root)
 
 
+def test_tree_scan_preserves_portable_fingerprint_for_raw_filename_and_symlink(tmp_path: Path) -> None:
+    import os
+
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'empty').mkdir()
+    raw_name = os.fsdecode(b'raw-\xff')
+    (root / raw_name).write_bytes(b'x')
+    (root / 'link').symlink_to(raw_name)
+    expected = hashlib.sha256(
+        b'D\0empty\0' + b'0\0\n'
+        + b'L\0link\0' + b'0\0raw-\xff\n'
+        + b'F\0raw-\xff\0' + b'1\0\n'
+    ).hexdigest()
+    for workers in (1, 4):
+        observed = scan_tree(root, file_workers=workers)
+        assert observed['portable_fingerprint_sha256'] == expected
+        assert (observed['files'], observed['directories'], observed['symlinks'],
+                observed['logical_bytes']) == (1, 1, 1, 1)
+
+
+def test_tree_scan_rejects_observation_outside_root(tmp_path: Path, monkeypatch) -> None:
+    from stockagent.data_sync import desync_snapshots as module
+
+    root = tmp_path / 'source'
+    root.mkdir()
+    outside = tmp_path / 'source-other'
+    outside.write_bytes(b'preserved')
+    monkeypatch.setattr(module, '_iter_lstat_bounded',
+                        lambda paths, executor: iter([(outside, outside.lstat())]))
+    with pytest.raises(ValueError) as expected:
+        outside.relative_to(root)
+    with pytest.raises(ValueError) as observed:
+        module.scan_tree(root)
+    assert str(observed.value) == str(expected.value)
+    assert outside.read_bytes() == b'preserved'
+
+
+def test_tree_scan_rejects_double_slash_observation_under_single_slash_root(tmp_path, monkeypatch):
+    from stockagent.data_sync import desync_snapshots as module
+
+    reference = tmp_path / 'reference'
+    reference.write_bytes(b'x')
+    monkeypatch.setattr(module.os, 'walk', lambda *args, **kwargs: iter([('/', [], ['entry'])]))
+    monkeypatch.setattr(module, '_iter_lstat_bounded',
+                        lambda paths, executor: iter([(Path('//entry'), reference.lstat())]))
+    with pytest.raises(ValueError) as expected:
+        Path('//entry').relative_to(Path('/'))
+    with pytest.raises(ValueError) as observed:
+        module.scan_tree(Path('/'))
+    assert str(observed.value) == str(expected.value)
+
+
+def test_tree_scan_preserves_double_slash_root_relative_name(tmp_path, monkeypatch):
+    from stockagent.data_sync import desync_snapshots as module
+
+    reference = tmp_path / 'reference'
+    reference.write_bytes(b'x')
+    original_resolve = Path.resolve
+    monkeypatch.setattr(Path, 'resolve',
+                        lambda path, *args, **kwargs: path if path == Path('//')
+                        else original_resolve(path, *args, **kwargs))
+    monkeypatch.setattr(module.os, 'walk', lambda *args, **kwargs: iter([('//', [], ['entry'])]))
+    monkeypatch.setattr(module, '_iter_lstat_bounded',
+                        lambda paths, executor: ((path, reference.lstat()) for path in paths))
+    observed = module.scan_tree(Path('//'))
+    assert observed['portable_fingerprint_sha256'] == hashlib.sha256(
+        b'F\0entry\0' + b'1\0\n').hexdigest()
+
+
+def test_tree_scan_preserves_same_root_relative_name(tmp_path: Path, monkeypatch) -> None:
+    from stockagent.data_sync import desync_snapshots as module
+
+    root = tmp_path / 'source'
+    root.mkdir()
+    calls = 0
+
+    def root_once(paths, executor):
+        nonlocal calls
+        calls += 1
+        return iter([(root, root.lstat())] if calls == 1 else [])
+
+    monkeypatch.setattr(module, '_iter_lstat_bounded', root_once)
+    observed = module.scan_tree(root)
+    assert observed['directories'] == 1
+    assert observed['portable_fingerprint_sha256'] == hashlib.sha256(b'D\0.\0' + b'0\0\n').hexdigest()
+
+
+def test_tree_scan_progress_keeps_ordered_counters(tmp_path: Path, monkeypatch) -> None:
+    from types import SimpleNamespace
+    from stockagent.data_sync import desync_snapshots as module
+
+    root = tmp_path / 'source'
+    root.mkdir()
+    (root / 'a').write_bytes(b'a')
+    (root / 'b').write_bytes(b'bc')
+    clock = iter((0, 5, 10))
+    monkeypatch.setattr(module, 'time', SimpleNamespace(monotonic=lambda: next(clock)))
+    events = []
+    observed = module.scan_tree(root, progress=events.append)
+    assert events == [
+        {'files': 1, 'directories': 0, 'symlinks': 0, 'logical_bytes': 1},
+        {'files': 2, 'directories': 0, 'symlinks': 0, 'logical_bytes': 3},
+    ]
+    assert (observed['files'], observed['logical_bytes']) == (2, 3)
+
+
 @pytest.mark.parametrize('workers', [True, 0, 5])
 def test_parallel_tree_scan_rejects_invalid_worker_count(tmp_path, workers):
     with pytest.raises(ValueError, match='workers'):

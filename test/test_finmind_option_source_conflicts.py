@@ -22,6 +22,64 @@ from scripts.request_finmind_option_contract_conflicts import register as regist
 from scripts.request_finmind_recent_option_conflicts import register as register_recent
 from scripts import run_finmind_option_conflict_wait as waiter
 
+
+def test_conflict_waiter_only_retries_a_proven_owner_lock_collision_quickly():
+    assert waiter.owner_retry_delay(2, None, 'FinMind complement worker already running\n') == 5
+    assert waiter.owner_retry_delay(2, None, 'unrelated argument error\n') is None
+    assert waiter.owner_retry_delay(0, 'batch_complete', '') == 5
+    assert waiter.owner_retry_delay(0, 'disk_guard', '') == 60
+    assert waiter.owner_retry_delay(0, 'rate_limited', '') == 300
+
+
+def test_option_whole_market_gate_requires_exact_success_and_terminal_evidence(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter, 'REPO', tmp_path)
+    run_id = 'product-backlog-123'
+    log_path = tmp_path / 'run.log'
+    record = {'run_id': run_id, 'repo_root': str(tmp_path), 'backend': 'systemd',
+              'unit': f'stockagent-agent-{run_id}.service', 'log': str(log_path),
+              'argv': ['run_fintech_python', 'scripts/run_finmind_option_corrected_product_backlog.py'],
+              'state': 'running', 'exit_code': None}
+    assert waiter.product_predecessor_decision(record, run_id, log_path, None, 'active') == 'wait'
+    assert waiter.product_predecessor_decision(record, run_id, log_path, None, 'failed') == 'blocked'
+    record.update(state='succeeded', exit_code=0)
+    assert waiter.product_predecessor_decision(record, run_id, log_path, None, None) == 'blocked'
+    terminal = {'state': 'evidenced_product_day_checks_finished', 'batches': 2,
+                'source_days_requiring_reaudit': 0, 'full_contract_or_training_completeness': False}
+    assert waiter.product_predecessor_decision(record, run_id, log_path, terminal, None) == 'ready'
+    record.update(state='cancelled', exit_code=-15)
+    assert waiter.product_predecessor_decision(record, run_id, log_path, terminal, None) == 'blocked'
+    record['argv'][1] = 'scripts/unrelated.py'
+    with pytest.raises(ValueError, match='identity mismatch'):
+        waiter.product_predecessor_decision(record, run_id, log_path, terminal, None)
+
+
+def test_option_whole_market_waiter_checks_product_workflow_before_source_calls(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter, 'REPO', tmp_path)
+    run_id, request_id = 'product-backlog-123', 'request-123'
+    run_dir = tmp_path / 'artifacts/operations/agent-workflow/runs' / run_id
+    run_dir.mkdir(parents=True)
+    root = tmp_path / 'data_finmind/complement'
+    (root / 'priority_queries').mkdir(parents=True)
+    priority = {'request_id': request_id, 'contract': 'provider_priority_query_v1',
+                'plan': {'expires_at_utc': (datetime.now(UTC) + timedelta(days=1)).isoformat()}}
+    (root / 'priority_queries' / f'{request_id}.json').write_text(json.dumps(priority))
+    record = {'run_id': run_id, 'repo_root': str(tmp_path), 'backend': 'systemd',
+              'unit': f'stockagent-agent-{run_id}.service', 'log': str(run_dir / 'run.log'),
+              'argv': ['run_fintech_python', 'scripts/run_finmind_option_corrected_product_backlog.py'],
+              'state': 'running', 'exit_code': None}
+    (run_dir / 'run.json').write_text(json.dumps(record))
+    monkeypatch.setattr(waiter.subprocess, 'run', lambda *a, **k: SimpleNamespace(returncode=0, stdout='active\n'))
+    def finish(_):
+        record.update(state='succeeded', exit_code=0)
+        (run_dir / 'run.json').write_text(json.dumps(record))
+        (run_dir / 'run.log').write_text(json.dumps({'state': 'evidenced_product_day_checks_finished',
+            'batches': 2, 'source_days_requiring_reaudit': 0, 'full_contract_or_training_completeness': False}) + '\n')
+    monkeypatch.setattr(waiter.time, 'sleep', finish)
+    assert waiter.wait_for_product_predecessor(root, run_id, request_id) is True
+    record.update(state='failed', exit_code=75)
+    (run_dir / 'run.json').write_text(json.dumps(record))
+    assert waiter.wait_for_product_predecessor(root, run_id, request_id) is False
+
 NOW = datetime(2026, 9, 27, 12, tzinfo=UTC)
 
 
@@ -201,6 +259,69 @@ def test_waiter_deduplicates_exact_dates_without_losing_unresolved_scopes():
         ('TaiwanOptionTick', '', '2025-01-02'), ('TaiwanOptionTick', '', '2025-01-03')]
 
 
+def test_corrected_readback_only_suppresses_same_source_false_conflicts(tmp_path, monkeypatch):
+    root = tmp_path / 'data_finmind/complement'
+    root.mkdir(parents=True)
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    parser = scripts / 'audit_taifex_option_contract_presence.py'
+    parser.write_text('parser')
+    normalizer = tmp_path / 'downloader/finmind_option_contract_keys.py'
+    normalizer.parent.mkdir()
+    normalizer.write_text('normalizer')
+    monkeypatch.setattr(waiter, 'REPO', tmp_path)
+    audit = tmp_path / 'audit'
+    audit.mkdir()
+    coverage_csv = audit / 'coverage.csv'
+    with coverage_csv.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['date', 'finmind_status', 'finmind_receipt_sha256',
+                                                'finmind_parquet_sha256'])
+        writer.writeheader()
+        for day in ('2020-01-02', '2020-01-03', '2020-01-06'):
+            writer.writerow({'date': day, 'finmind_status': 'complete_payload_sha_verified',
+                             'finmind_receipt_sha256': 'receipt', 'finmind_parquet_sha256': 'object'})
+    coverage = audit / 'coverage.json'
+    coverage.write_text(json.dumps({'contract': 'taifex_option_annual_positive_days_finmind_receipts_v1',
+                                    'finmind_root': str(root), 'day_inventory': str(coverage_csv),
+                                    'day_inventory_sha256': _sha(coverage_csv)}))
+    days = audit / 'days.csv'
+    with days.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['date', 'source_status', 'missing_contracts'])
+        writer.writeheader()
+        writer.writerows([{'date': '2020-01-02', 'source_status': 'contract_key_readback_verified',
+                           'missing_contracts': 0},
+                          {'date': '2020-01-03', 'source_status': 'contract_key_readback_verified',
+                           'missing_contracts': 1},
+                          {'date': '2020-01-06', 'source_status': 'observed_empty', 'missing_contracts': 0}])
+    missing = audit / 'missing.csv'
+    with missing.open('w', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=['date', 'product', 'series', 'strike', 'right', 'session'])
+        writer.writeheader()
+        writer.writerow({'date': '2020-01-03', 'product': 'TXO', 'series': '202001W1',
+                         'strike': 12000, 'right': 'P', 'session': 'day'})
+    summary = audit / 'summary.json'
+    summary.write_text(json.dumps({'contract': 'taifex_option_ordinary_open_contract_vs_finmind_v2',
+                                   'coverage_summary': str(coverage), 'coverage_summary_sha256': _sha(coverage),
+                                   'audit_script_sha256': _sha(parser), 'series_normalizer_sha256': _sha(normalizer),
+                                   'day_inventory': str(days), 'day_inventory_sha256': _sha(days),
+                                   'missing_inventory': str(missing), 'missing_inventory_sha256': _sha(missing)}))
+    readbacks, pins = waiter.corrected_contract_readbacks(root, [summary])
+    assert str(missing) in pins and str(normalizer) in pins
+    request = {'correction_id': 'contract-conflict-test', 'original_receipt_sha256': 'receipt',
+               'original_parquet_sha256': 'object', 'expected_source_contracts': [['TXO', '202001W1', 12000., 'P']]}
+    requests = [{**request, 'start_date': day} for day in ('2020-01-02', '2020-01-03', '2020-01-06')]
+    requests.append({**request, 'start_date': '2020-01-02', 'original_receipt_sha256': 'changed'})
+    requests.append({'correction_id': 'product-conflict-test', 'start_date': '2020-01-02'})
+    retained, counts = waiter.filter_superseded_contract_requests(requests, readbacks)
+    assert retained == requests[1:]
+    assert counts == {'superseded': 1, 'retained': 1, 'not_comparable': 2}
+    with pytest.raises(ValueError, match='not a subset'):
+        waiter.filter_superseded_contract_requests([{**requests[1], 'expected_source_contracts': []}], readbacks)
+    missing.write_text(missing.read_text() + '\n')
+    with pytest.raises(ValueError, match='evidence changed'):
+        waiter.corrected_contract_readbacks(root, [summary])
+
+
 def _recent_setup(tmp_path):
     root = tmp_path / 'data_finmind/complement'
     root.mkdir(parents=True)
@@ -375,6 +496,10 @@ def test_contract_proof_requires_missing_keys_and_preserves_original_keys(tmp_pa
     evidence = verify([prior_key, missing_key])
     assert evidence['verified_expected_contract_keys'] == 1
     assert evidence['verified_prior_contract_keys'] == 1
+    decimal_month = ('CAO', '202511.0', 24.5, 'C')
+    assert verify([prior_key, decimal_month])['verified_expected_contract_keys'] == 1
+    false_week = ('TXO', '202511F4.0', 25100.0, 'P')
+    assert verify([false_week, missing_key]) is None
     original.write_bytes(original.read_bytes() + b'changed')
     assert verify([prior_key, missing_key]) is None
 
@@ -425,8 +550,12 @@ def _contract_setup(tmp_path):
     return root, conn, task, coverage_path, summary, missing, archive
 
 
-def test_contract_plan_is_exact_bounded_and_receipt_pinned(tmp_path):
+@pytest.mark.parametrize('version', ['v1', 'v2'])
+def test_contract_plan_is_exact_bounded_and_receipt_pinned(tmp_path, version):
     root, conn, task, coverage, summary, _, _ = _contract_setup(tmp_path)
+    content = json.loads(summary.read_text())
+    content['contract'] = f'taifex_option_ordinary_open_contract_vs_finmind_{version}'
+    summary.write_text(json.dumps(content))
     before = conn.execute('SELECT * FROM tasks ORDER BY partition').fetchall()
     status = register_contracts(root, coverage, summary, NOW)
     assert (status['dates'], status['contract_day_keys'], status['provider_calls']) == (1, 2, 0)
@@ -498,12 +627,16 @@ def _monthly_contract_setup(root, conn, output, day):
     return task, coverage, summary, raw, missing
 
 
-def test_monthly_contract_plan_appends_to_existing_without_overwriting(tmp_path):
+@pytest.mark.parametrize('version', ['v1', 'v2'])
+def test_monthly_contract_plan_appends_to_existing_without_overwriting(tmp_path, version):
     root, conn, _, annual, annual_summary, _, _ = _contract_setup(tmp_path)
     register_contracts(root, annual, annual_summary, NOW)
     original = next((root / CONTRACT_BATCHES).glob('*.json'))
     original_sha = _sha(original)
     task, coverage, summary, _, _ = _monthly_contract_setup(root, conn, annual.parent, '2019-07-12')
+    content = json.loads(summary.read_text())
+    content['contract'] = f'taifex_option_monthly_open_contract_vs_finmind_{version}'
+    summary.write_text(json.dumps(content))
     result = register_contracts(root, coverage, summary, NOW, append=True)
     assert (result['dates'], result['contract_day_keys'], result['provider_calls']) == (1, 1, 0)
     assert _sha(original) == original_sha

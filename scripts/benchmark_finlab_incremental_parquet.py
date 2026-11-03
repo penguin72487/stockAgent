@@ -138,8 +138,8 @@ def trial(table, scratch: Path, row_group_size: int | None, *, use_dictionary: b
             if not same(polars_read, original, metadata=False):
                 raise ValueError('complete restored Polars value/schema parity failed')
             with duckdb.connect() as connection:
-                observed = connection.execute('SELECT * FROM read_parquet(?)',
-                    [[str(p) for p in restored_paths]]).to_arrow_table()
+                observed = connection.sql('SELECT * FROM read_parquet(?)',
+                    params=[[str(p) for p in restored_paths]]).to_arrow_table()
                 if not same(observed, original, metadata=False):
                     raise ValueError('complete restored DuckDB value/schema parity failed')
         releases.append(release)

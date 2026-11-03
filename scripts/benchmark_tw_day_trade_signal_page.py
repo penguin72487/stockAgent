@@ -142,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument("--mode", default="all", help="Exact dashboard mode filter; all retains the full universe")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--hide-zero-targets", action="store_true")
     parser.add_argument(
@@ -193,6 +194,8 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("narrow probe and legacy full projection are mutually exclusive")
     if args.probe_narrow_summary and args.public_price_root is not None:
         parser.error("a narrow summary probe cannot measure the public full page")
+    if args.probe_narrow_summary and args.mode != "all":
+        parser.error("the diagnostic narrow summary probe does not implement mode filtering")
     quote_source = None
     quote_before = None
     if args.public_price_root is not None:
@@ -219,6 +222,7 @@ def main(argv: list[str] | None = None) -> int:
             state_dir=args.state_dir,
             start_date=args.start_date,
             end_date=args.end_date,
+            mode=args.mode,
             limit=args.limit,
             hide_zero_targets=args.hide_zero_targets,
             timing_ms=stages,
@@ -281,6 +285,7 @@ def main(argv: list[str] | None = None) -> int:
         "complete": complete,
         "start_date": args.start_date,
         "end_date": args.end_date,
+        "mode": args.mode,
         "hide_zero_targets": args.hide_zero_targets,
         "total": result.get("total"),
         "returned": result.get("returned"),

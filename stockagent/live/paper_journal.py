@@ -59,9 +59,11 @@ def _intent_path(path: Path) -> Path:
     return _head_path(path).with_suffix(".append-intent.json")
 
 
-def layout_generations(root: Path) -> dict:
+def layout_generations(root: Path, *, names=FILENAMES) -> dict:
     result = {}
-    for name in FILENAMES:
+    for name in names:
+        if name not in FILENAMES:
+            raise ValueError("unsupported paper journal")
         path = _head_path(Path(root) / name)
         for member in (path, path.with_suffix(".enrolled")):
             try:

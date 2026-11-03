@@ -93,6 +93,78 @@ def test_capture_headroom_uses_current_policy_and_payload_bound(tmp_path, monkey
         migration._require_capture_headroom(tmp_path, 1024**3)
 
 
+def test_e_capture_headroom_uses_physical_volume_and_e_reserve(tmp_path, monkeypatch):
+    from stockagent.data_sync import cache_capacity, workspace_volume
+    enrollment = tmp_path / 'enrollment.json'
+    enrollment.touch()
+    workspace = tmp_path / 'e-workspace'
+    workspace.mkdir()
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    monkeypatch.setattr(workspace_volume, 'configuration', lambda: {
+        'mount_point': str(workspace), 'minimum_free_bytes': 64 * 1024**3})
+    monkeypatch.setattr(cache_capacity, 'load_capacity_policy',
+                        lambda: {'minimum_free_bytes': 25 * 1024**3})
+    monkeypatch.setattr(Path, 'is_mount', lambda path: path == Path('/mnt/e'))
+    monkeypatch.setattr(migration.shutil, 'disk_usage', lambda path: SimpleNamespace(
+        free=(60 if Path(path) == Path('/mnt/e') else 800) * 1024**3))
+    with pytest.raises(SnapshotError, match='minimum_free=68719476736'):
+        migration._require_capture_headroom(workspace, 1)
+
+
+def test_production_private_preparation_uses_e_and_retires_only_after_recovery(setup, monkeypatch):
+    from stockagent.data_sync import materialized_cache, workspace_volume
+    repo, _, entries, args, _ = setup
+    operations = repo.parent / 'operations'
+    operation = operations / ('a' * 16 + '-' + 'b' * 32)
+    args.migration_state = operation
+    args.retire_staging = True
+    enrollment = repo.parent / 'enrollment.json'
+    enrollment.touch()
+    workspace = repo.parent / 'e-migration'
+    workspace.mkdir()
+    monkeypatch.setattr(migration, 'MIGRATION_OPERATIONS', operations)
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    monkeypatch.setattr(workspace_volume, 'admit', lambda *_: {})
+    monkeypatch.setattr(workspace_volume, 'path', lambda kind, create=False: workspace)
+    monkeypatch.setattr(materialized_cache, 'process_references_many', lambda *_: [])
+    source = Path(entries[1]['source'])
+    (source / 'status.json').write_text('{"cursor":1}')
+    with sqlite3.connect(source / 'state.sqlite3') as database:
+        database.execute('CREATE TABLE observed(value)')
+        database.execute('INSERT INTO observed VALUES(3)')
+    result = migration.migrate_catalog(repo, args, [entries[1]])
+    row = result['datasets']['private']
+    assert row['state'] == 'verified', row
+    assert row['owned_scratch_retirement']['state'] == 'retired'
+    prepared = json.loads((operation / 'preparations/private.json').read_bytes())
+    scratch = workspace / 'dataset-versions' / operation.name
+    assert Path(prepared['controls_staging']).is_relative_to(scratch / 'controls')
+    assert Path(prepared['sqlite_states'][0]['retained_snapshot_staging']).is_relative_to(
+        scratch / 'sqlite-snapshots')
+    assert (source / 'status.json').exists() and (source / 'state.sqlite3').exists()
+    assert json.loads(Path(row['recovery_receipt']).read_bytes())['full_original_file_reconstruction_verified']
+
+
+def test_private_preparation_keeps_old_c_binding_when_e_is_enrolled(setup, monkeypatch):
+    from stockagent.data_sync import workspace_volume
+    repo, cold, entries, args, policy = setup
+    operations = repo.parent / 'operations'
+    args.migration_state = operations / ('c' * 16 + '-' + 'd' * 32)
+    monkeypatch.setattr(migration, 'MIGRATION_OPERATIONS', operations)
+    enrollment = repo.parent / 'not-yet-enrolled.json'
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    source = Path(entries[1]['source'])
+    (source / 'status.json').write_text('{"cursor":1}')
+    private = migration.private_history_root(cold, policy)
+    initialize_packed_layout(private, node_id='test')
+    before = migration._private_preparation(entries[1], args, source, private, policy)
+    assert Path(before['controls_staging']).is_relative_to(args.migration_state / 'controls')
+    enrollment.touch()
+    monkeypatch.setattr(workspace_volume, 'path', lambda *_a, **_k: pytest.fail('existing binding changed'))
+    after = migration._private_preparation(entries[1], args, source, private, policy)
+    assert after == before
+
+
 def test_private_control_freeze_uses_observed_size_and_complete_original_bytes(tmp_path, monkeypatch):
     import os
     source = tmp_path / 'source'
@@ -169,8 +241,9 @@ def test_recovery_uses_full_verified_native_pack_reads_only_for_original_D(
     assert options['reconstruct_all'] is True
     assert options['d_primary_native_pack_reads'] is native_packs
     assert options['d_primary_native_chunk_reads'] is native_packs
+    assert options['adaptive_inventory_memory'] is native_packs
     assert callable(options['progress'])
-    assert 'd_primary_native_blob_reads' not in options
+    assert options['d_primary_native_blob_reads'] is native_packs
     assert proof['full_original_file_reconstruction_verified'] is True
     assert proof['manifest_sha256'] == selected.manifest_sha256
     assert json.loads(receipt.read_text()) == proof
@@ -180,6 +253,38 @@ def test_recovery_uses_full_verified_native_pack_reads_only_for_original_D(
                               tmp_path / 'progress.json') == proof
     assert len(calls) == 1
     assert resolutions == [{'require_objects': False}, {'require_objects': True}]
+
+
+def test_recovery_progress_keeps_fast_phase_changes_and_endpoints_without_accepting_metadata(
+        tmp_path, monkeypatch):
+    selected = SimpleNamespace(manifest_sha256='b' * 64, manifest={'source': {'files': 31}})
+    monkeypatch.setattr(migration, 'resolve_packed_snapshot_id', lambda *_a, **_k: selected)
+    monkeypatch.setattr(migration.time, 'monotonic', lambda: 100.0)
+    receipt, progress_path = tmp_path / 'recovery.json', tmp_path / 'progress.json'
+    observed = []
+    write = migration.atomic_write_json
+    def capture(path, value, **options):
+        if path == progress_path:
+            observed.append(value)
+        return write(path, value, **options)
+    monkeypatch.setattr(migration, 'atomic_write_json', capture)
+    def verify(_root, _release, **options):
+        for stage in ('load-packed-inventory', 'validate-packed-inventory', 'verify-cold-objects'):
+            for count in (0, 1, 31):
+                options['progress']({'stage': stage, 'completed_items': count, 'total_items': 31})
+            assert not receipt.exists()
+            visible = json.loads(progress_path.read_bytes())
+            assert visible['stage'] == stage and visible['completed_items'] == 31
+            assert visible['acceptance'] is False and visible['attempt_id'] == 'current-attempt'
+        return {'independently_reconstructed_files': 31}
+    monkeypatch.setattr(migration, 'verify_packed_snapshot', verify)
+    proof = migration._recover(tmp_path / 'cold', 'test', 'fixed', receipt, progress_path,
+                               attempt_id='current-attempt')
+    assert [(v['stage'], v['completed_items']) for v in observed] == [
+        (stage, count) for stage in ('load-packed-inventory', 'validate-packed-inventory',
+                                    'verify-cold-objects') for count in (0, 31)]
+    assert proof['full_original_file_reconstruction_verified'] is True
+    assert json.loads(receipt.read_bytes()) == proof
 
 
 def test_full_recovery_checks_presence_once_and_cached_proof_still_rejects_missing_object(tmp_path, monkeypatch):
@@ -309,6 +414,125 @@ def test_queue_preference_never_outranks_committed_recovery_or_oldest_retry():
         'bulk', 'finmind', 'finlab', 'retry-old', 'retry-new']
 
 
+def test_bad_source_link_waits_for_real_change_then_finishes_original_recovery(setup):
+    repo, cold, entries, args, policy = setup
+    bad = Path(entries[1]['source']) / 'vanished-build'
+    bad.symlink_to('/dev/shm/vanished-code-build')
+    first = migration.migrate_catalog(repo, args, entries)
+    row = first['datasets']['private']
+    assert row['state'] == 'waiting_retry' and row['attempts'] == 1
+    assert row['blocked_source_link']['path'] == bad.name
+    attempt = args.migration_state / 'attempts/private' / (row['attempt_id'] + '.json')
+    failure_bytes = attempt.read_bytes()
+    original_plan = (args.migration_state / 'plan.json').read_bytes()
+    # Even an expired deadline cannot justify reading the same source again.
+    path = args.migration_state / 'progress.json'
+    progress = json.loads(path.read_bytes())
+    progress['datasets']['private']['retry_at_unix'] = 0
+    path.write_text(json.dumps(progress))
+    waiting = migration.migrate_catalog(repo, args, entries)
+    assert waiting['datasets']['private']['attempt_id'] == row['attempt_id']
+    assert waiting['datasets']['private']['attempts'] == 1
+    assert attempt.read_bytes() == failure_bytes
+    # A real source change wakes immediately, without the previous cooldown.
+    bad.unlink()
+    complete = migration.migrate_catalog(repo, args, entries)
+    fixed = complete['datasets']['private']
+    assert complete['state'] == 'verified' and fixed['attempts'] == 2
+    assert fixed['last_failure']['attempt_id'] == row['attempt_id']
+    assert fixed['last_source_link_wait'] == row['blocked_source_link']
+    assert (args.migration_state / 'plan.json').read_bytes() == original_plan
+    assert attempt.read_bytes() == failure_bytes
+    selected = resolve_latest_packed(migration.private_history_root(cold, policy), 'private')
+    restored = fetch_packed_snapshot(migration.private_history_root(cold, policy), repo / 'restore', selected)
+    assert (restored / 'raw.txt').read_bytes() == b'private'
+
+
+def test_legacy_link_failure_adopts_only_exact_current_observation(tmp_path):
+    bad = tmp_path / 'build-link'
+    bad.symlink_to('/dev/shm/absent-build')
+    entry = {'dataset': 'test', 'source': str(tmp_path)}
+    original = {'state': 'waiting_retry', 'attempts': 617, 'attempt_id': 'original',
+        'error': 'absolute symlink is not snapshot-safe: build-link -> /dev/shm/absent-build'}
+    row = dict(original)
+    assert migration._source_precondition_wait(entry, row, {}, retry_seconds=60)
+    assert row['attempts'] == 617 and row['attempt_id'] == 'original'
+    assert row['error'] == original['error']
+    bad.unlink()
+    assert not migration._source_precondition_wait(entry, row, {}, retry_seconds=60)
+    assert row['retry_at_unix'] == 0
+    for relative in ('../build-link', '/private/build-link'):
+        row = {**original, 'error': f'absolute symlink is not snapshot-safe: {relative} -> /dev/shm/absent-build'}
+        assert not migration._source_precondition_wait(entry, row, {}, retry_seconds=60)
+        assert 'blocked_source_link' not in row
+
+
+def test_unobservable_link_preserves_the_failure_without_retry_io(tmp_path, monkeypatch):
+    entry = {'dataset': 'test', 'source': str(tmp_path)}
+    row = {'state': 'waiting_retry', 'attempts': 617, 'error': 'original failure',
+        'blocked_source_link': {'contract': 'source_link_precondition_v1', 'path': 'bad',
+                                'observation': {'state': 'present'}}}
+    monkeypatch.setattr(migration, '_source_link_observation', lambda *_: None)
+    assert migration._source_precondition_wait(entry, row, {}, retry_seconds=60)
+    assert row['error'] == 'original failure' and row['attempts'] == 617
+    assert 'blocked_source_link' in row
+
+
+def test_futures_dependency_wait_has_no_failed_attempt_and_wakes_on_recovery(tmp_path):
+    entry = {'dataset': 'local-tw-futures', 'source': str(tmp_path)}
+    row = {'state': 'pending', 'attempts': 0}
+    datasets = {'local-tw-index-futures': {'state': 'waiting_retry'}}
+    assert migration._source_precondition_wait(entry, row, datasets, retry_seconds=60)
+    assert row['state'] == 'waiting_retry' and row['attempts'] == 0
+    assert 'error' not in row and 'attempt_id' not in row
+    datasets['local-tw-index-futures']['state'] = 'verified'
+    assert not migration._source_precondition_wait(entry, row, datasets, retry_seconds=60)
+    assert 'dependency_wait' not in row and row['retry_at_unix'] == 0
+
+
+def test_committed_release_recovery_always_precedes_source_preconditions(tmp_path, monkeypatch):
+    entry = {'dataset': 'local-tw-futures', 'source': str(tmp_path)}
+    row = {'state': 'recovery', 'snapshot_id': 'fixed', 'blocked_source_link': {'path': 'bad'}}
+    monkeypatch.setattr(migration, '_source_link_observation', lambda *_: pytest.fail('must resume fixed release'))
+    assert not migration._source_precondition_wait(entry, row,
+        {'local-tw-index-futures': {'state': 'pending'}}, retry_seconds=60, cold=tmp_path)
+    assert row['snapshot_id'] == 'fixed' and row['state'] == 'recovery'
+
+
+def test_full_cold_volume_waits_without_spending_attempt_and_wakes_on_capacity(tmp_path, monkeypatch):
+    entry = {'dataset': 'pending', 'source': str(tmp_path)}
+    row = {'state': 'waiting_retry', 'attempts': 3, 'error': 'retained ENOSPC evidence',
+           'attempt_id': 'previous', 'retry_at_unix': 10**20}
+    monkeypatch.setattr(migration.shutil, 'disk_usage', lambda _: SimpleNamespace(free=0))
+    assert migration._source_precondition_wait(entry, row, {}, retry_seconds=60, cold=tmp_path)
+    assert row['attempts'] == 3 and row['attempt_id'] == 'previous'
+    assert row['error'] == 'retained ENOSPC evidence'
+    assert row['capacity_wait']['available_bytes'] == 0
+    monkeypatch.setattr(migration.shutil, 'disk_usage', lambda _: SimpleNamespace(free=64 * 1024**2))
+    assert not migration._source_precondition_wait(entry, row, {}, retry_seconds=60, cold=tmp_path)
+    assert 'capacity_wait' not in row and row['retry_at_unix'] == 0
+    assert row['attempts'] == 3
+
+
+def test_full_cold_volume_recovers_a_committed_release_even_if_its_journal_was_interrupted(setup, monkeypatch):
+    repo, cold, entries, args, _ = setup
+    entry = next(row for row in entries if row['publish'])
+    first = migration.migrate_catalog(repo, args, [entry])
+    assert first['state'] == 'verified'
+    state_path = args.migration_state / 'progress.json'
+    document = json.loads(state_path.read_bytes())
+    row = document['datasets'][entry['dataset']]
+    fixed = row.pop('snapshot_id')
+    row.pop('manifest_sha256')
+    row.update(state='waiting_retry', error='retained failure', retry_at_unix=10**20)
+    state_path.write_text(json.dumps(document))
+    monkeypatch.setattr(migration.shutil, 'disk_usage', lambda _: SimpleNamespace(free=0))
+    monkeypatch.setattr(publisher, '_publish_entry', lambda *a: pytest.fail('must not republish on a full volume'))
+    recovered = migration.migrate_catalog(repo, args, [entry])
+    assert recovered['state'] == 'verified'
+    assert recovered['datasets'][entry['dataset']]['snapshot_id'] == fixed
+
+
 def test_future_retry_deadline_still_yields_to_other_work(setup, monkeypatch):
     repo, _, entries, args, _ = setup
     args.maximum_attempted_sources = 1
@@ -355,6 +579,33 @@ def test_lifecycle_priority_change_keeps_original_operation_and_daily_deadline(s
     assert after['operation_directory'] == before['operation_directory']
     assert (Path(before['operation_directory']) / 'plan.json').read_bytes() == plan
     assert migration.advance_catalog_versions(repo, configuration, now=300)['next_cycle_unix'] == 200 + 86400
+
+
+def test_durable_lifecycle_passes_canonical_retention_owner_to_publisher(setup, monkeypatch):
+    repo, cold, entries, args, _ = setup
+    original, seen = publisher._publish_entry, []
+    def publish(entry, options, parent):
+        seen.append(options.retention_config)
+        return original(entry, options, parent)
+    monkeypatch.setattr(publisher, '_publish_entry', publish)
+    monkeypatch.setattr(publisher, '_load_catalog', lambda *_: entries)
+    result = migration.advance_catalog_versions(repo,
+        {'cold_root': str(cold), 'state_root': str(args.migration_state.parent / 'control')})
+    assert result['verified_datasets'] == 1
+    assert seen == [repo / 'configs/data_sync/packed_retention.json']
+
+
+def test_explicit_retention_owner_is_preserved_for_non_cli_migration(setup, monkeypatch):
+    repo, _, entries, args, _ = setup
+    args.retention_config = repo / 'custom-retention-owner.json'
+    original, seen = publisher._publish_entry, []
+    def publish(entry, options, parent):
+        seen.append(options.retention_config)
+        return original(entry, options, parent)
+    monkeypatch.setattr(publisher, '_publish_entry', publish)
+    result = migration.migrate_catalog(repo, args, entries)
+    assert result['state'] == 'verified'
+    assert seen == [args.retention_config]
 
 
 def test_all_sources_including_private_have_exact_verified_versions(setup):
@@ -2674,6 +2925,61 @@ def test_interrupted_activity_preserves_fixed_snapshot_and_attempt_before_resume
     assert interruption['state'] == stage and interruption['snapshot_id'] == snapshot
     assert (args.migration_state / 'attempts/public' / (old_attempt + '.json')).read_bytes() == old_receipt
     assert first['datasets']['public']['state'] == 'verified'
+
+
+@pytest.mark.parametrize('phase', ['publication', 'recovery'])
+def test_shutdown_io_failure_retains_phase_and_resumes_exact_committed_release(setup, monkeypatch, phase):
+    repo, _, entries, args, _ = setup
+    requested = False
+    args.stop_requested = lambda: requested
+    original = publisher._publish_entry if phase == 'publication' else migration._recover
+    def interrupted(*_args, **_options):
+        nonlocal requested
+        requested = True
+        raise SnapshotError('Native Windows cold read failed: ')
+    target, method = (publisher, '_publish_entry') if phase == 'publication' else (migration, '_recover')
+    monkeypatch.setattr(target, method, interrupted)
+    first = migration.migrate_catalog(repo, args, entries)
+    row = first['datasets']['public']
+    assert row['state'] == ('processing' if phase == 'publication' else 'recovery')
+    assert 'retry_at_unix' not in row and 'error' not in row
+    assert row['shutdown_interruption']['error'] == 'Native Windows cold read failed: '
+    assert first['datasets']['private']['attempts'] == 0
+    attempt = args.migration_state / 'attempts/public' / (row['attempt_id'] + '.json')
+    original_attempt = attempt.read_bytes()
+    requested = False
+    monkeypatch.setattr(target, method, original)
+    if phase == 'recovery':
+        monkeypatch.setattr(publisher, '_publish_entry',
+            lambda *_: pytest.fail('shutdown must not republish the committed source'))
+    resumed = migration.migrate_catalog(repo, args, entries)
+    assert resumed['state'] == 'verified'
+    restored = resumed['datasets']['public']
+    assert restored['last_interruption']['attempt_id'] == row['attempt_id']
+    if phase == 'recovery':
+        assert restored['snapshot_id'] == row['snapshot_id']
+    assert attempt.read_bytes() == original_attempt
+
+
+def test_stop_requested_before_source_step_does_not_start_another_source(setup, monkeypatch):
+    repo, _, entries, args, _ = setup
+    args.stop_requested = lambda: True
+    monkeypatch.setattr(publisher, '_publish_entry', lambda *_: pytest.fail('stopping activity published'))
+    result = migration.migrate_catalog(repo, args, entries)
+    assert all(row['state'] == 'pending' and row['attempts'] == 0 for row in result['datasets'].values())
+
+
+def test_native_io_failure_without_activity_stop_keeps_real_failure_and_retry(setup, monkeypatch):
+    repo, _, entries, args, _ = setup
+    args.stop_requested = lambda: False
+    def failed_read(*_args, **_options):
+        raise SnapshotError('Native Windows cold read failed: ')
+    monkeypatch.setattr(migration, '_recover', failed_read)
+    result = migration.migrate_catalog(repo, args, [entries[0]])
+    row = result['datasets']['public']
+    assert row['state'] == 'waiting_retry' and row['error_type'] == 'SnapshotError'
+    assert row['error'] == 'Native Windows cold read failed: '
+    assert row['retry_at_unix'] > 0 and 'shutdown_interruption' not in row
 
 
 def test_sqlite_backup_is_not_repeated_when_main_publication_retries(setup, monkeypatch):

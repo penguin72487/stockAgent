@@ -11,6 +11,8 @@ source scripts/shioaji_history_runner_common.sh
 run_root="${SHIOAJI_HISTORICAL_MARKET_RUN_ROOT:-artifacts/data_repair/shioaji_historical_market_data}"
 tx_scheduler="${SHIOAJI_FUTURES_HISTORY_RUN_ROOT:-artifacts/data_repair/shioaji_futures_history}/scheduler.json"
 output_root="${SHIOAJI_HISTORICAL_MARKET_OUTPUT_ROOT:-data_tw_shioaji_history}"
+option_scope="${SHIOAJI_HISTORICAL_MARKET_OPTION_SCOPE:-latest_txo}"
+collections="${SHIOAJI_HISTORICAL_MARKET_COLLECTIONS:-}"
 max_queries="${SHIOAJI_HISTORICAL_MARKET_BATCH_QUERIES:-500}"
 max_traffic_fraction="${SHIOAJI_HISTORICAL_MARKET_MAX_TRAFFIC_FRACTION:-0.90}"
 inventory_refresh="${SHIOAJI_HISTORICAL_MARKET_INVENTORY_REFRESH_SECONDS:-3600}"
@@ -18,6 +20,8 @@ for value in "$max_queries" "$inventory_refresh"; do
   [[ "$value" =~ ^[0-9]+$ ]] && (( value >= 1 && value <= 10000 )) || exit 2
 done
 mkdir -p "$run_root"
+scope_args=(--option-scope "$option_scope")
+if [[ -n "$collections" ]]; then scope_args+=(--collections "$collections"); fi
 exec 9>"$run_root/runner.lock"
 flock -n 9 || exit 3
 exec > >(tee -a "$run_root/run.log") 2>&1
@@ -49,7 +53,7 @@ while true; do
   run_fintech_python -m downloader.download_shioaji_historical_market_data \
     --simulation --output-dir "$output_root" --max-queries "$max_queries" \
     --max-traffic-fraction "$max_traffic_fraction" \
-    --refresh-empty --prioritize-futures "${refresh_args[@]}"
+    --refresh-empty --prioritize-futures "${scope_args[@]}" "${refresh_args[@]}"
   rc=$?
   set -e
   flock -u 8
@@ -58,7 +62,11 @@ while true; do
   fi
   case "$rc" in
     0)
-      history_publish "$output_root/summary.json" exact tw-shioaji-history
+      if [[ "$option_scope" == latest_txo && -z "$collections" ]]; then
+        history_publish "$output_root/summary.json" exact tw-shioaji-history
+      else
+        echo '[shioaji-history-runner] publication=deferred reason=scoped_inventory_not_full_dataset'
+      fi
       pending="$(run_fintech_python - "$output_root/summary.json" <<'PY'
 import json, sys
 print(int(json.load(open(sys.argv[1]))['pending_queries']))

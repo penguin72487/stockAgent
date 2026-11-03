@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 import hashlib
 import json
 from pathlib import Path
+import struct
 import subprocess
 import zipfile
 
@@ -88,6 +89,55 @@ def test_restored_working_tree_cannot_accept_extra_or_corrupt_inner_files(auxili
         verified_working_tree(destination / "code")
 
 
+def test_restored_working_tree_rejects_crc_damage_even_when_member_bytes_are_unchanged(auxiliary, tmp_path):
+    root, receipt, _ = auxiliary
+    destination = tmp_path / 'delivery'
+    export_auxiliary(root, destination, control_receipt=receipt)
+    archive = destination / 'code/working-tree.zip'
+    body = bytearray(archive.read_bytes())
+    central_header = body.index(b'PK\x01\x02')
+    body[central_header + 16] ^= 1  # Change the central-directory CRC only.
+    archive.write_bytes(body)
+    with pytest.raises(SnapshotError, match='CRC or structure differs'):
+        verified_working_tree(destination / 'code')
+
+
+def test_restored_working_tree_checks_crc_of_an_empty_member(auxiliary, tmp_path):
+    root, receipt, _ = auxiliary
+    (root / 'README.md').write_bytes(b'')
+    destination = tmp_path / 'delivery'
+    export_auxiliary(root, destination, control_receipt=receipt)
+    archive = destination / 'code/working-tree.zip'
+    body = bytearray(archive.read_bytes())
+    offset = body.index(b'PK\x01\x02')
+    while body[offset:offset + 4] == b'PK\x01\x02':
+        name_length, extra_length, comment_length = struct.unpack_from('<HHH', body, offset + 28)
+        name = body[offset + 46:offset + 46 + name_length]
+        if name == b'README.md':
+            body[offset + 16] ^= 1
+            break
+        offset += 46 + name_length + extra_length + comment_length
+    else:
+        pytest.fail('empty member missing from central directory')
+    archive.write_bytes(body)
+    with pytest.raises(SnapshotError, match='CRC or structure differs'):
+        verified_working_tree(destination / 'code')
+
+
+def test_restored_working_tree_rejects_modified_member_with_valid_zip_crc(auxiliary, tmp_path):
+    root, receipt, _ = auxiliary
+    destination = tmp_path / 'delivery'
+    export_auxiliary(root, destination, control_receipt=receipt)
+    archive = destination / 'code/working-tree.zip'
+    with zipfile.ZipFile(archive) as source:
+        members = [(item, source.read(item)) for item in source.infolist()]
+    with zipfile.ZipFile(archive, 'w') as target:
+        for item, body in members:
+            target.writestr(item, b'altered valid ZIP member' if item.filename == 'README.md' else body)
+    with pytest.raises(SnapshotError, match='restored file SHA differs'):
+        verified_working_tree(destination / 'code')
+
+
 @pytest.mark.parametrize("damage", ["archive", "logical_state", "same_mvcc", "public_archive"])
 def test_invalid_control_receipt_cannot_enter_a_closed_delivery(auxiliary, tmp_path, damage):
     root, receipt, archive = auxiliary
@@ -116,6 +166,29 @@ def test_portable_control_uses_relative_objects_and_retains_exact_logical_identi
     assert portable["source_receipt_sha256"] == hashlib.sha256(receipt.read_bytes()).hexdigest()
     assert state["identity_sha256"] == portable["logical_state_identity_sha256"]
     assert not str(archive).startswith(str(receipt.parent))
+
+
+def test_control_source_receipt_hash_binds_the_bytes_that_were_parsed(auxiliary, monkeypatch):
+    from stockagent.data_sync.backup_auxiliary import control_input
+
+    _, receipt, _ = auxiliary
+    original_read = Path.read_bytes
+    initial = original_read(receipt)
+    changed = json.loads(initial)
+    changed['observed_at_utc'] = '2026-01-02T03:04:05+00:00'
+    later = json.dumps(changed).encode()
+    reads = []
+
+    def read_with_concurrent_change(path):
+        if path == receipt:
+            reads.append(True)
+            return initial if len(reads) == 1 else later
+        return original_read(path)
+
+    monkeypatch.setattr(Path, 'read_bytes', read_with_concurrent_change)
+    portable, _, _ = control_input(receipt)
+    assert portable['source_receipt_sha256'] == hashlib.sha256(initial).hexdigest()
+    assert len(reads) == 1
 
 
 def test_private_runtime_and_ignored_licensed_sources_do_not_affect_public_code_identity(auxiliary):

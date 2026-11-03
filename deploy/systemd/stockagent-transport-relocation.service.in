@@ -1,0 +1,14 @@
+[Unit]
+Description=Verified original lab203 sender placement from D staging to E workspace
+Requires=stockagent-e-workspace-mount.service
+After=stockagent-e-workspace-mount.service stockagent-backup-transport-mount.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash -c 'source __REPO_ROOT__/scripts/runtime_env.sh && run_fintech_python __REPO_ROOT__/scripts/install_backup_stream.py --relocate-to-workspace --evidence /var/lib/stockagent/workspace-volume/transport-relocation-v1'
+TimeoutStartSec=infinity
+TimeoutStopSec=90
+
+[Install]
+WantedBy=multi-user.target

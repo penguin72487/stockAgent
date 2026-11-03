@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from dataclasses import replace
+import errno
+import hashlib
 import json
 import os
 import time
@@ -33,6 +35,53 @@ def _fixture(tmp_path: Path) -> tuple[LegacyArchiveSpec, Path, Path]:
             os.utime(path, (old, old))
     spec = LegacyArchiveSpec("legacy-artifact-markets-crypto", "markets/crypto", 7, tmp_path / "stage")
     return spec, artifact_root, source
+
+
+def test_guarded_d_encoded_evidence_retries_an_exact_transient_missing_file(tmp_path, monkeypatch):
+    encoded = tmp_path / 'encoded.raw'
+    encoded.write_bytes(b'actual data')
+    real_hash = archive_module.sha256_file
+    calls, delays = [], []
+    def read(path):
+        calls.append(path)
+        if len(calls) == 1:
+            raise FileNotFoundError(errno.ENOENT, 'temporarily unavailable', str(path))
+        return real_hash(path)
+    monkeypatch.setattr(archive_module, 'sha256_file', read)
+    monkeypatch.setattr(archive_module.time, 'sleep', delays.append)
+    digest, size = archive_module._encoded_file_evidence(encoded, guarded_d_stage=True)
+    assert digest == hashlib.sha256(b'actual data').hexdigest() and size == 11
+    assert len(calls) == 2 and delays == [0.05]
+
+
+@pytest.mark.parametrize(('guarded', 'wrong_path', 'count'), [
+    (True, False, 4), (False, False, 1), (True, True, 1),
+])
+def test_encoded_evidence_never_accepts_a_missing_file_or_retries_other_paths(
+        tmp_path, monkeypatch, guarded, wrong_path, count):
+    encoded = tmp_path / 'encoded.raw'
+    calls = []
+    def missing(path):
+        calls.append(path)
+        raise FileNotFoundError(errno.ENOENT, 'missing', str(tmp_path / 'other' if wrong_path else path))
+    monkeypatch.setattr(archive_module, 'sha256_file', missing)
+    monkeypatch.setattr(archive_module.time, 'sleep', lambda _: None)
+    with pytest.raises(FileNotFoundError):
+        archive_module._encoded_file_evidence(encoded, guarded_d_stage=guarded)
+    assert len(calls) == count
+
+
+def test_preparation_progress_counts_original_bytes_but_never_claims_retirement(tmp_path):
+    spec, root, source = _fixture(tmp_path)
+    events = []
+    manifest = prepare_archive(spec, root, progress=events.append)
+    assert events[0]['files_completed'] == 0 and events[0]['files_total'] == 2
+    final = events[-1]
+    assert final['state'] == 'encoded-files-checked' and final['files_completed'] == 2
+    assert final['source_bytes_completed'] == final['source_bytes_total']
+    assert final['source_bytes_total'] == sum(row['source']['size'] for row in manifest['files'])
+    assert all(event['acceptance'] is False for event in events)
+    assert verify_archive_directory(spec.stage_root / spec.dataset / 'archive', source)['files'] == 2
 
 
 def test_encoded_tree_census_is_complete_with_bounded_parallel_metadata(tmp_path, monkeypatch):
@@ -376,7 +425,36 @@ def test_real_publisher_holds_owner_only_for_canonical_commit(tmp_path, monkeypa
     assert result["source_files"] == 2
     assert progress_events and all(event['acceptance'] is False for event in progress_events)
     assert any(event['stage'] == 'packing_changed_small_files' for event in progress_events)
+    readback = [event for event in progress_events
+                if event['stage'] == 'post-publication-verify-materialized-files']
+    assert readback and readback[-1]['completed_items'] == readback[-1]['total_items']
+    assert readback[-1]['acceptance_proof'] is False
     assert (source / "fold_01/checkpoint_best.pt").read_bytes() == b"legacy incomplete checkpoint"
+
+
+@pytest.mark.parametrize(('manual_capture', 'expected_workers'), [(False, 1), (True, 4)])
+def test_publisher_reuses_admitted_worker_count_for_packed_readback(
+        tmp_path, monkeypatch, manual_capture, expected_workers):
+    spec, artifact_root, source = _fixture(tmp_path)
+    if manual_capture:
+        spec = replace(spec, manual_capture_min_stable_hours=12)
+    prepare_archive(spec, artifact_root, manual_capture=manual_capture, repo_root=tmp_path)
+    real_verify = archive_module.verify_packed_snapshot
+    readback_workers = []
+
+    def verify_packed(*args, **kwargs):
+        readback_workers.append(kwargs['materialized_file_workers'])
+        return real_verify(*args, **kwargs)
+
+    # A guarded D stage chooses four workers; this fixture stays on the test
+    # filesystem but exercises the real publisher and its complete readback.
+    monkeypatch.setattr(archive_module, '_d_stage_file_workers', lambda *_: 4)
+    monkeypatch.setattr(archive_module, 'verify_packed_snapshot', verify_packed)
+    result = publish_archive(spec, artifact_root, tmp_path / 'packed', repo_root=tmp_path,
+                             manual_capture=manual_capture)
+    assert readback_workers == [expected_workers]
+    assert result['source_files'] == 2
+    assert (source / 'fold_01/checkpoint_best.pt').read_bytes() == b'legacy incomplete checkpoint'
 
 
 def test_selected_restore_keeps_full_archive_verification_and_exact_members(tmp_path):
@@ -870,6 +948,39 @@ def test_benchmark_scratch_cannot_capture_an_arbitrary_legacy_d_source(tmp_path,
     assert not stage.exists() and source.is_dir()
 
 
+@pytest.mark.parametrize('available', [0, 1024**3])
+def test_manual_d_backup_can_spend_its_pool_but_still_needs_source_budget(tmp_path, monkeypatch, available):
+    import stockagent.data_sync.cold_primary as primary
+    spec, artifacts, original = _fixture(tmp_path)
+    source = artifacts / 'operations/closed-backup'
+    source.parent.mkdir(parents=True)
+    original.rename(source)
+    stage = tmp_path / 'guarded-offline-d-scratch'
+    monkeypatch.setattr(archive_module, 'D_OFFLINE_STAGE_ROOT', stage)
+    spec = replace(spec, relative_root='operations/closed-backup', stage_root=stage,
+                   capture_contract=archive_module.MANUAL_WSL_CAPTURE_CONTRACT,
+                   manual_capture_min_stable_hours=12)
+    monkeypatch.setattr(primary, '_check_d_primary_mount', lambda root: None)
+    monkeypatch.setattr(archive_module.shutil, 'disk_usage', lambda root:
+                        type('Usage', (), {'free': available})())
+    if available == 0:
+        with pytest.raises(SnapshotError, match='source-size budget'):
+            prepare_archive(spec, artifacts, manual_capture=True, use_backup_reserve=True)
+        assert not stage.exists() and source.is_dir()
+    else:
+        prepared = prepare_archive(spec, artifacts, manual_capture=True, use_backup_reserve=True)
+        verified = verify_archive_directory(stage / spec.dataset / 'archive', source,
+                                            spec=spec, manual_capture=True, artifact_root=artifacts)
+        assert verified['files'] == len(prepared['files']) == 2
+
+
+def test_backup_reserve_never_applies_to_ordinary_or_unscoped_archives(tmp_path):
+    spec, artifacts, _ = _fixture(tmp_path)
+    for manual in (False, True):
+        with pytest.raises(SnapshotError, match='guarded-D manual'):
+            prepare_archive(spec, artifacts, manual_capture=manual, use_backup_reserve=True)
+
+
 def test_offline_d_scratch_retains_full_source_budget_and_32_gib(tmp_path, monkeypatch):
     import stockagent.data_sync.cold_primary as primary
     spec, artifacts, original = _fixture(tmp_path)
@@ -1199,3 +1310,37 @@ def test_oversize_stage_encoding_keeps_unbounded_original_local_reader(tmp_path,
         os.fstat(fd)  # The caller still owns its generation-fence descriptor.
     finally:
         os.close(fd)
+
+
+@pytest.mark.parametrize('failure', ['none', 'native-exit', 'replace-on-close'])
+def test_reviewed_raw_batch_uses_complete_native_sha_and_preserves_held_fd_fences(tmp_path, monkeypatch, failure):
+    import hashlib
+    from stockagent.data_sync import windows_cold_io as native
+    path = tmp_path/'raw-encoding'
+    second = tmp_path/'second-encoding'
+    data = b'unmodified original values' * 123
+    path.write_bytes(data)
+    second.write_bytes(data)
+    monkeypatch.setattr(archive_module, 'reviewed_retired_stage', lambda _spec: {'enrolled': True})
+    monkeypatch.setattr(archive_module, 'NATIVE_ENCODED_READ_MIN_BYTES', 1)
+    monkeypatch.setattr(archive_module, 'NATIVE_RAW_BATCH_MIN_BYTES', 1)
+    digest = hashlib.sha256(data).hexdigest()
+    calls = []
+    def hash_many(paths):
+        calls.append(paths)
+        if failure == 'native-exit':
+            raise SnapshotError('native full SHA failed')
+        if failure == 'replace-on-close':
+            replacement = tmp_path/'replacement'; replacement.write_bytes(data); replacement.replace(path)
+        return {path: digest, second: digest}
+    monkeypatch.setattr(native, 'hash_many', hash_many)
+    checked = [({'codec': 'raw', 'encoded_size': len(data)}, p.name, p.name) for p in (path, second)]
+    def verify():
+        with archive_module._reviewed_raw_proofs(tmp_path, checked, object()) as proofs:
+            assert proofs == {p.name: (digest, len(data)) for p in (path, second)}
+    if failure == 'none':
+        verify()
+    else:
+        with pytest.raises(SnapshotError):
+            verify()
+    assert calls == [[path, second]]

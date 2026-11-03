@@ -1,5 +1,6 @@
 import asyncio
 import fcntl
+import threading
 from datetime import datetime
 from types import SimpleNamespace
 
@@ -252,3 +253,223 @@ def test_offhours_release_rechecks_eligibility_after_acquiring_model_mutex(monke
     assert discord_bot._release_offhours_gpu_cache_sync() is False
     assert not discord_bot._MODEL_INFERENCE_LOCK.locked()
     assert idle_model_cache == []
+
+
+@pytest.fixture
+def isolated_preopen_scheduler(monkeypatch):
+    class PreopenClock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 10, 29, 8, 45, tzinfo=tz)
+
+    # These tests exercise scheduler mechanics, not the actual time of day.
+    monkeypatch.setattr(discord_bot, "datetime", PreopenClock)
+    configs = {name: SimpleNamespace(market=name, timezone="Asia/Taipei", open_time="09:00",
+        day_trade_simulation_enabled=True, overnight_simulation_enabled=False)
+        for name in ("slow", "fast")}
+    keys = {name: f"2026-10-29:{name}:preopen" for name in configs}
+    monkeypatch.setattr(discord_bot, "_scheduled_markets", lambda: list(configs))
+    monkeypatch.setattr(discord_bot, "_resolve_market", configs.__getitem__)
+    monkeypatch.setattr(discord_bot, "_preopen_prepare_key", lambda cfg, _now: keys[cfg.market])
+    monkeypatch.setattr(discord_bot.bot, "_preopen_prepare_jobs", {})
+    monkeypatch.setattr(discord_bot.bot, "_last_preopen_prepare_keys", set())
+    monkeypatch.setattr(discord_bot.bot, "_preopen_retry_after", {})
+    monkeypatch.setattr(discord_bot.bot, "_preopen_failure_counts", {})
+    monkeypatch.setattr(discord_bot, "_log_exception", lambda *_args: None)
+    return keys
+
+
+async def _wait_for_test_condition(condition, timeout=3.0):
+    async def poll():
+        while not condition():
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(poll(), timeout)
+
+
+def test_preopen_slow_source_does_not_block_other_mode_or_duplicate_worker(
+    monkeypatch, isolated_preopen_scheduler,
+):
+    release = threading.Event()
+    started = threading.Event()
+    calls = []
+
+    def prepare(cfg):
+        calls.append((cfg.market, "base"))
+        if cfg.market == "slow":
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release source")
+        return SimpleNamespace(summary={"panel_date": "2026-10-28"})
+
+    def final_arm(cfg):
+        calls.append((cfg.market, "final"))
+        return SimpleNamespace(summary={"panel_date": "2026-10-28"})
+
+    monkeypatch.setattr(discord_bot, "_prewarm_market_signal_sync", prepare)
+    monkeypatch.setattr(discord_bot, "_final_arm_market_signal_sync", final_arm)
+
+    async def exercise():
+        try:
+            await discord_bot.preopen_prepare.coro()
+            await _wait_for_test_condition(lambda: started.is_set())
+            await _wait_for_test_condition(lambda: isolated_preopen_scheduler["fast"]
+                in discord_bot.bot._last_preopen_prepare_keys)
+            assert "slow" in discord_bot.bot._preopen_prepare_jobs
+            isolated_preopen_scheduler["slow"] = "2026-10-29:slow:epoch-1:preopen-final-arm"
+            await discord_bot.preopen_prepare.coro()
+            assert calls.count(("slow", "base")) == 1
+            assert ("slow", "final") not in calls
+            release.set()
+            await _wait_for_test_condition(lambda: "slow" not in discord_bot.bot._preopen_prepare_jobs)
+            await discord_bot.preopen_prepare.coro()
+            await _wait_for_test_condition(lambda: isolated_preopen_scheduler["slow"]
+                in discord_bot.bot._last_preopen_prepare_keys)
+            assert calls.count(("slow", "final")) == 1
+        finally:
+            release.set()
+
+    asyncio.run(exercise())
+
+
+def test_preopen_failure_is_per_mode_and_preserves_retry(monkeypatch, isolated_preopen_scheduler):
+    def prepare(cfg):
+        if cfg.market == "slow":
+            raise RuntimeError("source unavailable")
+        return SimpleNamespace(summary={"panel_date": "2026-10-28"})
+
+    monkeypatch.setattr(discord_bot, "_prewarm_market_signal_sync", prepare)
+
+    async def exercise():
+        await discord_bot.preopen_prepare.coro()
+        await _wait_for_test_condition(lambda: not discord_bot.bot._preopen_prepare_jobs)
+        assert isolated_preopen_scheduler["fast"] in discord_bot.bot._last_preopen_prepare_keys
+        assert isolated_preopen_scheduler["slow"] not in discord_bot.bot._last_preopen_prepare_keys
+        assert discord_bot.bot._preopen_failure_counts == {isolated_preopen_scheduler["slow"]: 1}
+        assert isolated_preopen_scheduler["slow"] in discord_bot.bot._preopen_retry_after
+
+    asyncio.run(exercise())
+
+
+def test_preopen_cancel_keeps_market_single_flight_until_thread_finishes(
+    monkeypatch, isolated_preopen_scheduler,
+):
+    release = threading.Event()
+    started = threading.Event()
+    calls = []
+
+    def prepare(cfg):
+        calls.append(cfg.market)
+        if cfg.market == "slow":
+            started.set()
+            if not release.wait(timeout=5):
+                raise TimeoutError("test did not release source")
+        return SimpleNamespace(summary={"panel_date": "2026-10-28"})
+
+    monkeypatch.setattr(discord_bot, "_prewarm_market_signal_sync", prepare)
+
+    async def exercise():
+        try:
+            await discord_bot.preopen_prepare.coro()
+            await _wait_for_test_condition(lambda: started.is_set())
+            job = discord_bot.bot._preopen_prepare_jobs["slow"]
+            job.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await job
+            assert discord_bot.bot._preopen_prepare_jobs["slow"] is job
+            await discord_bot.preopen_prepare.coro()
+            assert calls.count("slow") == 1
+            release.set()
+            await _wait_for_test_condition(lambda: "slow" not in discord_bot.bot._preopen_prepare_jobs)
+        finally:
+            release.set()
+
+    asyncio.run(exercise())
+
+
+def test_preopen_cancel_before_task_starts_releases_slot_for_retry(
+    monkeypatch, isolated_preopen_scheduler,
+):
+    calls = []
+    monkeypatch.setattr(discord_bot, "_prewarm_market_signal_sync", lambda cfg:
+        calls.append(cfg.market) or SimpleNamespace(summary={"panel_date": "2026-10-28"}))
+
+    async def exercise():
+        await discord_bot.preopen_prepare.coro()
+        jobs = tuple(discord_bot.bot._preopen_prepare_jobs.values())
+        assert len(jobs) == 2
+        for job in jobs:
+            job.cancel()
+        await asyncio.gather(*jobs, return_exceptions=True)
+        await _wait_for_test_condition(lambda: not discord_bot.bot._preopen_prepare_jobs)
+        assert calls == []
+        await discord_bot.preopen_prepare.coro()
+        await _wait_for_test_condition(lambda: not discord_bot.bot._preopen_prepare_jobs)
+        assert sorted(calls) == ["fast", "slow"]
+        assert set(discord_bot.bot._last_preopen_prepare_keys) == set(isolated_preopen_scheduler.values())
+
+    asyncio.run(exercise())
+
+
+def test_preopen_waiter_yields_model_lock_at_open_without_blocking_scheduled_catchup(monkeypatch):
+    cfg = SimpleNamespace(market="cash", timezone="Asia/Taipei", open_time="09:00",
+                          day_trade_simulation_enabled=True)
+    observed = [datetime(2026, 10, 29, 8, 59, 59)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed[0].replace(tzinfo=tz)
+
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    started = threading.Event()
+    finished = threading.Event()
+    outcomes = []
+
+    def waiter():
+        discord_bot._PREOPEN_BACKGROUND_CONTEXT.active = True
+        started.set()
+        try:
+            with discord_bot._preopen_model_lock(cfg):
+                outcomes.append("incorrectly entered")
+        except discord_bot._PreopenBackgroundOpeningPriority:
+            outcomes.append("yielded")
+        finally:
+            discord_bot._PREOPEN_BACKGROUND_CONTEXT.active = False
+            finished.set()
+
+    with discord_bot._MODEL_INFERENCE_LOCK:
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        assert started.wait(timeout=2)
+        observed[0] = datetime(2026, 10, 29, 9, 0, 0)
+        assert finished.wait(timeout=2)
+    thread.join(timeout=2)
+    assert outcomes == ["yielded"]
+    # The actual scheduled path can still perform a necessary cold catch-up.
+    with discord_bot._preopen_model_lock(cfg):
+        assert discord_bot._MODEL_INFERENCE_LOCK.locked()
+
+
+def test_background_preopen_admission_yields_only_during_opening_window(monkeypatch, isolated_preopen_scheduler):
+    observed = [datetime(2026, 10, 29, 9, 0, 0)]
+
+    class Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return observed[0].replace(tzinfo=tz)
+
+    monkeypatch.setattr(discord_bot, "datetime", Clock)
+    calls = []
+    monkeypatch.setattr(discord_bot, "_prewarm_market_signal_sync", lambda cfg:
+        calls.append(cfg.market) or SimpleNamespace(summary={"panel_date": "2026-10-28"}))
+
+    async def exercise():
+        await discord_bot.preopen_prepare.coro()
+        assert not discord_bot.bot._preopen_prepare_jobs
+        assert not calls
+        observed[0] = datetime(2026, 10, 29, 9, 5, 0)
+        await discord_bot.preopen_prepare.coro()
+        await _wait_for_test_condition(lambda: not discord_bot.bot._preopen_prepare_jobs)
+        assert sorted(calls) == ["fast", "slow"]
+
+    asyncio.run(exercise())

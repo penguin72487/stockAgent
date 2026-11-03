@@ -29,6 +29,7 @@ from stockagent.data.tw_futures_decision_clock import (
 )
 from stockagent.data.tw_stock_futures_history import _reuse_verified_contract
 from stockagent.data.tw_stock_futures_kbars import read_futures_kbar_sources
+from stockagent.data.tw_futures_reference_gaps import quarantine_reference_gaps, withhold_uncertified_fallbacks
 
 
 def _entry_minute_filter(window_minutes):
@@ -543,6 +544,72 @@ def supplement_community_rpt(inventory, source, minutes, coverage, trades, *,
     return minutes, coverage.filter(pl.col('verified')).select(keys), coverage, trades, proof
 
 
+def supplement_official_recent(manifest, source, minutes, coverage, trades, *,
+                               progress, workers=4, window_minutes=1):
+    """Fill only unverified contract-days from independently pinned exchange originals.
+
+    A wider unknown-final session is accepted only by the existing official
+    full-day book verifier. Previously verified contract-days and their source
+    identities are unchanged. An absent official date is not a zero-trade day.
+    """
+    from concurrent.futures import ThreadPoolExecutor
+    from stockagent.data.tw_futures_official_ticks import pin_official_tick_inventory, read_official_tick_day
+
+    keys = ['date', 'physical_contract']
+    path = Path(manifest)
+    manifest_sha = sha256_file(path)
+    document = json.loads(path.read_text())
+    official_dates = {record['trading_date'] for record in document.get('raw_downloads', [])
+                      if record.get('kind') == 'futures'}
+    missing = coverage.filter(~pl.col('verified')).select(*keys, 'outright_volume', 'block_volume')
+    pending = (source.filter(pl.col('executable')).drop('outright_volume')
+               .join(missing, on=keys, how='inner', validate='1:1')
+               .filter(pl.col('date').cast(pl.String).is_in(sorted(official_dates))))
+    if pending.select(keys).is_duplicated().any():
+        raise ValueError('official supplement requires unique unverified physical contract-days')
+    items = pin_official_tick_inventory(path, sorted(pending['date'].unique().to_list()))
+    by_day = {str(frame['date'][0]): frame for frame in pending.partition_by('date')}
+
+    def inspect(item):
+        bars, days, events = read_official_tick_day(item, by_day[item['date']], asset_scope='all_twd')
+        admitted = days.filter(pl.col('verified')).select(keys)
+        if (days.height != by_day[item['date']].height or days.select(keys).is_duplicated().any()
+                or bars.join(admitted, on=keys, how='anti').height
+                or events.join(admitted.rename({'date': 'trade_date'}),
+                               on=['trade_date', 'physical_contract'], how='anti').height):
+            raise ValueError('official supplement produced an unverified or misaligned print')
+        return item, bars, days.filter(pl.col('verified')), events
+
+    accepted_bars, accepted_days, accepted_events, records = [], [], [], []
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for index, (item, bars, days, events) in enumerate(pool.map(inspect, items), 1):
+            if days.height:
+                accepted_bars.append(bars.filter(_entry_minute_filter(window_minutes)))
+                accepted_days.append(days.select(coverage.columns))
+                accepted_events.append(events)
+            records.append({**item, 'examined_contract_days': by_day[item['date']].height,
+                            'admitted_contract_days': days.height})
+            progress(stage='official_recent_supplement_readback', dates_checked=index,
+                     dates_total=len(items), accepted_contract_days=sum(x['admitted_contract_days'] for x in records))
+    if accepted_days:
+        replacements = pl.concat(accepted_days, how='vertical_relaxed')
+        if (replacements.select(keys).is_duplicated().any()
+                or replacements.join(missing.select(keys), on=keys, how='anti').height):
+            raise ValueError('official supplement may replace only unique unverified contract-days')
+        coverage = pl.concat([coverage.join(replacements.select(keys), on=keys, how='anti'), replacements],
+                             how='vertical_relaxed').sort(keys)
+        minutes = pl.concat([minutes, *accepted_bars], how='vertical_relaxed')
+        trades = pl.concat([trades, *accepted_events], how='vertical_relaxed')
+    if sha256_file(path) != manifest_sha:
+        raise ValueError('official supplement manifest changed during readback')
+    proof = dict(contract='taifex_recent_full_session_supplement_v1',
+                 manifest=dict(path=str(path.resolve()), sha256=manifest_sha),
+                 historical_point_in_time_verified=False, fill_verified=False,
+                 admission='same_physical_contract_official_original_complete_book_volume_and_hlc',
+                 source_records=records, accepted_contract_days=sum(x['admitted_contract_days'] for x in records))
+    return minutes, coverage.filter(pl.col('verified')).select(keys), coverage, trades, proof
+
+
 def paired_entries(source, minutes, verified_days, *, asset_scope='stock_only',
                    window_minutes=1, quarantine_days=None, prepared_entries=None):
     """Pure alignment: execution availability never changes policy eligibility."""
@@ -577,7 +644,7 @@ def paired_entries(source, minutes, verified_days, *, asset_scope='stock_only',
     return result
 
 
-def paired_opening_references(source, minutes, verified_days):
+def paired_opening_references(source, minutes, verified_days, *, return_trades=False):
     """Use only real prints; official marks never become fallback trades.
 
     Daily closing prints have date precision, so retain a nullable trade_ts and
@@ -594,14 +661,15 @@ def paired_opening_references(source, minutes, verified_days):
         (pl.col("date").cast(pl.Datetime("us")) + pl.duration(days=1)
             - pl.duration(microseconds=1)).alias("available_by"),
         pl.col("official_source_sha256").alias("source_sha256"),
-        pl.lit(False).alias("is_session_open"))
+        pl.lit(False).alias("is_session_open"), pl.lit(False).alias('opening_order_proven'))
     prefix = minutes.filter((pl.col("volume") > 0) & (pl.col("minute") <= 540)).join(
         verified_days.select(keys).unique(), on=keys, how="semi")
     minute_trades = prefix.select("physical_contract", pl.col("close").alias("price"),
         pl.col("date").alias("trade_date"),
         pl.lit(None, dtype=pl.Datetime("us")).alias("trade_ts"),
         (pl.col("date").cast(pl.Datetime("us")) + pl.duration(minutes=pl.col("minute"))).alias("available_by"),
-        pl.col("source_file_sha256").alias("source_sha256"), pl.lit(False).alias("is_session_open"))
+        pl.col("source_file_sha256").alias("source_sha256"), pl.lit(False).alias("is_session_open"),
+        pl.lit(False).alias('opening_order_proven'))
     first = prefix.sort("minute").group_by(keys, maintain_order=True).first().join(
         source.select(*keys, "observed_open"), on=keys, how="left", validate="1:1")
     # A daily opening outside the first observed minute contradicts the
@@ -612,11 +680,13 @@ def paired_opening_references(source, minutes, verified_days):
     openings = first.select("physical_contract", pl.col("observed_open").alias("price"),
         pl.col("date").alias("trade_date"), pl.lit(None, dtype=pl.Datetime("us")).alias("trade_ts"),
         (pl.col("date").cast(pl.Datetime("us")) + pl.duration(minutes=pl.col("minute"))).alias("available_by"),
-        pl.col("source_file_sha256").alias("source_sha256"), pl.lit(True).alias("is_session_open"))
+        pl.col("source_file_sha256").alias("source_sha256"), pl.lit(True).alias("is_session_open"),
+        ((pl.col('high') - pl.col('low')).abs() <= 1e-6).alias('opening_order_proven'))
     trades = pl.concat([closes, minute_trades, openings], how="vertical_relaxed")
     decisions = source.select(*keys, "symbol")
-    return {clock: resolve_opening_references(decisions, trades, decision_time=clock)
-            for clock in ("08:45", "09:00")}
+    references = {clock: resolve_opening_references(decisions, trades, decision_time=clock)
+                  for clock in ("08:45", "09:00")}
+    return (references, trades) if return_trades else references
 
 
 def load_verified_history(history_root, tick_roots, source, *, progress=None, include_reference_minutes=False,
@@ -818,11 +888,19 @@ def build(args):
                 progress=progress, workers=args.source_workers, window_minutes=max(windows),
                 block_detail_inventory=getattr(args, 'official_block_detail_inventory', None))
             history_proof['community_rpt_supplement'] = supplement
+        official_supplement = getattr(args, 'taifex_recent_supplement_manifest', None)
+        if official_supplement is not None:
+            if scope != 'all_twd' or not args.with_opening_reference:
+                raise ValueError('official recent supplement needs all-TWD dated rules and opening references')
+            minutes, verified, coverage, reference_trades, supplement = supplement_official_recent(
+                official_supplement, source, minutes, coverage, reference_trades,
+                progress=progress, workers=args.source_workers, window_minutes=max(windows))
+            history_proof['official_recent_supplement'] = supplement
         atomic_write_parquet(output / 'source_coverage.parquet', coverage)
     else:
         if any(getattr(args, name, None) is not None for name in (
                 'community_rpt_inventory', 'finmind_product_fallback_manifest',
-                'taifex_recent_fallback_manifest')):
+                'taifex_recent_fallback_manifest', 'taifex_recent_supplement_manifest')):
             raise ValueError('tick source supplements require the canonical whole-market source')
         progress(stage="historical_minute_validation", contract_days=source.height)
         minutes, verified, history_proof = load_verified_history(args.history_root, args.tick_root, source,
@@ -859,17 +937,6 @@ def build(args):
         verified = pl.concat([verified, days]).unique()
         sources.extend(receipts)
         missing = missing.join(days, on=["date", "physical_contract"], how="anti")
-    references = {}
-    if args.with_opening_reference:
-        if quarantine is not None and reference_trades is not None:
-            # An incomplete tape cannot establish the session's first print.
-            # Carry the last verified real trade with its original timestamp;
-            # the unknown day supplies neither an opening claim nor a fill.
-            reference_trades = reference_trades.join(verified.rename({'date': 'trade_date'}),
-                on=['trade_date', 'physical_contract'], how='semi')
-        references = ({clock: resolve_opening_references(source.select('date','physical_contract','symbol'),
-            reference_trades, decision_time=clock) for clock in ('08:45','09:00')}
-            if reference_trades is not None else paired_opening_references(all_source, minutes, verified))
     gaps = missing.select("date", "product", "contract", "asset_class", "physical_contract", "symbol", "volume").with_columns(
         pl.lit("source_evidence_missing").alias("status"), pl.col("volume").alias("outright_volume"))
     atomic_write_parquet(output / "coverage_gaps.parquet", gaps)
@@ -877,6 +944,24 @@ def build(args):
         validate_execution_quarantine(quarantine, gaps, daily_sha256=daily_sha, rules_sha256=rules_sha)
         if sha256_file(quarantine_path) != quarantine_sha:
             raise ValueError('execution quarantine changed during source readback')
+    references = {}
+    reference_version = 3 if args.with_opening_reference else 1
+    has_reference_trade_events = reference_trades is not None
+    if args.with_opening_reference:
+        if quarantine is not None and reference_trades is not None:
+            # An incomplete tape cannot establish the session's first print.
+            # A verified old print is not necessarily the latest after a gap.
+            reference_trades = reference_trades.join(verified.rename({'date': 'trade_date'}),
+                on=['trade_date', 'physical_contract'], how='semi')
+        if reference_trades is not None:
+            references = {clock: resolve_opening_references(source.select('date','physical_contract','symbol'),
+                reference_trades, decision_time=clock) for clock in ('08:45','09:00')}
+        else:
+            references, reference_trades = paired_opening_references(all_source, minutes, verified, return_trades=True)
+        references = {clock: withhold_uncertified_fallbacks(quarantine_reference_gaps(
+            frame.filter(pl.col('date') >= start), reference_trades,
+            gaps.select('date', 'physical_contract'), coverage_start=source['date'].min()), reference_trades)
+            for clock, frame in references.items()}
     ready = not gaps.height or quarantine is not None
     identity = {"daily": daily_sha, "rules": rules_sha, "start": str(source["date"].min()),
         "end": str(source["date"].max()), "historical_source": history_proof,
@@ -884,11 +969,12 @@ def build(args):
     if spec_pin is not None:
         identity['entry_specifications']=spec_pin
     if references:
-        identity["opening_reference_contracts"] = [opening_reference_contract(c) for c in references]
+        identity["opening_reference_contracts"] = [opening_reference_contract(c, version=reference_version) for c in references]
+        identity['reference_continuity_policy'] = 'withhold_fallback_until_cross_session_and_same_second_certified_v3'
         identity['reference_observations'] = ('first_second_official_open_reconciled_or_unavailable_v2'
-            if reference_trades is not None else 'verified_minute_and_prior_official_observed_close')
+            if has_reference_trade_events else 'verified_minute_and_prior_official_observed_close')
         if quarantine is not None:
-            identity['quarantine_reference_policy'] = 'ignore_unverified_day_prints_carry_last_verified_real_trade_with_original_clock'
+            identity['quarantine_reference_policy'] = 'withhold_across_unverified_contract_days_or_before_covered_daily_axis_v3'
     identities = {}
     for window in windows:
         options = dict(window_minutes=window, quarantine_unknown=quarantine is not None)
@@ -934,7 +1020,7 @@ def build(args):
                 atomic_write_parquet(ref_path, refs)
                 atomic_write_json(directory / 'opening_reference_manifest.json', {
                     'dataset': OPENING_REFERENCE_DATASET, 'status': 'complete' if ready else 'partial',
-                    'contract': opening_reference_contract(clock), 'pair_identity': pair_identity,
+                    'contract': opening_reference_contract(clock, version=reference_version), 'pair_identity': pair_identity,
                     'source_daily_sha256': daily_sha, 'data_sha256': sha256_file(ref_path), 'rows': refs.height,
                     'counts': dict(refs.group_by('reference_kind').len().iter_rows()),
                 })
@@ -966,6 +1052,8 @@ def main():
                    help='Explicit original product/day receipts for selected missing all-TWD bulk dates')
     p.add_argument('--taifex-recent-fallback-manifest', type=Path,
                    help='Frozen canonical TAIFEX recent archive receipt for explicit all-TWD days')
+    p.add_argument('--taifex-recent-supplement-manifest', type=Path,
+                   help='Pinned TAIFEX originals supplement only independently unverified contract-days')
     p.add_argument('--community-rpt-inventory', type=Path,
                    help='Optional source-separated community archive inventory; full-session certificates required')
     p.add_argument('--official-block-detail-inventory', type=Path,

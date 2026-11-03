@@ -98,6 +98,8 @@ def audit(state_dir, output):
         for market, mode in (original.get("modes") or {}).items():
             if mode.get("entry_retry_pending_commit") or mode.get("ledger_state_divergence"):
                 raise RuntimeError(f"{market}: pending or divergent ledger commit; reload not accepted")
+        from stockagent.live.paper_signal_commit_recovery import export_abort_receipts
+        export_abort_receipts(state_dir, isolated)
         engine = TwDayTradeSimulationEngine(isolated)
         if inventory(original) != inventory(engine.state):
             raise RuntimeError("restart altered persisted inventory, raw targets or consumed signals")

@@ -6,6 +6,7 @@ fetch. No signed URL, token or account-scoped metadata is retained.
 """
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import UTC, datetime, timedelta
 from importlib.metadata import version
 import importlib
@@ -59,6 +60,7 @@ def checked_get(key: str, *, sdk=None) -> tuple[object, dict]:
     old_expiry = storage.get_time_expired(key) if compatible else None
     marker = None
     forced = not compatible
+    recovery = None
     try:
         if compatible:
             for name in flags:
@@ -68,16 +70,24 @@ def checked_get(key: str, *, sdk=None) -> tuple[object, dict]:
             if isinstance(publications, dict):
                 publications.pop(key, None)
             storage.set_time_expired(key, datetime.now(UTC) - timedelta(seconds=1), save=False)
-        frame = sdk.get(key, force_download=forced, progress="event", progress_callback=progress)
-        if compatible:
-            marker = getattr(storage, "_publications", {}).get(key)
-            if not (isinstance(marker, tuple) and len(marker) == 2
-                    and marker[0] == storage.get_time_created(key)):
-                # Concurrent expiry refresh or a free/local-only cache policy
-                # can bypass metadata. It must never count as a source check.
-                forced = True
-                frame = sdk.get(key, force_download=True, progress="event", progress_callback=progress)
+        recovery_context = nullcontext(None)
+        if compatible and getattr(sdk, "__name__", None) == "finlab.data":
+            from scripts.finlab_recent_null_recovery import recent_null_recovery
+            recovery_context = recent_null_recovery(storage, key)
+        with recovery_context as recovery:
+            frame = sdk.get(key, force_download=forced, progress="event", progress_callback=progress)
+            if compatible:
                 marker = getattr(storage, "_publications", {}).get(key)
+                if not (isinstance(marker, tuple) and len(marker) == 2
+                        and marker[0] == storage.get_time_created(key)):
+                    # Concurrent expiry refresh or a free/local-only cache policy
+                    # can bypass metadata. It must never count as a source check.
+                    forced = True
+                    frame = sdk.get(key, force_download=True, progress="event", progress_callback=progress)
+                    marker = getattr(storage, "_publications", {}).get(key)
+        if recovery and recovery["hash_mismatch"]:
+            # The SDK's normal hash-mismatch branch requests the full source.
+            forced = True
         checked = datetime.now(UTC)
         evidence = {"source_checked_at_utc": checked.isoformat(),
                     "source_check_mode": "upstream_forced" if forced else "upstream_incremental",
@@ -86,6 +96,12 @@ def checked_get(key: str, *, sdk=None) -> tuple[object, dict]:
                     "incremental_adapter_version": 1, "normalization_contract_version": 2,
                     "provider_content_hash": None, "provider_hash_basis": None,
                     "finlab_sdk_version": version("finlab")}
+        if recovery and (recovery["recovered"] or recovery["hash_mismatch"]):
+            evidence["recent_merge_recovery"] = {
+                "contract": "finlab_recent_null_promotion_v1",
+                "sdk_hash_verified": recovery["recovered"],
+                "sdk_full_fallback_after_hash_mismatch": recovery["hash_mismatch"],
+            }
         if compatible:
             expiry = storage.get_time_expired(key)
             if (isinstance(expiry, datetime) and expiry.tzinfo

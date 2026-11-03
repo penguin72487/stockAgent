@@ -10,7 +10,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
-from stockagent.training_rescue import Rescue, RescueError, load_policy  # noqa: E402
+from stockagent.training_rescue import Rescue, RescueCapacityWait, RescueError, load_policy  # noqa: E402
 
 
 def main():
@@ -102,13 +102,22 @@ def main():
     return 0
 
 
-if __name__ == "__main__":
+def cli():
     try:
-        raise SystemExit(main())
+        return main()
     except BlockingIOError:
         print(json.dumps({"state": "owner_busy_no_duplicate_operation", "retry_later": True}))
-        raise SystemExit(75)
+        return 75
+    except RescueCapacityWait as exc:
+        print(json.dumps({"state": "waiting_d_capacity", "retry_later": True,
+                          "reason": str(exc)[:400], "source_retirement": False,
+                          "runtime_acceptance": False}, ensure_ascii=False))
+        return 75
     except (RescueError, OSError, ValueError, KeyError, TypeError) as exc:
         print(json.dumps({"state": "rescue_rejected", "error_type": type(exc).__name__,
                           "reason": str(exc)[:400]}, ensure_ascii=False), file=sys.stderr)
-        raise SystemExit(65)
+        return 65
+
+
+if __name__ == "__main__":
+    raise SystemExit(cli())

@@ -134,6 +134,102 @@ def test_interrupted_manifest_requires_exact_frozen_link_plan(tmp_path, monkeypa
         recover_complete_archive_manifest(spec, root, manual_capture=True)
 
 
+@pytest.mark.parametrize('incomplete', [False, True])
+def test_device_renumber_resumes_frozen_d_capture_without_reencoding_existing_files(
+        tmp_path, monkeypatch, incomplete):
+    import stockagent.data_sync.cold_primary as cold_primary
+
+    spec, root, source = _case(tmp_path, monkeypatch)
+    second = source / 'data' / 'second.json'
+    second.write_bytes(b'additional original')
+    old_ns = time.time_ns() - 2 * 86400 * 10**9
+    os.utime(second, ns=(old_ns, old_ns))
+    monkeypatch.setattr(archive_module, 'D_BENCHMARK_STAGE_ROOT', spec.stage_root)
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda _root: None)
+    signature = archive_module._source_signature
+    with monkeypatch.context() as old_boot:
+        old_boot.setattr(archive_module, '_source_signature',
+                         lambda info: {**signature(info), 'device': info.st_dev + 77})
+        original = prepare_archive(spec, root, manual_capture=True)
+    stage = spec.stage_root / spec.dataset
+    plan_before = (stage / 'source_plan.json').read_bytes()
+    links_before = (stage / 'symlink_plan.json').read_bytes()
+    manifest_path = stage / 'archive' / 'legacy_archive_manifest.json'
+    manifest_path.unlink()
+    missing = next(row for row in original['files'] if row['path'].endswith('second.json'))
+    if incomplete:
+        key = hashlib.sha256(missing['path'].encode()).hexdigest()
+        (stage / 'receipts' / f'{key}.json').unlink()
+        (stage / 'archive' / missing['encoded_path']).unlink()
+        assert recover_complete_archive_manifest(spec, root, manual_capture=True) is None
+        encoded = []
+        encoder = archive_module._encode_one
+        def track(path, *args, **kwargs):
+            encoded.append(path.name)
+            return encoder(path, *args, **kwargs)
+        monkeypatch.setattr(archive_module, '_encode_one', track)
+        resumed = prepare_archive(spec, root, manual_capture=True)
+        assert encoded == ['second.json']
+    else:
+        monkeypatch.setattr(archive_module, '_encode_one', lambda *a, **kw: pytest.fail('reencoded'))
+        resumed = recover_complete_archive_manifest(spec, root, manual_capture=True)
+    assert resumed == original
+    assert (stage / 'source_plan.json').read_bytes() == plan_before
+    assert (stage / 'symlink_plan.json').read_bytes() == links_before
+    proof = verify_archive_directory(stage / 'archive', source, spec=spec,
+                                     manual_capture=True, artifact_root=root)
+    assert proof['files'] == 2 and proof['symlinks'] == 4
+
+
+def test_inventory_renumber_requires_exact_link_targets_and_observations(tmp_path, monkeypatch):
+    from copy import deepcopy
+    from scripts import retire_local_offline_artifacts as cleanup
+
+    spec, root, _source = _case(tmp_path, monkeypatch)
+    monkeypatch.setattr(cleanup, 'benchmark_evidence', lambda *a, **kw: {})
+    current = cleanup.observe(root, spec.relative_root, service_refs=[], configuration_refs=[],
+                              process_refs=[], repo_root=tmp_path, preserve_symlinks=True)
+    old = deepcopy(current)
+    for row in old['observation_rows']:
+        row['signature'][0] += 77
+    for link in old['symlinks']:
+        link['source']['device'] += 77
+    result = cleanup.uniform_device_renumber_drift(old, current)
+    assert result and result['source_bytes_verified'] is False
+    for field in ('target_b64', 'device', 'inode'):
+        damaged = deepcopy(current)
+        link = damaged['symlinks'][0]
+        if field == 'target_b64':
+            link[field] = link[field][::-1]
+        else:
+            link['source'][field] += 1
+        assert cleanup.uniform_device_renumber_drift(old, damaged) is None
+
+
+@pytest.mark.parametrize('defect', ['partial', 'mixed', 'inode', 'boolean', 'path'])
+def test_interrupted_plan_renumber_rejects_partial_or_other_changes(defect):
+    from copy import deepcopy
+
+    source = {'device': 12, 'inode': 1, 'size': 2, 'mtime_ns': 3, 'ctime_ns': 4, 'mode': 0o600}
+    old = [{'path': name, 'source': {**source, 'inode': index}}
+           for index, name in enumerate(('a', 'b'), start=1)]
+    current = deepcopy(old)
+    for row in current:
+        row['source']['device'] = 13
+    assert archive_module._uniform_source_plan_device_renumber(old, current) == (12, 13)
+    if defect == 'partial':
+        current[0]['source']['device'] = 12
+    elif defect == 'mixed':
+        current[0]['source']['device'] = 14
+    elif defect == 'inode':
+        current[0]['source']['inode'] += 1
+    elif defect == 'boolean':
+        old[0]['source']['inode'] = True
+    else:
+        current[0]['path'] = 'different'
+    assert archive_module._uniform_source_plan_device_renumber(old, current) is None
+
+
 def test_reclaim_count_never_follows_links_or_counts_external_targets(tmp_path):
     tree = tmp_path / 'candidate'
     tree.mkdir()
@@ -284,3 +380,80 @@ def test_symlink_retirement_and_exact_recovery_keep_final_gates(tmp_path, monkey
     assert restored['symlinks'] == 4
     assert (source/'file-link').read_bytes() == b'original source bytes'
     assert (source/'dangling').is_symlink() and not (source/'dangling').exists()
+
+
+@pytest.mark.parametrize('change_link_after_quarantine', [False, True])
+def test_owned_split_quarantine_audits_symlinks_before_unlink(
+        tmp_path, monkeypatch, change_link_after_quarantine):
+    """The resumed audit uses the original root for opaque absolute targets."""
+    import stockagent.data_sync.artifact_retirement as common
+    import stockagent.data_sync.cold_primary as cold_primary
+    import stockagent.data_sync.legacy_artifact_retirement as retirement
+    import stockagent.data_sync.remote_legacy_return as remote
+    from scripts import retire_local_offline_artifacts as cleanup
+    from stockagent.data_sync.packed_snapshots import initialize_packed_layout
+
+    spec, root, source = _case(tmp_path, monkeypatch)
+    packed, backup, hot, state = (tmp_path / name for name in ('packed', 'backup', 'hot', 'state'))
+    hot.mkdir()
+    initialize_packed_layout(packed, node_id='penguin')
+    release = publish_archive(spec, root, packed, repo_root=tmp_path, manual_capture=True)
+    shutil.copytree(packed, backup)
+    monkeypatch.setattr(cold_primary.BackupConfig, 'load',
+                        lambda _p: SimpleNamespace(source=packed, destination=backup))
+    monkeypatch.setattr(cold_primary.VolumeGuard, 'check', lambda self: None)
+    monkeypatch.setattr(retirement, 'artifact_process_references', lambda *a: [])
+    monkeypatch.setattr(retirement, 'process_references', lambda *a: [])
+    monkeypatch.setattr(retirement, '_active_service_references', lambda *a: [])
+    monkeypatch.setattr(common, 'artifact_process_references', lambda *a: [])
+    monkeypatch.setattr(common, 'process_references', lambda *a: [])
+    monkeypatch.setattr(common, 'artifact_service_references', lambda paths, *_: {str(p): [] for p in paths})
+    monkeypatch.setattr(common, '_running_hot_bridge', lambda *_: False)
+    monkeypatch.setattr(remote, 'active_configuration_references', lambda *a: [])
+    options = dict(repo_root=tmp_path, artifact_root=root, hot_root=hot, sync_root=packed,
+                   materialized_root=tmp_path/'materialized', state_root=state,
+                   activation_root=tmp_path/'activations', backup_config=tmp_path/'backup.json',
+                   peer_proof={'ok': True, 'checked_at': datetime.now(timezone.utc).isoformat(), 'peers': []},
+                   bridge_inactive=True, manual_immediate=True, manual_capture=True)
+    plan = retirement.plan_legacy_retirement(spec, **options)
+    receipt = tmp_path / 'receipt'
+    receipt.mkdir()
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path / 'common.lock')
+    monkeypatch.setattr(cleanup, '_wait_for_convergence', lambda *a: {'ok': True})
+    monkeypatch.setattr(cleanup, 'verified_retained_benchmark', lambda *a: {})
+    apply = cleanup.apply_legacy_retirement
+    quarantine = []
+
+    def after_rename(current_spec, **kwargs):
+        try:
+            return apply(current_spec, **kwargs)
+        except retirement.LegacyQuarantineAuditRequired:
+            record = json.loads(retirement._state_path(state, spec.dataset).read_bytes())
+            path = Path(record['quarantine'])
+            quarantine.append(path)
+            assert (path/'source'/'dangling').is_symlink()
+            if change_link_after_quarantine:
+                link = path/'source'/'dangling'
+                link.unlink()
+                link.symlink_to(source/'different')
+                old_ns = time.time_ns() - 2 * 86400 * 10**9
+                os.utime(link, ns=(old_ns, old_ns), follow_symlinks=False)
+            raise
+
+    monkeypatch.setattr(cleanup, 'apply_legacy_retirement', after_rename)
+    if change_link_after_quarantine:
+        with pytest.raises(SnapshotError):
+            cleanup.retire_after_convergence(spec, None, receipt, plan, options,
+                                            separate_quarantine_audit=True)
+        assert quarantine and (quarantine[0]/'source'/'dangling').is_symlink()
+        assert (quarantine[0]/'source'/'data'/'report.json').read_bytes() == b'original source bytes'
+        assert json.loads(retirement._state_path(state, spec.dataset).read_bytes())['state'] == 'retiring'
+    else:
+        result = cleanup.retire_after_convergence(spec, None, receipt, plan, options,
+                                                 separate_quarantine_audit=True)
+        assert result['deleted'] and result['resumed_quarantine'] and not source.exists()
+        restored = restore_archive(spec, packed, source, materialized_root=tmp_path/'restored-cache',
+                                   snapshot_id=release['snapshot_id'])
+        assert restored['symlinks'] == 4
+        assert (source/'file-link').read_bytes() == b'original source bytes'
+        assert (source/'dangling').is_symlink() and not (source/'dangling').exists()

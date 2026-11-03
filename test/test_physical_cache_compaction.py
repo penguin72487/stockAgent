@@ -311,6 +311,24 @@ def test_policy_selects_only_explicit_real_child_and_rejects_symlink(tmp_path):
         compaction.policy_roots(alias, tmp_path)
 
 
+def test_policy_uses_only_enrolled_cache_root_alias_and_rejects_descendant_links(tmp_path):
+    destination = tmp_path/'service_data/cache'; destination.mkdir(parents=True)
+    (tmp_path/'artifacts').mkdir()
+    (tmp_path/'artifacts/cache').symlink_to(destination, target_is_directory=True)
+    root = destination/'minute-test'; root.mkdir()
+    policy = tmp_path/'policy.json'
+    policy.write_text(json.dumps({'schema_version': 1, 'contract': compaction.CONTRACT,
+                                 'cache_roots': ['artifacts/cache/minute-test']}))
+    assert compaction.policy_roots(policy, tmp_path) == [root]
+    root.rmdir(); root.symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError, match='redirected'):
+        compaction.policy_roots(policy, tmp_path)
+    (tmp_path/'artifacts/cache').unlink()
+    (tmp_path/'artifacts/cache').symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ValueError, match='unregistered service compatibility'):
+        compaction.policy_roots(policy, tmp_path)
+
+
 def test_existing_daily_owner_is_the_only_automation_entrypoint():
     wrapper = (Path(__file__).parents[1] / "scripts/run_artifact_dedup.sh").read_text()
     assert "/etc/stockagent/service-cache-compaction.json" in wrapper

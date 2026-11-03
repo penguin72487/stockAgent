@@ -6,7 +6,7 @@ import json
 import pytest
 
 from downloader.provider_priority import CONTRACT, register
-from downloader.tej_history import (_ready_task, _record_incremental_priority_claim,
+from downloader.tej_history import (_ready_task, _record_incremental_priority_claim, _record_finite_priority_claim,
                                     configure_runtime_policy, connect, run_one)
 from test_tej_history import FakeBridge, registry as registry
 
@@ -52,6 +52,162 @@ def test_generic_request_rotation_respects_expiry_and_original_due_priority(tmp_
         assert _ready_task(con, NOW.isoformat(), None, {})['task_id'] == 'due'
         assert _ready_task(con, NOW.isoformat(), None, POLICY)['task_id'] == 'requested'
         assert _ready_task(con, (NOW + timedelta(hours=3)).isoformat(), None, POLICY)['task_id'] == 'due'
+
+
+def test_requested_tej_tasks_rotate_by_oldest_native_attempt_without_weakening_gates(tmp_path):
+    """A safely requeued early ID must not repeatedly hide the rest of a request."""
+    with closing(connect(tmp_path)) as con, con:
+        for name in ('a', 'b', 'c'):
+            add(con, name, name, 200, kind='discover')
+    register(tmp_path, {'contract': CONTRACT, 'provider': 'tej', 'reason': 'finite metadata',
+                        'created_at_utc': NOW.isoformat(),
+                        'expires_at_utc': (NOW + timedelta(hours=2)).isoformat(),
+                        'items': ['a', 'b', 'c']}, now=NOW)
+    with closing(connect(tmp_path)) as con, con:
+        assert _ready_task(con, NOW.isoformat(), None, {})['task_id'] == 'a'
+        # Only the native owner records a committed claim. A known-unsent
+        # failure may be requeued, but selection alone changes nothing.
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='a'", (NOW.isoformat(),))
+        assert _ready_task(con, NOW.isoformat(), None, {})['task_id'] == 'b'
+        assert _ready_task(con, NOW.isoformat(), None, {})['task_id'] == 'b'
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='b'",
+                    ((NOW + timedelta(seconds=1)).isoformat(),))
+        con.execute("UPDATE tasks SET next_attempt_at_utc=? WHERE task_id='c'",
+                    ((NOW + timedelta(hours=1)).isoformat(),))
+        assert _ready_task(con, NOW.isoformat(), None, {})['task_id'] == 'a'
+        assert _ready_task(con, (NOW + timedelta(hours=1)).isoformat(), None, {})['task_id'] == 'c'
+
+
+def test_requested_tej_rotation_preserves_older_request_precedence(tmp_path):
+    with closing(connect(tmp_path)) as con, con:
+        add(con, 'old', 'a', 200, kind='discover')
+        add(con, 'new', 'b', 200, kind='discover')
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='old'", (NOW.isoformat(),))
+    for item, offset in [('old', 0), ('new', 1)]:
+        created = NOW + timedelta(seconds=offset)
+        register(tmp_path, {'contract': CONTRACT, 'provider': 'tej', 'reason': 'finite metadata',
+                            'created_at_utc': created.isoformat(),
+                            'expires_at_utc': (NOW + timedelta(hours=2)).isoformat(),
+                            'items': [item]}, now=created)
+    with closing(connect(tmp_path)) as con:
+        assert _ready_task(con, (NOW + timedelta(seconds=2)).isoformat(), None, {})['task_id'] == 'old'
+
+
+def test_finite_retry_rotation_prevents_cross_request_starvation_and_reserves_retry(tmp_path):
+    with closing(connect(tmp_path)) as con, con:
+        add(con, 'old', 'old-table', 201, kind='discover')
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='old'", (NOW.isoformat(),))
+        for i in range(5):
+            add(con, f'new-{i}', f'new-table-{i}', -30)
+        add(con, 'due', 'incremental-table', -1000)
+    for items, offset in [(['old'], 0), ([f'new-{i}' for i in range(5)], 1)]:
+        created = NOW + timedelta(seconds=offset)
+        register(tmp_path, {'contract': CONTRACT, 'provider': 'tej', 'reason': 'finite source scope',
+                            'created_at_utc': created.isoformat(),
+                            'expires_at_utc': (NOW + timedelta(hours=2)).isoformat(),
+                            'items': items}, now=created)
+    policy = {**POLICY, 'finite_retry_after_fresh_attempts': 4}
+    now = (NOW + timedelta(seconds=2)).isoformat()
+    with closing(connect(tmp_path)) as con, con:
+        chosen = []
+        for _ in range(5):
+            # Four due incremental claims still precede each finite turn.
+            con.execute("INSERT OR REPLACE INTO meta VALUES('scheduler_incremental_attempt_streak','4')")
+            row = _ready_task(con, now, None, policy)
+            assert _ready_task(con, now, None, policy)['task_id'] == row['task_id']
+            chosen.append(row['task_id'])
+            _record_finite_priority_claim(con, dict(row), now, policy)
+            if row['task_id'] != 'old':
+                con.execute("UPDATE tasks SET state='complete' WHERE task_id=?", (row['task_id'],))
+        assert chosen == ['new-0', 'new-1', 'new-2', 'new-3', 'old']
+        assert con.execute("SELECT value FROM meta WHERE key='scheduler_finite_fresh_claim_streak'").fetchone()[0] == '0'
+        con.execute("INSERT OR REPLACE INTO meta VALUES('scheduler_incremental_attempt_streak','0')")
+        assert _ready_task(con, now, None, policy)['task_id'] == 'due'
+
+
+def test_finite_retry_rotation_preserves_gates_and_only_counts_real_registered_claims(tmp_path):
+    with closing(connect(tmp_path)) as con, con:
+        add(con, 'old', 'old-table', 200, kind='discover')
+        add(con, 'fresh', 'fresh-table', -30)
+        add(con, 'unregistered', 'other-table', -30)
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='old'", (NOW.isoformat(),))
+    for item, offset in [('old', 0), ('fresh', 1)]:
+        created = NOW + timedelta(seconds=offset)
+        register(tmp_path, {'contract': CONTRACT, 'provider': 'tej', 'reason': 'finite source scope',
+                            'created_at_utc': created.isoformat(),
+                            'expires_at_utc': (NOW + timedelta(hours=2)).isoformat(),
+                            'items': [item]}, now=created)
+    policy = {'finite_retry_after_fresh_attempts': 4}
+    now = (NOW + timedelta(seconds=2)).isoformat()
+    with closing(connect(tmp_path)) as con, con:
+        assert _ready_task(con, now, None, policy)['task_id'] == 'fresh'
+        # Merely inspecting the selector or claiming unrelated work changes no counter.
+        _record_finite_priority_claim(con, dict(con.execute("SELECT * FROM tasks WHERE task_id='unregistered'").fetchone()), now, policy)
+        assert con.execute("SELECT value FROM meta WHERE key='scheduler_finite_fresh_claim_streak'").fetchone() is None
+        con.execute("UPDATE tasks SET next_attempt_at_utc=? WHERE task_id='fresh'", ((NOW + timedelta(hours=1)).isoformat(),))
+        assert _ready_task(con, now, None, policy)['task_id'] == 'old'
+        con.execute("UPDATE tasks SET next_attempt_at_utc=NULL WHERE task_id='fresh'")
+        con.execute("INSERT INTO desktop_retry_windows VALUES('fresh-table','other','attempt',1,?,'source_input_failure','audit')",
+                    ((NOW + timedelta(hours=1)).isoformat(),))
+        assert _ready_task(con, now, None, policy)['task_id'] == 'old'
+        # Once both priority intents expire, native priority selection resumes.
+        assert _ready_task(con, (NOW + timedelta(hours=3)).isoformat(), None, policy)['task_id'] == 'unregistered'
+
+
+def test_finite_retry_lane_rotates_across_requests_by_real_attempt_time(tmp_path):
+    with closing(connect(tmp_path)) as con, con:
+        for name in ('old', 'new', 'fresh'):
+            add(con, name, name + '-table', 200, kind='discover')
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='old'", ((NOW + timedelta(minutes=10)).isoformat(),))
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='new'", ((NOW + timedelta(minutes=1)).isoformat(),))
+    for item, offset in [('fresh', 0), ('old', 1), ('new', 2)]:
+        created = NOW + timedelta(seconds=offset)
+        register(tmp_path, {'contract': CONTRACT, 'provider': 'tej', 'reason': 'finite source scope',
+                            'created_at_utc': created.isoformat(),
+                            'expires_at_utc': (NOW + timedelta(hours=2)).isoformat(),
+                            'items': [item]}, now=created)
+    policy = {'finite_retry_after_fresh_attempts': 4}
+    now = (NOW + timedelta(minutes=11)).isoformat()
+    with closing(connect(tmp_path)) as con, con:
+        assert _ready_task(con, now, None, policy)['task_id'] == 'fresh'
+        # The reserved retry turn also applies if the oldest request is fresh.
+        con.execute("INSERT OR REPLACE INTO meta VALUES('scheduler_finite_fresh_claim_streak','4')")
+        assert _ready_task(con, now, None, policy)['task_id'] == 'new'
+        task = dict(con.execute("SELECT * FROM tasks WHERE task_id='new'").fetchone())
+        _record_finite_priority_claim(con, task, now, policy)
+        con.execute("UPDATE tasks SET attempted_at_utc=? WHERE task_id='new'", (now,))
+        con.execute("UPDATE tasks SET state='complete' WHERE task_id='fresh'")
+        assert _ready_task(con, now, None, policy)['task_id'] == 'old'
+
+
+@pytest.mark.parametrize('value', [True, 0, -1, 101, 1.5, '4'])
+def test_finite_retry_rotation_requires_explicit_bounded_policy(tmp_path, value):
+    with pytest.raises(ValueError, match='retry rotation'):
+        configure_runtime_policy(tmp_path, {'finite_retry_after_fresh_attempts': value})
+    assert configure_runtime_policy(tmp_path, {})['finite_retry_after_fresh_attempts'] is None
+
+
+def test_finite_retry_counter_is_written_by_the_original_claim_lifecycle(registry):
+    _, root, _, config = registry
+    configure_runtime_policy(root, {**config, **POLICY, 'finite_retry_after_fresh_attempts': 4})
+    now = datetime.now(UTC)
+    with closing(connect(root)) as con:
+        target = con.execute("SELECT task_id FROM tasks WHERE kind='discover'").fetchone()[0]
+    register(root, {'contract': CONTRACT, 'provider': 'tej', 'reason': 'bounded source scope',
+                    'created_at_utc': now.isoformat(), 'expires_at_utc': (now + timedelta(hours=1)).isoformat(),
+                    'items': [target]}, now=now)
+    assert run_one(root, FakeBridge()) == 'completed_task'
+    with closing(connect(root)) as con:
+        assert con.execute("SELECT state FROM tasks WHERE task_id=?", (target,)).fetchone()[0] == 'complete'
+        assert con.execute("SELECT value FROM meta WHERE key='scheduler_finite_fresh_claim_streak'").fetchone()[0] == '1'
+
+
+def test_finite_retry_policy_works_before_any_priority_intent_exists(registry):
+    _, root, _, config = registry
+    configure_runtime_policy(root, {**config, **POLICY, 'finite_retry_after_fresh_attempts': 4})
+    assert run_one(root, FakeBridge()) == 'completed_task'
+    with closing(connect(root)) as con:
+        assert con.execute("SELECT value FROM meta WHERE key='scheduler_finite_fresh_claim_streak'").fetchone() is None
 
 
 @pytest.mark.parametrize('barrier', ['quarantine', 'retry_window', 'not_due'])

@@ -279,6 +279,24 @@ def test_full_chain_shard_empty_scope_and_overlap_fail_closed(tmp_path: Path) ->
         _merge_full_chain_shards(weekly[:1], tmp_path / "empty.parquet", scope="weekly", futures_reference=reference)
 
 
+def test_full_chain_rejects_traded_series_after_nominal_expiry(tmp_path: Path) -> None:
+    import pytest
+
+    futures = _futures(tmp_path)
+    source = tmp_path / "shifted_expiry.csv"
+    _write(source, _OPTION_HEADER, [
+        # The nominal 2025-01-01 Wednesday was a holiday; a positive
+        # next-day record contradicts treating that nominal date as final.
+        _option_row("2025/01/02", "202501W1", 20200, "買權", 100, 110),
+        _option_row("2025/01/02", "202501W2", 20200, "買權", 100, 110),
+    ])
+    target = tmp_path / "weekly_chain.parquet"
+    with pytest.raises(ValueError, match="point-in-time expiry evidence"):
+        build_taifex_option_full_chain([source], futures, target, series_scope="weekly")
+    assert not target.exists()
+    assert not target.with_suffix(".parquet.tmp").exists()
+
+
 _FUTURES_HEADER = [
     "交易日期",
     "契約",

@@ -37,20 +37,28 @@ def witness_shape(value):
             and isinstance(value['metadata_sha256'], str) and _HASH.fullmatch(value['metadata_sha256']) is not None))
 
 
+def _target_source(registry, url):
+    """Identify the only target scope; this does not approve a declaration."""
+    from downloader.news_fulltext_cmoneylearning import cmoneylearning_literal_original
+    if not cmoneylearning_literal_original(url):
+        raise ValueError('invalid_observed_original_declaration')
+    source = registry.require(url)
+    if (source.provider != 'cmoneylearning' or not source.allowed
+            or source.embedded_article_layout != 'cmoneylearning_visible_article_v8'
+            or source.acquisition_mode != 'finite' or not source.allow_reviewed_supplements):
+        raise ValueError('invalid_observed_original_declaration')
+    return source
+
+
 def validate_witness(db, registry, url, witness):
     """Approve acquisition scope only, bound to the unchanged failed parent."""
     from downloader.news_fulltext_candidate_diagnostics import recorded_cmnews_canonical
-    from downloader.news_fulltext_cmoneylearning import cmoneylearning_literal_original
     from downloader.news_fulltext_repairs import _bytes, _clock, _head, _source_contract
     error = 'invalid_observed_original_declaration'
     try:
-        if not witness_shape(witness) or not cmoneylearning_literal_original(url):
+        if not witness_shape(witness):
             raise ValueError(error)
-        source = registry.require(url)
-        if (source.provider != 'cmoneylearning' or not source.allowed
-                or source.embedded_article_layout != 'cmoneylearning_visible_article_v8'
-                or source.acquisition_mode != 'finite' or not source.allow_reviewed_supplements):
-            raise ValueError(error)
+        source = _target_source(registry, url)
         parent_url, target = witness['parent_url'], witness['parent_head']
         parent = registry.require(parent_url)
         head = db.execute('SELECT * FROM articles WHERE url=?', (parent_url,)).fetchone()
@@ -107,9 +115,19 @@ def _schema(queue):
         queue._original_declaration_outbox_ready = True
 
 
+def has_pending(queue):
+    """Check the indexed local outbox; this is a hint, never permission."""
+    source = queue.registry.sources.get('cmoneylearning')
+    if not source or not source.allowed or source.embedded_article_layout != 'cmoneylearning_visible_article_v8':
+        return False
+    _schema(queue)
+    return queue.db.execute("SELECT 1 FROM original_declaration_outbox WHERE state='pending' LIMIT 1").fetchone() is not None
+
+
 def record_failure(queue, row, error):
     """Called INSIDE the original queue-failure transaction; never commit."""
     from downloader.news_fulltext_diagnostics import FailureResponse
+    from downloader.news_fulltext_policy import NewsError
     from downloader.news_fulltext_repairs import _bytes, _head, _source_contract
     if row['provider'] != 'cmnews' or error.code != 'article_identity_not_verified':
         return
@@ -136,26 +154,43 @@ def record_failure(queue, row, error):
             parent_source=_source_contract(queue.db, parent, row['url'])[1],
             received_at_utc=context.received_at_utc, response_sha256=hashlib.sha256(response.body).hexdigest(),
             response_bytes=len(response.body), attribute=attribute)
-        source, _ = validate_witness(queue.db, queue.registry, url, witness)
+        # Persist bounded same-response facts with the failed parent before
+        # the fallible full witness validation. The consumer still validates
+        # the unchanged parent, source, clock and exact declaration before it
+        # can create a target head or acquisition membership.
+        source = _target_source(queue.registry, url)
+        if not witness_shape(witness):
+            raise ValueError('invalid_observed_original_declaration')
         payload = _bytes(dict(url=url, declared_original=witness,
             source_data_fingerprint=source.data_fingerprint,
             source_authorization_fingerprint=source.authorization_fingerprint))
         if len(payload) > 16384:
             return
         _schema(queue)
-        queue.db.execute('INSERT OR IGNORE INTO original_declaration_outbox VALUES (?,\'pending\',?,?,NULL,NULL)',
-            (hashlib.sha256(payload).hexdigest(), payload.decode(), context.received_at_utc))
+        inserted = queue.db.execute('INSERT OR IGNORE INTO original_declaration_outbox VALUES (?,\'pending\',?,?,NULL,NULL)',
+            (hashlib.sha256(payload).hexdigest(), payload.decode(), context.received_at_utc)).rowcount
+        if inserted:
+            # A transaction may still roll back. This is only a wake hint;
+            # the indexed outbox remains the durable source of truth.
+            queue._url_metadata_continuation_pending = True
         queue.metrics.count('cmnews', 'original_declaration_outbox_recorded')
-    except Exception:
-        # The failed original remains a failure; a metadata error must not lose
-        # it or stop unrelated publishers. Failure evidence/budgets stay intact.
+    except (sqlite3.Error, OSError):
+        # An I/O failure while storing the outbox cannot commit the parent as
+        # terminal with the same-response declaration silently lost. The
+        # enclosing transaction rolls back; normal owner recovery retains the
+        # claim rather than fabricating a successful durable failure record.
+        queue.metrics.count('cmnews', 'original_declaration_outbox_record_errors')
+        raise
+    except (ValueError, KeyError, TypeError, OverflowError, RecursionError, NewsError):
+        # Invalid source facts do not authorize a request. The parent failure
+        # can still be recorded; the metadata diagnostic remains best effort.
         queue.metrics.count('cmnews', 'original_declaration_outbox_record_errors')
 
 
 def consume(queue, *, limit=16, max_seconds=.02, stop=None):
     """Resume pending declarations through the existing owner, in O(work)."""
     import json
-    from downloader.news_fulltext_cohorts import approve_declared_original
+    from downloader.news_fulltext_cohorts import DeclaredOriginalProofConflict, approve_declared_original
     from downloader.news_fulltext_policy import NewsError
     from downloader.news_fulltext_queue import utc_now
     source = queue.registry.sources.get('cmoneylearning')
@@ -164,11 +199,29 @@ def consume(queue, *, limit=16, max_seconds=.02, stop=None):
     if (type(limit) is not int or not 1 <= limit <= 32 or type(max_seconds) not in (int, float)
             or not 0 < max_seconds <= .1):
         raise ValueError('invalid_original_declaration_slice')
-    _schema(queue)
+    if stop is not None and stop.is_set():
+        return {'processed': 0, 'outcomes': {}}
     started, processed, counts = time.monotonic(), 0, Counter()
-    rows = queue.db.execute("SELECT * FROM original_declaration_outbox WHERE state='pending' ORDER BY id LIMIT ?", (limit,)).fetchall()
+    # A failed retained witness remains pending, but must not indefinitely
+    # block a different declaration. This is only a scheduling hint; the
+    # outbox state remains the durable source of truth after a restart.
+    try:
+        _schema(queue)
+        after = getattr(queue, '_original_declaration_last', '')
+        rows = queue.db.execute("SELECT * FROM original_declaration_outbox WHERE state='pending' AND id>? ORDER BY id LIMIT ?",
+                                (after, limit)).fetchall()
+        if not rows and after:
+            rows = queue.db.execute("SELECT * FROM original_declaration_outbox WHERE state='pending' ORDER BY id LIMIT ?",
+                                    (limit,)).fetchall()
+    except (OSError, sqlite3.OperationalError):
+        queue.metrics.count('cmnews', 'original_declaration_storage_deferred')
+        return {'processed': 0, 'outcomes': {'original_declaration_storage_deferred': 1}}
     for row in rows:
-        if time.monotonic()-started >= max_seconds or stop is not None and stop.is_set():
+        # A slow indexed read cannot consume every slice without processing a
+        # declaration. The soft budget applies after the first bounded item;
+        # an explicit stop still wins before that item is touched.
+        if (stop is not None and stop.is_set()
+                or (processed > 0 and time.monotonic()-started >= max_seconds)):
             break
         try:
             with queue.db:
@@ -191,14 +244,20 @@ def consume(queue, *, limit=16, max_seconds=.02, stop=None):
                     outcome, state = 'declared_original_witness_rejected', 'rejected'
                 queue.db.execute('UPDATE original_declaration_outbox SET state=?,completed_at_utc=?,outcome=? WHERE id=? AND state=\'pending\'',
                     (state, utc_now(), outcome, row['id']))
-        except (OSError, sqlite3.OperationalError):
+                queue.counter('original_declaration_' + outcome, 1)
+        except (OSError, sqlite3.OperationalError) as error:
             # Roll back membership and leave the original pending declaration
             # intact. The normal intake interval retries without another GET
             # or crashing/restarting an otherwise healthy publisher owner.
             counts['original_declaration_storage_deferred'] += 1
             queue.metrics.count('cmnews', 'original_declaration_storage_deferred')
+            if isinstance(error, DeclaredOriginalProofConflict):
+                queue.metrics.count('cmnews', 'declared_original_local_proof_conflicts')
+            if stop is None or not stop.is_set():
+                queue._original_declaration_last = row['id']
             break
         processed += 1
         counts[outcome] += 1
-        queue.counter('original_declaration_' + outcome, 1)
+        if stop is None or not stop.is_set():
+            queue._original_declaration_last = row['id']
     return {'processed': processed, 'outcomes': dict(counts)}

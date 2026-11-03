@@ -27,6 +27,35 @@ DATASETS = (
     'TaiwanOptionInstitutionalInvestorsAfterHours', 'TaiwanOptionOpenInterestLargeTraders',
     'TaiwanOptionVix',
 )
+UNDERLYING_DATASETS = (
+    'TaiwanStockPrice', 'TaiwanStockPriceAdj', 'TaiwanStockPriceLimit',
+    'TaiwanStockSuspended',
+)
+UNDERLYING_RESEARCH_DATASETS = (
+    'TaiwanStockBalanceSheet', 'TaiwanStockCashFlowsStatement',
+    'TaiwanStockFinancialStatements', 'TaiwanStockDividend',
+    'TaiwanStockDividendResult', 'TaiwanStockDayTradingSuspension',
+    'TaiwanStockDispositionSecuritiesPeriod', 'TaiwanStockInstitutionalInvestorsBuySell',
+    'TaiwanStockLoanCollateralBalance', 'TaiwanStockMarginMaintenance',
+    'TaiwanStockMarginPurchaseShortSale', 'TaiwanStockMarginShortSaleSuspension',
+    'TaiwanStockMarketValue', 'TaiwanStockMarketValueWeight',
+)
+RELEASE_PRECONDITION_DATASETS = (
+    'CnnFearGreedIndex', 'TaiwanBusinessIndicator', 'TaiwanDailyShortSaleBalances',
+    'TaiwanStock10Year', 'TaiwanStockActiveETFHolding', 'TaiwanStockActiveETFHoldingChange',
+    'TaiwanStockBlockTrade', 'TaiwanStockBlockTradingDailyReport',
+    'TaiwanStockCapitalReductionReferencePrice', 'TaiwanStockConvertibleBondDaily',
+    'TaiwanStockConvertibleBondDailyOverview', 'TaiwanStockConvertibleBondInstitutionalInvestors',
+    'TaiwanStockConvertibleBondPutProvision', 'TaiwanStockDayTrading',
+    'TaiwanStockEvery5SecondsIndex', 'TaiwanStockFinancialStatements',
+    'TaiwanStockGovernmentBankBuySell', 'TaiwanStockHoldingSharesPer',
+    'TaiwanStockIndustryChainMoneyFlow', 'TaiwanStockInfoWithWarrantSummary',
+    'TaiwanStockMonthPrice', 'TaiwanStockMonthRevenue', 'TaiwanStockSecuritiesLending',
+    'TaiwanStockShareholding', 'TaiwanStockWeekPrice', 'TaiwanTotalExchangeMarginMaintenance',
+)
+SCOPES = {'derivatives': DATASETS, 'underlying_due': UNDERLYING_DATASETS,
+          'underlying_research': UNDERLYING_RESEARCH_DATASETS,
+          'release_preconditions': RELEASE_PRECONDITION_DATASETS}
 OWNER_FILES = tuple(REPO / path for path in (
     'scripts/run_finmind_sponsor_derivative_due_wait.py', 'downloader/download_finmind_sponsor.py',
     'downloader/finmind_corrections.py', 'downloader/finmind_scheduling.py',
@@ -35,9 +64,12 @@ OWNER_FILES = tuple(REPO / path for path in (
 ))
 
 
-def run(root: Path, *, max_requests: int, max_wait_seconds: int, sampler=None) -> dict:
+def run(root: Path, *, max_requests: int, max_wait_seconds: int, sampler=None,
+        datasets=DATASETS) -> dict:
     if not 1 <= max_requests <= 16 or not 1 <= max_wait_seconds <= 1800:
         raise ValueError('a bounded derivative refresh and wait are required')
+    if datasets not in SCOPES.values():
+        raise ValueError('an exact permitted refresh scope is required')
     root = root.resolve()
     if not (root / 'queue.sqlite3').is_file():
         raise ValueError('an existing canonical Sponsor queue is required')
@@ -62,7 +94,7 @@ def run(root: Path, *, max_requests: int, max_wait_seconds: int, sampler=None) -
                 continue
             try:
                 result = owner.run_once(root, max_requests=max_requests, workers=1,
-                                        datasets=DATASETS, capacity_sampler=capacity)
+                                        datasets=datasets, capacity_sampler=capacity)
             finally:
                 fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         print(json.dumps({'state': 'owner_pass', 'owner_state': result.get('state'),
@@ -78,10 +110,12 @@ def run(root: Path, *, max_requests: int, max_wait_seconds: int, sampler=None) -
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--scope', choices=SCOPES, default='derivatives')
     parser.add_argument('--max-requests', type=int, default=12)
     parser.add_argument('--max-wait-seconds', type=int, default=600)
     args = parser.parse_args()
-    result = run(ROOT, max_requests=args.max_requests, max_wait_seconds=args.max_wait_seconds)
+    result = run(ROOT, max_requests=args.max_requests, max_wait_seconds=args.max_wait_seconds,
+                 datasets=SCOPES[args.scope])
     print(json.dumps({'state': result.get('state'), 'last_task': result.get('last_task'),
                       'provider_calls_by_waiter': 0}, ensure_ascii=False), flush=True)
     return 75 if result.get('state') in {'finite_wait_elapsed', 'owner_changed'} else 0

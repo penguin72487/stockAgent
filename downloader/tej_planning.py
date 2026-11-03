@@ -310,7 +310,15 @@ def install_plan(con, definition: dict, request: dict, payload: dict, config: di
     con.executemany('UPDATE tasks SET work_expected_rows=? WHERE task_id=?',weights)
     # Source evidence and failed receipts remain; this is a queue encoding /
     # field-partition upgrade, not deletion or relabelling successful data.
-    con.execute("UPDATE tasks SET state='superseded_preview_partition_v1' WHERE table_id=? AND kind='download' AND scope_contract=? AND (state='pending' OR (state='blocked' AND last_error_code='preview_column_limit_repartition_required'))",
+    # A finite priority may already own a verified subset before a complete
+    # discovery arrives. Preserve that pending work. Refill waits for the
+    # finite task to resolve, then excludes its verified receipt from the
+    # later lazy tiles, so no field/company/date is silently lost or repeated.
+    from downloader.tej_priority_coverage import ensure_priority_coverage_index, INDEX_TABLE
+    ensure_priority_coverage_index(con)
+    con.execute("UPDATE tasks SET state='superseded_preview_partition_v1' WHERE table_id=? AND kind='download' AND scope_contract=? AND "
+                f"((state='pending' AND NOT EXISTS (SELECT 1 FROM {INDEX_TABLE} i WHERE i.task_id=tasks.task_id)) "
+                "OR (state='blocked' AND last_error_code='preview_column_limit_repartition_required'))",
                 (definition['table_id'],SOURCE_SCOPE_CONTRACT))
     con.execute('UPDATE tables SET work_grid_rows=?,field_batches=?,last_error_code=CASE WHEN last_error_code=\'preview_column_limit_repartition_required\' THEN NULL ELSE last_error_code END WHERE table_id=?',
                 (plan['total_work_rows'],plan['field_batches'],definition['table_id']))
@@ -323,21 +331,48 @@ def install_plan(con, definition: dict, request: dict, payload: dict, config: di
 def refill_ready_plans(con) -> int:
     from downloader.tej_history import SOURCE_SCOPE_CONTRACT, compact_request, stable_id
     from downloader.tej_value_priority import installed_priority
+    from downloader.tej_priority_coverage import (ensure_priority_coverage_index,
+        exclude_verified_scopes, matching_priority_witnesses)
+    from downloader.tej_key_layout import key_count
+    from pathlib import Path
 
     generated=0
-    plans=con.execute("SELECT p.table_id,p.next_query,p.phase,p.priority FROM download_plans p WHERE p.next_query<p.total_queries AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.table_id=p.table_id AND t.kind='download' AND t.scope_contract=? AND t.state IN ('pending','running','blocked') AND NOT(t.state='pending' AND COALESCE(t.last_error_code,'')=?)) ORDER BY p.priority,p.table_id",(SOURCE_SCOPE_CONTRACT,COMPANY_MEMBERSHIP_DEFERRED)).fetchall()
+    ready_sql="SELECT p.table_id,p.next_query,p.total_queries,p.phase,p.priority FROM download_plans p WHERE p.next_query<p.total_queries AND NOT EXISTS(SELECT 1 FROM tasks t WHERE t.table_id=p.table_id AND t.kind='download' AND t.scope_contract=? AND t.state IN ('pending','running','blocked') AND NOT(t.state='pending' AND COALESCE(t.last_error_code,'')=?)) ORDER BY p.priority,p.table_id"
+    plans=con.execute(ready_sql,(SOURCE_SCOPE_CONTRACT,COMPANY_MEMBERSHIP_DEFERRED)).fetchall()
+    if not plans:
+        return 0
+    ensure_priority_coverage_index(con)
+    # The first read is only a fast empty check; reselect under the writer
+    # transaction because a finite priority may have arrived in between.
+    plans=con.execute(ready_sql,(SOURCE_SCOPE_CONTRACT,COMPANY_MEMBERSHIP_DEFERRED)).fetchall()
+    database = con.execute("PRAGMA database_list").fetchone()[2]
+    if not database:
+        raise ValueError('A persistent canonical queue is required for priority source evidence')
+    root = Path(database).resolve().parent
     for row in plans:
         definition=dict(con.execute('SELECT * FROM tables WHERE table_id=?',(row['table_id'],)).fetchone())
         encoded=con.execute('SELECT plan_json FROM download_plans WHERE table_id=?',(row['table_id'],)).fetchone()[0]
-        plan=json.loads(encoded); query=next_request(plan,row['next_query'])
-        from downloader.tej_key_layout import key_count
-        key=stable_id([row['table_id'],query]); expected=len(query['company_labels'])*(1 if key_count(query)==1 else len(query['date_labels']))
-        con.execute('INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,expected_rows,scope_contract,work_expected_rows) VALUES(?,?,?,?,?,?,?,?,?)',
-                    (key,row['table_id'],'download',row['phase'],installed_priority(con,row['table_id'],row['priority']),
-                     json.dumps(compact_request(query,definition),ensure_ascii=False,separators=(',',':')),
-                     expected,SOURCE_SCOPE_CONTRACT,expected))
-        con.execute('UPDATE download_plans SET next_query=next_query+1 WHERE table_id=?',(row['table_id'],))
-        generated+=1
+        plan=json.loads(encoded); ordinal=row['next_query']
+        # A covered whole tile needs no new source action. Advance until a
+        # nonempty remainder is materialized, preserving the original plan.
+        while ordinal < row['total_queries']:
+            query=next_request(plan,ordinal)
+            if key_count(query)==2 and query.get('frequency')=='daily':
+                witnesses=matching_priority_witnesses(con,root,row['table_id'],query)
+                children,_=exclude_verified_scopes(row['table_id'],ordinal,query,witnesses)
+            else:
+                children=[query]  # Snapshot and multi-record scope stay unchanged.
+            for child in children:
+                key=stable_id([row['table_id'],child]); expected=len(child['company_labels'])*(1 if key_count(child)==1 else len(child['date_labels']))
+                con.execute('INSERT INTO tasks(task_id,table_id,kind,phase,priority,request_json,expected_rows,scope_contract,work_expected_rows) VALUES(?,?,?,?,?,?,?,?,?)',
+                            (key,row['table_id'],'download',row['phase'],installed_priority(con,row['table_id'],row['priority']),
+                             json.dumps(compact_request(child,definition),ensure_ascii=False,separators=(',',':')),
+                             expected,SOURCE_SCOPE_CONTRACT,expected))
+                generated+=1
+            ordinal+=1
+            con.execute('UPDATE download_plans SET next_query=? WHERE table_id=?',(ordinal,row['table_id']))
+            if children:
+                break
     return generated
 
 
@@ -409,6 +444,8 @@ def repartition_selector_pending(con, root, row) -> bool:
              expected,SOURCE_SCOPE_CONTRACT,expected,row['safe_prequery_retries'],row['next_attempt_at_utc']))
     from downloader.provider_priority import inherit
     inherit(con, row['task_id'], [identifier for identifier, _, _ in children])
+    from downloader.tej_priority_coverage import inherit_priority_coverage
+    inherit_priority_coverage(con, row['task_id'], [identifier for identifier, _, _ in children])
     if retry is not None and retry['task_id']==row['task_id']:
         con.execute('UPDATE desktop_retry_windows SET task_id=? WHERE table_id=?',(children[0][0],row['table_id']))
     return True  # Caller commits the queue; durable intent is not a download receipt.
@@ -534,6 +571,8 @@ def repartition_missing_companies(con, root, task: dict, verified: dict, members
                  COMPANY_MEMBERSHIP_DEFERRED if missing else None))
         from downloader.provider_priority import inherit
         inherit(con, task['task_id'], [identifier for identifier, _, _, _ in children])
+        from downloader.tej_priority_coverage import inherit_priority_coverage
+        inherit_priority_coverage(con, task['task_id'], [identifier for identifier, _, _, _ in children])
     else:
         con.execute("UPDATE tasks SET state='pending',next_attempt_at_utc=?,last_error_code=? WHERE task_id=?",
                     (due,COMPANY_MEMBERSHIP_DEFERRED,task['task_id']))

@@ -315,6 +315,60 @@ def test_explicit_capacity_deferred_minute_is_bounded_and_retains_other_guards(
                    for g in capacity_guards) >= expected
 
 
+@pytest.mark.parametrize('guard_result', [0, 75, 'before_source'])
+def test_workspace_priority_selects_futures_and_rechecks_both_volumes(tmp_path, monkeypatch, guard_result):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+    from stockagent.data import finlab_futures_sdk as adapter
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key, day = 'tw_futures_minute:I5F_201611', date(2016, 11, 8)
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'workspace fixture',
+        'created_at_utc': (now - timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now + timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()}]}, now=now)
+    calls, guards = [], []
+    def fetch(output, dataset, partition, *, overlay, futures_workspace):
+        assert futures_workspace is True and dataset == key
+        if guard_result == 'before_source':
+            raise adapter.PartitionFailure('workspace_unavailable_before_source')
+        calls.append(partition)
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'state': 'general_work_pending', 'minute_residual_allowed': False,
+         'supplemental_allowed': False, 'actionable_pending': 9, 'scheduled_reserve_mb': 500})
+    monkeypatch.setattr(module, 'acquisition_dispatch_status', lambda _:
+        {'state': 'deferred', 'reason': 'physical_backing_reserve',
+         'physical_free_bytes': 40, 'required_bytes_including_reserve': 64})
+    monkeypatch.setattr(module, 'check_futures_workspace_dispatch',
+                        lambda *a, **kw: guards.append(True) or (75 if guard_result == 75 else 0))
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (2500, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(module, '_supports_futures_partition',
+                        lambda *a: pytest.fail('workspace must use pinned bridge'))
+    monkeypatch.setattr(adapter, 'validated_overlay', lambda _: tmp_path / 'overlay')
+    monkeypatch.setattr(adapter, 'fetch_with_owner_session', fetch)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=4, reserve_mb=0, minimum_free_gb=0, now=now, kind='tw_minute',
+        finite_priority_only=True, capacity_deferred_priority=True, futures_workspace_only=True)
+    assert result['futures_workspace_only'] is True and result['stock_priority_attempts'] == 0
+    assert result['futures_priority_attempts'] == (1 if guard_result == 0 else 0)
+    assert calls == ([day] if guard_result == 0 else [])
+    assert guards and result['state'] == ('finite_priority_pass_complete' if guard_result == 0 else 'capacity_deferred')
+
+
 def test_capacity_deferred_exception_rechecks_due_dispatch_before_each_partition(tmp_path, monkeypatch):
     from downloader.artifact_io import atomic_write_json
     from downloader.provider_priority import CONTRACT, register

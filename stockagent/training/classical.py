@@ -125,7 +125,7 @@ def run_classical(panel, folds, config, output_dir, *, resume=True,
     next_folds = t._next_fold_by_id(folds if deployment_folds is None else deployment_folds)
     store = PhysicalCSRStore(panel.features, settings.cache_root,
         cache_bytes=settings.cache_bytes)
-    patience = max(1, int(math.ceil(config.training.epochs *
+    patience = max(1, int(math.ceil((config.training.early_stopping_reference_epochs or config.training.epochs) *
                                   config.training.early_stopping_no_improve_ratio)))
     results = []
     root_refresh_pending = False

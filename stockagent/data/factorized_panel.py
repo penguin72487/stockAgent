@@ -257,7 +257,8 @@ class FactorizedPanelFeatures:
                  *, cache_bytes: int = 512 * 1024**2,
                  max_slab_bytes: int = 2 * 1024**3,
                  symbols: np.ndarray | None = None, cache: _BlockCache | None = None,
-                 base_identity: dict | None = None, transfer_mode: str = "dense_cpu"):
+                 base_identity: dict | None = None, transfer_mode: str = "dense_cpu",
+                 date_offset: int | None = None):
         if transfer_mode not in {"dense_cpu", "compact_cuda", "compact_cuda_packed", "compact_cuda_cached"}:
             raise ValueError("factorized transfer mode must be dense_cpu, compact_cuda, compact_cuda_packed or compact_cuda_cached")
         self.transfer_mode = transfer_mode
@@ -267,7 +268,19 @@ class FactorizedPanelFeatures:
         self.symbol_indices = (np.arange(base.shape[1], dtype=np.int64)
                                if symbols is None else np.asarray(symbols, dtype=np.int64))
         self.max_slab_bytes = int(max_slab_bytes)
-        self.common = np.load(self.root / manifest["common"]["path"], mmap_mode="r", allow_pickle=False)
+        common = np.load(self.root / manifest["common"]["path"], mmap_mode="r", allow_pickle=False)
+        if common.ndim != 2 or common.shape[1] != len(manifest["common_channels"]):
+            raise ValueError("shared feature calendar/schema mismatch")
+        if date_offset is None:
+            if common.shape[0] != base.shape[0]:
+                raise ValueError("shared feature calendar/schema mismatch")
+            offset = 0
+            self.common = common
+        else:
+            offset = int(date_offset)
+            if offset != date_offset or offset < 0 or offset + base.shape[0] > common.shape[0]:
+                raise ValueError("factorized source calendar slice is out of bounds")
+            self.common = common[offset:offset + base.shape[0]]
         flat=[];self._symbol_blocks=[]
         for block in manifest["blocks"]:
             entries=[]
@@ -283,8 +296,11 @@ class FactorizedPanelFeatures:
             raise ValueError("shared feature calendar/schema mismatch")
         from stockagent.data.panel_cache import array_content_fingerprint
         self.base_identity = array_content_fingerprint(base) if base_identity is None else base_identity
-        self.root_identity = _digest({"contract":manifest.get("contract",CONTRACT),"manifest":manifest,"base":self.base_identity})
-        self._source_root_identity, self._row_offset = self.root_identity, 0
+        identity = {"contract":manifest.get("contract",CONTRACT),"manifest":manifest,"base":self.base_identity}
+        if date_offset is not None:
+            identity["physical_date_interval"] = [offset, offset + base.shape[0]]
+        self.root_identity = _digest(identity)
+        self._source_root_identity, self._row_offset = self.root_identity, offset
         self.content_fingerprint = {"present": True, "shape": list(self.shape), "dtype": "float32",
             "sha256": _digest({"root":self.root_identity,"symbols":self.symbol_indices.tolist()}),
             "fingerprint_kind": "factorized_source_and_base_contract_not_dense_byte_hash"}
@@ -951,8 +967,22 @@ def verify_factorized_members(root: Path, manifest: dict, *, workers: int | None
                 progress(done)
 
 
+def _factorized_date_slice_offset(source_dates: list[str], dates: list[str]) -> int:
+    """Admit only an exact, contiguous interval of a verified source calendar."""
+    from bisect import bisect_left
+
+    if (not dates or source_dates != sorted(set(source_dates))
+            or dates != sorted(set(dates))):
+        raise ValueError("factorized feature universe/calendar differs from executable panel")
+    offset = bisect_left(source_dates, dates[0])
+    if source_dates[offset:offset + len(dates)] != dates:
+        raise ValueError("factorized feature universe/calendar differs from executable panel")
+    return offset
+
+
 def verify_factorized_layout(manifest: dict, *, symbols: list[str], dates: list[str],
-                             base_feature_names: list[str]) -> list[str]:
+                             base_feature_names: list[str],
+                             allow_contiguous_date_slice: bool = False) -> list[str]:
     """Shared full-calendar/schema admission without constructing model tensors."""
     if manifest.get("contract") not in SUPPORTED_CONTRACTS or manifest.get("status") != "complete":
         raise ValueError("factorized panel contract/build is not complete")
@@ -967,8 +997,12 @@ def verify_factorized_layout(manifest: dict, *, symbols: list[str], dates: list[
             or manifest.get("research_only") is not True
             or manifest.get("feature_lag") != 1):
         raise ValueError("factorized research/lag contract mismatch")
-    if manifest["symbols"] != symbols or manifest["dates"] != dates:
+    if manifest["symbols"] != symbols:
         raise ValueError("factorized feature universe/calendar differs from executable panel")
+    if manifest["dates"] != dates:
+        if not allow_contiguous_date_slice:
+            raise ValueError("factorized feature universe/calendar differs from executable panel")
+        _factorized_date_slice_offset(manifest["dates"], dates)
     if manifest["base_feature_names"] != base_feature_names:
         raise ValueError("factorized base features differ from the declared base ABI")
     names = [*base_feature_names, *manifest["individual_channels"], *manifest["common_channels"]]
@@ -986,7 +1020,7 @@ def verify_factorized_layout(manifest: dict, *, symbols: list[str], dates: list[
                     raise ValueError("factorized symbol blocks are not a complete aligned partition")
                 width+=part["shape"][1]
             if width!=len(symbols):raise ValueError("factorized symbol blocks omit securities")
-    if rows != len(dates):
+    if rows != len(manifest["dates"]):
         raise ValueError("factorized blocks do not cover the full executable calendar")
     return names
 
@@ -1016,14 +1050,18 @@ def attach_factorized_features(panel, manifest_path: str | Path, *, transfer_mod
     clock = _factorized_execution_clock(panel, execution_mode)
     path = Path(manifest_path).resolve(strict=True)
     manifest = json.loads(path.read_text())
+    dates = [str(d)[:10] for d in panel.dates]
     names = verify_factorized_layout(manifest, symbols=panel.symbols,
-        dates=[str(d)[:10] for d in panel.dates], base_feature_names=panel.feature_names)
+        dates=dates, base_feature_names=panel.feature_names, allow_contiguous_date_slice=True)
+    date_offset = (None if manifest["dates"] == dates
+                   else _factorized_date_slice_offset(manifest["dates"], dates))
     root = path.parent
     verify_factorized_members(root,manifest,progress_callback=progress_callback)
     features = FactorizedPanelFeatures(root, manifest, panel.features,
         cache_bytes=(int(manifest.get("host_cache_bytes", 512 * 1024**2))
                      if host_cache_bytes is None else int(host_cache_bytes)),
-        max_slab_bytes=int(manifest.get("max_slab_bytes",2*1024**3)),transfer_mode=transfer_mode)
+        max_slab_bytes=int(manifest.get("max_slab_bytes",2*1024**3)),transfer_mode=transfer_mode,
+        date_offset=date_offset)
     if clock is not None:
         features.content_fingerprint = {**features.content_fingerprint, "execution_clock": clock}
     panel.features, panel.feature_names = features, names

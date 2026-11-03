@@ -387,6 +387,29 @@ def test_fixed_rights_use_decimal_source_operands_and_reject_future_price():
         reviewed_fixed_subscription_rights([dict(fact)],review)
 
 
+def test_inspected_notice_zero_requires_its_own_prior_price_and_explicit_conclusion():
+    from scripts.build_tw_futures_margin_event_candidates import reviewed_fixed_subscription_rights
+    fact = dict(product='IA2', deliverable_cash_twd=0., subscription_rights_at_final_settlement=True)
+    component = dict(product='IA2', page=2, valuation_kind='notice_declared_out_of_money_zero_v1',
+        observation_date='2011-12-12', closing_price='9.34', subscription_price='10',
+        covers_all_subscription_components=True,
+        transcribed_formula='100年12月12日標的證券收盤價格為9.34元，低於現金增資認購價格10元，故不予計算。')
+    review = dict(visually_reviewed_pages=[2], published_date='2012-06-29',
+                  fixed_subscription_rights=[component])
+    result = reviewed_fixed_subscription_rights([dict(fact)], review)[0]
+    assert result['fixed_subscription_rights_twd'] == 0.
+    assert result['deliverable_cash_twd'] == 0.
+    assert result['fixed_subscription_rights_evidence']['derived_value_twd'] == '0'
+    assert 'subscription_quantity' not in result['fixed_subscription_rights_evidence']
+    for changes in ({'observation_date': '2011-12-13'}, {'closing_price': '10'},
+                    {'subscription_price': '9'}, {'transcribed_formula': '價格9.34低於10'}):
+        bad_review = dict(review, fixed_subscription_rights=[{**component, **changes}])
+        with pytest.raises(ValueError, match='notice-declared zero'):
+            reviewed_fixed_subscription_rights([dict(fact)], bad_review)
+    with pytest.raises(ValueError, match='inspected original page'):
+        reviewed_fixed_subscription_rights([dict(fact)], dict(review, visually_reviewed_pages=[1]))
+
+
 def test_corporate_fields_can_bind_complete_sentences_when_scanned_labels_are_lost():
     cells=[['契約代號','HN1調整為HN2'],['','HN2契約乘數不調整(仍為2,120.1821)'],
         ['約定標的物','調整為2,120.1821股標的證券'],['調整契約月份','101年3月到期契約'],
@@ -882,6 +905,19 @@ def test_second_adjusted_contract_cannot_inherit_standard_share_count():
     assert _fixed_fee_contract_metadata('DLF','中華電期貨','stock_future')[0]==2000.
     assert _fixed_fee_contract_metadata('QFF','小型台積電期貨','stock_future')[0]==100.
     _validate_fixed_contract_units(pl.DataFrame({'product':['TX','MTX','T5F','QFF']}))
+
+
+def test_fixed_unit_adapter_rejects_historical_xif_before_resize():
+    with pytest.raises(ValueError, match='dated XIF multiplier and position split'):
+        _validate_fixed_contract_units(pl.DataFrame({'product':['XIF']}))
+    with pytest.raises(ValueError, match='dated XIF multiplier and position split'):
+        _validate_fixed_contract_units(pl.DataFrame({'product':['TX','XIF'],
+            'date':[date(2026,7,6),date(2026,7,3)]}))
+    with pytest.raises(ValueError, match='dated XIF multiplier and position split'):
+        _validate_fixed_contract_units(pl.DataFrame({'product':['XIF'], 'date':[None]}))
+    with pytest.raises(ValueError, match='dated XIF multiplier and position split'):
+        _validate_fixed_contract_units(pl.DataFrame({'product':['XIF'], 'date':[date(2026,7,6)]}))
+    _validate_fixed_contract_units(pl.DataFrame({'product':['XIF'], 'date':[date(2026,7,7)]}))
 
 
 def test_margin_tables_preserve_product_units_and_column_order():

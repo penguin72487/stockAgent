@@ -7,6 +7,7 @@ and use the existing article queue for every newly discovered public ID.
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from datetime import datetime, timezone
 import hashlib
 import html
@@ -17,7 +18,7 @@ import sqlite3
 import time
 from urllib.parse import parse_qs, urlencode, urlsplit
 
-from downloader.artifact_io import atomic_write_json, atomic_write_parquet, sha256_file, table_from_records
+from downloader.artifact_io import atomic_write_json, atomic_write_parquet, table_from_records
 from downloader.news_fulltext_policy import NewsError
 
 
@@ -29,9 +30,22 @@ FAILURE_SCOPE_CONTRACT_VERSION = 1
 FAILURE_DEADLINE_CONTRACT_VERSION = 1
 FAILURE_DIAGNOSTIC_CONTRACT_VERSION = 2
 TOTAL_RECONCILIATION_CONTRACT_VERSION = 1
+LOCAL_EVIDENCE_FAILURES = frozenset({
+    'cnyes_index_not_modified_without_evidence',
+    'cnyes_index_original_evidence_unverified',
+    'cnyes_index_original_receipt_unverified',
+})
 ENDPOINT = 'https://api.cnyes.com/media/api/v1/newslist/all'
 MAXIMUM_PAGE = 100_000  # Engineering bound, not an official pagination limit.
 MANIFEST_PRIORITY_BAND = -10_000_000
+# Bound the local work for one ETA projection, not source quota or completion.
+PARTIAL_WITNESS_MAX_ROWS = 4096
+PARTIAL_WITNESS_MAX_CHARS = 1_048_576
+PARTIAL_WITNESS_SINGLE_MAX_CHARS = 8192
+PARTIAL_LOCAL_MAX_MISSING_PAGES = 4096
+PARTIAL_LOCAL_MAX_OBSERVED_PAGES = 16384
+_BOUNDED_WITNESS_SQL = ("CASE WHEN typeof(value)='text' AND length(CAST(value AS BLOB))<=32768 "
+                        "AND length(value)<=8192 THEN value END")
 FIELDS = frozenset({
     'abTesting', 'categoryId', 'columnists', 'coverSrc', 'hasCoverPhoto',
     'isCategoryHeadline', 'isIndex', 'newsId', 'payment', 'publishAt', 'summary', 'title',
@@ -718,7 +732,10 @@ def _reconcile_index_totals(queue, source, scope, accepted_page, *, changed=Fals
         queue.db.execute('DELETE FROM queue_settings WHERE key=? AND value=?', (key, active[0]))
 
 
-def accept_index(queue, task, response, links, source):
+def accept_index(queue, task, response, links, source, *, _checkpoint_id=None, _observed=None):
+    from downloader.news_fulltext import (_article_links_started_after_heads, _discovery_head_fields,
+                                          _locked_discovery_head_matches, _missing_article_links)
+
     day, page, _, _ = validate_request(task['url'],source)
     if response.url != task['url']:
         raise NewsError('cnyes_index_request_response_scope_mismatch',retry=True,delay=60)
@@ -727,12 +744,35 @@ def accept_index(queue, task, response, links, source):
     if response.status == 304:
         # A conditional response cannot supply lost list evidence or add URLs.
         from downloader.news_fulltext_bulk import cnyes_scope
-        if task.get('parser_fingerprint') not in compatible_fingerprints(source) or not queue.db.execute(
-                'SELECT 1 FROM cnyes_public_index_observations WHERE response_sha256=? AND index_fingerprint=? '
-                'AND scope_url=? AND page=? AND authorization_fingerprint=?',
-                (task.get('response_sha256'),task['parser_fingerprint'],cnyes_scope(task['url']),page,source.authorization_fingerprint)).fetchone():
+        from downloader.news_fulltext_cnyes_index_checkpoint import inspect_retained
+        from downloader.news_fulltext_queue import replay_source_path
+        import pyarrow as pa
+        digest, index_fingerprint = task.get('response_sha256'), task.get('parser_fingerprint')
+        if (links or index_fingerprint not in compatible_fingerprints(source)
+                or not isinstance(digest, str) or re.fullmatch(r'[0-9a-f]{64}', digest) is None):
             raise NewsError('cnyes_index_not_modified_without_evidence',retry=True,delay=60)
+        observation = queue.db.execute(
+                'SELECT * FROM cnyes_public_index_observations WHERE response_sha256=? AND index_fingerprint=? '
+                'AND scope_url=? AND page=? AND authorization_fingerprint=?',
+                (digest,index_fingerprint,cnyes_scope(task['url']),page,source.authorization_fingerprint)).fetchone()
+        relative = ('list_metadata/cnyes/' + index_fingerprint + '/'
+                    + hashlib.sha256(task['url'].encode()).hexdigest() + '-' + digest + '.parquet')
+        if observation is None or observation['evidence_path'] != relative:
+            raise NewsError('cnyes_index_not_modified_without_evidence',retry=True,delay=60)
+        try:
+            # Resolve both paths under the canonical root before validating;
+            # retain the unresolved paths to reject symlinked file evidence.
+            replay_source_path(queue.root, relative)
+            replay_source_path(queue.root, relative + '.receipt.json')
+            inspect_retained(queue.root / relative, relative, index_fingerprint,
+                             queue.root / (relative + '.receipt.json'), [observation], source)
+        except (FileNotFoundError, ValueError, TypeError, KeyError, OverflowError,
+                NewsError, pa.ArrowException) as error:
+            raise NewsError('cnyes_index_not_modified_without_evidence',retry=True,delay=60) from error
         with queue.db:
+            if not _locked_discovery_head_matches(queue, task, _discovery_head_fields(task)):
+                queue.metrics.count(source.provider, 'public_index_stale_source_head')
+                return 0
             if stale_dispatch(queue, source, task):
                 queue.metrics.count(source.provider, 'public_index_stale_revision_responses')
                 return 0
@@ -760,54 +800,90 @@ def accept_index(queue, task, response, links, source):
     # An identical page from an older publisher version is not evidence that
     # the current page is stuck. During a changed-list round a page may move;
     # duplicates among the current heads must still be resolved before finish.
-    if (posts and previous and not _round(queue, source, info['scope'])
+    fields = _discovery_head_fields(task)
+    current_source = queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone()
+    source_stale_before_commit = bool(fields and (current_source is None
+        or any(current_source[key] != task[key] for key in fields)))
+    if (posts and previous and not source_stale_before_commit and not stale_dispatch(queue, source, task)
+            and not _round(queue, source, info['scope'])
             and not (prior_page and (prior_page['total'], prior_page['pages'], prior_page['ids_sha256'])
                      != (info['total'], info['pages'], info['ids_sha256']))):
         raise NewsError('cnyes_index_pagination_no_progress',retry=True,delay=3600)
+    observed = clock() if _observed is None else _observed
+    if _checkpoint_id is None:
+        from downloader.news_fulltext_cnyes_index_checkpoint import register
+        _checkpoint_id = register(queue, task, response, source, observed)
     context_sha = hashlib.sha256(response.url.encode()).hexdigest()
     relative = 'list_metadata/cnyes/'+fingerprint+'/'+context_sha+'-'+sha+'.parquet'
     target = queue.root/relative
     receipt = queue.root/(relative+'.receipt.json')
-    if not target.exists():
+    if not target.exists() and not target.is_symlink():
+        # An existing receipt is evidence of a different original observation;
+        # a new response must not silently reconstruct it with a new clock.
+        if receipt.exists() or receipt.is_symlink():
+            raise NewsError('cnyes_index_original_evidence_unverified',retry=True,delay=60)
         atomic_write_parquet(target,table_from_records([{
             'request_url':response.url,'response_sha256':sha,'raw_response_body':response.body,
-            'source_observed_at_utc':clock(),'index_fingerprint':fingerprint,
+            'source_observed_at_utc':observed,'index_fingerprint':fingerprint,
             'authorization_fingerprint':source.authorization_fingerprint,
             'metadata_only':True,'accepted_body_count':0,'publish':False,
         }]),compression='zstd',compression_level=9,durable=True)
     # Recover a crash between atomic Parquet and receipt commits from exact
     # original bytes, request context, authorization and metadata-only flags.
     # Never rewrite the original file or its observation clock.
-    from pyarrow import parquet as pq
-    retained = pq.read_table(target).to_pylist()
-    if len(retained) != 1 or any(retained[0].get(key) != value for key,value in {
-            'request_url':response.url,'response_sha256':sha,'raw_response_body':response.body,
-            'index_fingerprint':fingerprint,'authorization_fingerprint':source.authorization_fingerprint,
-            'metadata_only':True,'accepted_body_count':0,'publish':False}.items()):
-        raise NewsError('cnyes_index_original_evidence_unverified',retry=True,delay=60)
-    receipt_data = {'parquet_path':relative,'sha256':sha256_file(target),'response_sha256':sha,
+    from downloader.news_fulltext_cnyes_index_checkpoint import MAX_RECEIPT_BYTES, _read_stable, read_retained_original
+    from downloader.news_fulltext_queue import replay_source_path
+    import pyarrow as pa
+    try:
+        replay_source_path(queue.root, relative)
+        _, file_sha = read_retained_original(target, fingerprint, source,
+                                             expected_url=response.url, expected_body=response.body)
+    except (FileNotFoundError, ValueError, TypeError, KeyError, OverflowError,
+            NewsError, pa.ArrowException) as error:
+        raise NewsError('cnyes_index_original_evidence_unverified',retry=True,delay=60) from error
+    receipt_data = {'parquet_path':relative,'sha256':file_sha,'response_sha256':sha,
         'index_fingerprint':fingerprint,'metadata_rows':len(posts),'accepted_body_count':0,
         'index_data_contract_version':INDEX_DATA_CONTRACT_VERSION,
         'blank_title_metadata_rows':info['blank_title_metadata_rows'],
         'metadata_only':True,'publish':False}
-    if receipt.exists():
-        original_receipt = json.loads(receipt.read_bytes())
-        if any(original_receipt.get(key) != value for key,value in receipt_data.items()):
-            raise NewsError('cnyes_index_original_receipt_unverified',retry=True,delay=60)
-    else:
+    if not receipt.exists() and not receipt.is_symlink():
         atomic_write_json(receipt,receipt_data,durable=True)
-    observed = clock()
+    try:
+        replay_source_path(queue.root, relative + '.receipt.json')
+        original_receipt = json.loads(_read_stable(receipt, MAX_RECEIPT_BYTES))
+        if (not isinstance(original_receipt, dict)
+                or any(original_receipt.get(key) != value for key,value in receipt_data.items())
+                or original_receipt.get('metadata_only') is not True
+                or original_receipt.get('publish') is not False
+                or any(type(original_receipt.get(key)) is not int for key in
+                       ('accepted_body_count','metadata_rows','index_data_contract_version','blank_title_metadata_rows'))):
+            raise ValueError('invalid_index_receipt')
+    except (FileNotFoundError, ValueError, TypeError, KeyError, OverflowError) as error:
+        raise NewsError('cnyes_index_original_receipt_unverified',retry=True,delay=60) from error
     with queue.db:
         before = _index_head(queue, source, info['scope'], page)
-        queue.add_articles([{'url':url,'title':title,'date':date} for url,title,date in actual_links])
         queue.db.execute('INSERT OR IGNORE INTO cnyes_public_index_observations VALUES (?,?,?,?,?,?,?,?,?,?,?,?)',
             (info['scope'],info['page'],sha,fingerprint,source.authorization_fingerprint,info['total'],info['pages'],
              info['ids_sha256'],len(posts),len(actual_links),relative,observed))
-        if stale_dispatch(queue, source, task):
+        source_stale = not _locked_discovery_head_matches(queue, task, _discovery_head_fields(task))
+        revision_stale = stale_dispatch(queue, source, task)
+        if source_stale or revision_stale:
             # Preserve exact source bytes/IDs, but an old in-flight request may
             # neither overwrite the new head nor postpone its pending retry.
-            queue.metrics.count(source.provider, 'public_index_stale_revision_responses')
+            # Its previously unknown public IDs remain useful, while existing
+            # article titles, clocks and retry state must not be overwritten.
+            missing = _missing_article_links(queue, actual_links)
+            queue.add_articles([{'url':url,'title':title,'date':date} for url,title,date in missing])
+            if source_stale:
+                queue.metrics.count(source.provider, 'public_index_stale_source_head')
+            if revision_stale:
+                queue.metrics.count(source.provider, 'public_index_stale_revision_responses')
+            from downloader.news_fulltext_cnyes_checkpoint import finish
+            finish(queue, _checkpoint_id)
             return 0
+        fresh_links = _article_links_started_after_heads(
+            queue, actual_links, task.get('_discovery_request_started_at_utc'))
+        queue.add_articles([{'url':url,'title':title,'date':date} for url,title,date in fresh_links])
         queue.db.execute('INSERT OR REPLACE INTO cnyes_public_index_heads VALUES (?,?,?,?,?)',
             (info['scope'],info['page'],sha,fingerprint,source.authorization_fingerprint))
         if info['page'] < info['pages']:
@@ -816,7 +892,8 @@ def accept_index(queue, task, response, links, source):
                              (url,source.provider,discovery_priority(info['source_day'],info['page']+1)))
         queue.db.execute('UPDATE discovery SET due=?,etag=?,last_modified=?,response_sha256=?,parser_fingerprint=?,'
                          'last_checked_at_utc=?,attempts=0,error_code=NULL WHERE url=?',
-            (time.time()+365*86400,response.headers.get('etag'),response.headers.get('last-modified'),sha,
+            ((time.time() if _observed is None else datetime.fromisoformat(observed.replace('Z', '+00:00')).timestamp())
+             +365*86400,response.headers.get('etag'),response.headers.get('last-modified'),sha,
              fingerprint,observed,task['url']))
         current = _index_head(queue, source, info['scope'], page)
         accepted_revision(queue, source, task, before, current)
@@ -833,6 +910,8 @@ def accept_index(queue, task, response, links, source):
                          'WHERE provider=? AND endpoint=? AND data_fingerprint IN ('
                          + ','.join('?' for _ in versions) + ')' + scope_guard,
                          (source.provider,ENDPOINT,*versions,*scope_parameters))
+        from downloader.news_fulltext_cnyes_checkpoint import finish
+        finish(queue, _checkpoint_id)
     queue.metrics.count(source.provider,'public_index_pages_verified')
     queue.metrics.count(source.provider,'public_index_metadata_rows_verified',len(posts))
     queue.metrics.count(source.provider,'public_index_public_article_ids',len(actual_links))
@@ -961,7 +1040,113 @@ def manifest_last_page_gate(db, source, phase, rows, scopes, *, now_epoch):
     return result
 
 
-def manifest_partial_page_gate(db, source, phase, rows, scopes, *, now_epoch):
+def _manifest_local_evidence_failures(db, source, phase, selected, guard, parameters, *, now_epoch):
+    """Find local failures via the bounded missing-page keys, not a queue scan.
+
+    A missing job is normal before its predecessor seeds it. The resulting
+    observation covers only these local failures; it does not predict that an
+    unstarted page will succeed. Return None for any ambiguous/truncated view.
+    """
+    if phase['remaining_pages'] > PARTIAL_LOCAL_MAX_MISSING_PAGES:
+        return None
+    incomplete = []
+    for row in selected.values():
+        count, total = row[1], row[9]
+        if type(count) is not int or type(total) is not int or not 1 <= count <= total <= MAXIMUM_PAGE:
+            return None
+        if count < total:
+            incomplete.append(row)
+    if sum(row[1] for row in incomplete) > PARTIAL_LOCAL_MAX_OBSERVED_PAGES:
+        return None
+    from downloader.news_fulltext_bulk import cnyes_scope
+    failed, waiting, missing_count = 0, [], 0
+    errors = tuple(sorted(LOCAL_EVIDENCE_FAILURES))
+    try:
+        for row in incomplete:
+            query = parse_qs(urlsplit(row[0]).query, keep_blank_values=True)
+            low = int(query['startAt'][0])
+            day = (low + 28800) // 86400
+            first = request_url(source, day)
+            validate_request(first, source)
+            if cnyes_scope(first) != row[0]:
+                return None
+            observed = db.execute('SELECT h.page FROM cnyes_public_index_heads h '
+                'JOIN cnyes_public_index_observations o '
+                'USING(scope_url,page,response_sha256,index_fingerprint,authorization_fingerprint) '
+                'WHERE h.scope_url=? AND ' + guard + ' AND h.authorization_fingerprint=?',
+                (row[0], *parameters, source.authorization_fingerprint)).fetchall()
+            pages = {item[0] for item in observed}
+            if (len(observed) != row[1] or len(pages) != row[1] or 1 not in pages
+                    or any(type(page) is not int or not 1 <= page <= row[9] for page in pages)):
+                return None
+            for page in range(2, row[9] + 1):
+                if page in pages:
+                    continue
+                missing_count += 1
+                url = request_url(source, day, page)
+                job = db.execute('SELECT kind,provider,due,attempts,error_code,last_checked_at_utc,'
+                    'superseded_by_windows_json FROM discovery WHERE url=? AND error_code IN ('
+                    + ','.join('?' for _ in errors) + ')', (url, *errors)).fetchone()
+                if job is None:
+                    continue
+                kind, provider, due, attempts, error, checked_raw, superseded = job
+                checked = datetime.fromisoformat(checked_raw)
+                if (kind != 'index' or provider != source.provider or superseded is not None
+                        or type(due) not in (int, float) or not math.isfinite(due)
+                        or not 0 <= due <= 253402214400 or type(attempts) is not int or attempts < 1
+                        or error not in LOCAL_EVIDENCE_FAILURES or checked.utcoffset() is None
+                        or checked.timestamp() > due):
+                    return None
+                failed += 1
+                if due > now_epoch:
+                    waiting.append(due)
+    except (KeyError, IndexError, NewsError, TypeError, ValueError, OverflowError, OSError):
+        return None
+    if missing_count != phase['remaining_pages']:
+        return None
+    return failed, waiting
+
+
+def _parse_partial_witness(source, key, raw):
+    from downloader.news_fulltext_bulk import cnyes_scope
+    value = json.loads(raw)
+    if not isinstance(value, dict):
+        raise ValueError('invalid witness')
+    url = value['request_url']
+    if not isinstance(url, str) or request_failure_scope_key(source, url) != key:
+        raise ValueError('invalid witness identity')
+    _, page, _, high = validate_request(url, source)
+    return value, page, cnyes_scope(url), high
+
+
+class PartialWitnessCache:
+    """Cache only exact parsed witness bytes; jobs and heads stay live reads."""
+
+    def __init__(self):
+        self._items = OrderedDict()
+        self._chars = 0
+
+    def parse(self, source, key, raw):
+        identity = (source.cnyes_index_api, source.cnyes_index_data_fingerprint, key)
+        item = self._items.get(identity)
+        if item is not None and item[0] == raw and item[1][3] <= int(time.time()) + 86400:
+            self._items.move_to_end(identity)
+            return item[1]
+        parsed = _parse_partial_witness(source, key, raw)
+        old = self._items.pop(identity, None)
+        if old is not None:
+            self._chars -= len(old[0])
+        while self._items and (len(self._items) >= PARTIAL_WITNESS_MAX_ROWS
+                              or self._chars + len(raw) > PARTIAL_WITNESS_MAX_CHARS):
+            _, old = self._items.popitem(last=False)
+            self._chars -= len(old[0])
+        if len(raw) <= PARTIAL_WITNESS_MAX_CHARS and PARTIAL_WITNESS_MAX_ROWS > 0:
+            self._items[identity] = (raw, parsed)
+            self._chars += len(raw)
+        return parsed
+
+
+def manifest_partial_page_gate(db, source, phase, rows, scopes, *, now_epoch, witness_cache=None):
     """Report proved request-local failures in the unfinished manifest only.
 
     This is an ETA observation, never a dispatch gate.  Request-specific
@@ -978,53 +1163,39 @@ def manifest_partial_page_gate(db, source, phase, rows, scopes, *, now_epoch):
         return result
     prefix = request_failure_scope_key(source) + ':'
     versions = compatible_fingerprints(source)
-    entries = db.execute("SELECT key,CASE WHEN typeof(value)='text' AND length(value)<=8192 THEN value END "
-                         'FROM queue_settings WHERE key>=? AND key<? LIMIT 129',
-                         (prefix, prefix + '\uffff')).fetchall()
-    if len(entries) > 128:
-        return result
     # Older queues can carry only the endpoint's original scope witness.  Do
     # not infer that its page recovered merely because the later per-page key
     # is absent; reuse the exact current endpoint witness if it still matches.
     current = db.execute('SELECT request_url FROM bulk_endpoint_cooldowns WHERE provider=? AND endpoint=? '
                          'AND error_code=? AND data_fingerprint IN (' + ','.join('?' for _ in versions) + ')',
                          (source.provider, ENDPOINT, 'cnyes_index_unverified_metadata', *versions)).fetchone()
-    if current is not None:
-        url = current[0]
-        if not isinstance(url, str):
-            return result
-        key = request_failure_scope_key(source, url)
-        if key not in {entry[0] for entry in entries}:
-            original = db.execute("SELECT CASE WHEN typeof(value)='text' AND length(value)<=8192 THEN value END "
-                                  'FROM queue_settings WHERE key=?',
-                                  (request_failure_scope_key(source),)).fetchone()
-            if original is None:
-                return result
-            entries.append((key, original[0]))
+    if current is not None and not isinstance(current[0], str):
+        return result
+    current_key = request_failure_scope_key(source, current[0]) if current is not None else None
     selected = {row[0]: row for row in rows if row[0] in scopes}
     guard, parameters = compatible_head_guard(source)
-    failed, waiting = 0, []
-    from downloader.news_fulltext_bulk import cnyes_scope
-    for key, raw in entries:
+    failed, waiting, inspected_chars = 0, [], 0
+    def inspect(key, raw):
+        nonlocal failed, inspected_chars
         try:
-            if not isinstance(key, str) or len(key) != len(prefix) + 64 or not isinstance(raw, str):
-                return result
-            value = json.loads(raw)
-            if not isinstance(value, dict):
-                return result
+            if (not isinstance(key, str) or len(key) != len(prefix) + 64 or not isinstance(raw, str)
+                    or len(raw) > PARTIAL_WITNESS_SINGLE_MAX_CHARS):
+                return False
+            inspected_chars += len(raw)
+            if inspected_chars > PARTIAL_WITNESS_MAX_CHARS:
+                return False
+            parsed = (_parse_partial_witness(source, key, raw) if witness_cache is None
+                      else witness_cache.parse(source, key, raw))
+            value, page, scope, _ = parsed
             url = value['request_url']
-            if not isinstance(url, str) or request_failure_scope_key(source, url) != key:
-                return result
-            _, page, _, _ = validate_request(url, source)
-            scope = cnyes_scope(url)
             if scope not in selected or page > selected[scope][9]:
-                continue
+                return True
             # A previously failed page that is now a verified head no longer
             # prevents this phase from finishing; keep its evidence untouched.
             if db.execute('SELECT 1 FROM cnyes_public_index_heads h WHERE h.scope_url=? AND h.page=? AND '
                           + guard + ' AND h.authorization_fingerprint=? LIMIT 1',
                           (scope, page, *parameters, source.authorization_fingerprint)).fetchone():
-                continue
+                return True
             deadline = value['not_before']
             if (type(value.get('contract_version')) is not int or value['contract_version'] != 1
                     or value.get('scope') != 'request' or value.get('permission_granted') is not False
@@ -1034,11 +1205,11 @@ def manifest_partial_page_gate(db, source, phase, rows, scopes, *, now_epoch):
                     or value.get('error_code') != 'cnyes_index_unverified_metadata'
                     or type(deadline) not in (int, float) or not math.isfinite(deadline)
                     or not 0 <= deadline <= 253402214400):
-                return result
+                return False
             job = db.execute('SELECT kind,provider,due,attempts,error_code,last_checked_at_utc,'
                              'superseded_by_windows_json FROM discovery WHERE url=?', (url,)).fetchone()
             if not job:
-                return result
+                return False
             kind, provider, due, attempts, error, checked_raw, superseded = job
             checked, recorded = datetime.fromisoformat(checked_raw), datetime.fromisoformat(value['recorded_at_utc'])
             if (kind != 'index' or provider != source.provider or superseded is not None
@@ -1047,12 +1218,38 @@ def manifest_partial_page_gate(db, source, phase, rows, scopes, *, now_epoch):
                     or error != value['error_code'] or not 0 <= deadline - due <= 1
                     or checked.utcoffset() is None or recorded.utcoffset() is None
                     or checked.timestamp() > due or checked > recorded or recorded.timestamp() > deadline):
-                return result
+                return False
             failed += 1
             if deadline > now_epoch:
                 waiting.append(deadline)
-        except (KeyError, NewsError, TypeError, ValueError, OverflowError, OSError):
+            return True
+        except (KeyError, NewsError, TypeError, ValueError, OverflowError, OSError, RecursionError):
+            return False
+
+    # Stream a bounded range without materializing every witness. Old valid
+    # witnesses for other dates or verified pages no longer force unknown by
+    # themselves. Malformed or truncated evidence still forbids an estimate.
+    entries = db.execute('SELECT key,' + _BOUNDED_WITNESS_SQL +
+                         ' FROM queue_settings WHERE key>=? AND key<? ORDER BY key LIMIT ?',
+                         (prefix, prefix + '\uffff', PARTIAL_WITNESS_MAX_ROWS + 1))
+    found_current = False
+    try:
+        for index, (key, raw) in enumerate(entries):
+            if index >= PARTIAL_WITNESS_MAX_ROWS or not inspect(key, raw):
+                return result
+            found_current |= key == current_key
+    finally:
+        entries.close()
+    if current_key is not None and not found_current:
+        original = db.execute('SELECT ' + _BOUNDED_WITNESS_SQL + ' FROM queue_settings WHERE key=?',
+                              (request_failure_scope_key(source),)).fetchone()
+        if original is None or not inspect(current_key, original[0]):
             return result
+    local = _manifest_local_evidence_failures(db, source, phase, selected, guard, parameters, now_epoch=now_epoch)
+    if local is None:
+        return result
+    failed += local[0]
+    waiting.extend(local[1])
     if failed > phase['remaining_pages']:
         return result
     result['failed_pages'] = failed
@@ -1152,6 +1349,7 @@ class PublicIndexRowsCache:
 
     def __init__(self):
         self._db = self._key = self._rows = None
+        self.witness_cache = PartialWitnessCache()
 
     def _clear(self):
         self._db = self._key = self._rows = None
@@ -1206,15 +1404,24 @@ def progress(db, source, *, owner_start_epoch=None, now_epoch=None, activity='in
     last_page_gate = manifest_last_page_gate(db, source, phase, rows, scopes, now_epoch=effective_now)
     if last_page_gate is not None:
         phase['last_page_gate'] = last_page_gate
-    partial_page_gate = manifest_partial_page_gate(db, source, phase, rows, scopes, now_epoch=effective_now)
+    partial_page_gate = manifest_partial_page_gate(db, source, phase, rows, scopes, now_epoch=effective_now,
+        witness_cache=rows_cache.witness_cache if isinstance(rows_cache, PublicIndexRowsCache) else None)
     if partial_page_gate is not None:
         phase['partial_page_gate'] = partial_page_gate
     phase['forecast'] = manifest_forecast(db, source, phase, scopes,
         owner_start_epoch=owner_start_epoch, now_epoch=effective_now,
         activity=activity)
+    # This indexed frontier is local work, not a source request or a count of
+    # missing stories. Old snapshots lack the contract and remain unknown.
+    pending, retry_at = db.execute(
+        "SELECT count(*),min(not_before) FROM cnyes_interrupted_page_checkpoints "
+        "WHERE state='pending' AND parquet_path GLOB 'cnyes_index_intents/*'").fetchone()
     return {'contract_version':CONTRACT_VERSION,'enabled':True,'manifest_phase':phase,
         'index_data_contract_version':INDEX_DATA_CONTRACT_VERSION,
         'manifest_schedule_contract_version':MANIFEST_SCHEDULE_CONTRACT_VERSION,'source_dates_observed':len(rows),
+        'checkpoint_contract_version':1,'pending_local_originals':pending,
+        'next_local_recovery_at_utc':datetime.fromtimestamp(retry_at, timezone.utc).isoformat() if retry_at is not None else None,
+        'local_recovery_ready':retry_at is not None and retry_at <= effective_now,
         'verified_pages':sum(row[1] for row in rows),'metadata_rows':sum(row[6] for row in rows),
         'public_ID_row_observations':sum(row[7] for row in rows),
         'dates_all_reported_pages_observed':sum(row[0] not in revisions and row[2]==row[3] and row[4]==row[5] and row[1]==row[5] for row in rows),

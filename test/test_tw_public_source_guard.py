@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import fcntl
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -17,6 +18,7 @@ from stockagent.live import signal_engine
 from stockagent.live.tw_public_source_guard import (
     TWPublicSourceUpdatePending,
     live_tw_public_source_read_guard,
+    read_source_pending_from_child,
 )
 
 
@@ -188,6 +190,73 @@ def test_producer_crash_releases_wait_and_does_not_mask_remaining_corruption(mon
     monkeypatch.setattr(signal_engine, "_build_panel_from_stable_source", corrupt)
     with pytest.raises(ValueError, match="another reference size"):
         signal_engine._build_panel(SimpleNamespace(data=SimpleNamespace(parquet_root=stocks)))
+
+
+def test_child_receipt_reports_actual_lock_observation_without_claiming_current_lock(tmp_path):
+    root, stocks, lock = _tree(tmp_path)
+    read_fd, write_fd = os.pipe()
+    token = "a" * 32
+    env = dict(os.environ, STOCKAGENT_TW_SOURCE_PENDING_PIPE=str(write_fd),
+               STOCKAGENT_TW_SOURCE_PENDING_TOKEN=token)
+    code = """
+import sys
+from stockagent.live.tw_public_source_guard import (
+    TWPublicSourceUpdatePending, live_tw_public_source_read_guard, report_source_pending_to_parent,
+)
+try:
+    with live_tw_public_source_read_guard(sys.argv[1]):
+        raise AssertionError('writer lock was bypassed')
+except TWPublicSourceUpdatePending as exc:
+    assert report_source_pending_to_parent(exc)
+    raise
+"""
+    try:
+        with lock.open("a+") as producer:
+            fcntl.flock(producer, fcntl.LOCK_EX)
+            child = subprocess.run([sys.executable, "-c", code, str(stocks)],
+                                   env=env, pass_fds=(write_fd,), capture_output=True, timeout=30)
+        assert child.returncode != 0
+        pending = read_source_pending_from_child(read_fd, token)
+        assert isinstance(pending, TWPublicSourceUpdatePending)
+        assert pending.source_root == root and pending.lock_path == lock
+        assert pending.details["producer_lock_held_at_child_observation"] is True
+        assert pending.details["current_lock_state"] == "unverified"
+        assert "producer_lock_held" not in pending.details
+        assert pending.details["child_observed_at_ns"] > 0
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize("payload", [b"not-json", b"{}", b" " * 4097,
+    b'{"version":1,"kind":"tw_public_source_update_pending","token":"wrong",'
+    b'"source_root":"/data","source_lock":"/lock","observed_at_ns":1}',
+    b'{"version":1,"kind":"tw_public_source_update_pending","token":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",'
+    b'"source_root":"relative","source_lock":"/lock","observed_at_ns":1}'])
+def test_invalid_child_receipt_never_reclassifies_failure(payload):
+    read_fd, write_fd = os.pipe()
+    try:
+        # An oversized payload can exceed pipe capacity; close the writer after
+        # using a smaller fragment which remains incomplete/invalid.
+        os.write(write_fd, payload[:4096])
+        assert read_source_pending_from_child(read_fd, "a" * 32) is None
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.parametrize("fields", [{"allocation_admitted": True}, {"required_bytes": []},
+                                   {"required_bytes": 123, "contract": "fake"}])
+def test_child_capacity_receipt_cannot_override_admission_or_contract(fields):
+    from stockagent.live.tw_public_source_guard import read_maintenance_pending_from_child
+    read_fd, write_fd = os.pipe()
+    try:
+        os.write(write_fd, json.dumps({"version": 1, "kind": "capacity_deferred", "token": "a" * 32,
+            "reason": "physical_backing_reserve", "fields": fields, "observed_at_ns": 123}).encode())
+        assert read_maintenance_pending_from_child(read_fd, "a" * 32) is None
+    finally:
+        os.close(write_fd)
+        os.close(read_fd)
 
 
 @pytest.mark.parametrize("phase", ["arm", "cache"])

@@ -47,6 +47,80 @@ def test_unpublished_summary_is_never_promoted_by_a_directory_scan(tmp_path):
     assert runner._latest_signal(spec, NOW)[1][0]["symbol"] == "2330"
 
 
+def test_preopen_pointer_does_not_load_targets_or_block_actual_opening(tmp_path, monkeypatch, capsys):
+    spec, pointer = _signal(tmp_path)
+    path = spec.live_output_dir / "latest_signal.json"
+    pointer.update(signal_ready_at="2026-10-28T08:59:58+08:00",
+                   artifact_published_at="2026-10-28T08:59:59+08:00")
+    path.write_text(json.dumps(pointer))
+    runner._LATEST_SIGNAL_CACHE.clear()
+    runner._PREOPEN_POINTER_REJECTIONS.clear()
+    original = runner.read_execution_weight_rows
+    calls = []
+
+    def record(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "read_execution_weight_rows", record)
+    assert runner._latest_signal(spec, NOW) is None
+    assert runner._latest_signal(spec, NOW) is None
+    assert calls == []
+    assert capsys.readouterr().out.count("waiting_actual_opening_signal") == 1
+
+    # Same-length, atomic replacement is a new generation; a valid signal
+    # must be visible without waiting for another mode or a cache TTL.
+    pointer.update(signal_ready_at="2026-10-28T09:00:05+08:00",
+                   artifact_published_at="2026-10-28T09:00:06+08:00")
+    replacement = path.with_suffix(".next")
+    replacement.write_text(json.dumps(pointer))
+    os.replace(replacement, path)
+    assert runner._latest_signal(spec, NOW)[1][0]["symbol"] == "2330"
+    assert calls == [1]
+
+
+def test_preopen_pointer_replacement_during_rejection_is_not_cached(tmp_path, monkeypatch):
+    spec, pointer = _signal(tmp_path)
+    path = spec.live_output_dir / "latest_signal.json"
+    stale = {**pointer, "signal_ready_at": "2026-10-28T08:59:58+08:00",
+             "artifact_published_at": "2026-10-28T08:59:59+08:00"}
+    path.write_text(json.dumps(stale))
+    runner._LATEST_SIGNAL_CACHE.clear()
+    runner._PREOPEN_POINTER_REJECTIONS.clear()
+    original = runner._signal_file_signature
+    calls = 0
+
+    def switch_on_recheck(file_path):
+        nonlocal calls
+        if file_path == path:
+            calls += 1
+            if calls == 2:
+                replacement = path.with_suffix(".next")
+                replacement.write_text(json.dumps(pointer))
+                os.replace(replacement, path)
+        return original(file_path)
+
+    monkeypatch.setattr(runner, "_signal_file_signature", switch_on_recheck)
+    assert runner._latest_signal(spec, NOW) is None
+    assert not runner._PREOPEN_POINTER_REJECTIONS
+    assert runner._latest_signal(spec, NOW) is not None
+
+
+def test_exact_opening_gate_accepts_published_pointer(tmp_path):
+    spec, pointer = _signal(tmp_path)
+    pointer.update(signal_ready_at="2026-10-28T09:00:00+08:00",
+                   artifact_published_at="2026-10-28T09:00:00+08:00")
+    summary_path = Path(pointer["summary_path"])
+    summary = json.loads(summary_path.read_text())
+    summary.update(signal_ready_at=pointer["signal_ready_at"],
+                   artifact_published_at=pointer["artifact_published_at"])
+    summary_path.write_text(json.dumps(summary))
+    (spec.live_output_dir / "latest_signal.json").write_text(json.dumps(pointer))
+    runner._LATEST_SIGNAL_CACHE.clear()
+    runner._PREOPEN_POINTER_REJECTIONS.clear()
+    assert runner._latest_signal(spec, NOW) is not None
+
+
 def test_pointer_identity_mismatch_never_falls_back_to_summary(tmp_path):
     spec, pointer = _signal(tmp_path)
     pointer["signal_id"] = "wrong-id"

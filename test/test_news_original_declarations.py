@@ -3,6 +3,9 @@ from copy import deepcopy
 import hashlib
 import json
 from pathlib import Path
+import sqlite3
+import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -71,6 +74,9 @@ def failure(queue, *, old_metadata_only=False):
         del error.cmnews_original_declaration
     queue.failed(row, error, 3)
     assert client.calls == [PARENT]
+    if not old_metadata_only:
+        row = queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()
+        assert row is not None and row['state'] == 'pending', queue.metrics.snapshot()['providers'].get('cmnews')
     return error
 
 
@@ -104,6 +110,317 @@ def test_same_response_is_atomic_acquisition_not_alias_or_body(queue):
     assert cohorts.validate_supplements(queue.root, queue.db)
 
 
+def test_slow_outbox_read_still_processes_one_declaration(queue, monkeypatch):
+    failure(queue)
+    parent = head(queue, PARENT)
+    times = iter([0.0, 1.0])
+    monkeypatch.setattr(declarations, 'time', SimpleNamespace(
+        monotonic=lambda: next(times, 1.0), time=time.time))
+    result = declarations.consume(queue, limit=1, max_seconds=.02)
+    assert result['outcomes'] == {'declared_original_acquisition_registered': 1}
+    assert head(queue, PARENT) == parent and head(queue, URL)['state'] == 'pending'
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'completed'
+
+
+def test_same_response_survives_transient_witness_validation(queue, monkeypatch):
+    validate = declarations.validate_witness
+    calls = []
+
+    def temporarily_unavailable(*args):
+        calls.append(1)
+        if len(calls) == 1:
+            raise sqlite3.OperationalError('synthetic validation read failure')
+        return validate(*args)
+
+    monkeypatch.setattr(declarations, 'validate_witness', temporarily_unavailable)
+    failure(queue)
+    parent = head(queue, PARENT)
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'original_declaration_storage_deferred': 1}
+    assert head(queue, URL) is None
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'pending'
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'declared_original_acquisition_registered': 1}
+    assert head(queue, URL)['state'] == 'pending' and head(queue, PARENT) == parent
+
+
+def test_outbox_write_failure_rolls_back_failed_parent(queue, monkeypatch):
+    client = http_stub(queue, response=response(parent_page(canonical=URL, schema_url=PARENT)))
+    get = client.get
+    client.get = lambda url, **kwargs: get(url)
+    row = queue.claim_url(PARENT, 300)
+    assert row is not None
+    with pytest.raises(NewsError, match='article_identity_not_verified') as caught:
+        fetch_article(client, row)
+    schema = declarations._schema
+
+    def unavailable(_queue):
+        raise sqlite3.OperationalError('synthetic outbox write failure')
+
+    monkeypatch.setattr(declarations, '_schema', unavailable)
+    with pytest.raises(sqlite3.OperationalError, match='synthetic outbox write failure'):
+        queue.failed(row, caught.value, 3)
+    assert head(queue, PARENT)['state'] == 'inflight'
+    assert head(queue, URL) is None
+    monkeypatch.setattr(declarations, '_schema', schema)
+    assert queue.failed(row, caught.value, 3)
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'pending'
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'declared_original_acquisition_registered': 1}
+    assert client.calls == [PARENT]
+
+
+def test_invalid_staged_declaration_cannot_create_target_or_permission(queue):
+    client = http_stub(queue, response=response(parent_page(canonical=URL, schema_url=PARENT)))
+    get = client.get
+    client.get = lambda url, **kwargs: get(url)
+    row = queue.claim_url(PARENT, 300)
+    with pytest.raises(NewsError, match='article_identity_not_verified') as caught:
+        fetch_article(client, row)
+    caught.value.cmnews_original_declaration['canonical_attribute']['literal_sha256'] = '0' * 64
+    assert queue.failed(row, caught.value, 3)
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'pending'
+    result = declarations.consume(queue, limit=1)
+    assert result['outcomes'] == {'declared_original_witness_rejected': 1}
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'rejected'
+    assert head(queue, URL) is None and queue.claim_url(URL, 300) is None
+    assert not queue.db.execute('SELECT 1 FROM finite_supplement_members').fetchone()
+    assert client.calls == [PARENT]
+
+
+def test_outbox_write_failure_recovers_inflight_parent_after_restart(queue, monkeypatch):
+    client = http_stub(queue, response=response(parent_page(canonical=URL, schema_url=PARENT)))
+    get = client.get
+    client.get = lambda url, **kwargs: get(url)
+    row = queue.claim_url(PARENT, 300)
+    with pytest.raises(NewsError, match='article_identity_not_verified') as caught:
+        fetch_article(client, row)
+    schema = declarations._schema
+
+    def unavailable(_queue):
+        raise sqlite3.OperationalError('synthetic outbox write failure')
+
+    monkeypatch.setattr(declarations, '_schema', unavailable)
+    with pytest.raises(sqlite3.OperationalError):
+        queue.failed(row, caught.value, 3)
+    assert head(queue, PARENT)['state'] == 'inflight'
+    root, registry = queue.root, queue.registry
+    monkeypatch.setattr(declarations, '_schema', schema)
+    queue.close()
+    restarted = NewsQueue(root, registry)
+    try:
+        restored = head(restarted, PARENT)
+        assert restored['state'] == 'retry' and restored['error_code'] == 'owner_restart'
+        assert head(restarted, URL) is None
+        retry = restarted.claim_url(PARENT, 300)
+        assert retry is not None
+        with pytest.raises(NewsError, match='article_identity_not_verified') as fresh:
+            fetch_article(client, retry)
+        assert restarted.failed(retry, fresh.value, 3)
+        assert declarations.consume(restarted, limit=1)['outcomes'] == {'declared_original_acquisition_registered': 1}
+        assert client.calls == [PARENT, PARENT]  # The uncommitted response cannot survive process restart.
+    finally:
+        restarted.close()
+
+
+def test_outbox_and_url_inbox_both_progress_with_one_item_per_slice(queue):
+    failure(queue)
+    parent = head(queue, PARENT)
+    payload, created = queue.db.execute('SELECT payload,created_at_utc FROM original_declaration_outbox').fetchone()
+    duplicate = payload + ' '
+    with queue.db:
+        queue.db.execute('INSERT INTO original_declaration_outbox VALUES (?,\'pending\',?,?,NULL,NULL)',
+            (hashlib.sha256(duplicate.encode()).hexdigest(), duplicate, created))
+    request = intake.submit_urls(queue.root, queue.registry, [PARENT])
+    first = intake.consume_urls(queue, limit=1, max_seconds=.1)
+    second = intake.consume_urls(queue, limit=1, max_seconds=.1)
+    assert first['processed'] == second['processed'] == 1
+    assert second['outcomes'] == {'existing_head_preserved': 1}
+    assert head(queue, PARENT) == parent
+    assert not Path(request['pending_path']).exists()
+    third = intake.consume_urls(queue, limit=1, max_seconds=.1)
+    assert third['processed'] == 1
+    assert queue.db.execute("SELECT count(*) FROM original_declaration_outbox WHERE state='pending'").fetchone()[0] == 0
+
+
+def test_committed_outbox_backlog_requests_immediate_owner_continuation(queue):
+    failure(queue)
+    payload, created = queue.db.execute('SELECT payload,created_at_utc FROM original_declaration_outbox').fetchone()
+    with queue.db:
+        for suffix in (' ', '  ', '   '):
+            duplicate = payload + suffix
+            queue.db.execute('INSERT INTO original_declaration_outbox VALUES (?,\'pending\',?,?,NULL,NULL)',
+                (hashlib.sha256(duplicate.encode()).hexdigest(), duplicate, created))
+    assert intake.consume_urls(queue, limit=1, max_seconds=.1)['processed'] == 1
+    assert queue.db.execute("SELECT count(*) FROM original_declaration_outbox WHERE state='pending'").fetchone()[0] == 3
+    assert queue._url_metadata_continuation_pending
+
+
+def test_new_original_declaration_hints_owner_after_durable_failure(queue):
+    failure(queue)
+    assert queue._url_metadata_continuation_pending
+    assert declarations.has_pending(queue)
+    assert intake.consume_urls(queue, limit=1)['processed'] == 1
+    assert not queue._url_metadata_continuation_pending and not declarations.has_pending(queue)
+
+
+def test_rolled_back_original_declaration_leaves_only_harmless_wake_hint(queue, monkeypatch):
+    real_count = queue.metrics.count
+
+    def interrupt(provider, event, *args, **kwargs):
+        if event == 'original_declaration_outbox_recorded':
+            raise OSError('synthetic failure after outbox insertion')
+        return real_count(provider, event, *args, **kwargs)
+
+    monkeypatch.setattr(queue.metrics, 'count', interrupt)
+    with pytest.raises(OSError, match='synthetic failure'):
+        failure(queue)
+    monkeypatch.setattr(queue.metrics, 'count', real_count)
+    assert queue._url_metadata_continuation_pending
+    assert intake.consume_urls(queue, limit=1)['processed'] == 0
+    assert not queue._url_metadata_continuation_pending and not declarations.has_pending(queue)
+    assert head(queue, URL) is None and not queue.db.execute('SELECT 1 FROM accepted_batches').fetchone()
+
+
+def test_outbox_discovery_io_failure_retries_without_losing_declaration(queue, monkeypatch):
+    failure(queue)
+    schema = declarations._schema
+    monkeypatch.setattr(declarations, '_schema', lambda _: (_ for _ in ()).throw(OSError('private index unavailable')))
+    result = intake.consume_urls(queue, limit=1)
+    assert result['outcomes'] == {'original_declaration_storage_deferred': 1}
+    assert queue._url_metadata_retry_at > time.monotonic()
+    assert queue.db.execute("SELECT count(*) FROM original_declaration_outbox WHERE state='pending'").fetchone()[0] == 1
+    monkeypatch.setattr(declarations, '_schema', schema)
+    assert intake.consume_urls(queue, limit=1)['processed'] == 1
+    assert not declarations.has_pending(queue)
+
+
+def test_unavailable_original_does_not_starve_later_outbox_item(queue, monkeypatch):
+    failure(queue)
+    payload, created = queue.db.execute('SELECT payload,created_at_utc FROM original_declaration_outbox').fetchone()
+    duplicate = payload + ' '
+    with queue.db:
+        queue.db.execute('INSERT INTO original_declaration_outbox VALUES (?,\'pending\',?,?,NULL,NULL)',
+            (hashlib.sha256(duplicate.encode()).hexdigest(), duplicate, created))
+    ids = [row[0] for row in queue.db.execute('SELECT id FROM original_declaration_outbox ORDER BY id')]
+    real_approve = cohorts.approve_declared_original
+    calls = [0]
+
+    def transient_first(*args):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise OSError('one retained witness is temporarily unavailable')
+        return real_approve(*args)
+
+    monkeypatch.setattr(cohorts, 'approve_declared_original', transient_first)
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'original_declaration_storage_deferred': 1}
+    assert head(queue, URL) is None
+    assert declarations.consume(queue, limit=1)['processed'] == 1
+    states = dict(queue.db.execute('SELECT id,state FROM original_declaration_outbox'))
+    assert states == {ids[0]: 'pending', ids[1]: 'completed'}
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'existing_head_preserved': 1}
+    assert not queue.db.execute("SELECT 1 FROM original_declaration_outbox WHERE state='pending'").fetchone()
+
+
+def test_declaration_counter_failure_rolls_back_membership_and_outbox(queue, monkeypatch):
+    failure(queue)
+    real_counter = queue.counter
+
+    def interrupted(key, value):
+        if key.startswith('original_declaration_'):
+            raise RuntimeError('synthetic counter failure')
+        return real_counter(key, value)
+
+    monkeypatch.setattr(queue, 'counter', interrupted)
+    with pytest.raises(RuntimeError, match='synthetic counter failure'):
+        declarations.consume(queue, limit=1)
+    assert head(queue, URL) is None
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'pending'
+    monkeypatch.setattr(queue, 'counter', real_counter)
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'declared_original_acquisition_registered': 1}
+
+
+def test_unavailable_url_inbox_does_not_hide_committed_declaration(queue, monkeypatch):
+    failure(queue)
+    intake.submit_urls(queue.root, queue.registry, [PARENT])
+
+    def unavailable(_):
+        raise OSError('temporary inbox failure')
+
+    monkeypatch.setattr(intake, '_pending', unavailable)
+    monkeypatch.setattr(intake, 'time', SimpleNamespace(monotonic=lambda: 0.0, time=time.time))
+    result = intake.consume_urls(queue, limit=2, max_seconds=.1)
+    assert result == {'processed': 1, 'outcomes': {'declared_original_acquisition_registered': 1},
+                      'inbox_unavailable': True}
+    assert head(queue, URL)['state'] == 'pending'
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'completed'
+
+
+@pytest.mark.parametrize('route', ['outbox', 'url_inbox'])
+def test_conflicting_local_proof_is_deferred_without_partial_head(queue, monkeypatch, route):
+    failure(queue, old_metadata_only=route == 'url_inbox')
+    parent = head(queue, PARENT)
+    if route == 'url_inbox':
+        witness = normal_witness(queue)
+        request = intake.submit_declared_urls(queue.root, queue.registry,
+            [{'url': URL, 'declared_original': witness}], contract_version=3)
+    persist = cohorts._persist_immutable_proof
+
+    def conflicting(*args):
+        raise ValueError('immutable source outcome proof conflicts with existing evidence')
+
+    monkeypatch.setattr(cohorts, '_persist_immutable_proof', conflicting)
+    result = declarations.consume(queue, limit=1) if route == 'outbox' else intake.consume_urls(queue, limit=1)
+    assert result['outcomes'] == {'original_declaration_storage_deferred': 1}
+    metrics_provider = 'cmnews' if route == 'outbox' else 'url_metadata'
+    assert queue.metrics.snapshot()['providers'][metrics_provider]['counts']['declared_original_local_proof_conflicts'] == 1
+    assert head(queue, URL) is None and head(queue, PARENT) == parent
+    assert queue.db.execute('SELECT count(*) FROM finite_supplement_members').fetchone()[0] == 0
+    if route == 'outbox':
+        assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'pending'
+    else:
+        assert Path(request['pending_path']).exists()
+    monkeypatch.setattr(cohorts, '_persist_immutable_proof', persist)
+    result = declarations.consume(queue, limit=1) if route == 'outbox' else intake.consume_urls(queue, limit=1)
+    assert result['outcomes'] == {'declared_original_acquisition_registered': 1}
+    assert head(queue, URL)['state'] == 'pending'
+
+
+def test_real_immutable_proof_conflict_is_retained_until_repaired(queue):
+    failure(queue)
+    payload = json.loads(queue.db.execute('SELECT payload FROM original_declaration_outbox').fetchone()[0])
+    _, proof = cohorts.validate_declared_original(queue.db, queue.registry, payload['url'], payload['declared_original'])
+    path = queue.root/'capture_cohorts'/'supplement_sources'/(hashlib.sha256(proof).hexdigest() + '.json')
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b'conflicting local evidence')
+    path.chmod(0o600)
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'original_declaration_storage_deferred': 1}
+    assert queue.metrics.snapshot()['providers']['cmnews']['counts']['declared_original_local_proof_conflicts'] == 1
+    assert path.read_bytes() == b'conflicting local evidence' and head(queue, URL) is None
+    assert queue.db.execute('SELECT state FROM original_declaration_outbox').fetchone()[0] == 'pending'
+    path.write_bytes(proof)  # Repair only this synthetic fixture's local evidence.
+    assert declarations.consume(queue, limit=1)['outcomes'] == {'declared_original_acquisition_registered': 1}
+    assert head(queue, URL)['state'] == 'pending'
+
+
+@pytest.mark.parametrize('route', ['outbox', 'url_inbox'])
+def test_rejected_witness_rolls_back_partial_acquisition_head(queue, monkeypatch, route):
+    failure(queue, old_metadata_only=route == 'url_inbox')
+    parent = head(queue, PARENT)
+    if route == 'url_inbox':
+        witness = normal_witness(queue)
+        intake.submit_declared_urls(queue.root, queue.registry,
+            [{'url': URL, 'declared_original': witness}], contract_version=3)
+    add = queue.add_articles
+
+    def invalid_after_partial_add(rows):
+        add(rows)
+        raise ValueError('synthetic invalid admission after head creation')
+
+    monkeypatch.setattr(queue, 'add_articles', invalid_after_partial_add)
+    result = declarations.consume(queue, limit=1) if route == 'outbox' else intake.consume_urls(queue, limit=1)
+    assert result['outcomes'] == {'declared_original_witness_rejected': 1}
+    assert head(queue, URL) is None and head(queue, PARENT) == parent
+    assert queue.db.execute('SELECT count(*) FROM finite_supplement_members').fetchone()[0] == 0
+
+
 def test_pending_declaration_resumes_after_owner_restart_without_another_get(queue):
     failure(queue)
     before = head(queue, PARENT)
@@ -121,14 +438,25 @@ def test_pending_declaration_resumes_after_owner_restart_without_another_get(que
 
 def test_normal_original_requires_actual_http_and_durable_acceptance(queue):
     failure(queue)
-    consume(queue)
+    assert consume(queue)['outcomes'] == {'declared_original_acquisition_registered': 1}
     parent = head(queue, PARENT)
     from downloader.news_fulltext_http import Response
     raw = original_page('/new-observed-original-20261027/').encode()
     client = http_stub(queue, response=Response(URL, 200, {'content-type': 'text/html; charset=UTF-8'}, raw))
     get = client.get
     client.get = lambda url, **kwargs: get(url)
-    record = fetch_article(client, queue.claim_url(URL, 300))
+    claimed = queue.claim_url(URL, 300)
+    assert claimed is not None, {
+        'head': head(queue, URL),
+        'cohort_member': bool(queue.db.execute(
+            'SELECT 1 FROM finite_cohort_members WHERE provider=? AND url=?',
+            ('cmoneylearning', URL)).fetchone()),
+        'supplement_member': bool(queue.db.execute(
+            'SELECT 1 FROM finite_supplement_members WHERE provider=? AND url=?',
+            ('cmoneylearning', URL)).fetchone()),
+        'now_epoch': time.time(),
+    }
+    record = fetch_article(client, claimed)
     queue.accept([record])
     assert client.calls == [URL] and head(queue, URL)['state'] == 'complete'
     assert head(queue, PARENT) == parent and verify_bodies(queue.root)['accepted']

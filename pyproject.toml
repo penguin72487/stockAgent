@@ -16,6 +16,7 @@ dependencies = [
   "tqdm>=4.66",
   "requests>=2.31",
   "urllib3>=2.2,<3",
+  "ijson>=3.5.1,<4",
 ]
 
 [project.optional-dependencies]

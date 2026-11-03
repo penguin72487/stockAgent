@@ -18,6 +18,39 @@ BRIDGE = (REPO / 'scripts/tej_smart_wizard_bridge.ps1').read_text()
 CATALOG = (REPO / 'scripts/inventory_tej_smart_wizard_catalog.ps1').read_text()
 
 
+def test_large_option_company_axis_sample_never_admits_scope_or_submits_a_query():
+    native = BRIDGE.split('public static string[] SampleLargeCompanyAxis', 1)[1].split('public static string[] ReadLargeCompanyAxisPage', 1)[0]
+    for guard in ('AssertControlScope(root,control,expectedPid,title)', 'IsWindowEnabled',
+                  'IsWindowVisible', 'Dialogs(root).Length!=0', 'WindowsForms10.LISTBOX.',
+                  'n<=150000||n>2000000', 'SignedControlResult(Message(control,0x18Bu,0,0))!=n',
+                  'SignedControlResult(r.ToInt64())!=len', 'b.Length!=len'):
+        assert guard in native
+    assert native.count('AssertControlScope(root,control,expectedPid,title)') == 2
+    for forbidden in ('WriteText(', 'NotifyBinding(', 'PostMessageW(', 'SelectList', 'Preview'):
+        assert forbidden not in native.split('{', 1)[1].replace('submits Preview', '')
+    branch = BRIDGE.split("if($requestDoc.action -ceq 'plan' -and $requestDoc.type -ceq 'Option (ALL)'", 1)[1].split("Stamp-ScopeTiming 'company_universe_and_lookup'", 1)[0]
+    for guard in ("$requestDoc.smart_id -ceq 'TEJ Derivatives'", '$availableCompanyCount -gt 150000',
+                  'SampleLargeCompanyAxis', 'Verify-EditableScope -BindingReadback',
+                  "contract='large_company_axis_diagnostic_only_v1'", 'full_axis_admitted=$false',
+                  'market_data_query_submitted=$false', "company-axis-sample.json",
+                  '$availableCompanies=Items $companyLists[2].Current.NativeWindowHandle'):
+        assert guard in branch
+    assert branch.index('Verify-EditableScope -BindingReadback') < branch.index("company-axis-sample.json")
+
+
+def test_large_company_axis_pages_are_bounded_source_reads_not_discovery_admission():
+    native = BRIDGE.split('public static string[] ReadLargeCompanyAxisPage', 1)[1].split('private static void ComboScope', 1)[0]
+    for guard in ('expectedCount<=150000||expectedCount>2000000', 'length<1||length>4096',
+                  'start<0||start>expectedCount-length', 'IsWindowEnabled', 'IsWindowVisible',
+                  'Dialogs(root).Length!=0', 'WindowsForms10.LISTBOX.',
+                  'SignedControlResult(Message(control,0x18Bu,0,0))!=expectedCount',
+                  'SignedControlResult(r.ToInt64())!=n', 'b.Length!=n'):
+        assert guard in native
+    assert native.count('AssertControlScope(root,control,expectedPid,title)') == 2
+    for forbidden in ('WriteText(', 'NotifyBinding(', 'PostMessageW(', 'SelectList', 'Preview'):
+        assert forbidden not in native
+
+
 def test_bulk_selection_keeps_model_notification_one_action_and_full_order_readback():
     bulk = BRIDGE.split('public static bool TrySelectListBulk', 1)[1].split('private static void DateScope', 1)[0]
     for proof in ('VerifyLookupList(root,source)', 'indices[i]<=indices[i-1]', '(style&0x808)==0',
@@ -271,6 +304,26 @@ def test_current_binding_readback_reads_selected_combo_not_the_entire_menu():
     selection=BRIDGE.split('function Select-Combo',1)[1].split('function Click-Button',1)[0]
     assert 'ExactComboIndex($ExpectedWindow,$h,$name)' in selection
     assert selection.count('NotifyBinding(')==1 and 'Items $h $true' not in selection
+
+
+def test_option_plan_uses_one_bounded_longer_universe_callback_only():
+    native = BRIDGE.split('public static void NotifyBinding', 1)[1].split(
+        'public static long[] Children', 1)[0]
+    assert 'timeoutMilliseconds!=150000u && timeoutMilliseconds!=600000u' in native
+    assert native.count('SendMessageTimeoutW(') == 1
+    assert 'throw new TimeoutException("Binding event unresolved; no notification retry")' in native
+    selector = BRIDGE.split('function Select-Combo', 1)[1].split('function Prepare-SourceBinding', 1)[0]
+    assert selector.count('[TejBridgeNative]::NotifyBinding(') == 1
+    assert '[uint32]$notificationTimeoutMs=150000' in selector
+    assert 'if($notificationTimeoutMs -eq 600000){$deadline=[DateTime]::UtcNow.AddSeconds(30)}' in selector
+    universe = BRIDGE.split("if($sectorFilterApplicable) {", 1)[1].split(
+        '$numericScale=Set-NumericScaleDefault', 1)[0]
+    assert "$requestDoc.action -ceq 'plan'" in universe
+    assert "$requestDoc.type -ceq 'Option (ALL)'" in universe
+    assert "$requestDoc.smart_id -ceq 'TEJ Derivatives'" in universe
+    assert "$universeNotificationTimeout=[uint32]150000" in universe
+    assert "$universeNotificationTimeout=[uint32]600000" in universe
+    assert "Select-Combo $sectorCombo 'ALL' $refreshUniverse $universeNotificationTimeout" in universe
 
 
 def test_combo_lookup_keeps_exact_current_names_and_rejects_unaccepted_cache_optimization():

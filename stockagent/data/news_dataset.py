@@ -26,17 +26,27 @@ import pyarrow.parquet as pq
 from downloader.artifact_io import atomic_write_json, atomic_write_parquet, atomic_write_text, sha256_file
 from downloader.news_fulltext_disk import BackingDiskSampler
 from stockagent.data.news_dataset_quality import audit_news_tables
+from stockagent.data.news_clock import (
+    CMNEWS_RETAINED_DECLARATION_BASIS, GLOBALVOICES_RETAINED_META_BASIS, combined_publication_update,
+    globalvoices_monthly_feed_clock_mismatch, legacy_globalvoices_basis_candidate,
+    legacy_globalvoices_publication_basis, legacy_cmnews_clock_candidate,
+    legacy_cmnews_publication_declaration,
+)
 from stockagent.data.news_dataset_storage import CopyOnWriteParts, LAYOUT, news_part_path, news_table_paths
 from stockagent.data.news_dataset_snapshots import (
     copy_snapshot, discard_new_build_work, seal_snapshot, verify_snapshot,
 )
 from stockagent.data.news_dataset_sources import (
-    HEADLINE_SCOPE_CONTRACT, checked_path, freeze_inputs, iter_body_groups, original_article_id, readonly_database,
+    BODY_QUALITY_SCOPE_CONTRACT, HEADLINE_SCOPE_CONTRACT, METADATA_SELECTION_SCOPE_CONTRACT,
+    PUBLICATION_BASIS_SCOPE_CONTRACT,
+    checked_path, freeze_inputs, iter_body_groups,
+    original_article_id, readonly_database,
     reuse_snapshot, source_metadata_record, url_article_id, utc_now,
 )
 
 CONTRACT_VERSION = 2
 SUPPORTED_CONTRACTS = {1, CONTRACT_VERSION}
+ARTICLE_SCHEMA_CONTRACT = "exact_retained_publication_and_update_declarations_v1"
 MIN_FREE_BYTES = 25 * 2**30
 
 
@@ -68,6 +78,8 @@ ARTICLE_SCHEMA = pa.schema([
     ("article_id", pa.string()), ("provider", pa.string()), ("url", pa.string()),
     ("title", pa.string()), ("body", pa.string()), ("document_id", pa.string()), ("text_kind", pa.string()),
     ("published_at_raw", pa.string()), ("published_at_utc", pa.timestamp("us", tz="UTC")),
+    ("retained_published_declaration_raw", pa.string()),
+    ("retained_modified_declaration_raw", pa.string()),
     ("publication_date", pa.date32()), ("publication_clock_status", pa.string()),
     ("metadata_date_raw", pa.string()), ("published_time_basis", pa.string()),
     ("modified_at_raw", pa.string()), ("observed_at_utc", pa.timestamp("us", tz="UTC")),
@@ -101,6 +113,9 @@ OBSERVATION_SCHEMA = pa.schema([
 ])
 SCHEMAS = {"articles": ARTICLE_SCHEMA, "documents": DOCUMENT_SCHEMA,
            "article_stocks": LINK_SCHEMA, "metadata_observations": OBSERVATION_SCHEMA}
+LEGACY_ARTICLE_SCHEMA = pa.schema([field for field in ARTICLE_SCHEMA
+                                  if field.name not in {"retained_published_declaration_raw",
+                                                        "retained_modified_declaration_raw"}])
 BODY_COLUMNS = {
     "article_id", "requested_url", "provider", "title", "body", "body_sha256",
     "published_at_raw", "modified_at_raw", "published_time_basis", "captured_at_utc",
@@ -115,10 +130,26 @@ BODY_COLUMNS = {
 def builder_fingerprint() -> str:
     sources = [Path(__file__), Path(__file__).with_name("news_dataset_sources.py"),
                Path(__file__).with_name("news_source_urls.py"),
+               Path(__file__).with_name("news_clock.py"),
                Path(__file__).with_name("news_dataset_quality.py"),
                Path(__file__).with_name("news_dataset_storage.py"),
                Path(__file__).with_name("news_dataset_snapshots.py")]
+    repo = Path(__file__).resolve().parents[2]
+    sources.extend(repo / path for path in ("downloader/news_fulltext_metadata_current.py",
+        "downloader/news_fulltext_repairs.py",
+        "downloader/news_fulltext_stored_quality.py", "downloader/news_fulltext_policy.py",
+        "downloader/news_fulltext_publishers.py", "downloader/news_fulltext_public_originals.py"))
     return hashlib.sha256("".join(sha256_file(p) for p in sources).encode()).hexdigest()
+
+
+def _schemas_for_manifest(manifest):
+    """Select an explicit new article schema or the pre-existing schema."""
+    contract = manifest.get("article_schema_contract")
+    if contract is None:
+        return {**SCHEMAS, "articles": LEGACY_ARTICLE_SCHEMA}
+    if contract != ARTICLE_SCHEMA_CONTRACT:
+        raise ValueError("unrecognized news article schema contract")
+    return SCHEMAS
 
 
 def source_clock(value) -> tuple[datetime | None, date | None, str]:
@@ -126,6 +157,12 @@ def source_clock(value) -> tuple[datetime | None, date | None, str]:
     if value is None or not str(value).strip():
         return None, None, "missing"
     raw = str(value)
+    if "(更新" in raw:
+        pair_status, pair = combined_publication_update(raw)
+        if pair_status:
+            if pair is None:
+                return None, None, "invalid"
+            return None, pair[0].date(), "naive_timezone_unverified"
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", raw):
         try:
             return None, date.fromisoformat(raw), "date_only"
@@ -163,6 +200,12 @@ def article_record(head: dict, document: dict, *, body=None, source_row=None, so
     full = document["text_kind"] == "fulltext"
     published = body.get("published_at_raw")
     clock, day, status = source_clock(published)
+    if full and head.get("provider") == "globalvoices" and globalvoices_monthly_feed_clock_mismatch(
+            provider=head.get("provider"), article_url=head.get("url"), request_url=body.get("source_request_url"),
+            method=body.get("extraction_method"), basis=body.get("published_time_basis"), published_utc=clock):
+        # Keep the publisher's exact claim in published_at_raw, but do not let
+        # a contradictory feed clock masquerade as an accepted source date.
+        clock, day, status = None, None, "source_feed_scope_clock_conflict"
     if not full:
         _, day, _ = source_clock(head.get("metadata_date_raw"))
         status = "metadata_date_not_verified_publication"
@@ -176,7 +219,9 @@ def article_record(head: dict, document: dict, *, body=None, source_row=None, so
         "title": body.get("title") if full else head.get("title"),
         "body": document["text"] if full else None,
         "document_id": document["document_id"], "text_kind": document["text_kind"],
-        "published_at_raw": _raw(published), "published_at_utc": clock, "publication_date": day,
+        "published_at_raw": _raw(published), "published_at_utc": clock,
+        "retained_published_declaration_raw": None, "retained_modified_declaration_raw": None,
+        "publication_date": day,
         "publication_clock_status": status, "metadata_date_raw": head.get("metadata_date_raw"),
         "published_time_basis": body.get("published_time_basis"), "modified_at_raw": _raw(body.get("modified_at_raw")),
         "observed_at_utc": observed, "available_at_utc": observed,
@@ -207,25 +252,76 @@ def _load_body_input(item):
     if original.metadata.num_rows != receipt.get("rows"):
         raise ValueError(f"news source receipt row mismatch: {relative}")
     selected = {h["id"].hex(): h for h in heads}
-    found, output, row_number = set(), [], 0
-    columns = sorted(BODY_COLUMNS.intersection(original.schema_arrow.names))
+    found, output, row_number, legacy_candidates = set(), [], 0, {}
+    columns_needed = BODY_COLUMNS
+    globalvoices = any(head.get("provider") == "globalvoices" for head in heads)
+    cmnews = any(head.get("provider") == "cmnews" for head in heads)
+    legacy_basis = (globalvoices and "published_time_basis" not in original.schema_arrow.names
+                    and {"raw_response_body", "response_sha256", "final_url"}.issubset(original.schema_arrow.names))
+    cmnews_clock = (cmnews and {"raw_response_body", "response_sha256", "final_url", "authors_json"}
+                    .issubset(original.schema_arrow.names))
+    if globalvoices:
+        columns_needed = BODY_COLUMNS | {"source_request_url"}
+    if legacy_basis or cmnews_clock:
+        columns_needed = columns_needed | {"response_sha256", "final_url", "source_response_article_id",
+                                           "source_request_url"}
+    columns = sorted(columns_needed.intersection(original.schema_arrow.names))
     for batch in original.iter_batches(batch_size=2048, columns=columns, use_threads=False):
         for record in batch.to_pylist():
             head = selected.get(record.get("article_id"))
             if head is not None and record.get("body_sha256") == head["body_sha256"]:
                 if record.get("provider") != head["provider"] or url_article_id(record["requested_url"]) != head["id"]:
                     raise ValueError("source body provider/URL disagrees with its frozen head")
+                if record.get("captured_at_utc") != head.get("captured_at_utc"):
+                    raise ValueError("source body observation clock disagrees with its frozen head")
                 if record["article_id"] in found:
                     raise ValueError("duplicate current article in accepted source batch")
                 document = document_record(record.get("body"), "fulltext")
                 if document["text_sha256"] != head["body_sha256"]:
                     raise ValueError("source body text does not match its committed checksum")
-                output.append((article_record(head, document, body=record, source_row=row_number,
-                                              source_sha=receipt["sha256"]), document))
+                article = article_record(head, document, body=record, source_row=row_number,
+                                         source_sha=receipt["sha256"])
+                output.append((article, document))
+                if legacy_basis and legacy_globalvoices_basis_candidate(record):
+                    legacy_candidates[row_number] = ("globalvoices", article, record)
+                elif cmnews_clock and legacy_cmnews_clock_candidate(record):
+                    legacy_candidates[row_number] = ("cmnews", article, record)
                 found.add(record["article_id"])
             row_number += 1
     if found != set(selected):
         raise ValueError(f"current body heads absent from immutable batch: {relative}")
+    if legacy_candidates:
+        # Avoid decoding any raw responses for RSS, contradictory metadata or
+        # other noncandidates. For verified HTML candidates, stream only the
+        # raw column and materialize one selected row at a time.
+        remaining = set(legacy_candidates)
+        last = max(remaining)
+        for index, batch in enumerate(original.iter_batches(batch_size=1, columns=["raw_response_body"],
+                                                             use_threads=False)):
+            if index in legacy_candidates:
+                kind, article, record = legacy_candidates[index]
+                record["raw_response_body"] = batch.column(0)[0].as_py()
+                if kind == "globalvoices":
+                    basis = legacy_globalvoices_publication_basis(record)
+                    if basis is not None:
+                        article["published_time_basis"] = basis
+                else:
+                    declarations = legacy_cmnews_publication_declaration(record)
+                    if declarations is not None:
+                        published, modified = declarations
+                        clock, day, status = source_clock(published)
+                        if clock is None or status != "source_timezone_aware":
+                            raise ValueError("verified retained declaration is not timezone-aware")
+                        article.update(retained_published_declaration_raw=published,
+                                       retained_modified_declaration_raw=modified,
+                                       published_at_utc=clock, publication_date=day,
+                                       publication_clock_status="source_timezone_aware_retained_declaration",
+                                       published_time_basis=CMNEWS_RETAINED_DECLARATION_BASIS)
+                remaining.remove(index)
+            if index >= last:
+                break
+        if remaining:
+            raise ValueError(f"current raw response rows absent from immutable batch: {relative}")
     return output
 
 
@@ -382,7 +478,8 @@ def _build_tables(root, source, snapshot_path, plan, *, workers, batch_rows, not
                 inputs = []
                 for relative in paths:
                     heads = [dict(r) for r in snapshot.execute("SELECT * FROM heads WHERE body_sha256 IS NOT NULL "
-                                                              "AND parquet_path=? ORDER BY id", (relative,))]
+                        "AND parquet_path=? AND NOT EXISTS "
+                        "(SELECT 1 FROM body_quality_exclusions e WHERE e.article_id=heads.id) ORDER BY id", (relative,))]
                     receipt = snapshot.execute("SELECT receipt_path FROM batches WHERE path=?", (relative,)).fetchone()
                     if not receipt:
                         raise ValueError("body head has no accepted-batch receipt")
@@ -414,8 +511,27 @@ def _build_tables(root, source, snapshot_path, plan, *, workers, batch_rows, not
                 done += len(rows)
                 writer.checkpoint("headlines", rows[-1]["id"].hex(), done)
                 notify("headlines", done, plan["counts"]["headline_articles"])
-            if done != plan["counts"]["headline_articles"]:
+            if done != plan["counts"]["ordinary_headline_articles"]:
                 raise ValueError("headline scope is incomplete")
+            ordinary_done = done
+            after, done = writer.position("reviewed_headlines")
+            cursor = snapshot.execute("SELECT h.* FROM heads h JOIN "
+                "(SELECT DISTINCT article_id FROM body_quality_exclusions WHERE article_id>?) e ON h.id=e.article_id "
+                "WHERE h.title IS NOT NULL AND trim(h.title)!='' AND NOT EXISTS "
+                "(SELECT 1 FROM metadata_only_heads m WHERE m.id=h.id) ORDER BY h.id",
+                (bytes.fromhex(after) if after else b"",))
+            while rows := cursor.fetchmany(batch_rows):
+                records = []
+                for head in rows:
+                    head = dict(head)
+                    document = document_record(head["title"], "headline")
+                    records.append((article_record(head, document), document))
+                writer.records(records)
+                done += len(rows)
+                writer.checkpoint("reviewed_headlines", rows[-1]["id"].hex(), done)
+                notify("headlines", ordinary_done + done, plan["counts"]["headline_articles"])
+            if done != plan["counts"]["reviewed_headline_articles"]:
+                raise ValueError("reviewed headline scope is incomplete")
             after, done = writer.position("metadata")
             for row in snapshot.execute("SELECT * FROM metadata_inputs WHERE origin_id>? ORDER BY origin_id", (int(after or 0),)):
                 origin = dict(row)
@@ -514,6 +630,7 @@ def _verify_manifest(root: Path, manifest: dict, *, deep: bool = True, notify=No
         raise ValueError("unaccepted news dataset contract")
     generation = checked_path(root, manifest["generation"] + "/generation.json").parent
     verify_snapshot(root, generation, manifest["source_snapshot"])
+    schemas = _schemas_for_manifest(manifest)
     counts, checked_bytes, paths = Counter(), 0, set()
     for number, part in enumerate(manifest["parts"], 1):
         if part["path"] in paths:
@@ -523,7 +640,7 @@ def _verify_manifest(root: Path, manifest: dict, *, deep: bool = True, notify=No
         if sha256_file(path) != part["sha256"]:
             raise ValueError("news dataset part checksum mismatch")
         original = pq.ParquetFile(path)
-        if original.metadata.num_rows != part["rows"] or original.schema_arrow != SCHEMAS[part["table_name"]]:
+        if original.metadata.num_rows != part["rows"] or original.schema_arrow != schemas[part["table_name"]]:
             raise ValueError("news dataset schema/row mismatch")
         if deep and part["table_name"] == "documents":
             for batch in original.iter_batches(batch_size=2048):
@@ -543,7 +660,7 @@ def _verify_manifest(root: Path, manifest: dict, *, deep: bool = True, notify=No
         raise ValueError("news unique document totals disagree")
     if notify:
         notify("relational_validation", 0, 1)
-    quality = audit_news_tables(root, manifest, SCHEMAS, memory_limit_mb=verification_memory_mb,
+    quality = audit_news_tables(root, manifest, schemas, memory_limit_mb=verification_memory_mb,
                                notify=notify)
     if notify:
         notify("relational_validation", 1, 1)
@@ -617,6 +734,14 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
                 existing = json.loads((output / "manifest.json").read_text())
                 if existing.get("headline_scope_contract") != HEADLINE_SCOPE_CONTRACT:
                     raise ValueError("news headline scope changed; build into a separate output root")
+                if existing.get("body_quality_scope_contract") != BODY_QUALITY_SCOPE_CONTRACT:
+                    raise ValueError("news body quality scope changed; build into a separate output root")
+                if existing.get("metadata_selection_scope_contract") != METADATA_SELECTION_SCOPE_CONTRACT:
+                    raise ValueError("news metadata selection scope changed; build into a separate output root")
+                if existing.get("publication_basis_scope_contract") != PUBLICATION_BASIS_SCOPE_CONTRACT:
+                    raise ValueError("news publication basis scope changed; build into a separate output root")
+                if existing.get("article_schema_contract") != ARTICLE_SCHEMA_CONTRACT:
+                    raise ValueError("news article schema changed; build into a separate output root")
             name = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]
             relative = "versions/" + name
             generation = output / relative
@@ -624,7 +749,11 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
             plan = (reuse_snapshot(source, generation, snapshot_from.resolve()) if snapshot_from is not None
                     else freeze_inputs(source, generation, progress=progress))
             active = {"generation": relative, "builder_fingerprint": fingerprint,
-                      "headline_scope_contract": HEADLINE_SCOPE_CONTRACT}
+                      "headline_scope_contract": HEADLINE_SCOPE_CONTRACT,
+                      "body_quality_scope_contract": BODY_QUALITY_SCOPE_CONTRACT,
+                      "metadata_selection_scope_contract": METADATA_SELECTION_SCOPE_CONTRACT,
+                      "publication_basis_scope_contract": PUBLICATION_BASIS_SCOPE_CONTRACT,
+                      "article_schema_contract": ARTICLE_SCHEMA_CONTRACT}
             if (output / "manifest.json").is_file():
                 parent_bytes = (output / "manifest.json").read_bytes()
                 parent = json.loads(parent_bytes)
@@ -638,6 +767,17 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
             atomic_write_json(active_path, active)
         if plan["source_root"] != str(source):
             raise ValueError("cannot resume news build from a different source root")
+        if (plan.get("body_quality_scope_contract") != BODY_QUALITY_SCOPE_CONTRACT
+                or active.get("body_quality_scope_contract") != BODY_QUALITY_SCOPE_CONTRACT):
+            raise ValueError("news body quality scope changed; cannot resume incompatible build")
+        if (plan.get("metadata_selection_scope_contract") != METADATA_SELECTION_SCOPE_CONTRACT
+                or active.get("metadata_selection_scope_contract") != METADATA_SELECTION_SCOPE_CONTRACT):
+            raise ValueError("news metadata selection scope changed; cannot resume incompatible build")
+        if (plan.get("publication_basis_scope_contract") != PUBLICATION_BASIS_SCOPE_CONTRACT
+                or active.get("publication_basis_scope_contract") != PUBLICATION_BASIS_SCOPE_CONTRACT):
+            raise ValueError("news publication basis scope changed; cannot resume incompatible build")
+        if active.get("article_schema_contract") != ARTICLE_SCHEMA_CONTRACT:
+            raise ValueError("news article schema changed; cannot resume incompatible build")
         parent = None
         if active.get("base_manifest_sha256"):
             if sha256_file(generation / "base_manifest.json") != active["base_manifest_sha256"]:
@@ -659,7 +799,7 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
                     "source_checksum_scope": "selected immutable body/metadata/RSS Parquet files plus frozen queue projection; not the live SQLite DB",
                     "split_policy": "not_assigned; group by dedup_group_id and choose task-specific causal cutoff",
                     "labels": "not_generated; prediction target and horizon not specified",
-                    "content_policy": "fulltext and headline remain separate; raw strings are not transformed",
+                    "content_policy": "fulltext and headline remain separate; exact owner-reviewed invalid bodies excluded; raw strings are not transformed",
                     "availability_policy": "current captured revision becomes available at its actual observation, not backdated publication",
                     "all_history_complete": False, "publish": False, "remote_training_export": False,
                     "training_injection_enabled": False, "scope": "local_research_corpus_not_license_attestation"}
@@ -675,14 +815,19 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
 
 def _publish_verified(output, generation, manifest, verification):
     """Move the readers' pointer only after the complete independent readback."""
+    # Rendering can reject unusual but valid empty tables. Finish it before
+    # moving the manifest pointer, so an error cannot publish a partial result.
+    readme = render_news_dataset_readme(manifest, verification)
+    schema = {name: [{"name": f.name, "type": str(f.type)} for f in fields]
+              for name, fields in _schemas_for_manifest(manifest).items()}
     atomic_write_json(generation / "verification.json", verification)
     atomic_write_json(generation / "quality_report.json", verification["quality"])
-    atomic_write_json(output / "manifest.json", manifest)
+    atomic_write_json(generation / "schema.json", schema)
     atomic_write_json(output / "verification.json", verification)
     atomic_write_json(output / "quality_report.json", verification["quality"])
-    atomic_write_json(output / "schema.json", {name: [{"name": f.name, "type": str(f.type)} for f in schema]
-                                               for name, schema in SCHEMAS.items()})
-    atomic_write_text(output / "README.md", render_news_dataset_readme(manifest, verification), durable=True)
+    atomic_write_json(output / "schema.json", schema)
+    atomic_write_text(output / "README.md", readme, durable=True)
+    atomic_write_json(output / "manifest.json", manifest)
     discard_new_build_work(output, generation, manifest)
     (output / ".active-build.json").unlink()
 
@@ -791,13 +936,16 @@ def render_news_dataset_readme(manifest: dict, verification: dict) -> str:
         f"- 資料建置完成：{stamp(manifest['built_at_utc'])}。",
         f"- 完整讀回驗證：{stamp(verification['verified_at_utc'])}；台灣時間為 UTC 加 8 小時。",
         "", "| 項目 | 數量 | 代表什麼 |", "| --- | ---: | --- |",
-        f"| 新聞文章 | {counts['articles']:,} | 以網址辨識的文章，不是事件數 |",
+        f"| 新聞文章 | {counts.get('articles', 0):,} | 以網址辨識的文章，不是事件數 |",
         f"| 有內文的文章 | {source_counts['fulltext_articles']:,} | `body` 有值 |",
         f"| 只有標題的文章 | {source_counts['headline_articles']:,} | `body` 是真正的 NULL |",
-        f"| 有標題的文章 | {counts['articles'] - missing_titles:,} | 非 NULL／非空字串；訓練時再排除純空白 |",
-        f"| 精確去重文字 | {counts['documents']:,} | 全文或標題原字串的不同版本，不是文章數 |",
-        f"| 新聞與股票關聯 | {counts['article_stocks']:,} | 同篇新聞可連到多檔股票及多個中繼資料來源 |",
-        f"| 中繼資料觀測 | {counts['metadata_observations']:,} | 來源列，不可再加到文章總數 |",
+        *([f"| 覆核排除的正文版本 | {source_counts['reviewed_excluded_body_heads']:,} | "
+           "只排除 owner 有精確版本證據的正文，原始資料仍保留 |"]
+          if 'reviewed_excluded_body_heads' in source_counts else []),
+        f"| 有標題的文章 | {counts.get('articles', 0) - missing_titles:,} | 非 NULL／非空字串；訓練時再排除純空白 |",
+        f"| 精確去重文字 | {counts.get('documents', 0):,} | 全文或標題原字串的不同版本，不是文章數 |",
+        f"| 新聞與股票關聯 | {counts.get('article_stocks', 0):,} | 同篇新聞可連到多檔股票及多個中繼資料來源 |",
+        f"| 中繼資料觀測 | {counts.get('metadata_observations', 0):,} | 來源列，不可再加到文章總數 |",
         f"| Parquet 檔案 | {len(manifest['parts']):,} | 僅目前版本的四張資料表 |",
         f"| Parquet 大小 | {verification['bytes_verified'] / 10**9:.2f} GB / "
         f"{verification['bytes_verified'] / 2**30:.2f} GiB | 不含快照索引、舊版本與原始新聞庫 |",
@@ -860,8 +1008,13 @@ def render_news_dataset_readme(manifest: dict, verification: dict) -> str:
                          "已改為共用不變分區、只寫新增與受影響分區；不是再複製一份全庫。")
     return (_DATASET_README.replace("<!-- snapshot -->", "\n".join(snapshot))
             .replace("<!-- providers -->", "\n".join(provider_rows))
+            .replace("<!-- retained-publication-field -->\n", (
+                "| `retained_published_declaration_raw`、`retained_modified_declaration_raw` | "
+                "經原頁核對的發布及更新宣告原字串；與舊擷取字串分開保存 |\n"
+                if manifest.get("article_schema_contract") == ARTICLE_SCHEMA_CONTRACT else ""))
             .replace("<!-- quality -->", quality_notes)
-            .replace("<!-- storage -->", storage_notes))
+            .replace("<!-- storage -->", storage_notes)
+            .replace("<!-- generation -->", manifest["generation"]))
 
 
 _DATASET_README = r"""# data_news：新聞標題與全文研究資料集
@@ -875,8 +1028,11 @@ _DATASET_README = r"""# data_news：新聞標題與全文研究資料集
 
 ## 目前有哪些資料？
 
-以下數字來自這個固定版本的 [manifest](manifest.json) 與 [驗證收據](verification.json)，
-不是下載服務的即時進度。新聞庫之後新增的資料，要建立新版本才會出現在這裡。
+以下數字來自這個固定版本的 [manifest](<!-- generation -->/manifest.json) 與
+[驗證收據](<!-- generation -->/verification.json)，不是下載服務的即時進度。
+根目錄目前指標是 [manifest.json](manifest.json)：建置中或中斷時，它的版本可能
+與本說明不同。下方讀取範例依根目錄指標選版；需要本說明的固定版本時，先核對版本。
+新聞庫之後新增的資料，要建立新版本才會出現在這裡。
 
 <!-- snapshot -->
 
@@ -916,7 +1072,8 @@ _DATASET_README = r"""# data_news：新聞標題與全文研究資料集
 - **只做內文任務：** 選 `body IS NOT NULL`，或使用 `iter_news_articles(..., text_kind='fulltext')`。
 - **標題加內文：** 保留兩個欄位，依模型需求組合；不要把缺內文的樣本偽裝成全文。
 
-`text_kind` 表示文字取得狀態，不是任務設定：`fulltext` 表示已保留內文；`headline` 表示只有標題。
+`text_kind` 表示本資料集的文字狀態：`fulltext` 表示採納已保留內文；`headline` 表示只採納標題。
+原始資料庫可能仍保留經精確覆核而排除的正文版本。
 沒有內文就是 Parquet `NULL`／Python `None`，不是 `""`、`"None"`、零或抓取成功的空文章。
 `fulltext` 不保證文章有標題，也不保證取得付費區、附件或原頁所有元素。
 `documents` 的 `headline` 只收「沒有內文文章」的標題，不是所有文章標題的全集。
@@ -941,7 +1098,8 @@ _DATASET_README = r"""# data_news：新聞標題與全文研究資料集
 | `provider` | 媒體／網址來源識別碼，不是 FinMind／FinLab 匯入來源名稱 |
 | `title`、`body` | 分開保留的標題與內文；兩欄可獨立缺值 |
 | `text_kind`、`document_id` | 取得狀態及對應的精確去重文字 |
-| `published_at_raw`、`published_at_utc` | 原發布時間字串、可確認時區後轉成的 UTC 時間；無法確認則 UTC 欄為 NULL |
+| `published_at_raw`、`published_at_utc` | 原始時間字串（可能合併發布及更新）與可確認時區的發布 UTC；有經核對的來源宣告時採該宣告，其餘 UTC 欄為 NULL |
+<!-- retained-publication-field -->
 | `publication_date`、`publication_clock_status` | 來源日期與解析／可信狀態；日期不能自動提升成精確時間 |
 | `metadata_date_raw`、`published_time_basis`、`modified_at_raw` | 清單原日期、發布時間取自哪裡、原修改時間；保留原本語意 |
 | `observed_at_utc`、`available_at_utc` | 本機實際觀測與本版本可用時間；與歷史發布時間分開 |
@@ -980,6 +1138,9 @@ _DATASET_README = r"""# data_news：新聞標題與全文研究資料集
 不拿網址第一次被發現的時間替後來更新的標題背書。中繼資料另保留自身匯入／觀測依據。
 
 缺少時區、只有日期、無效或缺少時間都明確標記，不擅自補成台灣時間、00:00 或開盤前。
+Global Voices 月份 RSS 的發布時鐘若與文章與來源月份範圍明顯衝突，標記為
+`source_feed_scope_clock_conflict`；原字串保留，發布日期及 UTC 時間保持 NULL，
+不從網址月份推定替代發布時間。這項檢查容許月份邊界一日，且沒有標記不代表來源時間已驗真。
 `metadata_date_raw` 與 FinLab `key_date` 也不等於已驗證的精確發布時間。
 目前是回補取得的現存版本，不是已驗證的歷史 point-in-time（當時可見）全文庫。
 
@@ -1058,7 +1219,9 @@ first_document = next(iter_news_documents(Path("data_news"), text_kind="fulltext
 
 本版本已完成所有輸出 Parquet 的校驗碼、schema 與筆數讀回、原文字雜湊重算，
 並以獨立 SQL 檢查主鍵重複、文章／文字／股票外鍵、內文一致性與空值規則。
-細節、時間分布與可重跑 SQL 在 [quality_report.json](quality_report.json)。
+細節、時間分布與可重跑 SQL 以本版驗收收據的 `quality` 為準；
+[quality_report.json](<!-- generation -->/quality_report.json) 是方便查看的副本，
+驗收恢復時需先核對兩者一致。
 這些檢查證明輸出符合資料契約，不等於每篇新聞事實正確、每次抽取都完美或所有歷史都完整。
 
 <!-- quality -->
@@ -1069,9 +1232,10 @@ first_document = next(iter_news_documents(Path("data_news"), text_kind="fulltext
 
 ## 檔案與版本怎麼找？
 
-- [manifest.json](manifest.json)：目前可讀版本、四表筆數、完整來源清單及每個 Parquet 的路徑／校驗碼。
-- [schema.json](schema.json)：完整欄位與型別。
-- [verification.json](verification.json)、[quality_report.json](quality_report.json)：驗收結果與檢查明細。
+- [manifest.json](<!-- generation -->/manifest.json)：本說明版本、四表筆數、來源清單及 Parquet 路徑／校驗碼。
+- [schema.json](<!-- generation -->/schema.json)：本版完整欄位與型別。
+- [verification.json](<!-- generation -->/verification.json)、[quality_report.json](<!-- generation -->/quality_report.json)：本版驗收結果與檢查明細。
+- 根目錄的 [manifest.json](manifest.json)：目前可讀版本的指標；根目錄其他報告是方便查看的副本。
 - [progress.json](progress.json)：資料集建置的階段進度，不是新聞網站的下載進度。
 - `versions/<版本>/`：該版 manifest、新增／重寫的 Parquet 與來源快照差異塊；未變動分區由 manifest 共用先前檔案。
 

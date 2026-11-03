@@ -24,6 +24,7 @@ from stockagent.data.tw_public_incremental import _encoded_row_groups, _generati
 from stockagent.data_sync.cache_capacity import GenerationWriteBudget, reserve_cache_write
 from stockagent.data_sync.factorized_projection_reuse import seal_new_file
 from stockagent.data_sync.immutable_cache_files import payload_info, stable_payload_hash
+from stockagent.service_layout import canonical_service_path
 
 CONTRACT = "canonical_row_local_parquet_group_projection_v1"
 MAX_INDEX_BYTES = 16 * 1024**2
@@ -32,7 +33,9 @@ MAX_INDEX_MEMBERS = 32_768
 
 class ParquetGroupProjection:
     def __init__(self, root, implementation, *, capacity_policy=None):
-        self.root = Path(root).absolute()
+        # Accept only the registered service-root compatibility alias. An
+        # arbitrary redirected root/descendant must still fail below.
+        self.root = canonical_service_path(root)
         if self.root.resolve() != self.root:
             raise ValueError("redirected source projection cache")
         self.implementation = implementation

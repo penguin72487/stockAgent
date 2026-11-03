@@ -3065,7 +3065,7 @@ def _run_minute_training_impl(
         epoch_test_curve = bool(config.training.epoch_test_curve)
         patience = int(
             math.ceil(
-                int(config.training.epochs)
+                int(config.training.early_stopping_reference_epochs or config.training.epochs)
                 * max(0.0, float(config.training.early_stopping_no_improve_ratio))
             )
         )

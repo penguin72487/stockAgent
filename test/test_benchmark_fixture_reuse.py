@@ -26,7 +26,7 @@ def _workflow_round_case(parent, number=7):
         'evidence': [{'path': 'scripts/producer.py', 'bytes': 12, 'sha256': 'a' * 64},
                      {'path': str(source.relative_to(parent) / 'trial.json'), 'bytes': 13, 'sha256': 'b' * 64}]}
     boundaries = {'all_workflows_measured': False, 'hardware_limit_proven': False}
-    if number in (8, 9, 10, 11):
+    if number in (8, 9, 10, 11, 12):
         acceptance.update(boundaries)
     else:
         acceptance['remaining_boundaries'] = boundaries
@@ -67,6 +67,17 @@ def _workflow_round_case(parent, number=7):
         objects['source_disposition.json'].update(selected_source='baseline_source',
             selected_batch_mib=256, performance_candidate_adopted=False,
             source_data_deleted=False, services_restarted=False, new_training_jobs=0)
+    if number == 12:
+        acceptance.update(performance_samples=8, fresh_confirmation_samples=4,
+            selected_source='optimized_source', performance_candidate_adopted=True,
+            all_six_outputs_equal=True, original_memory_gate_rejection_retained=True,
+            remote_strict_environment_passed=False)
+        readback.pop('raw_samples_verified')
+        readback.pop('collector_phases_verified')
+        readback.update(raw_complete_samples_verified=8, full_collector_phases=13,
+            mean_checks=36, all_six_outputs_equal=True, selected_source='optimized_source')
+        objects['source_disposition.json'].update(state='selected_source_verified',
+            selected='optimized_source', production_services_restarted=0)
     def write(*, bind=True):
         raw = json.dumps(acceptance).encode()
         (source / 'optimization_acceptance.json').write_bytes(raw)
@@ -78,7 +89,7 @@ def _workflow_round_case(parent, number=7):
     return source, objects, write
 
 
-@pytest.mark.parametrize('number', [6, 7, 8, 9, 10, 11])
+@pytest.mark.parametrize('number', [6, 7, 8, 9, 10, 11, 12])
 def test_workflow_round_retains_small_original_receipts_and_preserves_scoped_claims(tmp_path, number):
     source, objects, _ = _workflow_round_case(tmp_path, number)
     # Real rounds include giant JSON measurement payloads. They belong to the
@@ -101,6 +112,270 @@ def test_workflow_round_retains_small_original_receipts_and_preserves_scoped_cla
         required_contract=contract) == result
     with pytest.raises(fixtures.SnapshotError):
         fixtures.completed_benchmark_evidence(kept, required_contract=contract)
+
+
+@pytest.mark.parametrize('problem', [
+    'sample_mismatch', 'bool_samples', 'phases', 'outputs', 'selected', 'disposition',
+    'lost_rejection', 'remote_claim', 'service_restart', 'changed_seal', 'unreviewed_round',
+])
+def test_workflow_round12_requires_original_reader_abi_and_preserved_failure(tmp_path, problem):
+    source, objects, write = _workflow_round_case(tmp_path, 12)
+    accepted, readback, disposition = (objects[name] for name in fixtures.WORKFLOW_ROUND_RECEIPTS)
+    if problem == 'sample_mismatch': readback['raw_complete_samples_verified'] = 7
+    elif problem == 'bool_samples': readback['raw_complete_samples_verified'] = True
+    elif problem == 'phases': readback['full_collector_phases'] = 12
+    elif problem == 'outputs': readback['all_six_outputs_equal'] = False
+    elif problem == 'selected': readback['selected_source'] = 'different_source'
+    elif problem == 'disposition': disposition['state'] = 'prepared'
+    elif problem == 'lost_rejection': accepted['original_memory_gate_rejection_retained'] = False
+    elif problem == 'remote_claim': accepted['remote_strict_environment_passed'] = True
+    elif problem == 'service_restart': disposition['production_services_restarted'] = 1
+    elif problem == 'changed_seal': accepted['scope'] += ' modified'
+    elif problem == 'unreviewed_round':
+        target = source.with_name('round13')
+        source.rename(target)
+        source = target
+    if problem != 'unreviewed_round': write(bind=problem != 'changed_seal')
+    with pytest.raises(fixtures.SnapshotError):
+        fixtures.completed_benchmark_evidence(source)
+
+
+def _workflow_round15_case(parent):
+    root = parent / 'artifacts/benchmarks/workflow_speed_optimization_20261021/round15'
+    root.mkdir(parents=True)
+    prefix = 'artifacts/benchmarks/workflow_speed_optimization_20261021/round15/'
+    accepted = {'contract': fixtures.WORKFLOW_ROUND_CONTRACTS[15], 'state': 'verified',
+        'observed_at_utc': '2026-10-23T09:11:06+00:00',
+        'source_archive_verified_at_seal': True,
+        'files': [{'path': prefix + role + '/source.py', 'sha256': 'a' * 64, 'bytes': 1}
+                  for role in ('baseline_source', 'candidate_source')]}
+    readback = {'state': 'verified', 'observed_at_utc': '2026-10-23T09:11:18+00:00',
+        'sealed_files_verified': 2, 'complete_fixed_input_trials_verified': 8, 'means_recomputed': 32}
+    for receipt in (accepted, readback):
+        receipt.update(dict.fromkeys(('candidate_admitted', 'full_collector_verified',
+            'full_collector_speedup_verified', 'all_workflows_measured', 'hardware_limit_proven'), False))
+    def write(bind=True):
+        body = json.dumps(accepted).encode()
+        if bind:
+            readback['seal_sha256'] = hashlib.sha256(body).hexdigest()
+        (root / fixtures.WORKFLOW_ROUND_RECEIPTS[0]).write_bytes(body)
+        (root / fixtures.WORKFLOW_ROUND_RECEIPTS[1]).write_text(json.dumps(readback))
+    write()
+    return root, accepted, readback, write
+
+
+def _workflow_round18_case(parent):
+    root = parent / 'artifacts/benchmarks/workflow_speed_optimization_20261021/round18'
+    root.mkdir(parents=True)
+    prefix = root.relative_to(parent).as_posix() + '/'
+    terminal = [{'run_id': 'good', 'state': 'succeeded', 'exit_code': 0},
+                {'run_id': 'failed', 'state': 'failed', 'exit_code': 127},
+                {'run_id': 'interrupted', 'state': 'interrupted', 'exit_code': None}]
+    accepted = {'state': 'verified_scoped_progress', 'observed_at_utc': '2026-10-23T13:16:08+00:00',
+        'files': [{'path': prefix + role + '/source.py', 'sha256': 'a' * 64, 'bytes': 12}
+                  for role in ('candidate_source', 'canonical_source')],
+        'terminal_runs': terminal, 'raw_current_registry_entries': 2144, 'raw_current_stage_bound': 1511,
+        'stage_bound': 1646, 'remaining_stage_unbound': 753}
+    readback = {'state': 'verified', 'observed_at_utc': '2026-10-23T13:16:45+00:00',
+        'sealed_files_verified': 2, 'terminal_command_receipts_verified': 3,
+        'raw_current_registry_entries': 2144, 'raw_current_stage_bound': 1511,
+        'stage_bound_recounted': 1646, 'remaining_unbound_recounted': 753,
+        'complete_fixed_trials_verified': 8, 'full_single_invocation_gap_free': True,
+        'full_collector_speedup_verified': False, 'failed_commands_retained': ['failed'],
+        'interrupted_commands_retained': ['interrupted']}
+    for row in (accepted, readback):
+        row.update(dict.fromkeys(('candidate_accepted', 'single_invocation_registry_scope_complete',
+                                 'all_workflows_measured', 'hardware_limit_proven'), False))
+        row['original_registry_scope_reconciled'] = True
+    disposition = {'state': 'selected_source_verified', 'selected_source': 'baseline', 'provider_calls': 0,
+        **dict.fromkeys(('cache_candidate_accepted', 'default_reuse_enabled', 'source_or_schema_writes',
+                        'service_restarts', 'new_gpu_jobs'), False)}
+    def write(bind=True):
+        body = json.dumps(accepted).encode()
+        if bind:
+            readback['seal_sha256'] = hashlib.sha256(body).hexdigest()
+        for name, value in zip(fixtures.WORKFLOW_ROUND_RECEIPTS,
+                               (accepted, readback, disposition), strict=True):
+            (root / name).write_text(json.dumps(value))
+    write()
+    return root, accepted, readback, disposition, write
+
+
+def test_round18_preserves_rejected_candidate_and_terminal_failures_in_retained_evidence(tmp_path):
+    root, accepted, _, _, _ = _workflow_round18_case(tmp_path)
+    retained = tmp_path / 'retained-evidence'
+    proof = fixtures.completed_benchmark_evidence(root, destination=retained)
+    assert proof['producer_contract'] == fixtures.WORKFLOW_ROUND_CONTRACTS[18]
+    assert len(proof['files']) == 3
+    assert json.loads((retained / fixtures.WORKFLOW_ROUND_RECEIPTS[0]).read_text()) == accepted
+    assert fixtures.completed_benchmark_evidence(retained, original_source=root,
+        required_contract=fixtures.WORKFLOW_ROUND_CONTRACTS[18]) == proof
+
+
+@pytest.mark.parametrize('defect', ['seal', 'count', 'bool-count', 'trials', 'failure-removed',
+    'failure-renamed', 'duplicate-run', 'failed-zero', 'unbound-count', 'candidate', 'claim',
+    'clock', 'source', 'scope', 'state', 'provider-call', 'rejected-baseline'])
+def test_round18_rejects_unbound_or_rewritten_original_evidence(tmp_path, defect):
+    root, accepted, readback, disposition, write = _workflow_round18_case(tmp_path)
+    if defect == 'seal': accepted['files'][0]['bytes'] += 1
+    elif defect == 'count': readback['sealed_files_verified'] = 1
+    elif defect == 'bool-count': readback['terminal_command_receipts_verified'] = True
+    elif defect == 'trials': readback['complete_fixed_trials_verified'] = 7
+    elif defect == 'failure-removed': readback['failed_commands_retained'] = []
+    elif defect == 'failure-renamed': readback['failed_commands_retained'] = ['other']
+    elif defect == 'duplicate-run': accepted['terminal_runs'][1]['run_id'] = 'good'
+    elif defect == 'failed-zero': accepted['terminal_runs'][1]['exit_code'] = 0
+    elif defect == 'unbound-count': readback['remaining_unbound_recounted'] = 0
+    elif defect == 'candidate': disposition['default_reuse_enabled'] = True
+    elif defect == 'claim': readback['hardware_limit_proven'] = True
+    elif defect == 'clock': readback['observed_at_utc'] = '2026-10-23T13:00:00+00:00'
+    elif defect == 'source': accepted['files'][0]['path'] = 'unrelated/source.py'
+    elif defect == 'scope': accepted['files'][0]['path'] = '../outside.py'
+    elif defect == 'state': accepted['state'] = 'running'
+    elif defect == 'provider-call': disposition['provider_calls'] = True
+    elif defect == 'rejected-baseline': disposition['selected_source'] = 'candidate'
+    write(bind=defect != 'seal')
+    with pytest.raises(fixtures.SnapshotError):
+        fixtures.completed_benchmark_evidence(root)
+
+
+def test_round15_preserves_original_negative_two_receipt_abi_and_quarantine(tmp_path):
+    root, accepted, _, _ = _workflow_round15_case(tmp_path)
+    (root / 'unbounded_measurements.json').write_text('not completion metadata')
+    result = fixtures.completed_benchmark_evidence(root, destination=tmp_path / 'retained-evidence')
+    assert result['producer_contract'] == fixtures.WORKFLOW_ROUND_CONTRACTS[15]
+    assert len(result['files']) == 2
+    retained = tmp_path / 'retained-evidence'
+    assert json.loads((retained / fixtures.WORKFLOW_ROUND_RECEIPTS[0]).read_text()) == accepted
+    states = tmp_path / 'states/retirements'
+    quarantine = states / 'quarantine/round15-fixture' / ('123-' + 'a' * 32)
+    quarantine.mkdir(parents=True)
+    moved = quarantine / 'source'
+    root.rename(moved)
+    (states / 'round15-fixture.json').write_text(json.dumps({
+        'schema_version': 1, 'dataset': 'round15-fixture',
+        'relative_root': 'benchmarks/workflow_speed_optimization_20261021/round15',
+        'state': 'retiring', 'quarantine': str(quarantine),
+        'snapshot_id': 'fixed-release', 'manifest_sha256': 'c' * 64}))
+    assert fixtures.completed_benchmark_evidence(moved, original_source=root,
+        required_contract=fixtures.WORKFLOW_ROUND_CONTRACTS[15]) == result
+
+
+def test_round15_historical_external_references_are_evidence_only(tmp_path):
+    root, accepted, readback, write = _workflow_round15_case(tmp_path)
+    for name in ('artifacts/benchmarks/workflow_speed_optimization_20261021/round12/confirmation_worker.py',
+            'artifacts/operations/agent-workflow/runs/workflow-r15-complete-abba-20261023T083653-example/run.json',
+            'docs/workflow_speed_optimization_2026-10-23_scalar_prefilter.md'):
+        accepted['files'].append({'path': name, 'bytes': 0, 'sha256': 'b' * 64})
+    readback['sealed_files_verified'] = len(accepted['files'])
+    write()
+    assert len(fixtures.completed_benchmark_evidence(root)['files']) == 2
+
+
+@pytest.mark.parametrize('defect', ['seal', 'count', 'bool-count', 'trials', 'means', 'claim',
+    'source', 'path', 'duplicate', 'clock', 'source-proof', 'state'])
+def test_round15_rejects_unbound_incomplete_or_misrepresented_experiment(tmp_path, defect):
+    root, accepted, readback, write = _workflow_round15_case(tmp_path)
+    if defect == 'seal': accepted['files'][0]['bytes'] = 2
+    elif defect == 'count': readback['sealed_files_verified'] = 1
+    elif defect == 'bool-count': readback['sealed_files_verified'] = True
+    elif defect == 'trials': readback['complete_fixed_input_trials_verified'] = 7
+    elif defect == 'means': readback['means_recomputed'] = 31
+    elif defect == 'claim': readback['candidate_admitted'] = True
+    elif defect == 'source': accepted['files'].pop()
+    elif defect == 'path': accepted['files'][0]['path'] = 'unrelated/source.py'
+    elif defect == 'duplicate': accepted['files'][1] = accepted['files'][0].copy()
+    elif defect == 'clock': readback['observed_at_utc'] = '2026-10-23T01:00:00+00:00'
+    elif defect == 'source-proof': accepted['source_archive_verified_at_seal'] = False
+    elif defect == 'state': accepted['state'] = 'running'
+    write(bind=defect != 'seal')
+    with pytest.raises(fixtures.SnapshotError):
+        fixtures.completed_benchmark_evidence(root)
+
+
+def _workflow_round13_case(parent):
+    root = parent / 'artifacts/benchmarks/workflow_speed_optimization_20261021/round13'
+    root.mkdir(parents=True)
+    sources = [{'path': 'scripts/producer.py', 'sha256': 'a' * 64}]
+    accepted = {'contract': fixtures.WORKFLOW_ROUND_CONTRACTS[13], 'state': 'verified',
+        'observed_at_utc': '2026-10-23T08:14:55+00:00',
+        'files': [{'path': 'canonical_source/scripts/producer.py', 'bytes': 12, 'sha256': 'a' * 64}],
+        'recomputed_means': [{'mean': 1.5}], 'current_source_identities_verified_at_seal': sources,
+        'required_run_states': {'workflow-r13-final-collection-example': 'failed',
+                                'workflow-r13-readback-repair-example': 'succeeded'},
+        'source_archive': 'canonical_source', 'complete_original_sample_rows': 12,
+        'selected_phase': 'path-only four-process static source inventory',
+        'prior_negative_results_retained': True, 'canonical_full_collector_verified': True,
+        'full_collector_speedup_verified': False, 'all_workflows_measured': False, 'hardware_limit_proven': False}
+    readback = {'state': 'verified', 'observed_at_utc': '2026-10-23T08:16:41+00:00',
+        'sealed_files_verified': 1, 'all_original_sample_rows': 12, 'recomputed_mean_checks': 1,
+        'archive_source_files': 1, 'full_collector_speedup_verified': False,
+        'all_workflows_measured': False, 'hardware_limit_proven': False}
+    disposition = {'state': 'selected_source_verified', 'observed_at_utc': '2026-10-23T07:59:37+00:00',
+        'sources': sources, 'code_inventory_workers': 4, 'default_code_inventory_workers': 0}
+    def write(bind=True):
+        body = json.dumps(accepted).encode()
+        if bind:
+            readback['seal_sha256'] = hashlib.sha256(body).hexdigest()
+        for name, value in zip(fixtures.WORKFLOW_ROUND_RECEIPTS, (accepted, readback, disposition), strict=True):
+            (root / name).write_text(json.dumps(value))
+    write()
+    return root, accepted, readback, disposition, write
+
+
+def test_original_round13_seal_keeps_failed_run_and_original_state(tmp_path):
+    root, accepted, _, _, _ = _workflow_round13_case(tmp_path)
+    (root / 'unrelated_measurement.json').write_text('[1,2,3]')
+    result = fixtures.completed_benchmark_evidence(root, destination=tmp_path / 'retained-evidence')
+    assert result['producer_state'] == 'verified'
+    assert result['producer_contract'] == fixtures.WORKFLOW_ROUND_CONTRACTS[13]
+    assert len(result['files']) == 3
+    assert json.loads((tmp_path / 'retained-evidence/optimization_acceptance.json').read_text()) == accepted
+
+
+@pytest.mark.parametrize('defect', ['seal', 'count', 'samples', 'means', 'source-count',
+    'source-sha', 'failure', 'repair', 'claim', 'phase', 'clock', 'path', 'state', 'workers'])
+def test_round13_rejects_changed_or_incomplete_original_static_phase_abi(tmp_path, defect):
+    root, accepted, readback, disposition, write = _workflow_round13_case(tmp_path)
+    if defect == 'seal': accepted['complete_original_sample_rows'] += 1
+    elif defect == 'count': readback['sealed_files_verified'] = 2
+    elif defect == 'samples': readback['all_original_sample_rows'] = True
+    elif defect == 'means': readback['recomputed_mean_checks'] = 0
+    elif defect == 'source-count': readback['archive_source_files'] = 2
+    elif defect == 'source-sha': disposition['sources'][0]['sha256'] = 'unknown'
+    elif defect == 'failure': accepted['required_run_states']['workflow-r13-final-collection-example'] = 'succeeded'
+    elif defect == 'repair': accepted['required_run_states'].pop('workflow-r13-readback-repair-example')
+    elif defect == 'claim': accepted['hardware_limit_proven'] = True
+    elif defect == 'phase': accepted['selected_phase'] = 'all workflows finished'
+    elif defect == 'clock': readback['observed_at_utc'] = '2026-10-23T01:00:00+00:00'
+    elif defect == 'path': accepted['files'][0]['path'] = '../escape'
+    elif defect == 'state': accepted['state'] = 'verified_scoped_engineering'
+    elif defect == 'workers': disposition['code_inventory_workers'] = True
+    write(bind=defect != 'seal')
+    with pytest.raises(fixtures.SnapshotError):
+        fixtures.completed_benchmark_evidence(root)
+
+
+def test_workflow_round12_retains_original_large_seal_without_admitting_measurement_payloads(tmp_path):
+    source, objects, write = _workflow_round_case(tmp_path, 12)
+    accepted, readback, _ = (objects[name] for name in fixtures.WORKFLOW_ROUND_RECEIPTS)
+    accepted['evidence'] = [
+        {'path': f'artifacts/benchmarks/workflow_speed_optimization_20261021/round12/trial_{i}/'
+                 + 'original_member_' * 8, 'bytes': 1, 'sha256': 'a' * 64}
+        for i in range(40574)]
+    readback['sealed_files_verified'] = len(accepted['evidence'])
+    write()
+    seal = source / 'optimization_acceptance.json'
+    assert 8 * 1024**2 < seal.stat().st_size <= 16 * 1024**2
+    (source / 'measurement.json').write_text('x' * (17 * 1024**2))
+    result = fixtures.completed_benchmark_evidence(source)
+    assert len(result['files']) == 3
+    assert result['producer_contract'] == fixtures.WORKFLOW_ROUND_CONTRACTS[12]
+    # A single original seal over its explicit bound still fails closed.
+    accepted['oversized'] = 'x' * (16 * 1024**2)
+    write()
+    with pytest.raises(fixtures.SnapshotError, match='bounded regular metadata'):
+        fixtures.completed_benchmark_evidence(source)
 
 
 @pytest.mark.parametrize('problem', ['state', 'contract', 'scope', 'missing', 'seal', 'count',

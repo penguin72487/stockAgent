@@ -174,6 +174,203 @@ def test_missing_receipt_recovered_from_exact_immutable_original_without_clock_r
     assert target.read_bytes() == original and receipt.is_file()
 
 
+@pytest.mark.parametrize('crash_point', ['before_receipt', 'before_database_commit'])
+def test_public_index_owner_recovers_interrupted_original_after_restart(cfg, tmp_path, monkeypatch, crash_point):
+    import sqlite3
+    import downloader.news_fulltext_cnyes_index as module
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+
+    registry, _ = registry_http(cfg, tmp_path)
+    owner = NewsQueue(tmp_path, registry)
+    try:
+        task = register(owner)
+        prepare_dispatch(owner, task)
+        task['_cnyes_revision_scope_idle'] = True
+        source = registry.sources['cnyes']
+        result = response(index_payload(ids=range(1, 31), total=31), task['url'])
+        links = parse_index(result, source)[2]
+        with monkeypatch.context() as patch:
+            if crash_point == 'before_receipt':
+                patch.setattr(module, 'atomic_write_json',
+                              lambda *a, **kw: (_ for _ in ()).throw(OSError('simulated receipt interruption')))
+                expected = OSError
+            else:
+                with owner.db:
+                    owner.db.execute("CREATE TEMP TRIGGER reject_index_schedule BEFORE UPDATE ON discovery "
+                                     "BEGIN SELECT RAISE(ABORT,'simulated schedule interruption'); END")
+                expected = sqlite3.IntegrityError
+            with pytest.raises(expected):
+                accept_discovery(owner, task, result, links, [], [])
+        assert owner.db.execute('SELECT count(*) FROM cnyes_public_index_observations').fetchone()[0] == 0
+        assert len(list(tmp_path.glob('list_metadata/cnyes/**/*.parquet'))) == 1
+    finally:
+        owner.close()
+
+    restored = NewsQueue(tmp_path, registry)
+    try:
+        pending = progress(restored.db, source)
+        assert pending['checkpoint_contract_version'] == 1
+        assert pending['pending_local_originals'] == 1 and pending['local_recovery_ready']
+        assert pending['next_local_recovery_at_utc'] is not None
+        assert recover(restored, limit=4, max_seconds=1)['outcomes'] == ['recovered']
+        assert restored.db.execute('SELECT count(*) FROM cnyes_public_index_observations').fetchone()[0] == 1
+        assert restored.db.execute('SELECT count(*) FROM articles').fetchone()[0] == len(links)
+        assert restored.db.execute('SELECT 1 FROM discovery WHERE url=?', (request_url(source, DAY, 2),)).fetchone()
+        assert not restored.db.execute("SELECT 1 FROM cnyes_interrupted_page_checkpoints WHERE state='pending'").fetchone()
+        completed = progress(restored.db, source)
+        assert completed['pending_local_originals'] == 0 and not completed['local_recovery_ready']
+        assert completed['next_local_recovery_at_utc'] is None
+    finally:
+        restored.close()
+
+
+@pytest.mark.parametrize('case', ['missing_original', 'corrupt_original', 'invalid_clock', 'policy_changed', 'newer_head', 'revision_changed'])
+def test_public_index_checkpoint_preserves_scope_and_newer_source(cfg, tmp_path, monkeypatch, case):
+    import downloader.news_fulltext_cnyes_index as module
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+    from downloader.news_fulltext_cnyes_index_checkpoint import defer_live_failure
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+
+    registry, _ = registry_http(cfg, tmp_path)
+    owner = NewsQueue(tmp_path, registry)
+    try:
+        task = register(owner)
+        prepare_dispatch(owner, task)
+        task['_cnyes_revision_scope_idle'] = True
+        source = registry.sources['cnyes']
+        result = response(index_payload(), task['url'])
+        links = parse_index(result, source)[2]
+        with monkeypatch.context() as patch:
+            name = 'atomic_write_parquet' if case == 'missing_original' else 'atomic_write_json'
+            patch.setattr(module, name, lambda *a, **kw: (_ for _ in ()).throw(OSError('interrupted')))
+            with pytest.raises(OSError):
+                accept_discovery(owner, task, result, links, [], [])
+        from downloader.news_fulltext_http import Response
+        other = Response(result.url, 200, {'content-type': 'application/json', 'etag': '"different"'}, result.body)
+        assert not defer_live_failure(owner, task, other, OSError('local disk'))
+        assert defer_live_failure(owner, task, result, OSError('local disk'))
+        neighbor = register(owner, 2)
+        clause, params = owner.discovery_dispatch_filter(source)
+        assert not owner.db.execute('SELECT 1 FROM discovery WHERE url=? AND ' + clause,
+                                    (task['url'], *params)).fetchone()
+        assert owner.db.execute('SELECT 1 FROM discovery WHERE url=? AND ' + clause,
+                                (neighbor['url'], *params)).fetchone()
+        if case == 'corrupt_original':
+            next(tmp_path.glob('list_metadata/cnyes/**/*.parquet')).write_bytes(b'bad parquet')
+        if case == 'invalid_clock':
+            row = owner.db.execute('SELECT parquet_path,witness_json FROM cnyes_interrupted_page_checkpoints').fetchone()
+            witness = json.loads(row['witness_json'])
+            witness['observed_at_utc'] = '9999-12-31T23:59:59-23:59'
+            with owner.db:
+                owner.db.execute('UPDATE cnyes_interrupted_page_checkpoints SET witness_json=? WHERE parquet_path=?',
+                                 (json.dumps(witness), row['parquet_path']))
+        if case == 'policy_changed':
+            registry.sources['cnyes'] = replace(source, authorization_fingerprint='f' * 64)
+        if case in {'newer_head', 'revision_changed'}:
+            with owner.db:
+                owner.add_articles([{'url': links[0][0], 'title': 'newer independent title'}])
+                if case == 'newer_head':
+                    owner.db.execute("UPDATE discovery SET error_code='http_429',attempts=4,due=1234567890 WHERE url=?",
+                                     (task['url'],))
+                else:
+                    from downloader.news_fulltext_cnyes_revision import start_round
+                    start_round(owner, source, cnyes_scope(task['url']), reason='synthetic_newer_round')
+            before = dict(owner.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+        expected = {'missing_original': 'original_missing', 'corrupt_original': 'invalid_original', 'invalid_clock': 'invalid_original',
+                    'policy_changed': 'policy_changed', 'newer_head': 'recovered', 'revision_changed': 'recovered'}[case]
+        assert recover(owner, limit=4, max_seconds=1)['outcomes'] == [expected]
+        if case in {'newer_head', 'revision_changed'}:
+            assert dict(owner.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone()) == before
+            assert owner.db.execute('SELECT count(*) FROM cnyes_public_index_observations').fetchone()[0] == 1
+            assert owner.db.execute('SELECT count(*) FROM cnyes_public_index_heads').fetchone()[0] == 0
+            assert owner.db.execute('SELECT count(*) FROM articles').fetchone()[0] == len(links)
+            assert owner.db.execute('SELECT title FROM articles WHERE url=?', (links[0][0],)).fetchone()[0] == 'newer independent title'
+        else:
+            assert owner.db.execute('SELECT count(*) FROM cnyes_public_index_observations').fetchone()[0] == 0
+            assert owner.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 0
+            assert owner.db.execute('SELECT state,outcome FROM cnyes_interrupted_page_checkpoints').fetchone()[:] == ('skipped', expected)
+    finally:
+        owner.close()
+
+
+def test_public_index_live_write_failure_wakes_local_recovery_without_second_http(cfg, tmp_path, monkeypatch):
+    import downloader.news_fulltext as main
+    import downloader.news_fulltext_cnyes_index as module
+    from test_news_fulltext import FakeResponse, http_fixture
+
+    cfg.update(min_free_disk_bytes=1, exclusive_http_owner=False)
+    registry, _ = registry_http(cfg, tmp_path)
+    url = request_url(registry.sources['cnyes'], DAY)
+    body = response(index_payload(), url).body
+    http, session = http_fixture(cfg, tmp_path, {
+        'https://api.cnyes.com/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        url: FakeResponse(body, headers={'Content-Type': 'application/json'}),
+    })
+    owner = NewsQueue(tmp_path, http.registry)
+    writer, calls = module.atomic_write_json, []
+    def fail_once(*args, **kwargs):
+        calls.append(1)
+        if len(calls) == 1:
+            raise OSError('simulated local receipt failure')
+        return writer(*args, **kwargs)
+    try:
+        register(owner)
+        monkeypatch.setattr(main, 'seed_discovery', lambda *_: None)
+        monkeypatch.setattr(module, 'atomic_write_json', fail_once)
+        main.run_cycle(owner, http, cfg, max_articles=0, max_discovery_requests=1, max_run_seconds=5)
+        assert owner.db.execute('SELECT count(*) FROM cnyes_public_index_observations').fetchone()[0] == 1
+        assert not owner.db.execute("SELECT 1 FROM cnyes_interrupted_page_checkpoints WHERE state='pending'").fetchone()
+        assert [request for request, _ in session.calls].count(url) == 1
+        assert len(calls) == 2
+    finally:
+        http.close(); owner.close()
+
+
+def test_public_index_checkpoint_survives_abrupt_process_exit(cfg, tmp_path):
+    from pathlib import Path
+    import subprocess
+    import sys
+    from downloader.news_fulltext_cnyes_checkpoint import recover
+
+    (tmp_path / 'synthetic_config.json').write_text(json.dumps(cfg), encoding='utf-8')
+    script = '''
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, 'test')
+from test_cnyes_news_bulk import registry_http, response
+from test_news_cnyes_public_index import register, index_payload
+from downloader.news_fulltext import accept_discovery
+from downloader.news_fulltext_cnyes_index import parse_index
+from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+from downloader.news_fulltext_queue import NewsQueue
+import downloader.news_fulltext_cnyes_index as module
+root = Path(sys.argv[1])
+config = json.loads((root / 'synthetic_config.json').read_text())
+registry, _ = registry_http(config, root)
+owner = NewsQueue(root, registry)
+task = register(owner)
+prepare_dispatch(owner, task)
+task['_cnyes_revision_scope_idle'] = True
+result = response(index_payload(), task['url'])
+links = parse_index(result, registry.sources['cnyes'])[2]
+module.atomic_write_json = lambda *args, **kwargs: os._exit(73)
+accept_discovery(owner, task, result, links, [], [])
+os._exit(74)
+'''
+    child = subprocess.run([sys.executable, '-c', script, str(tmp_path)], cwd=Path.cwd(), timeout=30,
+                           capture_output=True, text=True, check=False)
+    assert child.returncode == 73, child.stderr
+    registry, _ = registry_http(cfg, tmp_path)
+    owner = NewsQueue(tmp_path, registry)
+    try:
+        assert recover(owner, limit=4, max_seconds=1)['outcomes'] == ['recovered']
+        assert owner.db.execute('SELECT count(*) FROM cnyes_public_index_observations').fetchone()[0] == 1
+        assert owner.db.execute('SELECT count(*) FROM articles').fetchone()[0] == 2
+    finally:
+        owner.close()
+
+
 def test_wrong_existing_receipt_not_overwritten(queue):
     task,r,_ = accept(queue,index_payload())
     evidence = queue.db.execute('SELECT evidence_path FROM cnyes_public_index_observations').fetchone()[0]
@@ -270,3 +467,120 @@ def test_304_without_same_scope_original_not_success(queue):
     r = replace(response(index_payload(),task['url']),status=304,body=b'')
     with pytest.raises(NewsError,match='cnyes_index_not_modified_without_evidence'):
         accept_discovery(queue,task,r,[],[],[])
+
+
+@pytest.mark.parametrize('damage', ['missing_original', 'missing_receipt', 'corrupt_original',
+                                    'receipt_rows', 'observation_rows'])
+def test_304_requires_verified_index_original_and_receipt(queue, damage):
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+
+    accept(queue, index_payload())
+    task = register(queue)
+    prepare_dispatch(queue, task)
+    observation = dict(queue.db.execute('SELECT * FROM cnyes_public_index_observations').fetchone())
+    original = queue.root / observation['evidence_path']
+    receipt = original.with_suffix('.parquet.receipt.json')
+    if damage == 'missing_original':
+        original.unlink()
+    elif damage == 'missing_receipt':
+        receipt.unlink()
+    elif damage == 'corrupt_original':
+        original.write_bytes(b'corrupt isolated fixture')
+    elif damage == 'receipt_rows':
+        value = json.loads(receipt.read_bytes())
+        value['metadata_rows'] += 1
+        receipt.write_text(json.dumps(value))
+    else:
+        with queue.db:
+            queue.db.execute('UPDATE cnyes_public_index_observations SET metadata_rows=metadata_rows+1')
+    before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+    head = tuple(queue.db.execute('SELECT * FROM cnyes_public_index_heads').fetchone())
+    r = replace(response(index_payload(), task['url']), status=304, body=b'')
+    with pytest.raises(NewsError, match='cnyes_index_not_modified_without_evidence'):
+        accept_discovery(queue, task, r, [], [], [])
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone()) == before
+    assert tuple(queue.db.execute('SELECT * FROM cnyes_public_index_heads').fetchone()) == head
+
+
+@pytest.mark.parametrize('damage', ['invalid_clock', 'missing_original'])
+def test_200_cannot_seal_invalid_or_replace_missing_index_evidence(queue, damage):
+    from downloader.artifact_io import atomic_write_parquet, table_from_records
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+
+    _, raw, _ = accept(queue, index_payload())
+    task = register(queue)
+    prepare_dispatch(queue, task)
+    observation = dict(queue.db.execute('SELECT * FROM cnyes_public_index_observations').fetchone())
+    original = queue.root / observation['evidence_path']
+    receipt = original.with_suffix('.parquet.receipt.json')
+    if damage == 'invalid_clock':
+        row = pq.read_table(original).to_pylist()[0]
+        row['source_observed_at_utc'] = 'not-a-time'
+        receipt.unlink()
+        atomic_write_parquet(original, table_from_records([row]), durable=True)
+        evidence_before = original.read_bytes()
+    else:
+        original.unlink()
+        evidence_before = receipt.read_bytes()
+    before = dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone())
+    with pytest.raises(NewsError, match='cnyes_index_original_evidence_unverified'):
+        accept_discovery(queue, task, raw, parse_index(raw, queue.registry.sources['cnyes'])[2], [], [])
+    if damage == 'invalid_clock':
+        assert not receipt.exists() and original.read_bytes() == evidence_before
+    else:
+        assert not original.exists() and receipt.read_bytes() == evidence_before
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (task['url'],)).fetchone()) == before
+
+
+def test_missing_index_receipt_recovers_unconditionally_without_blocking_other_pages(queue):
+    from downloader.news_fulltext import _discovery_head_fields
+    from downloader.news_fulltext_cnyes_revision import prepare_dispatch
+
+    _, raw, _ = accept(queue, index_payload())
+    task = register(queue)
+    other = register(queue, day=DAY + 1)
+    with queue.db:
+        queue.db.execute("UPDATE discovery SET etag='old-tag',last_modified='old-clock' WHERE url=?", (task['url'],))
+    task = register(queue)
+    prepare_dispatch(queue, task)
+    evidence = queue.db.execute('SELECT evidence_path FROM cnyes_public_index_observations').fetchone()[0]
+    original = queue.root / evidence
+    original_bytes = original.read_bytes()
+    receipt = original.with_suffix('.parquet.receipt.json')
+    receipt.unlink()
+    with pytest.raises(NewsError, match='cnyes_index_not_modified_without_evidence') as caught:
+        accept_discovery(queue, task, replace(raw, status=304, body=b''), [], [], [])
+    fail_discovery(queue, task, caught.value, expected_head_fields=_discovery_head_fields(task))
+    retry = register(queue)
+    assert retry['etag'] is None and retry['last_modified'] is None
+    assert queue.db.execute('SELECT count(*) FROM bulk_endpoint_cooldowns WHERE provider=? AND endpoint=?',
+                            ('cnyes', ENDPOINT)).fetchone()[0] == 0
+    assert dict(queue.db.execute('SELECT * FROM discovery WHERE url=?', (other['url'],)).fetchone()) == other
+    prepare_dispatch(queue, retry)
+    calls = []
+    def fake_get(url, *, headers):
+        calls.append((url, headers))
+        return raw
+    http = SimpleNamespace(registry=queue.registry, get=fake_get, metrics=NewsMetrics())
+    result = fetch_discovery(http, retry)
+    assert calls == [(retry['url'], {})]  # Fake HTTP; no publisher request.
+    accept_discovery(queue, retry, *result)
+    assert receipt.exists() and original.read_bytes() == original_bytes
+    assert register(queue)['error_code'] is None
+
+
+def test_local_index_evidence_failure_does_not_relax_existing_source_cooldown(queue):
+    import time
+    from downloader.news_fulltext import _discovery_head_fields
+
+    task = register(queue)
+    source = queue.registry.sources['cnyes']
+    deadline = time.time() + 3600
+    with queue.db:
+        queue.db.execute('INSERT INTO bulk_endpoint_cooldowns VALUES (?,?,?,?,?,?)',
+                         ('cnyes', ENDPOINT, source.cnyes_index_data_fingerprint,
+                          deadline, 'http_429', task['url']))
+    before = tuple(queue.db.execute('SELECT * FROM bulk_endpoint_cooldowns').fetchone())
+    fail_discovery(queue, task, NewsError('cnyes_index_not_modified_without_evidence', retry=True, delay=60),
+                   expected_head_fields=_discovery_head_fields(task))
+    assert tuple(queue.db.execute('SELECT * FROM bulk_endpoint_cooldowns').fetchone()) == before

@@ -94,6 +94,22 @@ def test_first_pointer_read_before_deadline_is_itself_timeliness_evidence(tmp_pa
     assert proof is not None and proof[2:] == (at("09:00:55"), "pointer_observed_by")
 
 
+@pytest.mark.parametrize("clock", ["08:59:59.999999", "08:30:00"])
+def test_preopen_artifact_cannot_become_a_live_signal_by_late_pointer_read(tmp_path, clock):
+    spec = SimpleNamespace(live_output_dir=tmp_path, market=MARKET, signal_market=None)
+    summary = original(None)
+    summary["artifact_published_at"] = f"{DAY}T{clock}+08:00"
+    assert _initial_opening_signal_proof(spec, summary, at("09:00:55")) is None
+
+
+def test_pointer_read_at_open_still_requires_a_valid_artifact_clock(tmp_path):
+    spec = SimpleNamespace(live_output_dir=tmp_path, market=MARKET, signal_market=None)
+    for clock in (None, f"{DAY}T09:00:01", "not-a-date", "2026-10-27T09:00:01+08:00"):
+        summary = original(None)
+        summary["artifact_published_at"] = clock
+        assert _initial_opening_signal_proof(spec, summary, at("09:00:55")) is None
+
+
 def test_artifact_time_is_not_pointer_publication_evidence_after_deadline(tmp_path):
     spec = SimpleNamespace(live_output_dir=tmp_path, market=MARKET, signal_market=None)
     assert _initial_opening_signal_proof(spec, original(None), at("09:01:05")) is None

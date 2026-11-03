@@ -21,6 +21,10 @@ class CatalogOwnerBusy(BlockingIOError):
     """The canonical catalog owner is working; the committed catalog is intact."""
 
 
+class CatalogColdCapacity(OSError):
+    """The guarded D lake has no writable bytes; retain its committed catalog."""
+
+
 def configuration(path=Path("/etc/stockagent/lakehouse-control.json")) -> dict:
     if path.is_symlink() or path.stat().st_mode & 0o077 or path.stat().st_uid != os.geteuid():
         raise ValueError("lakehouse control needs its private locally owned configuration")
@@ -202,11 +206,40 @@ def _metadata_arrow_reader(c, incoming, *, maximum_bytes=16*1024**2, maximum_row
     return pa.RecordBatchReader.from_batches(schema, batches())
 
 
+def _insert_new_metadata(con, c, incoming, key_snapshot):
+    """Insert prechecked values in the same native snapshot, or recheck in SQL.
+
+    The caller holds the canonical catalog owner lock. ``incoming`` excludes
+    keys present when ``key_snapshot`` was read, and every payload is checked
+    again by the Arrow reader. The transaction's snapshot must still be that
+    exact committed DuckLake snapshot before the redundant full anti-join can
+    be omitted. A changed or unavailable snapshot keeps the original SQL
+    conflict check, including its treatment of duplicate incoming rows.
+    """
+    if not incoming:
+        return
+    current_snapshot = con.execute("SELECT max(snapshot_id) FROM ducklake_snapshots('lake')").fetchone()[0]
+    con.register('incoming_metadata', _metadata_arrow_reader(c, incoming))
+    if key_snapshot is not None and current_snapshot == key_snapshot:
+        con.execute('INSERT INTO lake.source_metadata SELECT * FROM incoming_metadata')
+    else:
+        con.execute("INSERT INTO lake.source_metadata SELECT i.* FROM incoming_metadata i WHERE NOT EXISTS (SELECT 1 FROM lake.source_metadata o WHERE o.relative=i.relative AND o.sha256=i.sha256)")
+
+
+def _delete_discarded_source_objects(con, relatives):
+    """Apply the already-authorized exact disposition in one registry scan."""
+    if not relatives:
+        return
+    import pyarrow as pa
+    keys = pa.table({'relative': pa.array(relatives, type=pa.string())})
+    con.register('discarded_object_keys', keys)
+    con.execute('DELETE FROM lake.source_objects WHERE relative IN (SELECT relative FROM discarded_object_keys)')
+
+
 def connect(c: dict, *, database=None, data_root=None, read_only=False):
     import duckdb
     con = duckdb.connect()
-    con.execute("SET threads=2")
-    con.execute("SET memory_limit='512MB'")
+    con.execute("SET memory_limit='-1'")
     con.execute("SET extension_directory=" + sql_text(c["extensions"]))
     con.execute("LOAD postgres")
     con.execute("LOAD ducklake")
@@ -307,6 +340,15 @@ def register(c: dict) -> dict:
             fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError as error:
             raise CatalogOwnerBusy('canonical catalog owner is busy') from error
+        # DuckLake must create Parquet on its guarded D data path.  A full
+        # volume cannot accept a changed catalog; avoid repeated full source
+        # censuses and futile SQL writes until its real capacity returns.
+        # Unknown/failed capacity observations still propagate as errors.
+        capacity_root = Path(c['lake_root'])
+        while not capacity_root.exists() and capacity_root != capacity_root.parent:
+            capacity_root = capacity_root.parent
+        if shutil.disk_usage(capacity_root).free == 0:
+            raise CatalogColdCapacity('guarded cold lake has no writable capacity')
         # Immutable manifests and publication heads are the change boundary.
         # Bounded reuse avoids 20k HDD stats each minute; a full catalog recapture
         # remains mandatory hourly and for any unavailable source/recovery.
@@ -360,6 +402,7 @@ def register(c: dict) -> dict:
             con.execute("CREATE TABLE IF NOT EXISTS lake.catalog_captures (capture_sha256 VARCHAR, observed_at_utc VARCHAR, release_count BIGINT, available_bytes BIGINT)")
             con.execute("CREATE TABLE IF NOT EXISTS lake.source_metadata (relative VARCHAR, sha256 VARCHAR, bytes BIGINT, content_utf8 VARCHAR)")
             captured = con.execute("SELECT count(*) FROM lake.catalog_captures WHERE capture_sha256=?", [catalog["identity_sha256"]]).fetchone()[0]
+            key_snapshot = con.execute("SELECT max(snapshot_id) FROM ducklake_snapshots('lake')").fetchone()[0]
             registered_keys = set(con.execute('SELECT relative,sha256 FROM lake.source_metadata').fetchall())
             metadata = _new_metadata_descriptors(c, catalog['files'], registered_keys,
                 workers=_catalog_metadata_workers(Path(c['cold_root'])))
@@ -373,7 +416,6 @@ def register(c: dict) -> dict:
                 objects = [{k: r[k] for k in ("relative", "sha256", "bytes", "role")} for r in catalog["files"]]
                 con.register("incoming_releases", pa.Table.from_pylist(releases))
                 con.register("incoming_objects", pa.Table.from_pylist(objects))
-                con.register('incoming_metadata', _metadata_arrow_reader(c, metadata))
                 con.execute("BEGIN")
                 con.execute("DELETE FROM lake.dataset_releases")
                 con.execute("INSERT INTO lake.dataset_releases SELECT * FROM incoming_releases")
@@ -383,9 +425,8 @@ def register(c: dict) -> dict:
                 # Only the explicit test disposition waives these exact,
                 # otherwise unreferenced CAS payloads. Historical registry
                 # metadata stays auditable; unrelated object versions remain.
-                for relative in catalog.get("discarded_testing_objects", []):
-                    con.execute("DELETE FROM lake.source_objects WHERE relative=?", [relative])
-                con.execute("INSERT INTO lake.source_metadata SELECT i.* FROM incoming_metadata i WHERE NOT EXISTS (SELECT 1 FROM lake.source_metadata o WHERE o.relative=i.relative AND o.sha256=i.sha256)")
+                _delete_discarded_source_objects(con, catalog.get("discarded_testing_objects", []))
+                _insert_new_metadata(con, c, metadata, key_snapshot)
                 if not captured:
                     con.execute("INSERT INTO lake.catalog_captures VALUES (?, ?, ?, ?)", [catalog["identity_sha256"], catalog["observed_at_utc"], len(releases), sum(r["bytes"] for r in objects)])
                 con.execute("COMMIT")
@@ -642,17 +683,22 @@ def acceptance(c: dict, delivery_id: str, *, enrolled_source=None, enrolled_cata
 
 def retire_accepted_transport(c, delivery_id, proof):
     from stockagent.data_sync.immutable_transport_cache import retire
+    from stockagent.data_sync.work_progress import work_pass
     if c.get("transport_cache_retirement") is not True:
         return {"state": "disabled"}
     try:
         guard(c)
-        retire(c, delivery_id, proof, apply=False)
+        with work_pass('dry_run'):
+            retire(c, delivery_id, proof, apply=False)
         guard(c)
-        result = retire(c, delivery_id, proof, apply=True)
+        with work_pass('apply'):
+            result = retire(c, delivery_id, proof, apply=True)
         notify_transport(c, ["lakehouse/lake-" + delivery_id])
         return {k: result[k] for k in ('state', 'reclaimed_bytes', 'primary_source_files_deleted', 'nas_archive_files_deleted')}
     except (OSError, ValueError) as error:
-        result = {"state": "retirement_deferred", "error_type": type(error).__name__}
+        from stockagent.data_sync.backup_transport_cache import retirement_failure_reason
+        result = {"state": "retirement_deferred", "error_type": type(error).__name__,
+                  "reason_code": retirement_failure_reason(error), "detail": str(error)[:512]}
         if isinstance(error, OSError):
             result.update(errno=error.errno, error_path=str(error.filename) if error.filename else None)
         return result
@@ -775,7 +821,7 @@ def stage_source_wave(c: dict) -> dict:
     """
     from stockagent.data_sync.immutable_replication import safe
     from stockagent.data_sync.nas_coverage import read_ledger, restic_keys
-    from stockagent.data_sync.immutable_transport_cache import PHYSICAL_TRANSPORT_ROOT
+    from stockagent.data_sync.immutable_transport_cache import PHYSICAL_TRANSPORT_ROOT, retirement_summary
     policy = source_wave_policy(c)
     guard(c)
     state = Path(c["state_root"])
@@ -832,10 +878,8 @@ def stage_source_wave(c: dict) -> dict:
                     row["nas_acceptance"] = proof
                     changed = True
                 retired = state / ('cache-retirement-' + delivery_id + '.json')
-                if retired.exists():
-                    value = json.loads(retired.read_bytes())
-                    retirement = {k: value[k] for k in
-                        ('state', 'reclaimed_bytes', 'primary_source_files_deleted', 'nas_archive_files_deleted')}
+                retirement = retirement_summary(retired)
+                if retirement is not None:
                     if row.get('transport_retirement') != retirement:
                         row['transport_retirement'] = retirement
                         changed = True
@@ -939,9 +983,18 @@ def stage_source_wave(c: dict) -> dict:
                     result['redelivery_request_error'] = type(error).__name__
             if chosen:
                 physical = PHYSICAL_TRANSPORT_ROOT
+                from stockagent.data_sync.transport_placement import D_BACKING, on_e, backing, check_transport
+                # Only the original enrolled transport adopts E. An isolated
+                # replay's explicit physical root must not probe or write to
+                # the host's real workspace merely because E is enrolled.
+                if physical == D_BACKING and on_e():
+                    from stockagent.data_sync.workspace_volume import admit
+                    check_transport()
+                    admit(size)
+                    physical = backing()
                 transport_parent = Path(c["transport_root"]).parent
                 if not physical.samefile(transport_parent) or shutil.disk_usage(physical).free < size + 64 * 1024**3:
-                    raise ValueError("bounded source replication lacks the enrolled D transport/capacity")
+                    raise ValueError("bounded source replication lacks its enrolled transport/capacity")
                 delivery_id, destination = _publish_source_wave(c, chosen, physical, ledger_path, ledger,
                                                                redelivery=redelivery)
                 pending.append(delivery_id)
@@ -1066,8 +1119,7 @@ def restore_lake_delivery(root: Path, scratch: Path, *, extensions: Path, pg_bin
         import duckdb
         con = duckdb.connect()
         try:
-            con.execute("SET threads=2")
-            con.execute("SET memory_limit='512MB'")
+            con.execute("SET memory_limit='-1'")
             con.execute("SET extension_directory=" + sql_text(extensions))
             con.execute("LOAD postgres")
             con.execute("LOAD ducklake")

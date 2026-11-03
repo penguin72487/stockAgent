@@ -68,8 +68,10 @@ def test_0830_revalidates_after_lock_downgrade_before_audit() -> None:
 
 
 @pytest.mark.parametrize("refresh,raced", [(False, False), (True, False), (True, True)])
+@pytest.mark.parametrize("probe_failed", [False, True])
 def test_0830_main_read_scans_allow_inference_and_recheck_write_upgrade(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, refresh: bool, raced: bool,
+    probe_failed: bool,
 ) -> None:
     """Exercise actual flock calls, including conversion and receipt fencing."""
     owner = run_tw_public_0830_check
@@ -96,8 +98,9 @@ def test_0830_main_read_scans_allow_inference_and_recheck_write_upgrade(
     monkeypatch.setattr(owner, "_same_session_accepted", lambda *a, **k: True)
     monkeypatch.setattr(owner, "_reuse_accepted_session", lambda **k: None)
     monkeypatch.setattr(owner, "_publication_errors", lambda *a, **k: [])
-    monkeypatch.setattr(owner, "_wait_for_event_monitor", lambda *a, **k: ({}, [], 0.))
-    monkeypatch.setattr(owner, "_event_monitor_errors", lambda *a, **k: [])
+    probe_errors = ["failed_probe_count"] if probe_failed else []
+    monkeypatch.setattr(owner, "_wait_for_event_monitor", lambda *a, **k: ({}, probe_errors, 0.))
+    monkeypatch.setattr(owner, "_event_monitor_errors", lambda *a, **k: probe_errors)
     monkeypatch.setattr(owner, "create_opening_revision_freeze", lambda *a, **k: {})
     monkeypatch.setattr(owner, "_defer_opening_bulk_step", lambda *a, **k: False)
     monkeypatch.setattr(owner, "_reusable_audit", lambda *a, **k: ({"model_safe": True}, {}))
@@ -130,10 +133,20 @@ def test_0830_main_read_scans_allow_inference_and_recheck_write_upgrade(
 
     monkeypatch.setattr(owner, "_derived_data_status", status)
     monkeypatch.setattr(owner.subprocess, "run", run)
-    assert owner.main() == 0
+    assert owner.main() == (1 if probe_failed else 0)
     payload = json.loads(receipt.read_bytes())
-    assert payload["status"] == "ok"
-    if not refresh:
+    assert payload["status"] == ("failed" if probe_failed else "ok")
+    if probe_failed:
+        assert scans == [True, True]
+        assert not commands, "an upstream failure must not start source/audit rebuilds"
+        assert "event_monitor:failed_probe_count" in payload["failures"]
+        assert payload["acceptance"]["strict_model_safety_audit"] is (not refresh)
+        assert payload["derived_data_status_after"]["current"] is (not refresh)
+        assert not any("revision changed" in error for error in payload["failures"])
+        if not refresh:
+            assert payload["audit_dependency_state"] == {"sha256": "same"}
+            assert not any("audit_revision_final:" in error for error in payload["failures"])
+    elif not refresh:
         assert scans == [True, True, True]  # before, after, final; not seven scans
         assert not commands
     elif raced:
@@ -882,6 +895,22 @@ def test_0830_final_revision_rejects_event_applied_after_audit() -> None:
         in errors
     )
 
+
+def test_0830_missing_audit_is_not_reported_as_observed_source_drift() -> None:
+    errors = run_tw_public_0830_check._audit_revision_errors(
+        derived_status={"current": True}, audited_dependency_state={},
+        final_dependency_state={"sha256": "same"},
+    )
+    assert errors == ["audit dependency revision was not observed; acceptance remains unverified"]
+
+
+def test_0830_missing_current_revision_is_not_reported_as_observed_drift() -> None:
+    errors = run_tw_public_0830_check._audit_revision_errors(
+        derived_status={"current": True}, audited_dependency_state={"sha256": "same"},
+        final_dependency_state={},
+    )
+    assert errors == ["current live-root dependency revision is unavailable"]
+
 def test_0830_builds_canonical_derived_layers_from_accepted_source_date(
     tmp_path: Path,
 ) -> None:
@@ -985,6 +1014,87 @@ def test_0830_verifies_release_semantics_not_parquet_file_size(tmp_path: Path) -
     assert check() == [
         "source_receipts: sha256 mismatch cbc_fx_reserve_release_vintages.parquet"
     ]
+
+
+def test_0830_verifies_actual_session_calendar_semantics(tmp_path: Path) -> None:
+    from stockagent.data.tw_public_features import _session_calendar_content_receipt
+
+    source = tmp_path / "twse_taiex_ohlc.summary.json"
+    row = {
+        "dataset": "twse_taiex_ohlc", "source": "TWSE",
+        "source_product": "indicesReport/MI_5MINS_HIST",
+        "coverage_complete": True, "replacement_promoted": True,
+        "failed_count": 0, "unresolved_month_count": 0,
+        "effective_start_date": "2026-01-02", "effective_end_date": "2026-10-29",
+        "output_rows": 200, "output_receipt": {"size": 123, "sha256": "a" * 64},
+    }
+    source.write_text(json.dumps(row), encoding="utf-8")
+    receipt = _session_calendar_content_receipt(source)
+    assert receipt["basis"] == "actual_session_receipt_semantics_v1"
+    summary = tmp_path / "feature.summary.json"
+    summary.write_text(json.dumps({"source_receipts": [receipt]}), encoding="utf-8")
+    check = lambda: run_tw_public_0830_check._receipt_dependency_errors(
+        summary, live_root=tmp_path, keys=("source_receipts",)
+    )
+    assert check() == []
+
+    source.write_text(json.dumps({**row, "completed_at": "new metadata"}, indent=2), encoding="utf-8")
+    assert check() == []
+
+    source.write_text(json.dumps({**row, "output_rows": 201}), encoding="utf-8")
+    assert check() == ["source_receipts: sha256 mismatch twse_taiex_ohlc.summary.json"]
+
+    source.write_text("{bad json", encoding="utf-8")
+    assert check() == ["source_receipts: semantic schema mismatch twse_taiex_ohlc.summary.json"]
+
+
+@pytest.mark.parametrize("misuse", ["other_file", "other_key", "nested_path"])
+def test_0830_rejects_calendar_semantics_for_other_dependencies(tmp_path: Path, misuse: str) -> None:
+    from stockagent.data.tw_public_features import _session_calendar_content_receipt
+
+    source = tmp_path / "twse_taiex_ohlc.summary.json"
+    source.write_text(json.dumps({"dataset": "twse_taiex_ohlc"}), encoding="utf-8")
+    receipt = _session_calendar_content_receipt(source)
+    key = "source_receipts"
+    if misuse == "other_file":
+        other = tmp_path / "other.summary.json"
+        other.write_bytes(source.read_bytes())
+        receipt["name"] = other.name
+    elif misuse == "other_key":
+        key = "other_receipts"
+    else:
+        other = tmp_path / "nested" / source.name
+        other.parent.mkdir()
+        other.write_bytes(source.read_bytes())
+        receipt["name"] = other.relative_to(tmp_path).as_posix()
+    summary = tmp_path / "feature.summary.json"
+    summary.write_text(json.dumps({key: [receipt]}), encoding="utf-8")
+    errors = run_tw_public_0830_check._receipt_dependency_errors(
+        summary, live_root=tmp_path, keys=(key,)
+    )
+    assert len(errors) == 1
+    assert "unsupported receipt basis actual_session_receipt_semantics_v1" in errors[0]
+
+
+@pytest.mark.parametrize("basis", ["raw", "calendar"])
+def test_0830_rejects_conflicting_receipts_for_the_same_path(tmp_path: Path, basis: str) -> None:
+    from stockagent.data.tw_public_features import _session_calendar_content_receipt
+
+    source = tmp_path / "twse_taiex_ohlc.summary.json"
+    source.write_text(json.dumps({"dataset": "twse_taiex_ohlc"}), encoding="utf-8")
+    receipt = (
+        _session_calendar_content_receipt(source)
+        if basis == "calendar"
+        else {"name": source.name, "size": source.stat().st_size,
+              "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
+    )
+    conflicting = {**receipt, "sha256": "0" * 64}
+    summary = tmp_path / "feature.summary.json"
+    summary.write_text(json.dumps({"source_receipts": [receipt, conflicting]}), encoding="utf-8")
+    errors = run_tw_public_0830_check._receipt_dependency_errors(
+        summary, live_root=tmp_path, keys=("source_receipts",)
+    )
+    assert errors == ["source_receipts: sha256 mismatch twse_taiex_ohlc.summary.json"]
 
 
 def test_0830_reuses_hash_bound_entitlements_without_timestamp_refresh(
@@ -1667,6 +1777,85 @@ def test_source_event_accepts_taifex_csv_representation_but_rejects_html() -> No
             content_type="text/html",
             content_disposition=None,
         )
+
+
+def _probe_test_response(body: bytes, *, status: int = 200, content_type="application/json"):
+    response = source_events.requests.Response()
+    response.status_code = status
+    response.url = "https://official.example/data"
+    response._content = body
+    response.headers["content-type"] = content_type
+    return response
+
+
+def test_source_probe_retries_html_without_accepting_its_version(monkeypatch):
+    responses = iter([
+        _probe_test_response(b"<html>publisher error</html>", content_type="text/html"),
+        _probe_test_response(b'[{"symbol":"2330"}]'),
+    ])
+    waits = []
+    monkeypatch.setattr(source_events.time, "sleep", lambda *_: None)
+    result = source_events._request(
+        SimpleNamespace(get=lambda *_a, **_kw: next(responses)),
+        url="https://official.example/data", previous={}, expected_json=True,
+        limiter=SimpleNamespace(wait=lambda: waits.append(True)),
+        args=SimpleNamespace(timeout=1, retries=1),
+    )
+    assert len(waits) == 2
+    assert result["version"] == source_events._body_sha256(
+        b'[{"symbol":"2330"}]', expected_json=True,
+    )
+
+
+def test_source_probe_failure_has_current_response_not_stale_304(monkeypatch):
+    body = b"<html>publisher error</html>"
+    response = _probe_test_response(body, content_type="text/html")
+    monkeypatch.setattr(source_events.requests, "Session", lambda: SimpleNamespace(get=lambda *_a, **_kw: response))
+    spec = DEFAULT_DATASETS["twse_api_opendata_t187ap11_l"]
+    result = source_events._probe_one(
+        spec, observed=datetime(2026, 11, 2, 8, 30, tzinfo=TAIPEI),
+        previous={"http_status": 304, "observed_version": "accepted"},
+        limiter=SimpleNamespace(wait=lambda: None), args=SimpleNamespace(timeout=1, retries=0),
+    )
+    assert result.status == "failed"
+    assert result.http_status == 200
+    assert result.error_kind == "invalid_source_payload"
+    assert result.response_content_type == "text/html"
+    assert result.response_bytes == len(body)
+    assert result.response_sha256 == hashlib.sha256(body).hexdigest()
+    assert "HTTP 200" in result.error
+    assert body.decode() not in result.error
+    state = {"datasets": {spec.name: {
+        "http_status": 304, "observed_version": "accepted",
+        "applied_version": "accepted", "body_sha256": "accepted-hash",
+    }}}
+    args = SimpleNamespace(fast_interval_seconds=60, medium_interval_seconds=300, slow_interval_seconds=300)
+    assert source_events._apply_probe_results(state, [result], specs_by_name={spec.name: spec}, args=args) == []
+    row = state["datasets"][spec.name]
+    assert row["http_status"] == 304
+    assert row["last_probe_http_status"] == 200
+    assert row["observed_version"] == row["applied_version"] == "accepted"
+    assert row["body_sha256"] == "accepted-hash"
+    assert row["last_probe_response_sha256"] == hashlib.sha256(body).hexdigest()
+
+
+def test_source_probe_timeout_does_not_reuse_previous_response_evidence(monkeypatch):
+    calls = []
+
+    def get(*_args, **_kwargs):
+        calls.append(True)
+        if len(calls) == 1:
+            return _probe_test_response(b"<html>error</html>", content_type="text/html")
+        raise source_events.requests.Timeout("timed out")
+
+    monkeypatch.setattr(source_events.time, "sleep", lambda *_: None)
+    with pytest.raises(source_events.SourceProbeError) as caught:
+        source_events._request(
+            SimpleNamespace(get=get), url="https://official.example/data", previous={},
+            expected_json=True, limiter=SimpleNamespace(wait=lambda: None),
+            args=SimpleNamespace(timeout=1, retries=1),
+        )
+    assert caught.value.evidence == {"error_kind": "request_error"}
 
 
 def test_source_event_version_uses_content_not_dynamic_attachment_name() -> None:
@@ -2517,6 +2706,7 @@ def test_post_open_gate_requires_same_session_signal_commit_for_every_mode() -> 
         {"recorded_at": "2026-08-17T09:00:01.001+08:00"},
         {"pending_entry_source_count": 1}, {"state_revision": True},
         {"entry_fill_policy": "official_open_replay"},
+        {"signal_reason_counts": 1}, {"signal_reason_counts": {1: 1}},
     ):
         assert not with_progress({**progress_row, **changes})["opening_execution"]["ready"]
     engine_sync["modes"][market]["entry_filled_shares"] = 500

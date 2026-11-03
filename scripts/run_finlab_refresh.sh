@@ -43,6 +43,20 @@ if ! [[ "$finlab_general_batch_size" =~ ^[0-9]+$ ]] || ! (( finlab_general_batch
   echo "[finlab] FINLAB_SYNC_BATCH_SIZE must be 1..64" >&2
   exit 2
 fi
+finlab_finite_general_only="${FINLAB_FINITE_GENERAL_ONLY:-0}"
+if [[ "$finlab_finite_general_only" != "0" && "$finlab_finite_general_only" != "1" ]]; then
+  echo "[finlab] FINLAB_FINITE_GENERAL_ONLY must be 0 or 1" >&2
+  exit 2
+fi
+finlab_max_batches="${FINLAB_SYNC_MAX_BATCHES:-500}"
+if [[ "$finlab_finite_general_only" == "1" ]]; then
+  finlab_max_batches="${FINLAB_SYNC_MAX_BATCHES:-1}"
+  if ! [[ "$finlab_max_batches" =~ ^[0-9]+$ ]] ||
+     ! (( finlab_max_batches >= 1 && finlab_max_batches <= 8 && finlab_general_batch_size <= 16 )); then
+    echo "[finlab] finite general-only mode requires 1..8 batches of at most 16 keys" >&2
+    exit 2
+  fi
+fi
 
 # The quota resets at 08:00 Taipei time, but live Taiwan opening has a
 # protected 08:20–09:10 resource window.  The first sweep only starts keys
@@ -109,7 +123,7 @@ if (( finlab_preopen )); then
   finlab_general_batch_size=1  # The original full-key opening runway stays binding.
 fi
 finlab_group_timeout_seconds=$((finlab_key_timeout_seconds * finlab_general_batch_size))
-for ((finlab_batch = 1; finlab_batch <= ${FINLAB_SYNC_MAX_BATCHES:-500}; finlab_batch++)); do
+for ((finlab_batch = 1; finlab_batch <= finlab_max_batches; finlab_batch++)); do
   if (( finlab_preopen )); then
     finlab_runway_seconds=$((finlab_preopen_deadline - $(date +%s)))
     if (( finlab_runway_seconds <= finlab_key_timeout_seconds + 30 )); then
@@ -155,6 +169,15 @@ for ((finlab_batch = 1; finlab_batch <= ${FINLAB_SYNC_MAX_BATCHES:-500}; finlab_
     break
   fi
 done
+
+# A bounded operator pass can make progress on the due-work gate without
+# restarting a paused maintenance timer or entering optional post-sync work.
+# The regular catalog, account lock, capacity, opening, quota and receipts
+# above remain authoritative; a partial batch is not a completion claim.
+if [[ "$finlab_finite_general_only" == "1" ]]; then
+  echo "[finlab] finite general-only pass ended; remaining work and timer state are unchanged"
+  exit 0
+fi
 
 # An intent may arrive after the final general key. Do not retain the account
 # for an optional overlay or intraday pass once that model request is visible.

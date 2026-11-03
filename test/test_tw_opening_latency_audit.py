@@ -7,6 +7,17 @@ import pytest
 from scripts.audit_tw_opening_latency import opening_coverage_milestones, opening_publication_slo
 
 
+def test_daily_audit_atomic_json_is_compact_without_losing_evidence(tmp_path):
+    from scripts.audit_tw_opening_latency import _atomic_json
+
+    path = tmp_path / "daily.json"
+    payload = {"來源": ["MIS", {"percent": 100, "elapsed_ms": None}], "valid": False}
+    _atomic_json(path, payload)
+    encoded = path.read_text(encoding="utf-8")
+    assert encoded == json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n"
+    assert json.loads(encoded) == payload
+
+
 def test_emergency_closure_applicability_reuses_configured_holidays_without_reclassifying_prices(tmp_path):
     from scripts.audit_tw_opening_latency import opening_session_context
     from stockagent.live.market_config import LiveMarketConfig
@@ -91,8 +102,8 @@ def test_postclose_symbol_forensics_reuses_original_assessment_without_rescannin
     from scripts import audit_tw_opening_symbol_status as symbols
     from stockagent.data import tw_current_trading_universe as registry
     calls = []
-    monkeypatch.setattr(registry, "load_current_universe", lambda _: {})
-    monkeypatch.setattr(symbols, "classify_symbols", lambda receipt, _: {
+    monkeypatch.setattr(registry, "load_recorded_universe", lambda _, **kwargs: {})
+    monkeypatch.setattr(symbols, "classify_retained_symbols", lambda receipt, _: {
         "contract": "opening_symbol_membership_and_source_evidence_v1", "session_date": receipt["session_date"],
         "source_captured_at": receipt["captured_at_taipei"]})
     def timeline(*args):
@@ -112,6 +123,23 @@ def test_postclose_symbol_forensics_reuses_original_assessment_without_rescannin
     with pytest.raises(ValueError, match="postclose only"):
         audit.postclose_symbol_forensics(receipt_bytes=raw, journal=tmp_path / "journal.jsonl",
             output_root=tmp_path, observed_at=datetime.fromisoformat("2026-10-22T09:00:30+08:00"))
+
+
+def test_postclose_invalid_snapshot_keeps_independent_journal_but_not_success(tmp_path, monkeypatch):
+    from scripts import audit_tw_opening_latency as audit
+    from scripts import audit_tw_opening_symbol_status as symbols
+    from stockagent.data import tw_current_trading_universe as registry
+    monkeypatch.setattr(registry, "load_recorded_universe", lambda _, **kwargs: {})
+    monkeypatch.setattr(symbols, "classify_retained_symbols", lambda receipt, _: {
+        "contract": "opening_symbol_membership_and_source_evidence_v1", "session_date": receipt["session_date"],
+        "source_captured_at": receipt["captured_at_taipei"], "state": "invalid_snapshot_clock"})
+    monkeypatch.setattr(symbols, "journal_symbol_timeline", lambda *args: {
+        "state": "observed", "requested_count": 2316})
+    raw = json.dumps({"session_date": "2026-10-30", "captured_at_taipei": "2026-10-30T13:29:59+08:00"}).encode()
+    report = audit.postclose_symbol_forensics(receipt_bytes=raw, journal=tmp_path / "journal.jsonl",
+        output_root=tmp_path, observed_at=datetime.fromisoformat("2026-10-30T13:35:00+08:00"))
+    assert report["state"] == "invalid_snapshot_clock"
+    assert report["journal_state"] == "observed" and report["requested_count"] == 2316
 
 
 def test_corrupt_retained_symbol_assessment_stays_visible_and_is_never_overwritten(tmp_path):
@@ -209,6 +237,50 @@ def test_new_standard_daily_audit_retains_valid_open_when_later_absence_expires(
     row = opening_coverage_milestones(path, "2026-10-13", ["A"])["milestones"][-1]
     assert row["last_trade_reference_standard"]["resolved_reference_candidate_count"] == 1
     assert row["last_trade_reference_standard"]["fresh_no_first_print_candidate_count"] == 0
+
+
+def test_daily_combined_percent_times_use_all_providers_and_expiring_original_proof(tmp_path):
+    path = tmp_path / "events.jsonl"
+    gate = int(datetime.fromisoformat("2026-10-13T09:00:00+08:00").timestamp() * 1000)
+    absence = lambda proof: {"symbol": "A", "state": "observed_no_first_print",
+        "no_first_print_observed_timestamp_ms": gate + proof}
+    # A's first proof expires before B arrives; a later proof, not the old
+    # delivery time, establishes simultaneous two-symbol candidate coverage.
+    write(path, [event("mis", 16100, [absence(16050)]),
+        event("finmind_snapshot", 16000, [{"symbol": "B", "state": "valid_open"}]),
+        event("mis", 1000, [absence(900)]),
+        event("shioaji_shared", 16_200_001, [{"symbol": "A", "state": "valid_open"}])])
+    result = opening_coverage_milestones(path, "2026-10-13", ["A", "B"])
+    combined = result["combined_session_percent_completion"]
+    genuine, candidates = combined["fields"]["genuine_open"], combined["fields"]["open_or_fresh_no_first_print"]
+    assert genuine["0"] == 0.0 and genuine["50"] == 16000.0 and genuine["51"] is None
+    assert candidates["50"] == 1000.0 and candidates["51"] == candidates["100"] == 16100.0
+    assert combined["contributing_providers"] == ["finmind_snapshot", "mis"]
+    assert "not_executable_fill" in combined["no_first_print_boundary"]
+
+
+def test_daily_combined_percent_reports_incomplete_evidence_instead_of_pass(tmp_path):
+    path = tmp_path / "events.jsonl"
+    write(path, [None, event("mis", 10, [{"symbol": "A", "state": "valid_open"}])])
+    result = opening_coverage_milestones(path, "2026-10-13", ["A", "B"])
+    combined = result["combined_session_percent_completion"]
+    assert combined["evidence_state"] == "lower_bound_or_incomplete"
+    assert combined["fields"]["genuine_open"]["50"] == 10.0
+    assert combined["fields"]["genuine_open"]["100"] is None
+
+
+def test_daily_audit_keeps_committed_prefix_when_writer_has_partial_tail(tmp_path):
+    path = tmp_path / "events.jsonl"
+    committed = json.dumps(event("mis", 10, [{"symbol": "A", "state": "valid_open"}])).encode() + b"\n"
+    path.write_bytes(committed + b'{"session_date":"2026-10-13","observed_at_taipei":"partial')
+    result = opening_coverage_milestones(path, "2026-10-13", ["A", "B"])
+    assert result["state"] == "incomplete_journal_prefix"
+    assert result["malformed_lines"] == 0
+    assert result["journal_prefix"]["partial_or_interrupted_tail"] is True
+    combined = result["combined_session_percent_completion"]
+    assert combined["evidence_state"] == "lower_bound_or_incomplete"
+    assert combined["fields"]["genuine_open"]["50"] == 10.
+    assert combined["fields"]["genuine_open"]["100"] is None
 
 
 @pytest.mark.parametrize("bad", [None, {}, "broken", {"session_date": "2026-10-13"}])
@@ -560,6 +632,9 @@ def fill_evidence(case, elapsed, *, replay=False):
 def test_daily_freezes_preopen_scope_and_accepts_only_full_original_clock_fills(daily_case):
     case = daily_case
     assert case.observe(-300)["state"] == "armed"
+    preopen = json.loads((case.output / "2026-10-14/coverage_summary.json").read_text())
+    assert preopen["source_state"] == "not_observed"
+    assert preopen["combined_session_percent_completion"] is None
     write(case.state / "opening_signal_latency.jsonl", [publication("mode", 500)])
     fill_evidence(case, 10.9)
     report = case.observe(12)
@@ -568,6 +643,41 @@ def test_daily_freezes_preopen_scope_and_accepts_only_full_original_clock_fills(
     assert deadlines[11000]["passed"] and not deadlines[10000]["passed"]
     assert report["provider_requests"] == 0 and not report["ledger_modified"]
     assert "execution_samples" not in report
+
+
+def test_daily_coverage_summary_keeps_all_percentages_and_evidence_boundaries(tmp_path):
+    from scripts.audit_tw_opening_latency import _daily_coverage_summary
+
+    percent = {str(i): None if i > 50 else i * 2 for i in range(101)}
+    combined = {"fields": {"genuine_open": percent}, "evidence_state": "lower_bound_or_incomplete"}
+    source = {"state": "degraded", "requested_count": 2, "malformed_lines": 1,
+        "combined_session_percent_completion": combined,
+        "provider_latency": {"providers": {"mis": {"first_valid_open_ms": 21.5, "failed_jobs": 2}}}}
+    report = {"session_date": "2026-10-14", "observed_at": "obs", "observation_started_at": "start",
+        "state": "missed_or_unverified", "expected_markets": ["mode"], "scope_matches_preopen": False,
+        "source_coverage_milestones": source, "evidence_errors": ["malformed_attempt_rows:1"]}
+    summary = _daily_coverage_summary(report, tmp_path / "latest.json")
+    assert summary["combined_session_percent_completion"] == combined
+    assert len(summary["combined_session_percent_completion"]["fields"]["genuine_open"]) == 101
+    assert summary["source_state"] == "degraded" and summary["malformed_lines"] == 1
+    assert summary["providers"]["mis"]["failed_jobs"] == 2
+    assert summary["scope_matches_preopen"] is False
+    assert summary["evidence_errors"] == ["malformed_attempt_rows:1"]
+    assert "not_verified_reference_prices_or_executions" in summary["boundary"]
+
+
+def test_daily_retains_nested_format_telemetry_without_treating_it_as_fills(daily_case):
+    case = daily_case
+    case.observe(-300)
+    row = publication("mode", 500)
+    row["post_inference_format_steps_ms"] = {"weight_rows": 0.0, "decision_rows_and_progress": 12.5}
+    row["post_inference_format_steps_contract"] = "sequential_nested_wall_time_v1"
+    write(case.state / "opening_signal_latency.jsonl", [row])
+    report = case.observe(12)
+    ready = report["mode_timings"]["mode"]["ready"][0]
+    assert ready["post_inference_format_steps_ms"] == {"weight_rows": 0.0, "decision_rows_and_progress": 12.5}
+    assert ready["post_inference_format_steps_contract"] == "sequential_nested_wall_time_v1"
+    assert report["state"] == "missed_or_unverified"
 
 
 def test_daily_late_fills_never_rewrite_the_first_deadline(daily_case):
@@ -649,12 +759,16 @@ def test_daily_retains_preparation_context_without_rebinding_an_old_warmup(daily
     path.parent.mkdir(parents=True)
     path.write_text(json.dumps({"updated_at": (case.gate - timedelta(seconds=301)).isoformat(),
         "run_id": "current-owner", "discord_connected": True, "core_health": "ready",
+        "discord_gateway": {"status": "available", "heartbeat_ack_rtt_ms": 120.0,
+            "sample_contract": "last_library_ack_rtt_ack_timestamp_unavailable_v1"},
         "startup_inference_warmup": {"run_id": warm_run, "status": "ready",
             "ready_count": 1, "market_count": 1, "model_cache_resident_ready": True,
             "markets": [{"market": "mode", "status": "ready"}]}}))
     report = case.observe(-300)
     context = report["owner_context"]
     assert context["state"] == "observed" and context["age_seconds"] == 1
+    assert context["discord_gateway"]["heartbeat_ack_rtt_ms"] == 120.0
+    assert "ack_timestamp_unavailable" in context["discord_gateway"]["sample_contract"]
     assert context["startup_inference_warmup"]["run_id"] == warm_run
     assert context["same_owner_resident_warmup_declared"] == (warm_run == "current-owner")
 
@@ -997,3 +1111,30 @@ def test_browser_end_to_end_requires_six_matching_visible_fsynced_targets_and_ho
     bad[0]["wallUnixMs"] -= 100
     assert not assess(samples=bad)["clock"]["stable"]
     assert assess(samples=events[1:])["under_one_second_on_local_host_clock"] is None
+
+
+def test_opening_clock_discontinuity_is_visible_even_without_a_matching_fill():
+    from scripts.audit_tw_opening_latency import opening_browser_end_to_end
+
+    session, publication, progress, launch, events, observed = _browser_end_to_end_fixture()
+    gate_ms = int(datetime.fromisoformat(session + "T09:00:00+08:00").timestamp() * 1000)
+    base = 5_000_000_000_000
+    # Continue the original 900 ms anchor with one sample per second. A later
+    # half-second wall rollback remains observable even when no target fills.
+    for delta in range(1900, 61900, 1000):
+        wall = gate_ms + delta - (500 if delta >= 14900 else 0)
+        before = base + delta * 1_000_000
+        events.append({"contract": "observer_clock_anchor_v1", "wallUnixMs": wall,
+                       "monotonicBeforeNs": str(before), "monotonicAfterNs": str(before + 1000)})
+    result = opening_browser_end_to_end(session, publication, [], launch, events, observed_at=observed)
+    assert result["state"] == "unverified"
+    assert result["clock"]["reason"] == "no_visible_full_target_evidence"
+    assert result["opening_minute_clock"]["stable"] is False
+    assert result["opening_minute_clock"]["wall_monotonic_span_ms"] == 500.0
+    assert result["opening_minute_clock"]["boundary"].endswith("not_exchange_or_UTC_calibration")
+
+    # Absent minute-spanning samples are not evidence of a stable clock.
+    short = opening_browser_end_to_end(session, publication, progress, launch,
+                                       events[:8], observed_at=observed)
+    assert short["opening_minute_clock"]["stable"] is False
+    assert short["opening_minute_clock"]["reason"] == "missing_bracketing_clock_samples"

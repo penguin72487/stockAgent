@@ -41,8 +41,11 @@ FINMIND_THROUGHPUT_RESERVATION_CONTRACT = "complete_finmind_throughput_reservati
 PUBLIC_BUILDER_CONTRACT = "tw_public_complete_builder_exact_parity_v1"
 TAIFEX_PROOF_MEMO_CONTRACT = "taifex_complete_curve_source_proof_memo_comparison_v1"
 WORKFLOW_ROUND_CONTRACTS = {
-    number: f"workflow_speed_round{number}_scoped_acceptance_v1" for number in (6, 7, 8, 9, 10, 11)
+    number: f"workflow_speed_round{number}_scoped_acceptance_v1" for number in (6, 7, 8, 9, 10, 11, 12)
 }
+WORKFLOW_ROUND_CONTRACTS[13] = 'workflow_round13_scoped_optimization_acceptance_v1'
+WORKFLOW_ROUND_CONTRACTS[15] = 'workflow_round15_scalar_prefilter_acceptance_v1'
+WORKFLOW_ROUND_CONTRACTS[18] = 'workflow_round18_scoped_progress_preservation_v1'
 WORKFLOW_ROUND_RECEIPTS = (
     "optimization_acceptance.json", "optimization_acceptance_readback.json", "source_disposition.json",
 )
@@ -111,7 +114,7 @@ def _workflow_round_contract(source: Path) -> str | None:
     A closed round is separate from its still-running parent optimization.
     Future rounds require review; a generic verified/complete flag is insufficient.
     """
-    match = re.fullmatch(r"round(6|7|8|9|10|11)", source.name)
+    match = re.fullmatch(r"round(6|7|8|9|10|11|12|13|15|18)", source.name)
     suite = re.fullmatch(r"workflow_speed_optimization_([0-9]{8})", source.parent.name)
     if (match is None or suite is None or len(source.parents) < 3
             or source.parents[1].name != "benchmarks" or source.parents[2].name != "artifacts"):
@@ -213,6 +216,33 @@ def _completed_workflow_round10(acceptance: dict, readback: dict, disposition: d
     return _workflow_selected_source_matches(acceptance, readback, disposition)
 
 
+def _completed_workflow_round12(acceptance: dict, readback: dict, disposition: dict) -> bool:
+    """Recognize the original complete-reader comparison and retained rejection.
+
+    Its full-reader count and phase names differ from earlier rounds. Preserve
+    the failed remote environment gate; archival admission is not CUDA readiness.
+    """
+    return (
+        type(acceptance.get("performance_samples")) is int
+        and acceptance["performance_samples"] > 0
+        and readback.get("raw_complete_samples_verified") == acceptance["performance_samples"]
+        and type(acceptance.get("fresh_confirmation_samples")) is int
+        and acceptance["fresh_confirmation_samples"] > 0
+        and type(readback.get("mean_checks")) is int and readback["mean_checks"] > 0
+        and acceptance.get("all_six_outputs_equal") is True
+        and readback.get("all_six_outputs_equal") is True
+        and acceptance.get("original_memory_gate_rejection_retained") is True
+        and acceptance.get("remote_strict_environment_passed") is False
+        and type(acceptance.get("performance_candidate_adopted")) is bool
+        and isinstance(acceptance.get("selected_source"), str)
+        and bool(acceptance["selected_source"].strip())
+        and readback.get("selected_source") == acceptance["selected_source"]
+        and disposition.get("selected") == acceptance["selected_source"]
+        and type(disposition.get("production_services_restarted")) is int
+        and disposition["production_services_restarted"] == 0
+    )
+
+
 def _completed_workflow_round(source: Path, objects: dict, contents: dict) -> bool:
     """Preserve original scoped completion, not current numerical acceptance.
 
@@ -221,24 +251,32 @@ def _completed_workflow_round(source: Path, objects: dict, contents: dict) -> bo
     to maintained source are not reinterpreted as today's source fingerprint.
     """
     contract = _workflow_round_contract(source)
+    if contract == WORKFLOW_ROUND_CONTRACTS[15]:
+        return _completed_workflow_round15(source, objects, contents)
+    if contract == WORKFLOW_ROUND_CONTRACTS[18]:
+        return _completed_workflow_round18(source, objects, contents)
     if contract is None or set(objects) != set(WORKFLOW_ROUND_RECEIPTS):
         return False
+    number = int(source.name[5:])
     acceptance, readback, disposition = (objects[name] for name in WORKFLOW_ROUND_RECEIPTS)
+    if number == 13:
+        return _completed_workflow_round13(acceptance, readback, disposition, contents)
     if (acceptance.get("contract") != contract
             or acceptance.get("state") != "verified_scoped_engineering"
             or readback.get("state") != "verified"
-            or disposition.get("state") not in {"reviewed", "prepared"}
+            or disposition.get("state") not in (
+                {"selected_source_verified"} if number == 12 else {"reviewed", "prepared"})
             or not isinstance(acceptance.get("scope"), str) or not acceptance["scope"].strip()):
         return False
-    number = int(source.name[5:])
     digest_key, count_key, samples_key = (("acceptance_sha256", "evidence_files_verified", "raw_samples_verified")
         if number == 6 else ("seal_sha256", "sealed_files_verified",
+                            "raw_complete_samples_verified" if number == 12 else
                             "performance_samples_verified" if number in (9, 10, 11) else
                             "optimization_samples_verified" if number == 8 else "raw_samples_verified"))
+    phases_key = "full_collector_phases" if number == 12 else "collector_phases_verified"
     if (readback.get(digest_key) != hashlib.sha256(contents[WORKFLOW_ROUND_RECEIPTS[0]]).hexdigest()
             or type(readback.get(samples_key)) is not int or readback[samples_key] <= 0
-            or type(readback.get("collector_phases_verified")) is not int
-            or readback["collector_phases_verified"] != 13):
+            or type(readback.get(phases_key)) is not int or readback[phases_key] != 13):
         return False
     try:
         start = datetime.fromisoformat(acceptance["observed_at_utc"])
@@ -247,7 +285,7 @@ def _completed_workflow_round(source: Path, objects: dict, contents: dict) -> bo
             return False
     except (KeyError, TypeError, ValueError):
         return False
-    boundaries = acceptance if number in (8, 9, 10, 11) else acceptance.get("remaining_boundaries")
+    boundaries = acceptance if number in (8, 9, 10, 11, 12) else acceptance.get("remaining_boundaries")
     if (not isinstance(boundaries, dict)
             or any(boundaries.get(key) is not False or readback.get(key) is not False
                    for key in ("all_workflows_measured", "hardware_limit_proven"))):
@@ -258,12 +296,20 @@ def _completed_workflow_round(source: Path, objects: dict, contents: dict) -> bo
         return False
     if number == 10 and not _completed_workflow_round10(acceptance, readback, disposition):
         return False
+    if number == 12 and not _completed_workflow_round12(acceptance, readback, disposition):
+        return False
     evidence = acceptance.get("evidence")
     if (not isinstance(evidence, list) or not 1 <= len(evidence) <= 50000
             or type(readback.get(count_key)) is not int or readback[count_key] != len(evidence)):
         return False
+    return _valid_workflow_file_rows(evidence)
+
+
+def _valid_workflow_file_rows(rows):
+    if not isinstance(rows, list) or not 1 <= len(rows) <= 50000:
+        return False
     names = set()
-    for row in evidence:
+    for row in rows:
         if (not isinstance(row, dict) or set(row) != {"path", "bytes", "sha256"}
                 or not isinstance(row["path"], str) or "\x00" in row["path"]
                 or "\\" in row["path"] or not row["path"]
@@ -276,6 +322,194 @@ def _completed_workflow_round(source: Path, objects: dict, contents: dict) -> bo
                 or row["path"] in names):
             return False
         names.add(row["path"])
+    return True
+
+
+def _completed_workflow_round18(source, objects, contents):
+    """Preserve round 18's original scoped and rejected experiment unchanged.
+
+    The producer wrote an unversioned seal, not a full-collector acceptance.
+    Bind its exact three-receipt ABI and independent seal readback. References
+    outside this single case remain historical evidence, never cleanup scope.
+    Every original/cold byte and live consumer gate is still checked by the
+    canonical retirement transaction.
+    """
+    if set(objects) != set(WORKFLOW_ROUND_RECEIPTS):
+        return False
+    accepted, readback, disposition = (objects[name] for name in WORKFLOW_ROUND_RECEIPTS)
+    files = accepted.get('files')
+    if (accepted.get('state') != 'verified_scoped_progress'
+            or 'contract' in accepted
+            or readback.get('state') != 'verified'
+            or disposition.get('state') != 'selected_source_verified'
+            or not _valid_workflow_file_rows(files)
+            or type(readback.get('sealed_files_verified')) is not int
+            or readback['sealed_files_verified'] != len(files)
+            or readback.get('seal_sha256') != hashlib.sha256(contents[WORKFLOW_ROUND_RECEIPTS[0]]).hexdigest()
+            or disposition.get('selected_source') != 'baseline'):
+        return False
+    for key in ('candidate_accepted', 'single_invocation_registry_scope_complete',
+                'all_workflows_measured', 'hardware_limit_proven'):
+        if any(row.get(key) is not False for row in (accepted, readback)):
+            return False
+    if (any(row.get('original_registry_scope_reconciled') is not True
+            for row in (accepted, readback))
+            or readback.get('full_single_invocation_gap_free') is not True
+            or readback.get('full_collector_speedup_verified') is not False
+            or any(disposition.get(key) is not False for key in
+                   ('cache_candidate_accepted', 'default_reuse_enabled',
+                    'source_or_schema_writes', 'service_restarts', 'new_gpu_jobs'))
+            or type(disposition.get('provider_calls')) is not int
+            or disposition['provider_calls'] != 0):
+        return False
+    for source_key, verification_key in (
+            ('terminal_runs', 'terminal_command_receipts_verified'),
+            ('raw_current_registry_entries', 'raw_current_registry_entries'),
+            ('raw_current_stage_bound', 'raw_current_stage_bound'),
+            ('stage_bound', 'stage_bound_recounted'),
+            ('remaining_stage_unbound', 'remaining_unbound_recounted')):
+        source_value, checked = accepted.get(source_key), readback.get(verification_key)
+        expected = len(source_value) if type(source_value) is list else source_value
+        if type(expected) is not int or expected <= 0 or type(checked) is not int or checked != expected:
+            return False
+    if (type(readback.get('complete_fixed_trials_verified')) is not int
+            or readback['complete_fixed_trials_verified'] != 8):
+        return False
+    terminals = accepted.get('terminal_runs')
+    if (not isinstance(terminals, list)
+            or any(not isinstance(row, dict) or not isinstance(row.get('run_id'), str)
+                   or row.get('state') not in {'succeeded', 'failed', 'interrupted'}
+                   or (row['state'] == 'succeeded' and
+                       (type(row.get('exit_code')) is not int or row['exit_code'] != 0))
+                   or (row['state'] == 'failed' and
+                       (type(row.get('exit_code')) is not int or row['exit_code'] == 0))
+                   or (row['state'] == 'interrupted' and row.get('exit_code') is not None)
+                   for row in terminals)
+            or len({row['run_id'] for row in terminals}) != len(terminals)):
+        return False
+    for state, key in (('failed', 'failed_commands_retained'),
+                       ('interrupted', 'interrupted_commands_retained')):
+        retained = readback.get(key)
+        if (not isinstance(retained, list) or not retained
+                or any(type(value) is not str for value in retained)
+                or len(set(retained)) != len(retained)
+                or set(retained) != {row['run_id'] for row in terminals if row['state'] == state}):
+            return False
+    prefix = 'artifacts/benchmarks/' + source.parent.name + '/' + source.name + '/'
+    if any(not any(row['path'].startswith(prefix + role + '/') for row in files)
+           for role in ('candidate_source', 'canonical_source')):
+        return False
+    try:
+        clocks = [datetime.fromisoformat(row['observed_at_utc']) for row in (accepted, readback)]
+        return all(clock.utcoffset() is not None for clock in clocks) and clocks == sorted(clocks)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _completed_workflow_round15(source, objects, contents):
+    """Preserve the original rejected candidate and two-receipt producer ABI.
+
+    This round wrote no source_disposition receipt. Its independently bound
+    seal includes baseline/candidate sources and all eight fixed-input trials.
+    Admission preserves that closed experiment; current byte recovery and
+    consumer/retirement checks still belong to the original archive owner.
+    """
+    names = WORKFLOW_ROUND_RECEIPTS[:2]
+    if set(objects) != set(names):
+        return False
+    accepted, readback = (objects[name] for name in names)
+    files = accepted.get('files')
+    if (accepted.get('contract') != WORKFLOW_ROUND_CONTRACTS[15]
+            or accepted.get('state') != 'verified' or readback.get('state') != 'verified'
+            or accepted.get('source_archive_verified_at_seal') is not True
+            or not _valid_workflow_file_rows(files)
+            or type(readback.get('sealed_files_verified')) is not int
+            or readback['sealed_files_verified'] != len(files)
+            or type(readback.get('complete_fixed_input_trials_verified')) is not int
+            or readback['complete_fixed_input_trials_verified'] != 8
+            or type(readback.get('means_recomputed')) is not int
+            or readback['means_recomputed'] != 32
+            or any(receipt.get(key) is not False for receipt in (accepted, readback) for key in
+                   ('candidate_admitted', 'full_collector_verified', 'full_collector_speedup_verified',
+                    'all_workflows_measured', 'hardware_limit_proven'))
+            or readback.get('seal_sha256') != hashlib.sha256(contents[names[0]]).hexdigest()):
+        return False
+    suite = 'artifacts/benchmarks/' + source.parent.name + '/'
+    prefix = suite + source.name + '/'
+    # The original seal also binds earlier verifier code, its agent run
+    # receipts and the report. These are historical evidence references,
+    # never extra source paths authorized for this cohort's retirement.
+    predecessors = {suite + name for name in ('round11/check_wheel_backend.py',
+        'round12/confirmation_worker.py', 'round14/optimization_acceptance_readback.json')}
+    def admitted_reference(name):
+        return (name.startswith(prefix) or name in predecessors
+            or re.fullmatch(r'artifacts/operations/agent-workflow/runs/workflow-r15-[A-Za-z0-9_-]+/run\.(json|log)', name)
+            or name == 'docs/workflow_speed_optimization_2026-10-23_scalar_prefilter.md')
+    if (any(not admitted_reference(row['path']) for row in files)
+            or any(not any(row['path'].startswith(prefix + role + '/') for row in files)
+                   for role in ('baseline_source', 'candidate_source'))):
+        return False
+    try:
+        clocks = [datetime.fromisoformat(receipt['observed_at_utc']) for receipt in (accepted, readback)]
+        return all(clock.utcoffset() is not None for clock in clocks) and clocks == sorted(clocks)
+    except (KeyError, TypeError, ValueError):
+        return False
+
+
+def _completed_workflow_round13(accepted, readback, disposition, contents):
+    """Original static-phase seal ABI; preserve its failed run and limited claim."""
+    files = accepted.get('files')
+    means = accepted.get('recomputed_means')
+    sources = accepted.get('current_source_identities_verified_at_seal')
+    states = accepted.get('required_run_states')
+    if (accepted.get('contract') != WORKFLOW_ROUND_CONTRACTS[13]
+            or accepted.get('state') != 'verified' or readback.get('state') != 'verified'
+            or disposition.get('state') != 'selected_source_verified'
+            or accepted.get('source_archive') != 'canonical_source'
+            or accepted.get('selected_phase') != 'path-only four-process static source inventory'
+            or accepted.get('prior_negative_results_retained') is not True
+            or accepted.get('canonical_full_collector_verified') is not True
+            or disposition.get('code_inventory_workers') != 4
+            or type(disposition.get('code_inventory_workers')) is not int
+            or disposition.get('default_code_inventory_workers') != 0
+            or type(disposition.get('default_code_inventory_workers')) is not int
+            or not _valid_workflow_file_rows(files)
+            or type(readback.get('sealed_files_verified')) is not int
+            or readback['sealed_files_verified'] != len(files)
+            or not isinstance(means, list) or not means
+            or type(readback.get('recomputed_mean_checks')) is not int
+            or readback['recomputed_mean_checks'] != len(means)
+            or type(accepted.get('complete_original_sample_rows')) is not int
+            or accepted['complete_original_sample_rows'] <= 0
+            or type(readback.get('all_original_sample_rows')) is not int
+            or readback['all_original_sample_rows'] != accepted['complete_original_sample_rows']
+            or not isinstance(sources, list) or not sources
+            or sources != disposition.get('sources')
+            or any(not isinstance(row, dict) or set(row) != {'path', 'sha256'}
+                   or not isinstance(row.get('path'), str)
+                   or not row['path'] or '\\' in row['path']
+                   or PurePosixPath(row['path']).is_absolute() or '..' in PurePosixPath(row['path']).parts
+                   or not isinstance(row.get('sha256'), str)
+                   or re.fullmatch('[0-9a-f]{64}', row['sha256']) is None for row in sources)
+            or len({row['path'] for row in sources}) != len(sources)
+            or type(readback.get('archive_source_files')) is not int
+            or readback['archive_source_files'] != len(sources)
+            or not isinstance(states, dict) or len(states) < 2
+            or any(not isinstance(key, str) or not key.startswith('workflow-r13-') or value not in {'succeeded', 'failed'}
+                   for key, value in states.items())
+            or sum(value == 'failed' for value in states.values()) != 1
+            or not any('readback-repair-' in key and value == 'succeeded' for key, value in states.items())
+            or any(accepted.get(key) is not False or readback.get(key) is not False for key in
+                   ('full_collector_speedup_verified', 'all_workflows_measured', 'hardware_limit_proven'))
+            or readback.get('seal_sha256') != hashlib.sha256(contents[WORKFLOW_ROUND_RECEIPTS[0]]).hexdigest()):
+        return False
+    try:
+        clocks = [datetime.fromisoformat(value['observed_at_utc'])
+                  for value in (disposition, accepted, readback)]
+        if any(clock.utcoffset() is None for clock in clocks) or clocks != sorted(clocks):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
     return True
 
 
@@ -1145,9 +1379,12 @@ def completed_benchmark_evidence(source: Path, *, destination: Path | None = Non
         return value
     producer_source = original_source if original_source is not None else source
     # These producers include giant JSON measurement payloads. Preserve every
-    # original in the full archive; retain only their three bounded completion
+    # original in the full archive; retain only their bounded completion
     # receipts on C. Do not parse or copy a 200 MB manifest as control metadata.
-    paths = ([source / name for name in WORKFLOW_ROUND_RECEIPTS]
+    receipt_names = (WORKFLOW_ROUND_RECEIPTS[:2]
+                     if _workflow_round_contract(producer_source) == WORKFLOW_ROUND_CONTRACTS[15]
+                     else WORKFLOW_ROUND_RECEIPTS)
+    paths = ([source / name for name in receipt_names]
              if _workflow_round_contract(producer_source) else sorted(source.glob("*.json")))
     external = _completion_receipt_paths(
         original_source if original_source is not None and source.name != 'retained-evidence' else source)
@@ -1162,7 +1399,17 @@ def completed_benchmark_evidence(source: Path, *, destination: Path | None = Non
         descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
         with os.fdopen(descriptor, 'rb') as handle:
             before = os.fstat(handle.fileno())
-            if not stat.S_ISREG(before.st_mode) or before.st_size > 8 * 1024**2:
+            # Original seals: round 12 is 11.39 MiB; round 15 is 8.52 MiB;
+            # round 18 is 13.14 MiB. Only these reviewed original seals get
+            # the larger bound; their measurement payloads are not controls.
+            # Only these reviewed acceptance receipts get the 16 MiB bound;
+            # giant measurement payloads and all other receipts remain 8 MiB.
+            maximum = (16 * 1024**2
+                       if _workflow_round_contract(producer_source) in (
+                           WORKFLOW_ROUND_CONTRACTS[12], WORKFLOW_ROUND_CONTRACTS[15],
+                           WORKFLOW_ROUND_CONTRACTS[18])
+                       and path.name == WORKFLOW_ROUND_RECEIPTS[0] else 8 * 1024**2)
+            if not stat.S_ISREG(before.st_mode) or before.st_size > maximum:
                 raise SnapshotError('benchmark evidence is not bounded regular metadata')
             total += before.st_size
             if total > 32 * 1024**2:
@@ -1206,7 +1453,7 @@ def completed_benchmark_evidence(source: Path, *, destination: Path | None = Non
         producer_contract, producer_state = TAIFEX_PROOF_MEMO_CONTRACT, "measurement_complete"
     elif _completed_workflow_round(producer_source, objects, contents):
         producer_contract = _workflow_round_contract(producer_source)
-        producer_state = "verified_scoped_engineering"
+        producer_state = objects[WORKFLOW_ROUND_RECEIPTS[0]]['state']
     elif _completed_comparison(fixture, accepted, objects):
         producer_contract, producer_state = fixture['contract'], accepted['state']
     else:

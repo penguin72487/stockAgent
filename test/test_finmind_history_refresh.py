@@ -102,6 +102,8 @@ def test_partial_full_response_does_not_bless_an_invalid_baseline():
 
 
 def test_failed_history_worker_recovery_cannot_publish_a_tail_as_full_history(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
     task = worker.Task('USStockPrice', 'BRK-A', 'history', 'id_history', 0, 'complete')
     old = [row('2014-01-02'), row('2026-09-25', 3)]
     original = worker._store(tmp_path, task, old, NOW - timedelta(days=1))
@@ -125,7 +127,13 @@ def test_failed_history_worker_recovery_cannot_publish_a_tail_as_full_history(tm
         calls.append(params)
         return [row('2026-09-28', 5)]
     monkeypatch.setattr(worker, '_fetch_rows', fetch)
-    worker.run_once(tmp_path, max_requests=1, required_keys=((task.dataset, task.data_id, task.partition),))
+    # The historical-merge assertion must not depend on the host's real free
+    # disk space; capacity admission is exercised separately by owner tests.
+    capacity = SimpleNamespace(root=tmp_path.absolute(),
+                               initial_sample=lambda: {'state': 'admitted'},
+                               sample=lambda: {'state': 'admitted'})
+    worker.run_once(tmp_path, max_requests=1, required_keys=((task.dataset, task.data_id, task.partition),),
+                    capacity_sampler=capacity)
     receipt, loaded = refresh.read_baseline(tmp_path, task)
     assert len(calls) == 1 and calls[0]['start_date'] == '1900-01-01'
     assert loaded == [*old, row('2026-09-28', 5)]

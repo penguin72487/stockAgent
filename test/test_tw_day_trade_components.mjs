@@ -3,6 +3,116 @@ import {readFileSync} from "node:fs";
 import test from "node:test";
 import vm from "node:vm";
 
+function pendingDetailHarness(kind) {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const requests = [];
+  let release;
+  const page = {rows: [{symbol: "2330", target_weight: .1}], total: 1, has_more: false};
+  const context = vm.createContext({
+    snapshot: {service_sync: {engine_generation: "owner-a", content_revision: 1}},
+    selection: "scope-a", URLSearchParams, AbortController,
+    Dashboard: {readJsonResponse: async response => response},
+    fetchWithTimeout: async (url, options) => {
+      requests.push({url, options});
+      if (requests.length === 1) return new Promise(resolve => { release = () => resolve(page); });
+      return page;
+    },
+    $: () => ({value: ""}),
+    detailSelectionKey: () => context.selection, detailRangeKey: () => "range",
+    selectedDetailStartDate: () => "2026-11-02", selectedDetailEndDate: () => "2026-11-02",
+    selectedMode: () => "all", SIGNAL_PAGE_SIZE: 100, POSITION_PAGE_SIZE: 100, EVENT_PAGE_SIZE: 100,
+    beginSilentTableUpdate() {}, validateDetailPage() {}, compareByAbsoluteWeight: () => 0,
+    syncFeaturePanelSelection() {}, renderSignals() {}, renderPositions() {}, renderEvents() {},
+    renderSignalFeaturePanel() {}, scheduleStatusRecovery() {},
+  });
+  for (const prefix of ["signal", "position", "event"]) {
+    Object.assign(context, {[`${prefix}Loading`]: false, [`${prefix}Rows`]: [],
+      [`${prefix}RequestRevisionInFlight`]: "", [`${prefix}RequestScopeInFlight`]: "",
+      [`${prefix}RequestSequence`]: 0, [`${prefix}AbortController`]: null,
+      [`${prefix}DataRevision`]: null, [`${prefix}SelectionKey`]: null,
+      [`${prefix}LoadError`]: "", [`${prefix}Total`]: 0, [`${prefix}HasMore`]: false});
+  }
+  Object.assign(context, {eventRecordRevision: null, signalFeatureDrivers: {},
+    signalDirectionSummary: {}, signalOpeningExecutionAudit: {}});
+  vm.runInContext(app.slice(app.indexOf("function detailDataRevision("), app.indexOf("function chartWindowLabel(")), context);
+  vm.runInContext(app.slice(app.indexOf("async function loadSignals("), app.indexOf("async function refresh(")), context);
+  const loader = {signals: "loadSignals", positions: "loadPositions", events: "loadEvents"}[kind];
+  return {context, requests, release: () => release(), load: () => context[loader]()};
+}
+
+for (const [kind, prefix] of [["signals", "signal"], ["positions", "position"], ["events", "event"]]) {
+  test(`${kind}: new revisions coalesce without aborting a valid in-flight selection`, async () => {
+    const h = pendingDetailHarness(kind);
+    const first = h.load();
+    h.context.snapshot.service_sync.content_revision = 2;
+    await h.load();
+    assert.equal(h.requests.length, 1);
+    assert.equal(h.requests[0].options.signal.aborted, false);
+    h.release();
+    await first;
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(h.requests.length, 2, "one catch-up request follows successful older data");
+    assert.equal(h.context[`${prefix}Rows`].length, 1);
+    const revision = prefix === "event" ? "eventRecordRevision" : `${prefix}DataRevision`;
+    assert.equal(h.context[revision], h.context.detailDataRevision(kind));
+    assert.equal(h.context[`${prefix}LoadError`], "");
+  });
+  for (const change of ["selection", "owner"]) {
+    test(`${kind}: ${change} changes still cancel and fence stale responses`, async () => {
+      const h = pendingDetailHarness(kind);
+      const first = h.load();
+      if (change === "selection") h.context.selection = "scope-b";
+      else h.context.snapshot.service_sync.engine_generation = "owner-b";
+      await h.load();
+      assert.equal(h.requests.length, 2);
+      assert.equal(h.requests[0].options.signal.aborted, true);
+      const rows = h.context[`${prefix}Rows`];
+      h.release();
+      await first;
+      assert.equal(h.context[`${prefix}Rows`], rows);
+      assert.equal(h.context[`${prefix}LoadError`], "");
+    });
+  }
+}
+
+test("minute history finishes a same-selection read before fetching the latest revision", async () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const calls = [], applied = [];
+  let release;
+  const context = vm.createContext({
+    document: {hidden: false}, snapshot: {service_sync: {engine_generation: "owner-a"}},
+    historyRevision: "history-a", chartHistory: null, chartHistoryKey: "", chartHistoryCache: new Map(),
+    historyInFlight: false, historyRequestKeyInFlight: "", historyRequestScopeInFlight: "",
+    historyRequestSequence: 0, historyAbortController: null, historyLoadError: "",
+    availableDetailDates: ["2026-11-02"], HISTORY_CLIENT_CACHE_MAX_ENTRIES: 3,
+    selectedDetailStartDate: () => "2026-11-02", selectedDetailEndDate: () => "2026-11-02",
+    detailRangeKey: () => "range", chartRequestKey: () => context.historyRevision,
+    chartHistoryMatchesSelection: () => true, AbortController, URLSearchParams,
+    fetchMinuteHistory: async (url, options) => {
+      calls.push({url, options});
+      if (calls.length === 1) return new Promise(resolve => { release = () => resolve({ok: true}); });
+      return {ok: true};
+    },
+    Dashboard: {readJsonResponse: async () => ({history: []}), cancelResponse() {}},
+    decodeChartHistory: value => value, validateMinuteHistory() {}, renderChart() {}, scheduleStatusRecovery() {},
+    applyChartHistory(payload, key) { context.chartHistory = payload; context.chartHistoryKey = key; applied.push(key); },
+  });
+  vm.runInContext(app.slice(app.indexOf("function chartReadScopeKey("), app.indexOf("function chartWindowLabel(")), context);
+  vm.runInContext(app.slice(app.indexOf("async function loadChartHistory("), app.indexOf("function renderPriceSources(")), context);
+  const pending = context.loadChartHistory({preferCache: true});
+  context.historyRevision = "history-b";
+  await context.loadChartHistory({preferCache: true});
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.signal.aborted, false);
+  release();
+  await pending;
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(calls.length, 2);
+  assert.deepEqual(applied, ["history-a", "history-b"]);
+  assert.equal(context.chartHistoryKey, "history-b");
+  assert.equal(context.historyLoadError, "");
+});
+
 test("counterfactual prefix clocks are not presented as original historical signals", () => {
   const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
   const context = vm.createContext({});
@@ -72,6 +182,68 @@ function components(options = {}) {
   });
   return {view, presentation, modes, byId};
 }
+
+test("fallback targets never claim a fill and respect date, mode, symbol and status", () => {
+  const {view} = components();
+  const key = "a".repeat(32);
+  const data = {session_date: "2026-10-29", modes: [
+    {market: "m", label: "模型", revision_index: 2, signal_ready_at: "2026-10-29T09:00:04+08:00"},
+    {market: "n", label: "另一模式", stale: true, revision_index: 1}], rows: [
+    {market: "m", symbol: "2330", name: "台積電", target_weight: 0.1, side: "long", public_signal_key: key},
+    {market: "n", symbol: "2317", name: "鴻海", target_weight: -0.2, side: "short", public_signal_key: key}]};
+  const selection = {start: "2026-10-29", end: "2026-10-29", mode: "all", symbol: "", status: "all"};
+  assert.equal(view.publishedSignalFallback(data, {...selection, end: "2026-10-28"}), null);
+  assert.equal(view.publishedSignalFallback(data, {...selection, mode: "m"}).rows.length, 1);
+  assert.equal(view.publishedSignalFallback(data, {...selection, symbol: "鴻海"}).rows.length, 1);
+  const filtered = view.publishedSignalFallback(data, {...selection, status: "closed"});
+  assert.equal(filtered.rows.length, 0);
+  assert.match(filtered.note, /無法套用/);
+  const fallback = view.publishedSignalFallback(data, selection);
+  assert.match(fallback.note, /非完整交易紀錄/);
+  const html = view.publishedSignalFallbackRow(fallback.rows[0]);
+  assert.match(html, /模擬委託及成交待核對/);
+  assert.doesNotMatch(html, /0 股|已成交|不可當沖/);
+  assert.match(view.publishedSignalFallbackRow(fallback.rows[1]), /上一版/);
+});
+
+test("newer published identity is not falsely paired with an older committed signal", () => {
+  const {view} = components();
+  const key = "a".repeat(32), old = "b".repeat(32);
+  const data = {session_date: "2026-10-29", modes: [{market: "m", status: "published", stale: false,
+    public_signal_key: key, signal_ready_at: "2026-10-29T09:00:06+08:00"}], rows: []};
+  const selection = {start: "2026-10-29", end: "2026-10-29", mode: "all", symbol: "", status: "all"};
+  const row = {session_date: "2026-10-29", market: "m", symbol: "2330", public_signal_key: old,
+    signal_at: "2026-10-29T09:00:05+08:00"};
+  assert.equal(view.publishedSignalAhead(data, selection, [row]), true);
+  assert.equal(view.publishedSignalFallback(data, selection, {ledgerReady: true}), null,
+    "a newer model preview cannot hide successful committed ledger details");
+  assert.ok(view.publishedSignalFallback(data, selection, {ledgerReady: false}),
+    "keep the independent target fallback while the ledger is unavailable");
+  assert.equal(view.publishedSignalAhead(data, selection, [{...row, public_signal_key: key}]), false);
+  assert.equal(view.publishedSignalAhead(data, selection, [{...row, signal_at: "2026-10-29T09:00:07+08:00"}]), false);
+  assert.equal(view.publishedSignalAhead(data, selection, [{...row, signal_at: null}]), false);
+  assert.equal(view.publishedSignalAhead({...data, modes: [{...data.modes[0], stale: true}]}, selection, [row]), false);
+  assert.equal(view.publishedSignalAhead(data, {...selection, status: "closed"}, [row]), false);
+  assert.equal(view.publishedSignalAhead(data, {...selection, end: "2026-10-28"}, [row]), false);
+});
+
+test("fallback positions are scoped to a committed open snapshot, never closed history", () => {
+  const {view} = components();
+  const data = {as_of: "2026-10-29T02:01:00Z", state_revision: 7, modes: [{market: "m", label: "模型"}],
+    rows: [{market: "m", symbol: "2330", name: "台積電", session_date: "2026-10-29", signed_shares: 1000, target_weight: 0.1},
+      {market: "m", symbol: "2317", session_date: "2026-10-28", signed_shares: -1000, target_weight: -0.3}]};
+  const selection = {start: "2026-10-29", end: "2026-10-29", mode: "all", symbol: "", status: "all"};
+  const current = view.livePositionFallback(data, selection);
+  assert.equal(current.rows.length, 1);
+  assert.equal(current.rows[0].symbol, "2330");
+  assert.equal(current.rows[0].label, "模型");
+  assert.match(current.note, /不含完整生命週期/);
+  assert.equal(view.livePositionFallback(data, {...selection, end: "2026-10-28"}), null);
+  assert.equal(view.livePositionFallback(data, {...selection, status: "open"}).rows.length, 1);
+  const closed = view.livePositionFallback(data, {...selection, status: "closed"});
+  assert.equal(closed.rows.length, 0);
+  assert.match(closed.note, /無法查詢已平倉/);
+});
 
 test("entry bracket rejections are explicit and never called a fill", () => {
   const {presentation} = components();
@@ -143,11 +315,12 @@ test("progressive targets show actual inventory without attributing old fills to
 
 test("progressive completion follows inventory deltas rather than addition-only fill counts", () => {
   const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
-  const source = app.slice(app.indexOf("  const revisionHtml ="), app.indexOf('  setHtml("signal-direction-summary"'));
+  const start = app.indexOf("  const revisionHtml =");
+  const source = app.slice(start, app.indexOf('  setHtml("signal-direction-summary"', start));
   const row = {market: "unit", day_trade_signal_update_policy: "progressive_open_reference_rebalance_v1",
     opening_signal_revision: {index: 2}, inventory_rebalance: {
       contract_valid: true, target_complete: false, remaining_delta_shares: 2000, unresolved_symbol_count: 1}};
-  const context = vm.createContext({snapshot: {modes: [row]}, esc: String, strategyLabel: String,
+  const context = vm.createContext({snapshot: {modes: [row]}, publishedAhead: false, esc: String, strategyLabel: String,
     number: String, shortTime: String});
   vm.runInContext(`function render() { ${source}\n return revisionHtml; }`, context);
   assert.match(context.render(), /庫存仍差 2000 股 · 1 檔待取價/);
@@ -422,4 +595,33 @@ test("opening telemetry shows durable publication subphases without treating the
   delete row.state_publication;
   context.renderOperations(data);
   assert.doesNotMatch(byId("opening-stage-progress").html, /帳本發布|JSON 編碼/);
+});
+
+test("corrupt opening diagnostic is visibly incomplete and never reported as a clean zero", () => {
+  const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
+  const source = app.slice(app.indexOf("function renderOperations(data)"), app.indexOf("function renderTwPublicMonitor(payload)"));
+  const nodes = new Map();
+  const byId = id => {
+    if (!nodes.has(id)) nodes.set(id, {textContent: "", html: ""});
+    return nodes.get(id);
+  };
+  const context = vm.createContext({
+    IS_OVERNIGHT: false, lastFetchMs: null, SERVICE_REVISION_REFRESH_MS: 1000, PRICE_REFRESH_MS: 60000,
+    clampRatio: value => Math.max(0, Math.min(1, Number(value || 0))),
+    number: (value, digits = 0) => Number(value || 0).toFixed(digits),
+    duration: String, sourceNumber: String, shortTime: String, countdown: () => "—",
+    esc: value => String(value ?? "—").replaceAll("<", "&lt;"),
+    strategyLabel: () => "unit", badge: String, progress: () => "",
+    $: byId, setHtml: (id, html) => { byId(id).html = html; },
+  });
+  vm.runInContext(app.slice(app.indexOf("function officialUniverseDescription("),
+    app.indexOf("function renderOvernightOperations(")), context);
+  vm.runInContext(source, context);
+  context.renderOperations({modes: [], opening_signal_latency: {
+    modes: [], failure_count: 0, integrity: {state: "partial_corrupt", malformed_lines: 1},
+  }});
+  assert.match(byId("latency-kpis").html, /測速紀錄不完整/);
+  assert.match(byId("latency-kpis").html, /至少 0/);
+  assert.doesNotMatch(byId("latency-kpis").html, /所選日沒有測速失敗紀錄/);
+  assert.match(byId("opening-stage-progress").html, /測速紀錄有損壞/);
 });

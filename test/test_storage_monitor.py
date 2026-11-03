@@ -10,6 +10,80 @@ import pytest
 
 from stockagent.data_sync import storage_monitor as storage
 
+_trading_opening_census_reason = storage.trading_opening_census_reason
+
+
+@pytest.fixture(autouse=True)
+def independent_of_live_trading_clock(monkeypatch):
+    """Only explicit guardian tests use a clock, never the machine's current time."""
+    monkeypatch.setattr(storage, 'trading_opening_census_reason', lambda *_: None)
+
+
+@pytest.mark.parametrize(('session', 'protected', 'age', 'expected'), [
+    ('open', True, 30, 'tw_opening_guard_active'),
+    ('closed', False, 30, None),
+    ('unknown', False, 30, 'tw_opening_guard_unknown'),
+    ('open', False, 30, 'tw_opening_guard_unknown'),
+    ('open', True, 181, 'tw_opening_guard_unknown'),
+    ('open', True, -121, 'tw_opening_guard_unknown'),
+])
+def test_trading_opening_guard_uses_fresh_canonical_receipt(tmp_path, session, protected, age, expected):
+    now = datetime(2026, 11, 3, 0, 30, tzinfo=timezone.utc)
+    path = tmp_path / 'artifacts/operations/tw_day_trade_guardian/latest.json'
+    path.parent.mkdir(parents=True)
+    path.write_text(json.dumps({'schema_version': 1, 'session_date': '2026-11-03',
+        'observed_at_taipei': (now - timedelta(seconds=age)).isoformat(), 'session_state': session,
+        'components': {'opening_resource_guard': {'protected': protected}}}))
+    assert _trading_opening_census_reason(tmp_path, now=now) == expected
+
+
+def test_trading_opening_guard_missing_receipt_defers_only_protected_window(tmp_path):
+    now = datetime(2026, 11, 3, 0, 30, tzinfo=timezone.utc)
+    assert _trading_opening_census_reason(tmp_path, now=now) == 'tw_opening_guard_unknown'
+    assert _trading_opening_census_reason(tmp_path, now=now - timedelta(minutes=11)) is None
+    assert _trading_opening_census_reason(tmp_path, now=now + timedelta(minutes=40)) is None
+    with pytest.raises(ValueError, match='requires_timezone'):
+        _trading_opening_census_reason(tmp_path, now=now.replace(tzinfo=None))
+
+
+def test_opening_guard_defers_optional_census_before_owner_observation(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, 'trading_opening_census_reason', lambda _: 'tw_opening_guard_active')
+    def forbidden(*_):
+        pytest.fail('opening guard must short-circuit optional scans')
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', forbidden)
+    assert storage.local_census_priority_reason({'id': 'penguin-wsl'}, tmp_path) == 'tw_opening_guard_active'
+
+
+def test_opening_guard_interrupts_owned_scan_after_it_starts(tmp_path, monkeypatch):
+    import sys
+    source = tmp_path / 'source'
+    source.mkdir()
+    lock = tmp_path / 'scheduler.lock'
+    lock.touch()
+    child_pid = tmp_path / 'child.pid'
+    now = datetime(2026, 11, 3, 0, 30, tzinfo=timezone.utc)
+    def guardian(_):
+        active = child_pid.exists()
+        return {'schema_version': 1, 'session_date': '2026-11-03',
+                'observed_at_taipei': now.isoformat(), 'session_state': 'open' if active else 'closed',
+                'components': {'opening_resource_guard': {'protected': active}}}
+    monkeypatch.setattr(storage, 'operation_metadata', guardian)
+    monkeypatch.setattr(storage, 'trading_opening_census_reason',
+                        lambda repo: _trading_opening_census_reason(repo, now=now))
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    monkeypatch.setattr(storage, 'DATASET_VERSION_OWNER_DIRECTORY', tmp_path)
+    monkeypatch.setattr(storage, 'capacity', lambda *_: measured())
+    monkeypatch.setattr(storage, 'resolve_roots', lambda *_: [
+        {'path': str(source), 'label': 'project', 'kind': 'source'}])
+    code = f"import os,time;open({str(child_pid)!r},'w').write(str(os.getpid()));time.sleep(30)"
+    monkeypatch.setattr(storage, 'du_command', lambda *_: [sys.executable, '-c', code])
+    monkeypatch.setattr(storage, 'CENSUS_PRIORITY_POLL_SECONDS', 0.05)
+    result = storage.census({'id': 'penguin-wsl', 'path': str(tmp_path)}, tmp_path,
+                            depth=1, timeout=5, wave_lock=lock)
+    assert result['state'] == 'deferred' and result['reason'] == 'tw_opening_guard_active'
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(child_pid.read_text()), 0)
+
 
 def measured(**change):
     return {"state": "measured", "observed_at_utc": "2026-10-25T07:00:00+00:00", "source": "statvfs",
@@ -68,6 +142,40 @@ def test_storage_capacity_keeps_reserve_distinct_and_never_sums_nested_disks():
     assert row["capacity"]["reserved_free_bytes"] == 200
     assert row["contained_in"] == "penguin-c"
     assert row["capacity"]["state"] == "measured"
+
+
+@pytest.mark.parametrize('defect', ['none', 'stale', 'partial', 'overstated', 'ambiguous', 'negative'])
+def test_host_accounting_separates_wsl_allocation_from_growable_free_and_hides_paths(defect):
+    raw = fixture_status()
+    raw['volumes'][0]['contained_in'] = 'penguin-c'
+    allocation = {'complete': True, 'distribution_count': 2, 'current_distribution_count': 1,
+                  'current_distribution_allocated_bytes': 6000,
+                  'all_distributions_allocated_bytes': 6500,
+                  'path': '/private/VHD', 'token': 'never-publish'}
+    cap = measured(source='native_windows', wsl_allocation=allocation)
+    if defect == 'stale':
+        cap['observed_at_utc'] = '2026-10-24T07:00:00+00:00'
+    elif defect == 'partial':
+        allocation['complete'] = False
+    elif defect == 'overstated':
+        allocation['all_distributions_allocated_bytes'] = 9000
+    elif defect == 'ambiguous':
+        allocation['current_distribution_count'] = 2
+    elif defect == 'negative':
+        allocation['current_distribution_allocated_bytes'] = -1
+    raw['volumes'].append({'id': 'penguin-c', 'capacity': cap})
+    result = storage.public_status(raw, now=storage.epoch('2026-10-25T07:01:00+00:00'))
+    wsl = volume(result, 'penguin-wsl')
+    account = wsl['host_storage_accounting']
+    assert account['state'] == ('measured' if defect == 'none' else 'unknown')
+    if defect == 'none':
+        assert account['current_wsl_allocated_bytes'] == 6000
+        assert account['other_wsl_allocated_bytes'] == 500
+        assert account['windows_and_other_used_bytes'] == 1500
+        assert account['current_wsl_capacity_ceiling_bytes'] == 7800
+        assert wsl['capacity']['available_bytes'] == 1800
+        assert wsl['writable_headroom']['available_bytes'] == 1800
+    assert 'private/VHD' not in json.dumps(result) and 'never-publish' not in json.dumps(result)
 
 
 def test_daily_capacity_history_records_each_fresh_volume_once_per_day(tmp_path):
@@ -383,12 +491,43 @@ def test_root_discovery_excludes_symlink_interfaces_and_overlapping_roots(tmp_pa
 def test_remote_failure_is_bounded_and_never_exposes_command_details(monkeypatch):
     monkeypatch.setattr(storage, "ssh_prefix", lambda _config: ["ssh", "private-host"])
     def timeout(*args, **kwargs):
-        assert kwargs["timeout"] == 15
+        assert 14 < kwargs["timeout"] <= 15
         raise subprocess.TimeoutExpired("private-secret", 15, stderr="private-secret")
     monkeypatch.setattr(storage.subprocess, "run", timeout)
     result = storage.remote_capacity({})
     assert result["state"] == "unavailable"
     assert "private" not in json.dumps(result)
+
+
+def test_remote_probe_retries_one_transient_reset_within_original_budget(monkeypatch):
+    monkeypatch.setattr(storage, 'ssh_prefix', lambda _: ['ssh', 'fixed-enrollment'])
+    results = iter([subprocess.CompletedProcess([], 255, '', 'Connection reset by peer'),
+                    subprocess.CompletedProcess([], 0, json.dumps(measured()), '')])
+    timeouts = []
+    def probe(_command, **kwargs):
+        timeouts.append(kwargs['timeout'])
+        return next(results)
+    monkeypatch.setattr(storage.subprocess, 'run', probe)
+    assert storage.remote_capacity({}) == measured()
+    assert len(timeouts) == 2 and 0 < timeouts[1] < timeouts[0] <= 15
+
+
+@pytest.mark.parametrize('results, attempts', [
+    ([subprocess.CompletedProcess([], 255, '', 'Permission denied')], 1),
+    ([subprocess.CompletedProcess([], 255, '', 'REMOTE HOST IDENTIFICATION HAS CHANGED')], 1),
+    ([subprocess.CompletedProcess([], 0, '{"private":"invalid capacity"}', '')], 1),
+    ([subprocess.CompletedProcess([], 255, '', 'Connection reset by peer')] * 2, 2)])
+def test_remote_probe_never_retries_auth_bad_data_or_repeats_forever(monkeypatch, results, attempts):
+    monkeypatch.setattr(storage, 'ssh_prefix', lambda _: ['ssh', 'private-host'])
+    remaining = iter(results)
+    calls = []
+    def probe(*args, **kwargs):
+        calls.append(kwargs['timeout'])
+        return next(remaining)
+    monkeypatch.setattr(storage.subprocess, 'run', probe)
+    result = storage.remote_capacity({})
+    assert result['state'] == 'unavailable' and len(calls) == attempts
+    assert 'private' not in json.dumps(result) and 'observed_at_utc' not in result
 
 
 def test_failed_windows_bridge_does_not_abort_other_volume_observations(monkeypatch):
@@ -434,8 +573,10 @@ def test_capacity_only_cycle_never_starts_census(tmp_path, monkeypatch):
 def test_capacity_ticks_publish_same_scan_progress_and_resume_an_interrupted_census(tmp_path, monkeypatch):
     import tempfile
     from threading import Event
+    from stockagent.data_sync import storage_runtime
 
     monkeypatch.setenv('WSL_DISTRO_NAME', 'test-distro')
+    monkeypatch.setattr(storage, 'DATASET_VERSION_OWNER_DIRECTORY', tmp_path)
     spec = {'id': 'penguin-wsl', 'path': str(tmp_path), 'roots': []}
     config = {'schema_version': 1, 'observer_node_id': 'penguin', 'capacity_interval_seconds': 60,
               'classification_interval_seconds': 21600, 'classification_timeout_seconds': 60,
@@ -473,6 +614,10 @@ def test_capacity_ticks_publish_same_scan_progress_and_resume_an_interrupted_cen
             raise Finished
 
     monkeypatch.setattr(storage, 'observe_capacities', capacities)
+    # This test owns a fake clock for capacity/census turns. A real systemctl
+    # probe's subprocess timeout also calls time.sleep and would accidentally
+    # advance that clock before the next capacity tick.
+    monkeypatch.setattr(storage_runtime, 'collect', lambda *_a, **_k: {})
     monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
     monkeypatch.setattr(storage, 'census', census)
     monkeypatch.setattr(storage.time, 'sleep', next_tick)
@@ -501,6 +646,233 @@ def test_wsl_census_defers_while_exact_retirement_wave_owns_lock(tmp_path, monke
     assert result == {'state': 'deferred', 'reason': 'retirement_wave_active'}
 
 
+@pytest.mark.parametrize('emit_record', [True, False])
+def test_waiting_retirement_preempts_owned_scan_and_releases_lock(tmp_path, monkeypatch, emit_record):
+    import sys
+    import time
+
+    monkeypatch.setattr(storage, 'DATASET_VERSION_OWNER_DIRECTORY', tmp_path)
+    source = tmp_path / 'source'
+    source.mkdir()
+    lock = tmp_path / 'scheduler.lock'
+    lock.touch()
+    child_pid = tmp_path / 'child.pid'
+    roots = [{'path': str(source), 'label': 'project', 'kind': 'source'}]
+    record = ('12\t' + str(source / 'done') + chr(0) + '900\tunfinished').encode()
+    code = ("import os,time\n"
+            f"open({str(child_pid)!r},'w').write(str(os.getpid()))\n"
+            + (f"os.write(1, {record!r})\n" if emit_record else '')
+            + "time.sleep(30)\n")
+    monkeypatch.setattr(storage, 'capacity', lambda *_: measured())
+    monkeypatch.setattr(storage, 'resolve_roots', lambda *_: roots)
+    monkeypatch.setattr(storage, 'du_command', lambda *_: [sys.executable, '-c', code])
+    monkeypatch.setattr(storage, 'CENSUS_PRIORITY_POLL_SECONDS', 0.1)
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: child_pid.exists())
+
+    started = time.monotonic()
+    result = storage.census({'id': 'penguin-wsl', 'path': str(tmp_path)}, tmp_path,
+                            depth=1, timeout=10, wave_lock=lock)
+    assert time.monotonic() - started < 8
+    if emit_record:
+        assert result['state'] == 'partial' and result['preempted'] is True
+        assert result['reason'] == 'retirement_wave_pending'
+        assert result['allocated_bytes'] == 12 and result['allocated_bytes_is_lower_bound']
+    else:
+        assert result == {'state': 'deferred', 'reason': 'retirement_wave_pending'}
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(child_pid.read_text()), 0)
+    with lock.open('r+') as held:
+        fcntl.flock(held, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def test_guarded_census_finishes_normally_without_waiting_retirement(tmp_path, monkeypatch):
+    monkeypatch.setattr(storage, 'DATASET_VERSION_OWNER_DIRECTORY', tmp_path)
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'data').write_bytes(b'data')
+    lock = tmp_path / 'scheduler.lock'
+    lock.touch()
+    monkeypatch.setattr(storage, 'capacity', lambda *_: measured())
+    monkeypatch.setattr(storage, 'resolve_roots', lambda *_: [
+        {'path': str(source), 'label': 'project', 'kind': 'source'}])
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    result = storage.census({'id': 'penguin-wsl', 'path': str(tmp_path)}, tmp_path,
+                            depth=1, timeout=10, wave_lock=lock)
+    assert result['state'] == 'complete' and result['preempted'] is False
+    assert result['roots_completed'] == 1 and result['reclaimable_bytes'] is None
+
+
+def test_transport_retirement_preempts_optional_census_but_not_capacity(tmp_path, monkeypatch):
+    import time
+    config = tmp_path/'configs/data_sync'
+    config.mkdir(parents=True)
+    owner = tmp_path/'owner'
+    owner.mkdir()
+    (config/'storage_monitor.json').write_text(json.dumps({'operations': {
+        'workspace_relocation_state_root': str(owner)}}))
+    (owner/'attempt.json').write_text(json.dumps({
+        'state': 'waiting_for_original_owner_or_reader', 'observed_at_epoch': time.time()}))
+    monkeypatch.setattr(storage, 'trading_opening_census_reason', lambda _: None)
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    for volume in ('penguin-wsl', 'penguin-d', 'penguin-workspace'):
+        assert storage.local_census_priority_reason({'id': volume}, tmp_path) == 'transport_relocation_owner_active'
+    assert storage.local_census_priority_reason({'id': 'penguin-c'}, tmp_path) is None
+    (owner/'attempt.json').write_text(json.dumps({
+        'state': 'waiting_for_original_owner_or_reader', 'observed_at_epoch': time.time() - 121}))
+    assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) is None
+
+
+def test_stale_retirement_counter_still_defers_optional_census_while_original_lock_is_held(tmp_path, monkeypatch):
+    import time
+    config = tmp_path / 'configs/data_sync'
+    config.mkdir(parents=True)
+    owner, backup = tmp_path / 'owner', tmp_path / 'backup'
+    owner.mkdir()
+    backup.mkdir()
+    (config / 'storage_monitor.json').write_text(json.dumps({'operations': {
+        'workspace_relocation_state_root': str(owner), 'backup_state_root': str(backup)}}))
+    (owner / 'retirement-status.json').write_text(json.dumps({
+        'state': 'verifying_and_retiring', 'observed_at_epoch': time.time() - 3600}))
+    monkeypatch.setattr(storage, 'trading_opening_census_reason', lambda _: None)
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    with (backup / 'cycle.lock').open('w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) == 'transport_relocation_owner_active'
+        # The read-only observation did not release or replace the original lock.
+        with (backup / 'cycle.lock').open('r') as probe, pytest.raises(BlockingIOError):
+            fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) is None
+
+
+def test_local_census_observes_existing_dataset_owner_lock_without_disturbing_it(tmp_path, monkeypatch):
+    lock = tmp_path / 'owner.lock'
+    lock.touch()
+    monkeypatch.setattr(storage, 'DATASET_VERSION_OWNER_DIRECTORY', tmp_path)
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    with lock.open('r+') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        assert storage.local_census_priority_reason({'id': 'penguin-d'}, tmp_path) == 'dataset_version_owner_active'
+        assert storage.local_census_priority_reason({'id': 'penguin-wsl'}, tmp_path) == 'dataset_version_owner_active'
+        assert storage.local_census_priority_reason({'id': 'penguin-c'}, tmp_path) is None
+        with lock.open('r+') as contender, pytest.raises(BlockingIOError):
+            fcntl.flock(contender, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    assert storage.local_census_priority_reason({'id': 'penguin-d'}, tmp_path) is None
+    lock.unlink()
+    assert storage.local_census_priority_reason({'id': 'penguin-d'}, tmp_path) is None
+    assert not lock.exists(), 'a monitoring probe must not create an owner lock'
+
+
+def test_d_census_defers_if_dataset_owner_cannot_be_observed(tmp_path, monkeypatch):
+    from stockagent.data_sync import dataset_migration
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    def inaccessible(*_):
+        raise PermissionError('owner cannot be read')
+    monkeypatch.setattr(dataset_migration, 'migration_owner_observation', inaccessible)
+    assert storage.local_census_priority_reason({'id': 'penguin-d'}, tmp_path) == 'dataset_version_owner_unobservable'
+    assert storage.local_census_priority_reason({'id': 'penguin-wsl'}, tmp_path) == 'dataset_version_owner_unobservable'
+    assert storage.local_census_priority_reason({'id': 'penguin-c'}, tmp_path) is None
+
+
+@pytest.mark.parametrize('emit_record', [True, False])
+def test_d_scan_yields_to_new_publication_preserving_partial_observation(tmp_path, monkeypatch, emit_record):
+    import sys
+    source = tmp_path / 'source'
+    source.mkdir()
+    wave_lock = tmp_path / 'scheduler.lock'
+    wave_lock.touch()
+    child_pid = tmp_path / 'child.pid'
+    roots = [{'path': str(source), 'label': 'project', 'kind': 'source'}]
+    record = ('12\t' + str(source / 'done') + chr(0) + '900\tunfinished').encode()
+    code = ("import os,time\n" + f"open({str(child_pid)!r},'w').write(str(os.getpid()))\n"
+            + (f"os.write(1, {record!r})\n" if emit_record else '') + "time.sleep(30)\n")
+    monkeypatch.setattr(storage, 'capacity', lambda *_: measured())
+    monkeypatch.setattr(storage, 'resolve_roots', lambda *_: roots)
+    monkeypatch.setattr(storage, 'du_command', lambda *_: [sys.executable, '-c', code])
+    monkeypatch.setattr(storage, 'CENSUS_PRIORITY_POLL_SECONDS', 0.1)
+    monkeypatch.setattr(storage, 'local_census_priority_reason',
+                        lambda *_: 'dataset_version_owner_active' if child_pid.exists() else None)
+    result = storage.census({'id': 'penguin-d', 'path': str(tmp_path)}, tmp_path,
+                            depth=1, timeout=10, wave_lock=wave_lock)
+    assert result['reason'] == 'dataset_version_owner_active'
+    if emit_record:
+        assert result['state'] == 'partial' and result['preempted'] is True
+        assert result['allocated_bytes'] == 12 and result['allocated_bytes_is_lower_bound']
+    else:
+        assert result['state'] == 'deferred'
+    with pytest.raises(ProcessLookupError):
+        os.kill(int(child_pid.read_text()), 0)
+
+
+def test_public_classification_only_exposes_known_deferral_reasons():
+    raw = fixture_status()
+    raw['volumes'][0]['classification'] = {'state': 'partial', 'tree': [],
+                                            'deferred_reason': 'dataset_version_owner_active'}
+    result = volume(storage.public_status(raw), 'penguin-wsl')['classification']
+    assert result['deferred_reason'] == 'dataset_version_owner_active'
+    for reason in ('tw_opening_guard_active', 'tw_opening_guard_unknown'):
+        raw['volumes'][0]['classification']['deferred_reason'] = reason
+        result = volume(storage.public_status(raw), 'penguin-wsl')['classification']
+        assert result['deferred_reason'] == reason
+    raw['volumes'][0]['classification']['deferred_reason'] = '/private/secret'
+    result = volume(storage.public_status(raw), 'penguin-wsl')['classification']
+    assert result['deferred_reason'] is None
+    raw['volumes'][0]['classification']['deferred_reason'] = ['unexpected']
+    result = volume(storage.public_status(raw), 'penguin-wsl')['classification']
+    assert result['deferred_reason'] is None
+
+
+def test_monitor_keeps_capacity_and_resumes_d_census_after_publication(tmp_path, monkeypatch):
+    import time
+    from threading import Event
+    monkeypatch.setenv('WSL_DISTRO_NAME', 'test-distro')
+    lock = tmp_path / 'owner.lock'
+    lock.touch()
+    owner = lock.open('r+')
+    fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    monkeypatch.setattr(storage, 'DATASET_VERSION_OWNER_DIRECTORY', tmp_path)
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    config = {'schema_version': 1, 'observer_node_id': 'penguin', 'capacity_interval_seconds': 60,
+              'classification_interval_seconds': 21600, 'classification_timeout_seconds': 60,
+              'classification_depth': 2, 'volumes': [{'id': 'penguin-d', 'path': str(tmp_path), 'roots': []}]}
+    config_path, output = tmp_path / 'config.json', tmp_path / 'status.json'
+    config_path.write_text(json.dumps(config))
+    output.write_text(json.dumps({'contract': storage.CONTRACT, 'volumes': [{'id': 'penguin-d',
+        'classification': {'state': 'partial', 'allocated_bytes': 123, 'tree': [],
+            'reason': 'previous_census_interrupted', 'observed_at_utc': storage.utc(),
+            'fingerprint': storage.census_fingerprint(config, config['volumes'][0], None)}}]}))
+    monkeypatch.setattr(storage, 'observe_capacities', lambda _: {'penguin-d': measured(observed_at_utc=storage.utc())})
+    calls, snapshots, started = [], [], Event()
+    def run_census(*args, **kwargs):
+        calls.append(kwargs['previous'])
+        started.set()
+        return {'state': 'complete', 'tree': [], 'observed_at_utc': storage.utc()}
+    monkeypatch.setattr(storage, 'census', run_census)
+    clock = [time.time()]
+    class Finished(Exception):
+        pass
+    def tick(_):
+        snapshots.append(json.loads(output.read_text()))
+        if len(snapshots) == 1:
+            owner.close()
+            clock[0] += 61
+        else:
+            assert started.wait(2)
+            raise Finished
+    monkeypatch.setattr(storage, 'time', SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic, sleep=tick))
+    try:
+        with pytest.raises(Finished):
+            storage.monitor(config_path, output, tmp_path, watch=True)
+    finally:
+        owner.close()
+    first = snapshots[0]['volumes'][0]
+    assert first['capacity']['state'] == 'measured'
+    assert first['classification']['deferred_reason'] == 'dataset_version_owner_active'
+    assert first['classification']['allocated_bytes'] == 123
+    assert snapshots[1]['volumes'][0]['classification']['state'] == 'scanning'
+    assert 'deferred_reason' not in snapshots[1]['volumes'][0]['classification']
+    assert len(calls) == 1
+
+
 def test_runnable_cleanup_defers_census_but_capacity_wait_does_not(tmp_path, monkeypatch):
     from scripts import plan_wsl_retirement_waves as planner
     run_id = 'safe-wave'
@@ -516,7 +888,32 @@ def test_runnable_cleanup_defers_census_but_capacity_wait_does_not(tmp_path, mon
     assert storage.priority_retirement_wave_pending(tmp_path)
 
 
+def test_timer_queue_waiting_for_wave_preempts_census_without_an_agent_run(tmp_path, monkeypatch):
+    from scripts import plan_wsl_retirement_waves as planner
+    monkeypatch.setattr(planner, 'observe_active_supervisors', lambda: [])
+    config = tmp_path/'configs/data_sync/wsl_retirement_queue.json'
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({'contract': 'stockagent.frozen_retirement_queue.v1', 'enabled': True,
+        'state_root': 'service_data/storage-retirement'}))
+    status = tmp_path/'service_data/storage-retirement/status.json'
+    status.parent.mkdir(parents=True)
+    current = {'contract': 'stockagent.frozen_retirement_queue.v1', 'all_enrolled_accepted': False,
+        'observed_at_utc': storage.utc(), 'state': 'waiting_existing_wave'}
+    status.write_text(json.dumps(current))
+    assert storage.priority_retirement_wave_pending(tmp_path)
+    status.write_text(json.dumps({**current, 'state': 'waiting_capacity'}))
+    assert not storage.priority_retirement_wave_pending(tmp_path)
+    status.write_text(json.dumps({**current, 'all_enrolled_accepted': True}))
+    assert not storage.priority_retirement_wave_pending(tmp_path)
+    status.write_text(json.dumps({**current, 'observed_at_utc': '2026-10-25T07:00:00+00:00'}))
+    assert not storage.priority_retirement_wave_pending(tmp_path)
+
+
 def test_capacity_continues_while_wsl_census_is_deferred(tmp_path, monkeypatch):
+    # This capacity/census test must not invoke live WSL probes whose retry
+    # sleeps would be intercepted by the controlled one-tick loop below.
+    import stockagent.data_sync.storage_runtime as runtime
+    monkeypatch.setattr(runtime,'collect',lambda previous,*a,**k:previous)
     monkeypatch.setenv('WSL_DISTRO_NAME', 'test-distro')
     config = {'schema_version': 1, 'observer_node_id': 'penguin', 'capacity_interval_seconds': 60,
               'classification_interval_seconds': 21600, 'classification_timeout_seconds': 60,
@@ -605,6 +1002,27 @@ def test_receiver_storage_receipt_must_match_paired_readiness_identity(tmp_path)
     snapshot.write_text(json.dumps(signed(telemetry)))
     assert storage.receipt_capacities(tmp_path)["nas-disk"]["state"] == "partial"
     assert storage.receipt_classifications(tmp_path) == {}
+
+
+def test_receiver_capacity_cycle_signs_host_metrics_in_same_paired_receipt(tmp_path, monkeypatch):
+    from scripts.backup_delivery_receipt import valid_signature
+    from stockagent.data_sync import storage_runtime
+    pairing = {"producer_device_id": "penguin", "receiver_device_id": "lab203", "repository_id": "a" * 64}
+    config = {"schema_version": 1, "observer_node_id": "lab203", "capacity_interval_seconds": 60,
+        "classification_interval_seconds": 21600, "classification_timeout_seconds": 60,
+        "classification_depth": 2, "pairing": pairing,
+        "volumes": [{"id": "lab203-disk", "path": str(tmp_path), "roots": []}]}
+    path, output = tmp_path / "config.json", tmp_path / "storage-status.json"
+    path.write_text(json.dumps(config))
+    monkeypatch.setattr(storage, "observe_capacities", lambda _: {"lab203-disk": measured()})
+    monkeypatch.setattr(storage_runtime, "receiver_host_observation", lambda *_a, **_k: (
+        {"cpu_sample": {"boot": "private"}}, {"contract": storage_runtime.HOST_RUNTIME_CONTRACT,
+         "observed_at_utc": storage.utc(), "metrics": {"cpu_count": 4}}))
+    storage.monitor(path, output, tmp_path)
+    receipt = json.loads(output.read_text())
+    valid_signature(receipt, storage.CONTRACT)
+    assert receipt["pairing"] == pairing and receipt["host_runtime"]["metrics"]["cpu_count"] == 4
+    assert "private" not in json.dumps(receipt)
 
 
 def test_bad_readiness_checksum_cannot_claim_nas_free_bytes(tmp_path):

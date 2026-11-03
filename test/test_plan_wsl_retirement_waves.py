@@ -1,3 +1,4 @@
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -28,6 +29,34 @@ def test_disjoint_cohorts_can_be_planned_in_serial_or_parallel(tmp_path):
     assert parallel['waves'][0]['capacity_deferrals'] == []
     assert parallel['waves'][0]['capacity_is_reserved'] is False
     assert parallel['authorizes_launch_or_retirement'] is False
+
+
+@pytest.mark.parametrize('mode', ['fixed_d_stage_only', 'd_stage_recovery_only'])
+def test_backup_pool_is_spendable_only_by_explicit_guarded_d_maintenance(tmp_path, mode):
+    row = cohort(tmp_path, 'one', tmp_path / 'one')
+    row[mode] = True
+    if mode == 'fixed_d_stage_only':
+        row['fixed_d_publication'] = {'max_temporary_object_bytes': 4096}
+    free = dict.fromkeys(('wsl', 'windows_c', 'primary_d'), 1024**3)
+    assert planner.build_plan([row], 1, free)['waves'][0]['capacity_deferrals']
+    plan = planner.build_plan([row], 1, free, use_backup_reserve=True)
+    wave = plan['waves'][0]
+    assert wave['capacity_deferrals'] == []
+    assert wave['required_bytes_heuristic'] == wave['workspace_bytes_heuristic']
+    assert wave['retained_reserve_bytes'] == 0
+    assert plan['backup_reserve_pool_bytes'] == planner.RESERVE
+    assert plan['authorizes_launch_or_retirement'] is False
+    for volume in ('wsl', 'windows_c', 'primary_d'):
+        for available in (None, wave['workspace_bytes_heuristic'][volume] - 1):
+            limited = {**free, volume: available}
+            blocked = planner.build_plan([row], 1, limited, use_backup_reserve=True)
+            assert volume in blocked['waves'][0]['capacity_deferrals']
+
+
+def test_backup_pool_never_changes_unscoped_source_sized_work(tmp_path):
+    row = cohort(tmp_path, 'one', tmp_path / 'one')
+    with pytest.raises(ValueError, match='guarded-D'):
+        planner.build_plan([row], 1, {}, use_backup_reserve=True)
 
 
 def test_overlapping_sources_receipts_and_old_blockers_defer(tmp_path):
@@ -72,6 +101,26 @@ def test_fixed_d_only_without_observed_publication_cannot_launch(tmp_path):
     result = planner.build_plan([row], 1, dict.fromkeys(('wsl', 'windows_c', 'primary_d'), 100 * 1024**3))
     assert result['waves'] == []
     assert 'fixed_d_stage_or_publication_unavailable' in row['preflight_deferrals']
+
+
+def test_completed_fixed_stage_inspection_does_not_read_retired_temporary_files(tmp_path, monkeypatch):
+    artifact, receipt = tmp_path/'artifacts', tmp_path/'receipts'
+    receipt.mkdir()
+    inventory = tmp_path/'inventory.json'
+    inventory.write_text(json.dumps({'schema_version': 1, 'contract': planner.owner.MANUAL_WSL_CAPTURE_CONTRACT,
+        'authority_node_id': 'penguin', 'items': [{'relative_root': 'benchmarks/one', 'logical_bytes': 100,
+            'allocated_unique_file_bytes': 128, 'files': 1, 'blockers': []}]}))
+    (receipt/'progress.json').write_text(json.dumps({'inventory_sha256': hashlib.sha256(inventory.read_bytes()).hexdigest(),
+        'all_selected_retired': True}))
+    monkeypatch.setattr(planner.owner, 'source_layout', lambda origin: (artifact, None, None, None))
+    monkeypatch.setattr(planner.owner, 'stage_profile', lambda data: (tmp_path/'stage', True))
+    monkeypatch.setattr(planner.owner, 'require_existing_fixed_d_stage',
+        lambda *a, **kw: pytest.fail('completed cohort must not read a retired stage'))
+    observed = planner.inspect_cohort(inventory, receipt, [], fixed_d_stage_only=True)
+    assert observed['historical_progress'] == 'retired_and_source_absent'
+    plan = planner.build_plan([observed], 1, {})
+    assert observed['preflight_deferrals'] == ['one_or_more_sources_absent_or_already_retired']
+    assert plan['waves'] == []  # The canonical acceptance still has to verify the fixed release.
 
 
 def test_guarded_d_recovery_budget_omits_only_the_disallowed_local_payload(tmp_path):
@@ -170,3 +219,57 @@ def test_inspection_finds_waiter_and_preserves_existing_owner(tmp_path, monkeypa
     assert observed['sources'][0]['present'] is True
     assert observed['canonical_argv'][2:4] == ['scripts/retire_local_offline_artifacts.py', 'apply']
     assert planner.build_plan([observed], 1, {})['waves'] == []
+
+
+@pytest.mark.parametrize('defect', ['none', 'manifest', 'unexpected-entry', 'redirected', 'missing-plan'])
+def test_only_bound_interrupted_quarantine_is_a_resume_candidate(tmp_path, monkeypatch, defect):
+    artifact, hot, states = (tmp_path / name for name in ('artifacts', 'hot', 'states'))
+    for path in (artifact, hot, states):
+        path.mkdir()
+    monkeypatch.setattr(planner.owner, 'source_layout', lambda origin: (artifact, hot, states, None))
+    monkeypatch.setattr(planner.owner, 'stage_profile', lambda data: (tmp_path / 'stage', True))
+    relative, fingerprint = 'benchmarks/suite/one', 'a' * 64
+    dataset = planner.owner.dataset_prefix(None) + hashlib.sha256(
+        (relative + fingerprint).encode()).hexdigest()[:24]
+    inventory = tmp_path / 'inventory.json'
+    inventory.write_text(json.dumps({'schema_version': 1,
+        'contract': planner.owner.MANUAL_WSL_CAPTURE_CONTRACT, 'authority_node_id': 'penguin',
+        'items': [{'relative_root': relative, 'fingerprint': fingerprint,
+                   'logical_bytes': 10, 'allocated_unique_file_bytes': 16,
+                   'files': 1, 'blockers': []}]}))
+    receipt = tmp_path / 'receipt'
+    plan_path = receipt / dataset / 'retirement-plan.json'
+    plan_path.parent.mkdir(parents=True)
+    parent = states / 'retirements/quarantine' / dataset
+    quarantine = parent / 'owned'
+    (quarantine / 'source').mkdir(parents=True)
+    plan = {'dataset': dataset, 'relative_root': relative,
+            'source': str(artifact / relative), 'hot_tree': str(hot / relative),
+            'manual_immediate': True, 'manual_capture': True, 'plan_fingerprint': 'f' * 64,
+            'snapshot_id': 'fixed-snapshot', 'manifest_sha256': 'c' * 64,
+            'full_verification': {'binding': {'dataset': dataset, 'hot': 'absent'}}}
+    state = {key: plan[key] for key in ('dataset', 'relative_root', 'plan_fingerprint',
+                                         'snapshot_id', 'manifest_sha256')}
+    state.update(state='retiring', quarantine=str(quarantine))
+    state_path = states / 'retirements' / (dataset + '.json')
+    if defect == 'manifest':
+        state['manifest_sha256'] = 'd' * 64
+    elif defect == 'unexpected-entry':
+        (quarantine / 'unknown').touch()
+    elif defect == 'redirected':
+        (quarantine / 'source').rmdir()
+        (quarantine / 'source').symlink_to(artifact, target_is_directory=True)
+    state_path.write_text(json.dumps(state))
+    if defect != 'missing-plan':
+        plan_path.write_text(json.dumps(plan))
+    observed = planner.inspect_cohort(inventory, receipt, [])
+    plan_result = planner.build_plan([observed], 1,
+        dict.fromkeys(('wsl', 'windows_c', 'primary_d'), 100 * 1024**3))
+    candidate = observed['sources'][0]['quarantine_resume_candidate']
+    if defect == 'none':
+        assert candidate['dataset'] == dataset and candidate['requires_fresh_owner_proofs']
+        assert plan_result['waves'][0]['cohorts'] == [0]
+        assert plan_result['authorizes_launch_or_retirement'] is False
+    else:
+        assert candidate is None and plan_result['waves'] == []
+        assert 'one_or_more_sources_absent_or_already_retired' in observed['preflight_deferrals']

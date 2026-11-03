@@ -133,7 +133,8 @@ def cnyes_corpus_market_head_audit(root: Path, *, notify=None):
                         pc.or_(pc.starts_with(urls, 'https://news.google.com/'),
                                pc.starts_with(urls, 'http://news.google.com/')))
                     for url in pc.filter(urls, candidates).to_pylist():
-                        if reason := headline_metadata_only_reason(url):
+                        reason = headline_metadata_only_reason(url)
+                        if reason in ('cnyes_market_route', 'literal_google_cnyes_market_route'):
                             reasons[reason] += 1
         after = path.stat()
         if signature != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):

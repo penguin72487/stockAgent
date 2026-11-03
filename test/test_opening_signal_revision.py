@@ -350,6 +350,70 @@ def test_strict_snapshot_rejects_append_during_projection_and_commit_retries(tmp
     assert dashboard.build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(9, 0, 10), require_committed_revision=True)["modes"]
 
 
+@pytest.mark.parametrize("change_phase", ["telemetry", "financial_projection"])
+def test_opening_telemetry_sample_and_financial_commit_have_separate_boundaries(
+    tmp_path, monkeypatch, change_phase,
+):
+    from stockagent.live import tw_day_trade_dashboard as dashboard
+    engine, spec = TwDayTradeSimulationEngine(tmp_path / "state"), revision_spec(tmp_path)
+    register(engine, spec, 0, .2)
+    original = dashboard._tail
+    calls = []
+
+    def concurrent_tail(path, *args, **kwargs):
+        result = original(path, *args, **kwargs)
+        if path.name == "opening_signal_latency.jsonl":
+            calls.append(path.name)
+            if change_phase == "telemetry":
+                engine._persist(_now(9, 0, 9))
+        return result
+
+    monkeypatch.setattr(dashboard, "_tail", concurrent_tail)
+    if change_phase == "financial_projection":
+        original_projection = dashboard._available_session_dates
+
+        def concurrent_projection(*args, **kwargs):
+            result = original_projection(*args, **kwargs)
+            engine._persist(_now(9, 0, 9))
+            return result
+
+        monkeypatch.setattr(dashboard, "_available_session_dates", concurrent_projection)
+    kwargs = dict(state_dir=engine.state_dir, now=_now(9, 0, 10), require_committed_revision=True)
+    if change_phase == "telemetry":
+        snapshot = dashboard.build_dashboard_snapshot(**kwargs)
+        assert snapshot["service_sync"]["state_revision"] == engine.state["state_revision"]
+    else:
+        with pytest.raises(dashboard.DashboardSnapshotChanged, match="commit"):
+            dashboard.build_dashboard_snapshot(**kwargs)
+    assert len(calls) == 1
+
+
+def test_opening_telemetry_appended_after_sample_is_visible_on_next_snapshot(tmp_path, monkeypatch):
+    from stockagent.live import tw_day_trade_dashboard as dashboard
+    engine, spec = TwDayTradeSimulationEngine(tmp_path / "state"), revision_spec(tmp_path)
+    register(engine, spec, 0, .2)
+    path = engine.state_dir / "opening_signal_latency.jsonl"
+    path.write_text('{"example":1}\n', encoding="utf-8")
+    original, reads = dashboard._tail, []
+
+    def concurrent_tail(source, *args, **kwargs):
+        result = original(source, *args, **kwargs)
+        if source == path:
+            reads.append(result)
+            if len(reads) == 1:
+                with path.open("a", encoding="utf-8") as handle:
+                    handle.write('{"example":2}\n')
+        return result
+
+    monkeypatch.setattr(dashboard, "_tail", concurrent_tail)
+    dashboard.build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(9, 0, 10),
+                                       require_committed_revision=True)
+    assert reads == [[{"example": 1}]]
+    dashboard.build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(9, 0, 11),
+                                       require_committed_revision=True)
+    assert reads == [[{"example": 1}], [{"example": 1}, {"example": 2}]]
+
+
 def test_revision_hash_ignores_receipt_book_and_last_tick_churn():
     stamp = int(_now(9, 0, 1).timestamp() * 1000)
     snapshot = PriceSnapshot(prices=np.array([100., 200.]), source="tw_mis",
@@ -472,6 +536,69 @@ def test_policy_requires_explicit_causal_strict_paper_contract(tmp_path):
         previous = revision_summary(0, _now(9, 0, 5))
         revision_fields(policy=SIGNAL_UPDATE_PROGRESSIVE, signal_id="other",
             input_fingerprint=previous["opening_signal_revision"]["input_fingerprint"], previous=previous)
+
+
+def historical_revision_summary(index, published, previous=None):
+    from stockagent.live.tw_day_trade_simulation import PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT
+    return revision_summary(index, published, previous) | {
+        "simulation_replay": True, "historical_minute_valuation": True,
+        "simulation_only": True, "production_order_possible": False,
+        "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+        "published_revision_replay": {"contract": PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT,
+            "plan_sha256": "a" * 64, "source_signal_id": f"original-{index}",
+            "publication_upper_bound": published.isoformat()}}
+
+
+def test_completed_minute_revision_replay_is_opt_in_and_preserves_fifo(tmp_path):
+    from scripts.rebuild_tw_day_trade_open_price_replay import _historical_pending_order_quotes
+    spec = replace(revision_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                   historical_progressive_revision_replay=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    initial = historical_revision_summary(0, _now(9, 0, 10))
+    quote = _quote(minute_volume_lots=100.) | {"execution_price_0901": 1000.,
+        "execution_price_0901_method": "minute_vwap", "quote_at": _now(9, 1).isoformat()}
+    assert engine.register_signal(spec=spec, summary=initial, signal_rows=[_row(.4)],
+        quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1),
+        counterfactual_open_replay=True) == "registered"
+    assert inventory(engine, spec) == 4000
+    original_fill = ledger(engine.fills_path)[0]
+    later = historical_revision_summary(1, _now(9, 1, 10), initial)
+    assert engine.register_signal(spec=spec, summary=later, signal_rows=[dict(_row(.2), open_price=1000.)], quotes={},
+        eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 3),
+        counterfactual_open_replay=True) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert inventory(engine, spec) == 4000 and mode["pending_reduction_orders"]["2330"]["remaining_shares"] == 2000
+    bars = {"2330": {_now(9, 3).isoformat(timespec="minutes"): {
+        "open": 1000., "high": 1001., "low": 999., "close": 1000.,
+        "volume_shares": 100000., "Amount": 100000000., "vwap": 1000.}}}
+    quotes = _historical_pending_order_quotes(mode, bars, observed=_now(9, 3))
+    engine._retry_historical_minute_reduction_orders(mode, quotes, _now(9, 3))
+    assert inventory(engine, spec) == 2000
+    assert ledger(engine.fills_path)[0] == original_fill
+    assert all(fill["simulation_replay"] is True for fill in ledger(engine.fills_path))
+
+
+@pytest.mark.parametrize("damage", ["too_recent", "foreign_plan", "not_simulation", "no_opt_in"])
+def test_historical_revision_replay_rejects_unproven_or_overlapping_clocks(tmp_path, damage):
+    spec = replace(revision_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                   historical_progressive_revision_replay=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    initial = historical_revision_summary(0, _now(9, 0, 10))
+    kwargs = dict(spec=spec, quotes={}, eligibility=_eligibility(), eligibility_coverage={},
+                  signal_rows=[_row(.4)], counterfactual_open_replay=True)
+    assert engine.register_signal(**kwargs, summary=initial, now=_now(9, 1)) == "registered"
+    later = historical_revision_summary(1, _now(9, 1, 10), initial)
+    if damage == "too_recent":
+        later["published_revision_replay"]["publication_upper_bound"] = _now(9, 2, 1).isoformat()
+    elif damage == "foreign_plan":
+        later["published_revision_replay"]["plan_sha256"] = "b" * 64
+    elif damage == "not_simulation":
+        kwargs["counterfactual_open_replay"] = False
+    else:
+        kwargs["spec"] = replace(spec, historical_progressive_revision_replay=False,
+                                 entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    assert engine.register_signal(**kwargs, summary=later, now=_now(9, 3)) != "registered"
+    assert ledger(engine.fills_path) == []
 
 
 def test_skipped_superseded_revisions_are_admitted_but_same_input_is_not():

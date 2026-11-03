@@ -119,9 +119,11 @@ def test_four_bucket_publication_keeps_every_original_recoverable(tmp_path):
 
 
 @pytest.mark.parametrize('failure',[None,'hash','mutation','byte-bound','oversized-corrupt'])
-def test_native_batch_verification_keeps_all_blob_integrity_and_generation_gates(tmp_path,monkeypatch,failure):
+@pytest.mark.parametrize('batch_limit', [16, 128])
+def test_native_batch_verification_keeps_all_blob_integrity_and_generation_gates(tmp_path,monkeypatch,failure,batch_limit):
+    monkeypatch.setattr(native, 'MAX_HASH_BATCH_MEMBERS', batch_limit)
     source=tmp_path/'source';source.mkdir()
-    for index in range(19):
+    for index in range(batch_limit + 3):
         (source/f'blob-{index}').write_bytes(str(index).encode()*300)
     cold=tmp_path/'cold'
     resolved=packed.publish_packed_snapshot(cold,'batch-example',source,loose_file_threshold_bytes=1)
@@ -158,8 +160,8 @@ def test_native_batch_verification_keeps_all_blob_integrity_and_generation_gates
             packed.verify_packed_snapshot(cold,resolved,d_primary_native_blob_reads=True)
     else:
         result=packed.verify_packed_snapshot(cold,resolved,d_primary_native_blob_reads=True)
-        assert result['objects']==19
+        assert result['objects']==batch_limit + 3
         if failure=='byte-bound':
             assert sum(map(len,batches))==10  # larger members still get a full streaming SHA
         else:
-            assert sorted(map(len,batches))==[3,16]
+            assert sorted(map(len,batches))==[3,batch_limit]

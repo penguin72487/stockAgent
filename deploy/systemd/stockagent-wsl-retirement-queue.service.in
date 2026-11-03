@@ -1,0 +1,15 @@
+[Unit]
+Description=Resume approved frozen WSL retirement cohorts through the canonical owner
+After=stockagent-packed-backup.service stockagent-service-layout.service syncthing@root.service
+ConditionPathExists=__REPO_ROOT__/configs/data_sync/wsl_retirement_queue.json
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash -c 'source "__REPO_ROOT__/scripts/runtime_env.sh" && run_fintech_python "__REPO_ROOT__/scripts/run_wsl_retirement_waves.py" --queue-config "__REPO_ROOT__/configs/data_sync/wsl_retirement_queue.json" --apply'
+ExecStartPost=/usr/bin/bash -c 'if [[ -f "__REPO_ROOT__/configs/data_sync/local_testing_artifact_disposition_20261102.json" ]]; then source "__REPO_ROOT__/scripts/runtime_env.sh"; stockagent_discard_exit=0; run_fintech_python "__REPO_ROOT__/scripts/discard_local_testing_artifacts.py" --policy "__REPO_ROOT__/configs/data_sync/local_testing_artifact_disposition_20261102.json" --state "__REPO_ROOT__/service_data/storage-discard/performance-20261102" --apply || stockagent_discard_exit=$$?; if [[ "$$stockagent_discard_exit" != 75 ]]; then exit "$$stockagent_discard_exit"; fi; fi'
+UMask=0077
+Nice=10
+TimeoutStartSec=infinity
+

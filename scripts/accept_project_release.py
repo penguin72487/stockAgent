@@ -27,6 +27,10 @@ if str(ROOT) not in sys.path:
 from downloader.artifact_io import atomic_write_json  # noqa: E402
 from stockagent.runtime_identity import verify_release_bundles, verify_source_release  # noqa: E402
 
+# Release bundles intentionally normalize member modes to 0644. Restore only
+# named, reviewed executable entrypoints; do not trust executable ZIP metadata.
+_EXECUTABLE_ENTRYPOINTS = frozenset({"coda_runner.sh"})
+
 
 def extract_recorded_sources(receipt: Path, destination: Path) -> None:
     """Only extract the unique regular files listed by the verified receipt."""
@@ -54,6 +58,8 @@ def extract_recorded_sources(receipt: Path, destination: Path) -> None:
             path = destination / entry.filename
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(body)
+            if entry.filename in _EXECUTABLE_ENTRYPOINTS:
+                path.chmod(0o700)
     verify_source_release(receipt, destination)
 
 

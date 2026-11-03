@@ -12,6 +12,8 @@ import pytest
 from scripts import run_discord_artifact_maintenance as runner
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
 
+_REAL_WAIT_FOR_TW_PUBLIC_REFRESH = runner._wait_for_tw_public_refresh
+
 
 @pytest.fixture
 def isolated_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -22,7 +24,7 @@ def isolated_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     monkeypatch.setattr(bot, "_rotate_error_log_if_needed", lambda: None)
     monkeypatch.setattr(bot, "_opening_critical_work_pending", lambda: False)
     monkeypatch.setattr(bot, "_interactive_signal_work_pending", lambda: False)
-    monkeypatch.setattr(runner, "_wait_for_tw_public_refresh", lambda: True)
+    monkeypatch.setattr(runner, "_wait_for_tw_public_refresh", lambda **_kw: True)
     monkeypatch.setattr(runner, "_populate_postclose_signal_caches", lambda _, **_kw: (0, 0, 0))
     monkeypatch.setattr(bot, "_artifact_maintenance_markets", lambda: ["market"])
     monkeypatch.setattr(
@@ -69,8 +71,9 @@ def test_source_writer_race_waits_without_failure_or_false_completion(
     monkeypatch.setattr(runner, "_populate_postclose_signal_caches", updating)
     assert runner.run_once(signal_cache_only=cache_only) == 0
     status = json.loads(status_path.read_text())
-    assert status["maintenance_run"]["status"] == "waiting_source"
-    assert status["maintenance_run"]["reason"] == "tw_public_refresh_in_progress"
+    worker = status["signal_cache_maintenance_run" if cache_only else "maintenance_run"]
+    assert worker["status"] == "waiting_source"
+    assert worker["reason"] == "tw_public_refresh_in_progress"
     assert emissions[-1]["status"] == "waiting_source"
     assert emissions[-1]["producer_lock_held"] and emissions[-1]["retryable"]
     assert not any(row.get("status") in {"signal_cache_complete", "complete", "degraded"} for row in emissions)
@@ -90,6 +93,24 @@ def test_only_the_full_isolated_worker_can_request_cold_source_warming(isolated_
     monkeypatch.setattr(runner, "_populate_postclose_signal_caches", caches)
     assert runner.run_once(signal_cache_only=cache_only) == 0
     assert observed == [not cache_only]
+
+
+def test_capacity_wait_preserves_error_evidence_without_false_inference_failure(isolated_worker, monkeypatch):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    status_path, emissions = isolated_worker
+    def unavailable(_):
+        raise CapacityDeferred("physical_backing_reserve", physical_free_bytes=10, required_bytes=100)
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", unavailable)
+    assert runner.run_once() == 0
+    status = json.loads(status_path.read_text())
+    job = status["jobs"]["market"]
+    assert job["status"] == "waiting_source" and job["error_type"] == "CapacityDeferred"
+    assert job["error_details"]["reason"] == "physical_backing_reserve"
+    assert job["error_details"]["allocation_admitted"] is False
+    assert job.get("failure_attempt", 0) == 0 and job["next_retry_at"]
+    assert status["maintenance_run"]["status"] == "waiting_source"
+    assert not any(row.get("status") in {"ready", "failed", "complete"} for row in emissions)
 
 
 @pytest.mark.parametrize("state", ["failed", "ready", "running"])
@@ -182,6 +203,50 @@ def test_other_markets_continue_without_hiding_deferred_work(
     assert emissions[-1]["deferred"] == 1
 
 
+def test_history_source_race_waits_and_other_mode_still_completes(isolated_worker, monkeypatch, tmp_path):
+    status_path, emissions = isolated_worker
+    monkeypatch.setattr(runner.discord_bot, "_artifact_maintenance_markets", lambda: ["market", "other"])
+
+    def inferred(cfg):
+        if cfg.market == "market":
+            raise TWPublicSourceUpdatePending(tmp_path, tmp_path / "writer.lock", observed_in_child=True)
+        return SimpleNamespace(summary={"panel_date": "2026-10-29"}, output_dir=tmp_path)
+
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", inferred)
+    assert runner.run_once() == 0
+    payload = json.loads(status_path.read_text())
+    waiting = payload["jobs"]["market"]
+    assert waiting["status"] == "waiting_source"
+    assert waiting["retry_delay_seconds"] == 60.0
+    assert waiting.get("failure_attempt", 0) == 0
+    assert waiting["error_details"]["current_lock_state"] == "unverified"
+    assert payload["jobs"]["other"]["status"] == "ready"
+    assert payload["maintenance_run"]["status"] == "waiting_source"
+    assert payload["maintenance_run"]["reason"] == "tw_public_refresh_observed_in_child"
+    assert emissions[-1]["lock_deferred"] == 1
+    assert not any(row.get("status") == "failed" for row in emissions)
+
+
+def test_source_wait_does_not_increase_failure_backoff(isolated_worker, monkeypatch, tmp_path):
+    status_path, _ = isolated_worker
+    bot = runner.discord_bot
+    monkeypatch.setenv("STOCKAGENT_ARTIFACT_BACKFILL_RETRY_BASE_SECONDS", "60")
+    monkeypatch.setenv("STOCKAGENT_ARTIFACT_BACKFILL_RETRY_MAX_SECONDS", "120")
+    bot._begin_artifact_backfill("market", "market")
+    first = bot._finish_artifact_backfill("market", "market", status="failed", exc=ValueError("bad data"))
+    assert first["failure_attempt"] == 1
+    for _ in range(3):
+        bot._begin_artifact_backfill("market", "market")
+        waiting = bot._finish_artifact_backfill("market", "market", status="waiting_source",
+            exc=TWPublicSourceUpdatePending(tmp_path, tmp_path / "writer.lock"))
+        assert waiting["failure_attempt"] == 1
+        assert waiting["last_failure"]["error_message"] == "bad data"
+    bot._begin_artifact_backfill("market", "market")
+    second = bot._finish_artifact_backfill("market", "market", status="failed", exc=ValueError("still bad"))
+    assert second["failure_attempt"] == 2 and second["retry_delay_seconds"] == 120.0
+    assert json.loads(status_path.read_text())["jobs"]["market"]["status"] == "failed"
+
+
 def test_running_factorized_source_does_not_spend_attempts_or_block_other_markets(
     isolated_worker, monkeypatch, tmp_path,
 ) -> None:
@@ -229,7 +294,7 @@ def test_close_cache_outcome_is_not_hidden_by_history_retry_or_completion(
 
     status = json.loads(status_path.read_text())
     assert status["jobs"]["market"] == pending  # No extra artifact attempt.
-    worker = status["maintenance_run"]
+    worker = status["signal_cache_maintenance_run" if cache_only else "maintenance_run"]
     assert worker["status"] == ("degraded" if failed else "waiting_source")
     assert worker["failures"] == int(failed)
     assert worker["attempted"] == 2
@@ -237,6 +302,72 @@ def test_close_cache_outcome_is_not_hidden_by_history_retry_or_completion(
     if failed:
         assert worker["reason"] == "postclose_cache_failed"
     assert "complete" not in emissions[-1]["status"]
+
+
+def test_independent_cache_worker_cannot_overwrite_running_history_receipt(isolated_worker, monkeypatch):
+    status_path, _ = isolated_worker
+    history = {"status": "running", "run_id": "history-owner", "updated_at": "2026-10-29T15:47:03+08:00"}
+    status_path.write_text(json.dumps({"jobs": {}, "maintenance_run": history}))
+    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", lambda _, **_kw: (2, 0, 0))
+    assert runner.run_once(signal_cache_only=True) == 0
+    status = json.loads(status_path.read_text())
+    assert status["maintenance_run"] == history
+    assert status["signal_cache_maintenance_run"]["status"] == "complete"
+    assert runner.discord_bot._artifact_backfill_health_summary()["status"] == "running"
+
+
+def test_empty_cache_scope_is_not_a_successful_cache_build(isolated_worker):
+    status_path, emissions = isolated_worker
+    assert runner.run_once(signal_cache_only=True) == 0
+    status = json.loads(status_path.read_text())
+    assert status["signal_cache_maintenance_run"]["status"] == "not_applicable"
+    assert emissions[-1]["status"] == "signal_cache_not_applicable"
+
+
+def test_cache_failure_remains_visible_even_when_history_completed(isolated_worker, monkeypatch):
+    status_path, _ = isolated_worker
+    history = {"status": "complete", "run_id": "history-owner", "updated_at": "2026-10-29T15:47:03+08:00"}
+    status_path.write_text(json.dumps({"jobs": {}, "maintenance_run": history}))
+    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", lambda _, **_kw: (2, 1, 0))
+    assert runner.run_once(signal_cache_only=True) == 1
+    status = json.loads(status_path.read_text())
+    assert status["maintenance_run"] == history
+    health = runner.discord_bot._artifact_backfill_health_summary()
+    assert health["status"] == "degraded"
+    assert health["cache_worker_status"] == "degraded"
+
+
+def test_full_worker_can_recover_an_earlier_cache_failure(isolated_worker, monkeypatch):
+    status_path, _ = isolated_worker
+    status_path.write_text(json.dumps({"jobs": {}, "signal_cache_maintenance_run": {
+        "status": "degraded", "run_id": "old-cache-owner", "reason": "postclose_cache_failed"}}))
+    monkeypatch.setattr(runner, "_populate_postclose_signal_caches", lambda _, **_kw: (2, 0, 0))
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", lambda _: None)
+    assert runner.run_once() == 0
+    status = json.loads(status_path.read_text())
+    assert status["signal_cache_maintenance_run"]["status"] == "complete"
+    assert status["maintenance_run"]["status"] == "complete"
+    assert runner.discord_bot._artifact_backfill_health_summary()["status"] == "ready"
+
+
+def test_cache_source_wait_records_its_own_progress_without_touching_history(isolated_worker, monkeypatch):
+    status_path, _ = isolated_worker
+    history = {"status": "running", "run_id": "history-owner"}
+    status_path.write_text(json.dumps({"jobs": {}, "maintenance_run": history}))
+    states = iter([True, False])
+    monkeypatch.setattr(runner.discord_bot, "_tw_public_refresh_in_progress", lambda: next(states))
+    monkeypatch.setattr(runner.time, "sleep", lambda _seconds: None)
+    transitions = []
+
+    def record(status, **kwargs):
+        transitions.append(status)
+        runner._record_signal_cache_maintenance_run(status, **kwargs)
+
+    assert _REAL_WAIT_FOR_TW_PUBLIC_REFRESH(record_maintenance_run=False, record_worker=record)
+    status = json.loads(status_path.read_text())
+    assert transitions == ["waiting_source", "running"]
+    assert status["maintenance_run"] == history
+    assert status["signal_cache_maintenance_run"]["status"] == "running"
 
 
 def test_cli_retains_global_code_failure_without_spending_artifact_attempts(
@@ -262,7 +393,7 @@ def test_cli_retains_global_code_failure_without_spending_artifact_attempts(
     assert emissions[-1]["status"] == "degraded"
 
 
-@pytest.mark.parametrize("state", ["failed", "running"])
+@pytest.mark.parametrize("state", ["failed", "running", "waiting_source"])
 def test_closed_day_resumes_only_existing_accepted_close_job(
     isolated_worker, monkeypatch, state,
 ):

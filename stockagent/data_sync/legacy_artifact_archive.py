@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import base64
 import binascii
+import errno
 import gzip
-from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager, nullcontext
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
+from contextlib import contextmanager, nullcontext, ExitStack
 import hashlib
 import itertools
 import json
+import logging
 import math
 import os
 import re
@@ -39,6 +41,7 @@ from stockagent.data_sync.desync_snapshots import (
     _raise_walk_error,
     _safe_relative_path,
     atomic_write_json,
+    scan_tree,
     sha256_file,
     validate_slug,
 )
@@ -70,6 +73,8 @@ CODEC_SUFFIXES = {"raw": "raw", "gzip": "gz", "zstd": "zst"}
 C_TEMP_STAGE_ROOT = Path("/var/lib/stockagent-legacy-archive-stage")
 D_BENCHMARK_STAGE_ROOT = Path("/srv/stockagent-d-volume/stockagent-completed-benchmark-scratch")
 D_OFFLINE_STAGE_ROOT = Path("/srv/stockagent-d-volume/stockagent-completed-offline-scratch")
+REVIEWED_STAGE_POLICY = Path(__file__).resolve().parents[2] / 'configs/data_sync/legacy_stage_retirement.json'
+LEGACY_D_STAGE_ROOT = Path('/srv/stockagent-d-volume/stockagent-legacy-archive-stage')
 MANUAL_WSL_CAPTURE_CONTRACT = "manual-wsl-artifact-preservation-v1"
 MANUAL_WSL_SCOPES = {"cache", "replays", "audits", "datasets", "data_repair", "maintenance", "operations", "benchmarks"}
 MANUAL_OFFLINE_SIMULATION_CONTRACT = "manual-wsl-offline-simulation-preservation-v1"
@@ -81,6 +86,8 @@ RETIRED_MINUTE_DERIVED_VIEWS = frozenset({
     "data_tw_minute/research_dataset_developing_v5",
     "data_tw_minute/research_dataset_schema2_volume_bug_20260807",
 })
+
+logger = logging.getLogger(__name__)
 OFFLINE_SIMULATION_PREFIXES = ("official-close-settlement-", "account-addition-",
                                "recompute-all-", "tw-day-trade-independent-")
 
@@ -268,6 +275,51 @@ def _validated_symlinks(rows: Any) -> list[dict[str, Any]]:
     if [row["path"] for row in rows] != sorted(seen):
         raise SnapshotError("legacy symlink inventory is not uniquely sorted")
     return rows
+
+
+def _uniform_source_plan_device_renumber(old: Any, current: Any) -> tuple[int, int] | None:
+    """Recognize one whole-plan device renumber without changing old evidence.
+
+    This is only an admission observation. The caller must still verify every
+    original byte and the independent cold reconstruction before retirement.
+    """
+    if not isinstance(old, list) or not isinstance(current, list) or not old or len(old) != len(current):
+        return None
+    mapping = set()
+    for before, after in zip(old, current, strict=True):
+        if (not isinstance(before, dict) or set(before) != {'path', 'source'}
+                or not isinstance(after, dict) or set(after) != {'path', 'source'}
+                or before['path'] != after['path']
+                or not isinstance(before['source'], dict) or not isinstance(after['source'], dict)
+                or set(before['source']) != set(after['source'])
+                or 'device' not in before['source']):
+            return None
+        source_before, source_after = before['source'], after['source']
+        old_device, new_device = source_before['device'], source_after['device']
+        if (type(old_device) is not int or type(new_device) is not int
+                or min(old_device, new_device) < 0 or old_device == new_device
+                or json.dumps({**source_before, 'device': new_device}, sort_keys=True)
+                   != json.dumps(source_after, sort_keys=True)):
+            return None
+        mapping.add((old_device, new_device))
+    return next(iter(mapping)) if len(mapping) == 1 else None
+
+
+def _symlink_plan_matches_device_renumber(old: Any, current: Any, mapping: tuple[int, int]) -> bool:
+    """Match exact opaque targets and observations apart from the device."""
+    try:
+        before_rows, after_rows = _validated_symlinks(old), _validated_symlinks(current)
+    except (SnapshotError, TypeError, KeyError, ValueError):
+        return False
+    if len(before_rows) != len(after_rows):
+        return False
+    old_device, new_device = mapping
+    for before, after in zip(before_rows, after_rows, strict=True):
+        if (before['path'] != after['path'] or before['target_b64'] != after['target_b64']
+                or before['source']['device'] != old_device or after['source']['device'] != new_device
+                or {**before['source'], 'device': new_device} != after['source']):
+            return False
+    return True
 
 
 def _assert_internal_symlink_targets(rows: list[dict[str, Any]], original_source: Path) -> None:
@@ -497,6 +549,61 @@ class _HashingReader:
 
 NATIVE_ENCODED_READ_MIN_BYTES = 64 * 1024**2
 NATIVE_ENCODED_READ_MAX_BYTES = 8 * 1024**3
+NATIVE_RAW_BATCH_MIN_BYTES = 512 * 1024**2
+
+
+@contextmanager
+def _reviewed_raw_proofs(archive, checked, spec):
+    """One native full-SHA batch, held FDs, no raw payload over the bridge.
+
+    Startup dominates individual mid-size members. Only amortize it across
+    a substantial reviewed raw cohort; gzip/zstd still run their full decoder.
+    Every held FD and name is checked again after the joined row verifiers.
+    """
+    if spec is None or reviewed_retired_stage(spec) is None:
+        yield {}
+        return
+    members = [(archive / encoded, row) for row, _relative, encoded in checked
+               if row['codec'] == 'raw'
+               and NATIVE_ENCODED_READ_MIN_BYTES <= row['encoded_size'] <= NATIVE_ENCODED_READ_MAX_BYTES]
+    if len(members) < 2 or sum(row['encoded_size'] for _path, row in members) < NATIVE_RAW_BATCH_MIN_BYTES:
+        yield {}
+        return
+    try:
+        soft_limit, _hard_limit = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if (soft_limit != resource.RLIM_INFINITY
+                and soft_limit - len(os.listdir('/proc/self/fd')) < len(members) + 16):
+            yield {}
+            return
+    except (OSError, ValueError, OverflowError):
+        yield {}
+        return
+    from stockagent.data_sync.windows_cold_io import hash_many
+    with ExitStack() as descriptors:
+        held = []
+        for path, row in members:
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+            descriptors.callback(os.close, fd)
+            observed = os.fstat(fd)
+            if not stat.S_ISREG(observed.st_mode) or observed.st_size != row['encoded_size']:
+                raise SnapshotError('reviewed raw native cohort member differs')
+            held.append((path, fd, _source_signature(observed)))
+        proofs, batch, batch_bytes = {}, [], 0
+        for path, row in members:
+            if batch and batch_bytes + row['encoded_size'] > 16 * 1024**3:
+                proofs.update(hash_many(batch)); batch, batch_bytes = [], 0
+            batch.append(path); batch_bytes += row['encoded_size']
+        if batch:
+            proofs.update(hash_many(batch))
+        def unchanged():
+            for path, fd, signature in held:
+                if (_source_signature(os.fstat(fd)) != signature
+                        or _source_signature(path.lstat()) != signature):
+                    raise SnapshotError('reviewed raw native cohort changed during verification')
+        unchanged()
+        yield {path.relative_to(archive).as_posix(): (proofs[path], signature['size'])
+               for path, _fd, signature in held}
+        unchanged()
 
 
 @contextmanager
@@ -508,7 +615,8 @@ def _encoded_input(path: Path, fd: int, opened):
     Small members and all other paths retain the original local reader.
     """
     if (NATIVE_ENCODED_READ_MIN_BYTES <= opened.st_size <= NATIVE_ENCODED_READ_MAX_BYTES
-            and any(path.is_relative_to(root) for root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT))):
+            and (any(path.is_relative_to(root) for root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT))
+                 or reviewed_retired_stage_path(path))):
         from stockagent.data_sync.windows_cold_io import binary_reader
         with binary_reader(path, expected_bytes=opened.st_size) as source:
             yield source
@@ -660,6 +768,24 @@ def _encode_one(source_file: Path, target: Path, codec: str, *, durable: bool = 
     return digest.hexdigest()
 
 
+def _encoded_file_evidence(path: Path, *, guarded_d_stage: bool) -> tuple[str, int]:
+    """Read a just-encoded object; retry only a short exact-path D visibility miss.
+
+    A retry never supplies evidence by itself. The real object must still be
+    read and hashed, and all later original/cold recovery checks are required.
+    """
+    delays = (0.05, 0.2, 1.0) if guarded_d_stage else ()
+    for attempt in range(len(delays) + 1):
+        try:
+            return sha256_file(path), path.stat().st_size
+        except FileNotFoundError as error:
+            if attempt == len(delays) or error.filename != str(path):
+                raise
+            logger.warning('Encoded D-stage file temporarily unavailable; retrying %s', path)
+            time.sleep(delays[attempt])
+    raise AssertionError('unreachable')
+
+
 def _manual_capture_usage_gate(source: Path, artifact_root: Path, *, repo_root: Path | None = None,
                                spec: LegacyArchiveSpec | None = None) -> None:
     from stockagent.data_sync.artifact_consumers import artifact_service_references
@@ -691,8 +817,12 @@ def _archive_directories(source: Path, *, allow_symlinks: bool = False) -> list[
 
 def prepare_archive(
     spec: LegacyArchiveSpec, artifact_root: Path, *, manual_capture: bool = False,
-    repo_root: Path | None = None,
+    repo_root: Path | None = None, progress: Callable[[dict], None] | None = None,
+    use_backup_reserve: bool = False,
 ) -> dict[str, Any]:
+    if type(use_backup_reserve) is not bool or (use_backup_reserve and (
+            not manual_capture or spec.stage_root not in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT))):
+        raise SnapshotError('backup reserve use requires an explicit guarded-D manual recovery')
     artifact_root = artifact_root.resolve()
     if spec.compression_profile not in COMPRESSION_PROFILES:
         raise SnapshotError("unknown legacy compression profile")
@@ -702,9 +832,11 @@ def prepare_archive(
     if spec.stage_root in (C_TEMP_STAGE_ROOT, D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT):
         available = shutil.disk_usage(spec.stage_root.parent).free
         planned_bytes = sum(row["source"]["size"] for row in source_plan(source, spec, manual_capture=manual_capture))
-        if available < planned_bytes + 32 * 1024**3:
+        retained_reserve = 0 if use_backup_reserve else 32 * 1024**3
+        if available < planned_bytes + retained_reserve:
             volume = "C" if spec.stage_root == C_TEMP_STAGE_ROOT else "guarded D temporary"
-            raise SnapshotError(f"{volume} archive scratch lacks source-size budget plus 32 GiB reserve")
+            detail = "source-size budget" if use_backup_reserve else "source-size budget plus 32 GiB reserve"
+            raise SnapshotError(f"{volume} archive scratch lacks {detail}")
         # WSL's virtual ext4 free space is not the Windows backing volume's
         # free space. Budget both before a new scratch wave can grow its VHDX.
         windows_c = Path("/mnt/c")
@@ -714,39 +846,81 @@ def prepare_archive(
     references = artifact_process_references(source, legacy_process_scope(spec, artifact_root))
     if references:
         raise SnapshotError(f"legacy source has process references: {references[:3]}")
-    planned = source_plan(source, spec, manual_capture=manual_capture)
+    current_plan = source_plan(source, spec, manual_capture=manual_capture)
+    planned = current_plan
     allow_symlinks = _opaque_symlinks_enabled(spec)
     directories = _archive_directories(source, allow_symlinks=allow_symlinks)
-    symlinks = _archive_symlinks(source, spec) if allow_symlinks else None
+    current_symlinks = _archive_symlinks(source, spec) if allow_symlinks else None
+    symlinks = current_symlinks
     if manual_capture:
         _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
     stage.mkdir(parents=True, exist_ok=True)
     plan_path = stage / "source_plan.json"
+    mapping = None
+    new_plan = False
+    if plan_path.is_symlink():
+        raise SnapshotError("legacy source plan is redirected")
+    if plan_path.exists():
+        prior = json.loads(plan_path.read_text(encoding="utf-8"))
+        if prior != current_plan:
+            # Only the reviewed D scratch can resume an interrupted plan after
+            # WSL renumbers its source device. Keep the original observations
+            # and receipts unchanged; live fences use the current signatures.
+            if (manual_capture and _prunable_stage(spec)
+                    and spec.stage_root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT)):
+                mapping = _uniform_source_plan_device_renumber(prior, current_plan)
+            if mapping is None:
+                raise SnapshotError("legacy source changed since staging began; quarantine stage for audit")
+        planned = prior
+    else:
+        new_plan = True
     if allow_symlinks:
         link_plan_path = stage / "symlink_plan.json"
         if link_plan_path.exists() or link_plan_path.is_symlink():
             if link_plan_path.is_symlink() or not link_plan_path.is_file():
                 raise SnapshotError("legacy symlink plan is redirected")
-            if json.loads(link_plan_path.read_text()) != symlinks:
+            prior_symlinks = json.loads(link_plan_path.read_text())
+            if (prior_symlinks != current_symlinks and (mapping is None
+                    or not _symlink_plan_matches_device_renumber(prior_symlinks, current_symlinks, mapping))):
                 raise SnapshotError("legacy symlinks changed since staging began")
+            symlinks = prior_symlinks
         else:
             if (stage / "receipts").exists() or archive.exists():
                 raise SnapshotError("interrupted stage has no frozen symlink plan")
             atomic_write_json(link_plan_path, symlinks)
-    if plan_path.exists():
-        prior = json.loads(plan_path.read_text(encoding="utf-8"))
-        if prior != planned:
-            raise SnapshotError("legacy source changed since staging began; quarantine stage for audit")
-    else:
+    if new_plan:
         atomic_write_json(plan_path, planned)
     receipts = stage / "receipts"
     receipts.mkdir(exist_ok=True)
     result_rows: list[dict[str, Any]] = []
+    completed_bytes, last_report = 0, 0.0
+    source_bytes_total = sum(row['source']['size'] for row in planned)
+    def report_preparation(*, force=False, state='running'):
+        nonlocal last_report
+        if progress is None:
+            return
+        now = time.monotonic()
+        if force or now - last_report >= 10:
+            progress({'stage': 'encode-and-check-receipts', 'state': state,
+                      'files_completed': len(result_rows), 'files_total': len(planned),
+                      'source_bytes_completed': completed_bytes,
+                      'source_bytes_total': source_bytes_total,
+                      'acceptance': False})
+            last_report = now
+    def record_rows(batch):
+        nonlocal completed_bytes
+        for row in batch:
+            result_rows.append(row)
+            completed_bytes += row['source']['size']
+        report_preparation()
+    report_preparation(force=True)
+    current_by_path = {item['path']: item['source'] for item in current_plan}
     def stage_item(item):
         relative = item["path"]
         source_file = source.joinpath(*PurePosixPath(relative).parts)
         signature = item["source"]
-        if _source_signature(source_file.lstat()) != signature:
+        current_signature = current_by_path[relative]
+        if _source_signature(source_file.lstat()) != current_signature:
             raise SnapshotError(f"legacy source changed during staging: {source_file}")
         key = hashlib.sha256(relative.encode("utf-8")).hexdigest()
         receipt_path = receipts / f"{key}.json"
@@ -782,7 +956,7 @@ def prepare_archive(
             trial = trial_root / f"{key}-{uuid.uuid4().hex}.{CODEC_SUFFIXES[trial_codec]}"
             trial_hash = _encode_one(source_file, trial, trial_codec, durable=spec.durable_staging,
                                      compression_level=level)
-            if _source_signature(source_file.lstat()) != signature:
+            if _source_signature(source_file.lstat()) != current_signature:
                 raise SnapshotError("legacy source changed during compression trial; trial retained")
             # Actual complete-file gain, not extension or a nonrepresentative
             # sample. Do not spend D writes/reads on incompressible encodings.
@@ -797,19 +971,22 @@ def prepare_archive(
             original_hash = (_encode_one(source_file, encoded_file, codec) if spec.durable_staging else
                              _encode_one(source_file, encoded_file, codec, durable=False))
             if trial is not None:
-                if original_hash != trial_hash or _source_signature(source_file.lstat()) != signature:
+                if original_hash != trial_hash or _source_signature(source_file.lstat()) != current_signature:
                     raise SnapshotError("legacy source changed between codec trials; trial retained")
                 trial.unlink()  # exact, privately created rejected encoding only
-        if _source_signature(source_file.lstat()) != signature:
+        if _source_signature(source_file.lstat()) != current_signature:
             raise SnapshotError(f"legacy source changed during compression: {source_file}")
+        encoded_hash, encoded_size = _encoded_file_evidence(encoded_file,
+            guarded_d_stage=(manual_capture and _prunable_stage(spec)
+                and spec.stage_root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT)))
         row = {
             "path": relative,
             "source": signature,
             "original_sha256": original_hash,
             "codec": codec,
             "encoded_path": encoded_path,
-            "encoded_sha256": sha256_file(encoded_file),
-            "encoded_size": encoded_file.stat().st_size,
+            "encoded_sha256": encoded_hash,
+            "encoded_size": encoded_size,
         }
         if spec.durable_staging:
             atomic_write_json(receipt_path, row)
@@ -834,7 +1011,8 @@ def prepare_archive(
         with large_file_lock if item['source']['size'] >= 64 * 1024**2 else nullcontext():
             return stage_item(item)
     if workers == 1:
-        result_rows = list(map(guarded_stage_item, planned))
+        for row in map(guarded_stage_item, planned):
+            record_rows((row,))
     else:
         keys = [hashlib.sha256(item['path'].encode('utf-8')).digest() for item in planned]
         if len(set(keys)) != len(keys):
@@ -842,15 +1020,16 @@ def prepare_archive(
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='legacy-stage') as executor:
             iterator = iter(planned)
             while batch := list(itertools.islice(iterator, 32)):
-                result_rows.extend(executor.map(guarded_stage_item, batch))
+                record_rows(executor.map(guarded_stage_item, batch))
+    report_preparation(force=True, state='encoded-files-checked')
     # Per-file checks alone miss an earlier file changing, or a new path
     # appearing, while a later file is being encoded. Require the whole tree
     # to remain identical before exposing the preservation manifest.
-    if source_plan(source, spec, manual_capture=manual_capture) != planned:
+    if source_plan(source, spec, manual_capture=manual_capture) != current_plan:
         raise SnapshotError("legacy source changed during staging; stage retained for audit")
     if _archive_directories(source, allow_symlinks=allow_symlinks) != directories:
         raise SnapshotError("legacy directories changed during staging; stage retained for audit")
-    if allow_symlinks and _archive_symlinks(source, spec) != symlinks:
+    if allow_symlinks and _archive_symlinks(source, spec) != current_symlinks:
         raise SnapshotError("legacy symlinks changed during staging; stage retained for audit")
     if manual_capture:
         _manual_capture_usage_gate(source, artifact_root, repo_root=repo_root, spec=spec)
@@ -892,9 +1071,48 @@ def _capture_manifest(spec, planned, directories, result_rows, *, manual_capture
     return manifest
 
 
+def _read_interrupted_capture_receipt(stage: Path, archive: Path, item: dict) -> tuple | None:
+    """Read one bounded receipt without following a redirected receipt file."""
+    key = hashlib.sha256(item['path'].encode('utf-8')).hexdigest()
+    receipt_name = 'receipts/' + key + '.json'
+    receipt = stage / receipt_name
+    try:
+        fd = os.open(receipt, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        return None
+    except OSError as error:
+        if error.errno == errno.ELOOP:
+            raise SnapshotError('interrupted per-file encoding control is invalid') from error
+        raise
+    with os.fdopen(fd, 'rb') as stream:
+        before = os.fstat(stream.fileno())
+        if not stat.S_ISREG(before.st_mode) or before.st_size > 64 * 1024:
+            raise SnapshotError('interrupted per-file encoding control is invalid')
+        content = stream.read(64 * 1024 + 1)
+        after = os.fstat(stream.fileno())
+    fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns')
+    if (len(content) > 64 * 1024 or len(content) != before.st_size
+            or any(getattr(before, name) != getattr(after, name) for name in fields)):
+        raise SnapshotError('interrupted per-file encoding control changed while reading')
+    row = json.loads(content)
+    if (not isinstance(row, dict) or set(row) != {'path', 'source', 'codec', 'encoded_path',
+            'encoded_sha256', 'encoded_size', 'original_sha256'}
+            or row['path'] != item['path']
+            or json.dumps(row['source'], sort_keys=True) != json.dumps(item['source'], sort_keys=True)
+            or not isinstance(row['codec'], str) or row['codec'] not in CODEC_SUFFIXES
+            or row['encoded_path'] != f"payload/{key[:2]}/{key}.{CODEC_SUFFIXES[row['codec']]}"
+            or type(row['encoded_size']) is not int or row['encoded_size'] < 0
+            or any(not isinstance(row[k], str) or re.fullmatch('[0-9a-f]{64}', row[k]) is None
+                   for k in ('original_sha256', 'encoded_sha256'))):
+        raise SnapshotError('interrupted encoding receipt differs from its original plan')
+    if not (archive / row['encoded_path']).exists():
+        return None
+    return row, receipt_name, 'archive/' + row['encoded_path']
+
+
 def recover_complete_archive_manifest(
     spec: LegacyArchiveSpec, artifact_root: Path, *, manual_capture: bool = False,
-    repo_root: Path | None = None,
+    repo_root: Path | None = None, progress: Callable[[dict], None] | None = None,
 ) -> dict[str, Any] | None:
     """Finish only a complete interrupted encoding, with no payload writes.
 
@@ -941,6 +1159,7 @@ def recover_complete_archive_manifest(
             changed += 1
     if mappings and (len(mappings) != 1 or changed != len(planned)):
         raise SnapshotError('interrupted capture has a partial or mixed device renumber')
+    mapping = next(iter(mappings)) if mappings else None
     allow_symlinks = _opaque_symlinks_enabled(spec)
     directories = _archive_directories(source, allow_symlinks=allow_symlinks)
     symlinks = None
@@ -950,33 +1169,53 @@ def recover_complete_archive_manifest(
         if link_plan.is_symlink() or not link_plan.is_file() or link_plan.stat().st_size > 64 * 1024**2:
             raise SnapshotError('interrupted capture lacks its frozen symlink plan')
         symlinks = _validated_symlinks(json.loads(link_plan.read_text()))
-        if _archive_symlinks(source, spec) != symlinks:
+        current_symlinks = _archive_symlinks(source, spec)
+        if (current_symlinks != symlinks and (mapping is None
+                or not _symlink_plan_matches_device_renumber(symlinks, current_symlinks, mapping))):
             raise SnapshotError('source symlinks changed since interrupted capture')
         expected.add('symlink_plan.json')
-    for item in planned:
-        key = hashlib.sha256(item['path'].encode('utf-8')).hexdigest()
-        receipt_name = 'receipts/' + key + '.json'
-        receipt = stage / receipt_name
-        if not receipt.exists():
+    def read_receipt(item):
+        return _read_interrupted_capture_receipt(stage, archive, item)
+
+    last_report = 0.0
+    def report_receipts(*, force=False, state='running'):
+        nonlocal last_report
+        if progress is None:
+            return
+        now = time.monotonic()
+        if force or now - last_report >= 10:
+            progress({'stage': 'inspect-interrupted-receipts', 'state': state,
+                      'files_completed': len(rows), 'files_total': len(planned),
+                      'acceptance': False})
+            last_report = now
+
+    def consume(observations):
+        for observation in observations:
+            if observation is None:
+                report_receipts(force=True, state='incomplete')
+                return False
+            row, receipt_name, encoded_name = observation
+            expected.update((receipt_name, encoded_name))
+            rows.append(row)
+            if len(rows) % 32 == 0:
+                report_receipts()
+        report_receipts()
+        return True
+
+    # Receipts have independent names. Keep the original plan order and bound
+    # read-ahead so an earlier missing/corrupt receipt retains its semantics.
+    report_receipts(force=True)
+    workers = _d_stage_file_workers(spec, archive) if manual_capture and _prunable_stage(spec) else 1
+    if workers == 1:
+        if not consume(map(read_receipt, planned)):
             return None
-        if receipt.is_symlink() or not receipt.is_file() or receipt.stat().st_size > 64 * 1024:
-            raise SnapshotError('interrupted per-file encoding control is invalid')
-        row = json.loads(receipt.read_text())
-        if (not isinstance(row, dict) or set(row) != {'path', 'source', 'codec', 'encoded_path',
-                'encoded_sha256', 'encoded_size', 'original_sha256'}
-                or row['path'] != item['path']
-                or json.dumps(row['source'], sort_keys=True) != json.dumps(item['source'], sort_keys=True)
-                or not isinstance(row['codec'], str) or row['codec'] not in CODEC_SUFFIXES
-                or row['encoded_path'] != f"payload/{key[:2]}/{key}.{CODEC_SUFFIXES[row['codec']]}"
-                or type(row['encoded_size']) is not int or row['encoded_size'] < 0
-                or any(not isinstance(row[k], str) or re.fullmatch('[0-9a-f]{64}', row[k]) is None
-                       for k in ('original_sha256', 'encoded_sha256'))):
-            raise SnapshotError('interrupted encoding receipt differs from its original plan')
-        encoded = archive / row['encoded_path']
-        if not encoded.exists():
-            return None
-        expected.update((receipt_name, 'archive/' + row['encoded_path']))
-        rows.append(row)
+    else:
+        with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='legacy-receipts') as executor:
+            iterator = iter(planned)
+            while batch := list(itertools.islice(iterator, 32)):
+                if not consume(executor.map(read_receipt, batch)):
+                    return None
+    report_receipts(force=True, state='receipt-scan-complete')
     # A complete stage is metadata-only recovery, not another source-sized wave.
     before_stage = metadata_tree(stage)
     if ({r['path'] for r in before_stage['rows'] if r['kind'] == 'file'} != expected
@@ -1002,7 +1241,7 @@ def recover_complete_archive_manifest(
             raise SnapshotError('current source bytes differ from the interrupted original')
     if (source_plan(source, spec, manual_capture=manual_capture) != current
             or _archive_directories(source, allow_symlinks=allow_symlinks) != directories
-            or (allow_symlinks and _archive_symlinks(source, spec) != symlinks)
+            or (allow_symlinks and _archive_symlinks(source, spec) != current_symlinks)
             or metadata_tree(stage)['fingerprint'] != before_stage['fingerprint']
             or artifact_process_references(stage, legacy_process_scope(spec, artifact_root))):
         raise SnapshotError('source or encoding changed during complete manifest recovery')
@@ -1016,7 +1255,8 @@ def recover_complete_archive_manifest(
 
 def _d_stage_file_workers(spec: LegacyArchiveSpec | None, archive: Path) -> int:
     """Bound reads to an enrolled D stage or this process's prune quarantine."""
-    if spec is not None and spec.stage_root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT):
+    if spec is not None and (spec.stage_root in (D_BENCHMARK_STAGE_ROOT, D_OFFLINE_STAGE_ROOT)
+                             or reviewed_retired_stage(spec) is not None):
         allowed = {
             (spec.stage_root / spec.dataset / 'archive').absolute(),
             (spec.stage_root / f'.{spec.dataset}.pruning-{os.getpid()}' / 'archive').absolute(),
@@ -1223,14 +1463,19 @@ def _verify_archive_directory(
 
     large_file_lock = threading.Lock()
 
-    def verify_row(checked):
+    def verify_row(checked, raw_proofs=None):
         row, relative, encoded = checked
         encoded_file = archive.joinpath(*PurePosixPath(encoded).parts)
         encoded_signature = encoded_paths.regular_file_signature(encoded)
         if encoded_signature[2] != row["encoded_size"]:
             raise SnapshotError(f"legacy encoded file differs: {encoded}")
-        with large_file_lock if row['encoded_size'] >= NATIVE_ENCODED_READ_MIN_BYTES else nullcontext():
-            encoded_digest, encoded_size, digest, size = _encoded_original_hashes(encoded_file, row["codec"])
+        raw_proof = (raw_proofs or {}).get(encoded)
+        if raw_proof is not None:
+            encoded_digest, encoded_size = raw_proof
+            digest, size = raw_proof  # Raw is exactly the decoded original.
+        else:
+            with large_file_lock if row['encoded_size'] >= NATIVE_ENCODED_READ_MIN_BYTES else nullcontext():
+                encoded_digest, encoded_size, digest, size = _encoded_original_hashes(encoded_file, row["codec"])
         if encoded_paths.regular_file_signature(encoded) != encoded_signature:
             raise SnapshotError(f"legacy encoded file changed during verification: {encoded}")
         if encoded_size != row["encoded_size"] or encoded_digest != row["encoded_sha256"]:
@@ -1269,7 +1514,15 @@ def _verify_archive_directory(
         # the same pass-pinned directory and per-file generation checks.
         with ThreadPoolExecutor(max_workers=file_workers) as executor:
             while batch := list(itertools.islice(checked, 64)):
-                yield from executor.map(verify_row, batch)
+                with _reviewed_raw_proofs(archive, batch, spec) as proofs:
+                    futures = [executor.submit(verify_row, row, proofs) for row in batch]
+                    try:
+                        for future in as_completed(futures):
+                            yield future.result()
+                    finally:
+                        # Keep the native batch's descriptor fences alive
+                        # until every verifier joins, including failures.
+                        wait(futures)
 
     for index, (size, drift) in enumerate(verified_rows(), start=1):
         if drift is not None:
@@ -1395,7 +1648,16 @@ def publish_archive(
                else {}),
             **_native_publish_options(sync_root),
         )
-    verify_packed_snapshot(sync_root, resolved, materialized_path=archive, **_native_read_options(sync_root))
+    def readback_progress(observation):
+        # This is an observation inside publication, not a retirement or
+        # independent recovery receipt. Keep the original callback contract.
+        publication_progress({**observation,
+            'stage': 'post-publication-' + str(observation.get('stage', 'unknown')),
+            'acceptance': False})
+    verify_packed_snapshot(sync_root, resolved, materialized_path=archive,
+                           materialized_file_workers=file_workers,
+                           **({'progress': readback_progress} if publication_progress is not None else {}),
+                           **_native_read_options(sync_root))
     # Publication may have been slow. Never declare the hot source preserved
     # if it changed after the archive verification but before the cold commit.
     verify_archive_directory(archive, source, spec=spec, manual_capture=manual_capture,
@@ -1557,8 +1819,74 @@ def _stage_cold_generation(sync_root: Path, spec: LegacyArchiveSpec) -> dict[str
             "manifest_sha256": resolved.manifest_sha256, "objects": objects}
 
 
+def _reviewed_stage_recovery_options(spec, sync_root, state_root):
+    options = _native_read_options(sync_root)
+    if options and reviewed_retired_stage(spec) is not None:
+        from stockagent.data_sync.packed_verification import configuration
+        compute = configuration(spec.dataset)
+        if compute is not None:
+            directory = state_root / 'stage-pruning' / spec.dataset / 'pack-verification' / uuid.uuid4().hex
+            options['pack_verification'] = {**compute, 'evidence_directory': str(directory)}
+        options['d_primary_native_original_hashes'] = True
+    return options
+
+
+def reviewed_retired_stage(spec: LegacyArchiveSpec) -> dict | None:
+    """Only individually pinned retired D encodings; never discover candidates."""
+    if spec.stage_root != LEGACY_D_STAGE_ROOT or not REVIEWED_STAGE_POLICY.exists():
+        return None
+    if REVIEWED_STAGE_POLICY.is_symlink() or REVIEWED_STAGE_POLICY.stat().st_size > 65536:
+        raise SnapshotError('reviewed legacy-stage policy is redirected or oversized')
+    policy = json.loads(REVIEWED_STAGE_POLICY.read_bytes())
+    rows = policy.get('datasets')
+    if (policy.get('schema_version') != 1 or policy.get('contract') != 'reviewed_retired_legacy_d_encoding_v1'
+            or policy.get('authority_node_id') != 'penguin' or policy.get('stage_root') != str(LEGACY_D_STAGE_ROOT)
+            or not isinstance(rows, dict) or len(rows) > 32):
+        raise SnapshotError('reviewed legacy-stage policy scope differs')
+    selected = rows.get(spec.dataset)
+    if selected is None:
+        return None
+    if (not isinstance(selected, dict) or set(selected) != {
+            'relative_root', 'snapshot_id', 'manifest_sha256', 'retirement_receipt_sha256'}
+            or selected.get('relative_root') != spec.relative_root
+            or not isinstance(selected.get('snapshot_id'), str)
+            or any(not isinstance(selected.get(key), str) or not re.fullmatch('[a-f0-9]{64}', selected[key])
+                   for key in ('manifest_sha256', 'retirement_receipt_sha256'))):
+        raise SnapshotError('reviewed legacy-stage dataset binding differs')
+    return selected
+
+
+def _check_reviewed_retired_stage(spec, resolved, state_path):
+    binding = reviewed_retired_stage(spec)
+    if binding is not None and (binding['snapshot_id'] != resolved.manifest['snapshot_id']
+            or binding['manifest_sha256'] != resolved.manifest_sha256
+            or state_path.is_symlink() or sha256_file(state_path) != binding['retirement_receipt_sha256']):
+        raise SnapshotError('reviewed legacy-stage fixed release or retirement receipt changed')
+
+
+def reviewed_retired_stage_path(path: Path) -> bool:
+    """Read-only native input for an exact enrolled archive or owned quarantine."""
+    try:
+        parts = Path(path).relative_to(LEGACY_D_STAGE_ROOT).parts
+    except ValueError:
+        return False
+    if len(parts) < 3 or parts[1] != 'archive':
+        return False
+    dataset = parts[0]
+    suffix = f'.pruning-{os.getpid()}'
+    if dataset.startswith('.') and dataset.endswith(suffix):
+        dataset = dataset[1:-len(suffix)]
+    if not re.fullmatch(r'[a-z0-9][a-z0-9-]{0,127}', dataset):
+        return False
+    specs = load_legacy_specs(Path(__file__).resolve().parents[2] / 'configs/data_sync/legacy_artifact_archives.json')
+    spec = specs.get(dataset)
+    return spec is not None and reviewed_retired_stage(spec) is not None
+
+
 def _prunable_stage(spec: LegacyArchiveSpec) -> bool:
     if spec.stage_root == C_TEMP_STAGE_ROOT:
+        return True
+    if reviewed_retired_stage(spec) is not None:
         return True
     reviewed = ((spec.stage_root == D_BENCHMARK_STAGE_ROOT
                  and spec.relative_root.startswith("benchmarks/")
@@ -1595,12 +1923,13 @@ def _stage_prune_metadata_workers(spec: LegacyArchiveSpec, stage: Path) -> int:
 
 
 def plan_archive_stage_prune(
-    spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path
+    spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     """Audit bounded temporary encoding only after exact hot retirement.
 
-    Existing D legacy stages/objects remain excluded. Only the separate explicit
-    completed-benchmark scratch may share these full recovery/quarantine gates.
+    D legacy stages require a separate exact release/retirement enrollment.
+    Source objects remain excluded. All original recovery/quarantine gates run.
     """
     if not _prunable_stage(spec):
         raise SnapshotError("stage pruning is restricted to the reviewed temporary roots")
@@ -1616,6 +1945,7 @@ def plan_archive_stage_prune(
         raise SnapshotError("encoding stage is missing or redirected")
     state = json.loads((state_root / "retirements" / f"{spec.dataset}.json").read_text())
     resolved = resolve_latest_packed(sync_root, spec.dataset)
+    _check_reviewed_retired_stage(spec, resolved, state_root / 'retirements' / (spec.dataset + '.json'))
     if (state.get("state") != "cold-only" or state.get("dataset") != spec.dataset
         or state.get("relative_root") != spec.relative_root
         or state.get("snapshot_id") != resolved.manifest["snapshot_id"]):
@@ -1628,14 +1958,41 @@ def plan_archive_stage_prune(
     metadata_workers = _stage_prune_metadata_workers(spec, stage)
     identity_before = {"dataset": spec.dataset, "snapshot_id": resolved.manifest["snapshot_id"],
                        "manifest_sha256": resolved.manifest_sha256}
-    stage_before = _stage_prune_fingerprint(stage, identity_before, file_workers=metadata_workers)
-    proof = verify_archive_directory(archive, spec=spec, file_workers=workers)
+    stage_before = _stage_prune_fingerprint(stage, identity_before, file_workers=metadata_workers,
+        **_stage_progress_option(progress, 'plan-initial-stage-fingerprint'))
+    proof = verify_archive_directory(archive, spec=spec, file_workers=workers,
+        **_stage_progress_option(progress, 'plan-verify-archive'))
     if sha256_file(archive / "legacy_archive_manifest.json") != resolved.manifest.get("metadata", {}).get("legacy_manifest_sha256"):
         raise SnapshotError("encoding stage manifest differs from the cold release")
     inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
-    verify_packed_snapshot(sync_root, resolved, materialized_path=archive,
-                           reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
-                           materialized_file_workers=workers, **_native_read_options(sync_root))
+    reviewed = reviewed_retired_stage(spec) is not None
+    if reviewed:
+        # The archive verifier just hashed every encoded byte and decoded
+        # original. Join its exact file commitments to the cold inventory;
+        # independently reconstruct ALL cold files, then retain the original
+        # portable-tree metadata fence. Rereading the same stage payloads
+        # adds no independent cold-recovery proof.
+        expected_files = {'legacy_archive_manifest.json': (
+            (archive / 'legacy_archive_manifest.json').stat().st_size,
+            resolved.manifest['metadata']['legacy_manifest_sha256'])}
+        expected_files.update({row['encoded_path']: (row['encoded_size'], row['encoded_sha256'])
+                               for row in proof['manifest']['files']})
+        cold_files = {row['path']: (row['size'], row['sha256']) for row in inventory if row['kind'] == 'file'}
+        if cold_files != expected_files:
+            raise SnapshotError('reviewed encoding commitments differ from the complete cold inventory')
+        cold_proof = verify_packed_snapshot(sync_root, resolved, reconstruct_all=True,
+            **_reviewed_stage_recovery_options(spec, sync_root, state_root),
+            **_stage_progress_option(progress, 'plan-reconstruct-cold'))
+        if (cold_proof.get('independently_reconstructed_files') != len(expected_files)
+                or cold_proof.get('independently_reconstructed_bytes') != sum(v[0] for v in expected_files.values())
+                or scan_tree(archive, file_workers=workers)['portable_fingerprint_sha256']
+                    != resolved.manifest['source']['portable_fingerprint_sha256']):
+            raise SnapshotError('reviewed encoding complete recovery counts or portable metadata differ')
+    else:
+        cold_proof = verify_packed_snapshot(sync_root, resolved, materialized_path=archive,
+            reconstruct_paths=[row['path'] for row in inventory if row['kind'] == 'file'],
+            materialized_file_workers=workers, **_native_read_options(sync_root),
+            **_stage_progress_option(progress, 'plan-reconstruct-cold'))
     rows = proof["manifest"]["files"]
     if json.loads((stage / "source_plan.json").read_text()) != [
         {"path": row["path"], "source": row["source"]} for row in rows
@@ -1665,10 +2022,16 @@ def plan_archive_stage_prune(
             while batch := list(itertools.islice(iterator, 64)):
                 yield from executor.map(check_receipt, batch)
 
-    for row, name in zip(rows, checked_receipts()):
+    receipt_progress = _stage_progress_callback(progress, 'plan-check-receipts')
+    if receipt_progress is not None:
+        receipt_progress({'stage': 'check-receipts', 'completed_items': 0, 'total_items': len(rows)})
+    for index, (row, name) in enumerate(zip(rows, checked_receipts()), 1):
         expected.add("archive/" + row["encoded_path"])
         expected.add(name)
-    signatures, reclaimable = _stage_prune_signatures(stage, file_workers=metadata_workers, collect_allocation=True)
+        if receipt_progress is not None and (index % 64 == 0 or index == len(rows)):
+            receipt_progress({'stage': 'check-receipts', 'completed_items': index, 'total_items': len(rows)})
+    signatures, reclaimable = _stage_prune_signatures(stage, file_workers=metadata_workers, collect_allocation=True,
+        **_stage_progress_option(progress, 'plan-final-stage-fingerprint'))
     observed_paths = {row["path"] for row in signatures}
     duplicates = []
     for extra in sorted(observed_paths-expected):
@@ -1695,13 +2058,29 @@ def plan_archive_stage_prune(
             "manifest_sha256": resolved.manifest_sha256, "apply_ready": True,
             "stage_fingerprint": fingerprint,
             "verified_duplicate_control_files": duplicates,
-            "full_verification": {"contract": "owned-archive-stage-verification-v1",
+            "full_verification": {"contract": ('owned-archive-stage-verification-v2' if reviewed
+                                                 else 'owned-archive-stage-verification-v1'),
                 "verified_at_epoch": time.time(), "cold_generation": generation,
+                **({'encoding_stage_fingerprint': fingerprint,
+                    'encoding_manifest_sha256': resolved.manifest['metadata']['legacy_manifest_sha256'],
+                    'complete_cold_reconstruction': cold_proof} if reviewed else {}),
                 "artifact_root": str(artifact_root.resolve()), "state_root": str(state_root.resolve())},
             "reclaimable_allocated_file_bytes": reclaimable, "cold_objects_deleted": 0}
 
 
-def _stage_prune_signatures(stage: Path, *, file_workers: int = 1, collect_allocation: bool = False):
+def _stage_progress_callback(progress, step):
+    if progress is None:
+        return None
+    return lambda observation: progress({**observation, 'prune_step': step, 'acceptance_proof': False})
+
+
+def _stage_progress_option(progress, step):
+    callback = _stage_progress_callback(progress, step)
+    return {'progress': callback} if callback is not None else {}
+
+
+def _stage_prune_signatures(stage: Path, *, file_workers: int = 1, collect_allocation: bool = False,
+                            progress: Callable[[dict[str, Any]], None] | None = None):
     """One fresh observation per file for both its type guard and identity.
 
     Every caller still walks the complete tree. Nothing is cached between the
@@ -1711,6 +2090,12 @@ def _stage_prune_signatures(stage: Path, *, file_workers: int = 1, collect_alloc
         raise ValueError('stage signature workers must be between 1 and 8')
     signatures = []
     inodes: dict[tuple[int, int], list[int]] = {}
+    last_report = time.monotonic()
+    def report():
+        if progress is not None:
+            progress({'stage': 'scan-stage-metadata', 'completed_items': len(signatures),
+                      'total_items': None, 'metadata_only': True, 'acceptance_proof': False})
+    report()
     pool = ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else nullcontext(None)
     with pool as executor:
         for parent, dirs, files in os.walk(stage, followlinks=False, onerror=_raise_walk_error):
@@ -1730,28 +2115,39 @@ def _stage_prune_signatures(stage: Path, *, file_workers: int = 1, collect_alloc
                     if record[:2] != [info.st_nlink, info.st_blocks * 512]:
                         raise SnapshotError("retirement inode changed during space audit")
                     record[2] += 1
+                if (progress is not None and len(signatures) % 128 == 0
+                        and time.monotonic() - last_report >= 5):
+                    report()
+                    last_report = time.monotonic()
+            if progress is not None and time.monotonic() - last_report >= 5:
+                report()
+                last_report = time.monotonic()
     signatures.sort(key=lambda row: row["path"])
+    report()
     if collect_allocation:
         reclaimable = sum(allocated for links, allocated, names in inodes.values() if links == names)
         return signatures, reclaimable
     return signatures
 
 
-def _stage_prune_fingerprint(stage: Path, plan: dict[str, Any], *, file_workers: int = 1) -> str:
+def _stage_prune_fingerprint(stage: Path, plan: dict[str, Any], *, file_workers: int = 1,
+                             progress: Callable[[dict[str, Any]], None] | None = None) -> str:
     identity = {"dataset": plan["dataset"], "snapshot_id": plan["snapshot_id"],
                 "manifest_sha256": plan["manifest_sha256"],
-                "signatures": _stage_prune_signatures(stage, file_workers=file_workers)}
+                "signatures": _stage_prune_signatures(stage, file_workers=file_workers,
+                    **({'progress': progress} if progress is not None else {}))}
     return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
 
 
 def apply_archive_stage_prune(
     spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path,
     expected_fingerprint: str, owned_verified_plan: dict[str, Any] | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     with _exclusive_lock(state_root / "retirements" / f"{spec.dataset}.lock"):
         return _apply_archive_stage_prune(spec, sync_root, artifact_root=artifact_root,
             state_root=state_root, expected_fingerprint=expected_fingerprint,
-            owned_verified_plan=owned_verified_plan)
+            owned_verified_plan=owned_verified_plan, progress=progress)
 
 
 def _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint):
@@ -1770,12 +2166,23 @@ def _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, 
     if (not _prunable_stage(spec) or plan.get("dataset") != spec.dataset
             or plan.get("stage") != str(spec.stage_root / spec.dataset)
             or plan.get("stage_fingerprint") != expected_fingerprint or plan.get("apply_ready") is not True
-            or proof.get("contract") != "owned-archive-stage-verification-v1"
+            or proof.get("contract") not in {'owned-archive-stage-verification-v1', 'owned-archive-stage-verification-v2'}
             or proof.get("artifact_root") != str(artifact_root.resolve())
             or proof.get("state_root") != str(state_root.resolve())
             or proof.get("cold_generation") != _stage_cold_generation(sync_root, spec)):
         raise SnapshotError("owned encoding stage full verification expired or its generation changed")
     state = json.loads((state_root / "retirements" / f"{spec.dataset}.json").read_text())
+    selected = resolve_latest_packed(sync_root, spec.dataset)
+    _check_reviewed_retired_stage(spec, selected,
+                                state_root / 'retirements' / (spec.dataset + '.json'))
+    if proof.get('contract') == 'owned-archive-stage-verification-v2':
+        cold = proof.get('complete_cold_reconstruction', {})
+        if (reviewed_retired_stage(spec) is None or proof.get('encoding_stage_fingerprint') != expected_fingerprint
+                or proof.get('encoding_manifest_sha256') != selected.manifest.get('metadata', {}).get('legacy_manifest_sha256')
+                or cold.get('manifest_sha256') != selected.manifest_sha256
+                or cold.get('independently_reconstructed_files') != selected.manifest['source']['files']
+                or cold.get('independently_reconstructed_bytes') != selected.manifest['source']['logical_bytes']):
+            raise SnapshotError('reviewed encoding full-stage proof differs from the fixed cold release')
     source = artifact_root.resolve() / spec.relative_root
     if (state.get("state") != "cold-only" or state.get("dataset") != spec.dataset
             or state.get("relative_root") != spec.relative_root
@@ -1840,12 +2247,14 @@ def recover_archive_stage_quarantine(
 def _apply_archive_stage_prune(
     spec: LegacyArchiveSpec, sync_root: Path, *, artifact_root: Path, state_root: Path,
     expected_fingerprint: str, owned_verified_plan: dict[str, Any] | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
     from stockagent.data_sync.materialized_cache import process_references, _pinned_snapshot_ids
 
     if owned_verified_plan is None:
-        plan = plan_archive_stage_prune(spec, sync_root, artifact_root=artifact_root, state_root=state_root)
+        plan = plan_archive_stage_prune(spec, sync_root, artifact_root=artifact_root, state_root=state_root,
+                                        **({'progress': progress} if progress is not None else {}))
     else:
         plan = owned_verified_plan
         _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
@@ -1853,7 +2262,8 @@ def _apply_archive_stage_prune(
         if stage.is_symlink() or stage.resolve() != stage or not stage.is_dir():
             raise SnapshotError("encoding stage is missing or redirected")
         metadata_workers = _stage_prune_metadata_workers(spec, stage)
-        if _stage_prune_fingerprint(Path(plan["stage"]), plan, file_workers=metadata_workers) != expected_fingerprint:
+        if _stage_prune_fingerprint(Path(plan["stage"]), plan, file_workers=metadata_workers,
+                **_stage_progress_option(progress, 'apply-before-rename-fingerprint')) != expected_fingerprint:
             raise SnapshotError("encoding stage changed after dry run")
     if plan["stage_fingerprint"] != expected_fingerprint:
         raise SnapshotError("encoding stage changed after dry run")
@@ -1864,16 +2274,29 @@ def _apply_archive_stage_prune(
     if quarantine.exists() or quarantine.is_symlink():
         raise SnapshotError("unfinished encoding stage quarantine requires audit")
     os.replace(stage, quarantine)
-    if _stage_prune_fingerprint(quarantine, plan, file_workers=metadata_workers) != expected_fingerprint:
+    if _stage_prune_fingerprint(quarantine, plan, file_workers=metadata_workers,
+            **_stage_progress_option(progress, 'apply-after-rename-fingerprint')) != expected_fingerprint:
         raise SnapshotError("encoding stage changed during rename; quarantine retained")
-    verify_archive_directory(quarantine / "archive", spec=spec, file_workers=workers)
+    reuse_encoding = (owned_verified_plan is not None
+                      and plan['full_verification']['contract'] == 'owned-archive-stage-verification-v2')
+    if reuse_encoding:
+        _check_owned_stage_plan(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
+        plan = {**plan, 'encoding_decode_reuse': {
+            'contract': 'same_owned_stage_generation_decode_reuse_v1',
+            'stage_fingerprint': expected_fingerprint,
+            'original_verified_at_epoch': plan['full_verification']['verified_at_epoch'],
+            'verification_time_extended': False}}
+    else:
+        verify_archive_directory(quarantine / 'archive', spec=spec, file_workers=workers,
+                                 **_stage_progress_option(progress, 'apply-verify-quarantine-archive'))
     _check_d_primary_mount(sync_root)
     resolved = resolve_latest_packed(sync_root, spec.dataset)
     if owned_verified_plan is None:
         inventory = _load_inventory(sync_root.resolve(), resolved.manifest)
         verify_packed_snapshot(sync_root, resolved,
                                reconstruct_paths=[row["path"] for row in inventory if row["kind"] == "file"],
-                               **_native_read_options(sync_root))
+                               **_native_read_options(sync_root),
+                               **_stage_progress_option(progress, 'apply-reconstruct-cold'))
     else:
         # Decode can take longer than the old proof lifetime on a small-file
         # HDD stage. Admit with a fresh proof before mutation; if it expires
@@ -1882,8 +2305,12 @@ def _apply_archive_stage_prune(
         _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
         age = time.time() - plan['full_verification']['verified_at_epoch']
         if age > 1500:
+            if reuse_encoding:
+                verify_archive_directory(quarantine / 'archive', spec=spec, file_workers=workers,
+                    **_stage_progress_option(progress, 'apply-verify-quarantine-archive'))
             cold_proof = verify_packed_snapshot(sync_root, resolved, reconstruct_all=True,
-                                               **_native_read_options(sync_root))
+                                               **_native_read_options(sync_root),
+                                               **_stage_progress_option(progress, 'apply-reconstruct-expired-cold-proof'))
             _check_stage_plan_binding(spec, sync_root, artifact_root, state_root, plan, expected_fingerprint)
             old_proof = plan['full_verification']
             plan = {**plan, 'prior_full_verification': old_proof,
@@ -1895,8 +2322,12 @@ def _apply_archive_stage_prune(
     if (resolved.manifest_sha256 != plan["manifest_sha256"] or process_references(quarantine)
         or process_references(stage) or source.exists() or source.is_symlink()
         or str(resolved.manifest["snapshot_id"]) in _pinned_snapshot_ids(Path("/srv/stockagent-packed-materialized"))
-        or _stage_prune_fingerprint(quarantine, plan, file_workers=metadata_workers) != expected_fingerprint):
+        or _stage_prune_fingerprint(quarantine, plan, file_workers=metadata_workers,
+            **_stage_progress_option(progress, 'apply-final-stage-fingerprint')) != expected_fingerprint):
         raise SnapshotError("encoding stage final gates changed; quarantine retained")
+    if progress is not None:
+        progress({'prune_step': 'apply-unlink-quarantine', 'stage': 'unlink-owned-stage',
+                  'state': 'running', 'acceptance_proof': False})
     shutil.rmtree(quarantine)
     return {**plan, "pruned": True, "reclaimed_allocated_file_bytes": plan["reclaimable_allocated_file_bytes"]}
 

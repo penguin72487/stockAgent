@@ -27,7 +27,7 @@ if __package__ in {None, ""}:
 from downloader.artifact_io import atomic_write_bytes
 from downloader.parquet_integrity import signature
 from scripts.audit_news_issuer_overlap import verified_finlab
-from scripts.plan_news_cnyes_disclosure_candidates import is_43_1_candidate
+from scripts.plan_news_cnyes_disclosure_candidates import is_43_1_candidate, valid_request_scoped_provenance
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -61,7 +61,9 @@ def _explicit_43_1(title: object) -> bool:
 def candidates(old: dict, new: dict, old_sha: str) -> list[dict]:
     """Validate both earlier worklists and retain their literal identity/day."""
     if (old.get("contract_version") != 1
-            or new.get("contract") != "cnyes_43_1_incremental_candidates_v1"
+            or new.get("contract") not in {"cnyes_43_1_incremental_candidates_v1",
+                                           "cnyes_43_1_incremental_candidates_v2",
+                                           "cnyes_43_1_incremental_candidates_v3"}
             or not isinstance(new.get("input_sha256"), list)
             or len(new["input_sha256"]) != 3 or new["input_sha256"][2] != old_sha):
         raise ValueError("worklist_contract_or_chain_mismatch")
@@ -96,6 +98,15 @@ def candidates(old: dict, new: dict, old_sha: str) -> list[dict]:
                         or row.get("official_release_clock_verified") is not False):
                     raise ValueError("invalid_or_duplicate_candidate")
                 if source == "incremental":
+                    if (new.get("contract") in {"cnyes_43_1_incremental_candidates_v2",
+                                                "cnyes_43_1_incremental_candidates_v3"}
+                            and not valid_request_scoped_provenance(row.get("source_observations"),
+                                row.get("selected_response_sha256"), row.get("selected_source_artifact_path"),
+                                **({"selected_receipt": row.get("selected_source_receipt_path"),
+                                    "selected_request": row.get("selected_source_request_sha256"),
+                                    "require_details": True}
+                                   if new.get("contract") == "cnyes_43_1_incremental_candidates_v3" else {}))):
+                        raise ValueError("invalid_candidate_provenance")
                     epoch = row.get("cnyes_published_epoch")
                     if type(epoch) is not int:
                         raise ValueError("invalid_candidate_epoch")

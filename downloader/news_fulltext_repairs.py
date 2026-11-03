@@ -21,6 +21,7 @@ from __future__ import annotations
 from collections import Counter, OrderedDict
 from contextlib import closing
 from datetime import datetime
+import errno
 import hashlib
 from itertools import islice
 import json
@@ -313,27 +314,33 @@ def _pending(directory):
             (entry for entry in entries if entry.name.endswith(".json")), MAX_PENDING + 1)), key=lambda p: p.name)
 
 
-def _rotation_order(queue, paths):
+def _rotation_order(queue, paths, *, cursor_key=ROUND_ROBIN_CURSOR_KEY, cursor_table='queue_settings'):
     """Continue after the previous request, including across owner restarts.
 
     Only bounded private mailbox ordering changes. A saved cursor is never
     used as a path, source permission, article identity or admission proof.
     """
-    saved = queue.db.execute('SELECT value FROM queue_settings WHERE key=?',
-                             (ROUND_ROBIN_CURSOR_KEY,)).fetchone()
+    if cursor_table not in {'queue_settings', 'native_candidate_schedule'}:
+        raise ValueError('invalid_cursor_table')
+    saved = queue.db.execute(f'SELECT value FROM {cursor_table} WHERE key=?',
+                             (cursor_key,)).fetchone()
     if saved is None or not isinstance(saved[0], str) or not _REQUEST_NAME.fullmatch(saved[0]):
         return paths
     split = next((index for index, path in enumerate(paths) if path.name > saved[0]), len(paths))
     return paths[split:] + paths[:split]
 
 
-def _record_turn(queue, path, stop):
+def _record_turn(queue, path, stop, *, cursor_key=ROUND_ROBIN_CURSOR_KEY, cursor_table='queue_settings'):
     # Commit with the existing admission transaction/cursor. An interrupted
     # transaction rolls back both the once-only outcome and this scheduling
     # position; removed/archived paths still give an unambiguous next turn.
+    if cursor_table not in {'queue_settings', 'native_candidate_schedule'}:
+        raise ValueError('invalid_cursor_table')
     if _REQUEST_NAME.fullmatch(path.name) and not (stop is not None and stop.is_set()):
-        queue.db.execute('INSERT OR REPLACE INTO queue_settings VALUES (?,?)',
-                         (ROUND_ROBIN_CURSOR_KEY, path.name))
+        queue.db.execute(f'INSERT INTO {cursor_table} VALUES (?,?) '
+                         'ON CONFLICT(key) DO UPDATE SET value=excluded.value '
+                         f'WHERE {cursor_table}.value IS NOT excluded.value',
+                         (cursor_key, path.name))
 
 
 def _already_admitted(db, provider, parser_fingerprint, article_id, outcome):
@@ -473,8 +480,12 @@ def _unique(pairs):
     return result
 
 
-def _read_private_request(path):
-    """Common bounded local mailbox reader; callers validate their own ABI."""
+def _read_private_request(path, *, include_payload=False):
+    """Read a bounded, content-addressed mailbox item without following links.
+
+    Snapshot consumers may retain the exact verified bytes alongside the
+    decoded request; owner admission still validates the same request ABI.
+    """
     with os.fdopen(os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)), "rb") as stream:
         info = os.fstat(stream.fileno())
         if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_REQUEST_BYTES or info.st_mode & 0o077:
@@ -482,7 +493,20 @@ def _read_private_request(path):
         payload = stream.read(MAX_REQUEST_BYTES + 1)
     if len(payload) > MAX_REQUEST_BYTES or hashlib.sha256(payload).hexdigest() != path.stem:
         raise ValueError("repair_input_digest_mismatch")
-    return json.loads(payload, object_pairs_hook=_unique)
+    request = json.loads(payload, object_pairs_hook=_unique)
+    return (request, payload) if include_payload else request
+
+
+def _unsafe_request_path(path, error):
+    """Recognize a proven unsafe inode without treating transient I/O as invalid."""
+    if error.errno not in (errno.ELOOP, errno.EISDIR):
+        return False
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return ((error.errno == errno.ELOOP and stat.S_ISLNK(mode))
+            or (error.errno == errno.EISDIR and stat.S_ISDIR(mode)))
 
 
 def _load(path):
@@ -776,20 +800,41 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
     queue.reviewed_repair_continuation_pending = False
     progressed, considered = False, 0
     base = queue.root / "reviewed_repairs"
-    if not base.exists() and not base.is_symlink():
-        return {"processed": 0, "outcomes": {}}
+    from downloader.news_fulltext_wake import clear_mailbox_scan_retry, defer_mailbox_scan_retry
     try:
+        try:
+            base.lstat()
+        except FileNotFoundError:
+            clear_mailbox_scan_retry(queue, 'repair')
+            return {"processed": 0, "outcomes": {}}
         directory = _directory(queue.root, "pending")
         paths = _rotation_order(queue, _pending(directory))
-    except (OSError, ValueError):
+    except (OSError, ValueError, sqlite3.OperationalError):
+        defer_mailbox_scan_retry(queue, 'repair')
         queue.metrics.count("local_repairs", "inbox_unavailable")
         return {"processed": 0, "outcomes": {}, "inbox_unavailable": True}
+    clear_mailbox_scan_retry(queue, 'repair')
     for path in paths:
-        if processed >= limit or time.monotonic() - started >= max_seconds or stop is not None and stop.is_set():
+        # Discovery or validation can itself exceed the soft slice. Permit one
+        # bounded request/target to make progress, then yield; the persisted
+        # turn keeps different requests fair across slow slices and restarts.
+        if (processed >= limit or stop is not None and stop.is_set()
+                or (considered > 0 and time.monotonic() - started >= max_seconds)):
             break
         try:
             request = _load_for_admission(queue, path)
         except (OSError, ValueError, TypeError, KeyError, OverflowError, RecursionError, NewsError) as error:
+            if stop is not None and stop.is_set():
+                break
+            if isinstance(error, OSError) and not _unsafe_request_path(path, error):
+                # Transient I/O is not proof that a sealed request is bad.
+                # Retain it and spend this request's turn so others can run.
+                counts['request_io_deferred'] += 1
+                processed += 1
+                with queue.db:
+                    _record_turn(queue, path, stop)
+                considered += 1
+                continue
             try:
                 _quarantine(queue, path, error)
                 progressed = True
@@ -801,6 +846,8 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
                 _record_turn(queue, path, stop)
             considered += 1
             continue
+        if stop is not None and stop.is_set():
+            break
         _schema(queue)
         with queue.db:
             queue.db.execute("INSERT OR IGNORE INTO reviewed_repair_jobs VALUES (?,?,0,?,NULL,?)",
@@ -809,7 +856,8 @@ def consume_repairs(queue, *, limit=32, max_seconds=0.05, stop=None):
             cursor = job["next_index"]
             previous_cursor = cursor
             while cursor < len(request["targets"]) and processed < limit:
-                if time.monotonic() - started >= max_seconds or stop is not None and stop.is_set():
+                if (stop is not None and stop.is_set()
+                        or ((processed > 0 or considered > 0) and time.monotonic() - started >= max_seconds)):
                     break
                 target = request["targets"][cursor]
                 try:

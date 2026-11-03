@@ -62,6 +62,8 @@ def _corpus_fixture(tmp_path):
         {'url': _literal_google_url(genuine), 'text_kind': 'headline'},
         {'url': 'https://www.cnyes.com.evil.example/twstock/6689', 'text_kind': 'headline'},
         {'url': 'https://news.google.com/rss/articles/opaque', 'text_kind': 'headline'},
+        {'url': 'https://cmnews.com.tw/tag/6650', 'text_kind': 'headline'},
+        {'url': _literal_google_url('https://cmnews.com.tw/tag/6650'), 'text_kind': 'headline'},
     ]
     parts = []
     for name, items in [('headline.parquet', rows), ('full.parquet', [
@@ -72,8 +74,8 @@ def _corpus_fixture(tmp_path):
         parts.append({'path': name, 'table_name': 'articles', 'rows': len(items),
                       'bytes': path.stat().st_size, 'sha256': sha256_file(path)})
     manifest = {'state': 'ready', 'contract_version': 2, 'storage_layout': 'news_incremental_parts_v2',
-                'generation': 'versions/test', 'parts': parts, 'row_counts': {'articles': 8},
-                'source_snapshot': {'source_root': str(source), 'counts': {'headline_articles': 6}}}
+                'generation': 'versions/test', 'parts': parts, 'row_counts': {'articles': 10},
+                'source_snapshot': {'source_root': str(source), 'counts': {'headline_articles': 8}}}
     atomic_write_json(root / 'manifest.json', manifest)
     return root, source
 
@@ -88,7 +90,7 @@ def test_corpus_market_audit_reads_all_headlines_but_keeps_fulltext_and_original
     output = tmp_path / 'audit.json'
     assert inspector.main(['--output', str(output), '--corpus-market-heads-only', '--corpus-root', str(root)]) == 0
     result = json.loads(output.read_text())
-    assert result['headline_rows_examined'] == 6 and result['fulltext_rows'] == 2
+    assert result['headline_rows_examined'] == 8 and result['fulltext_rows'] == 2
     assert result['metadata_only_market_headlines'] == 2
     assert result['metadata_only_by_reason'] == {'cnyes_market_route': 1, 'literal_google_cnyes_market_route': 1}
     assert result['fulltext_rows_pruned_by_statistics'] == 2

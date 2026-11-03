@@ -64,6 +64,31 @@ def test_recent_listing_cutoff_rejects_unfinished_and_future_dates() -> None:
     ) == date(2026, 9, 25)
 
 
+def test_manifest_refresh_retains_exact_old_and_new_source_receipts(tmp_path: Path) -> None:
+    head = tmp_path / "manifest.json"
+    old = b'{ "status": "complete", "generation": 1 }\n'
+    head.write_bytes(old)
+    MODULE._write_manifest_preserving_versions(tmp_path, {"status": "complete", "generation": 2})
+    new = head.read_bytes()
+    archives = tmp_path / "manifest_versions"
+    assert (archives / f"{MODULE._sha256_bytes(old)}.json").read_bytes() == old
+    assert (archives / f"{MODULE._sha256_bytes(new)}.json").read_bytes() == new
+    MODULE._write_manifest_preserving_versions(tmp_path, {"status": "complete", "generation": 2})
+    assert head.read_bytes() == new
+
+
+def test_manifest_hash_collision_fails_without_changing_head(tmp_path: Path) -> None:
+    head = tmp_path / "manifest.json"
+    old = b'{"generation": 1}\n'
+    head.write_bytes(old)
+    archive = tmp_path / "manifest_versions" / f"{MODULE._sha256_bytes(old)}.json"
+    archive.parent.mkdir()
+    archive.write_bytes(b"unexpected contents")
+    with pytest.raises(ValueError, match="collision"):
+        MODULE._write_manifest_preserving_versions(tmp_path, {"generation": 2})
+    assert head.read_bytes() == old
+
+
 def test_recent_rolling_gap_reuses_only_hash_verified_prior_window(
     tmp_path: Path,
 ) -> None:

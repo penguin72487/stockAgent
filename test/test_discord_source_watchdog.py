@@ -18,6 +18,14 @@ from services.discord_bot import bot as discord_bot
 COMMAND = ("{python}", "shared_source.py")
 
 
+@pytest.fixture(autouse=True)
+def isolated_error_log(tmp_path, monkeypatch):
+    """Synthetic timeouts must not pollute or rotate the native bot's logs."""
+    path = tmp_path / "discord-errors.log"
+    monkeypatch.setattr(discord_bot, "ERROR_LOG_PATH", path)
+    return path
+
+
 @pytest.fixture
 def clock(monkeypatch):
     value = {"now": 100.0}
@@ -286,7 +294,7 @@ def test_parallel_input_stage_never_uses_an_unrelated_source_budget(opening, clo
 
 @pytest.mark.parametrize("returncode", [0, 2, "timeout"])
 def test_existing_source_command_registers_its_actual_wait_and_always_cleans_up(
-    tmp_path, opening, clock, monkeypatch, returncode,
+    tmp_path, opening, clock, monkeypatch, returncode, isolated_error_log,
 ):
     cfg, registry, _ = opening
     command = discord_bot._resolve_pre_signal_command(cfg.pre_signal_command)
@@ -320,3 +328,9 @@ def test_existing_source_command_registers_its_actual_wait_and_always_cleans_up(
             discord_bot._run_pre_signal_command_serialized(cfg, bypass_cache=True)
     assert registry.snapshot(command) is None
     assert killed == ([True] if returncode == "timeout" else [])
+    assert discord_bot.ERROR_LOG_PATH == isolated_error_log
+    if returncode == "timeout":
+        assert "pre_signal_command:test" in isolated_error_log.read_text()
+        assert "TimeoutExpired" in isolated_error_log.read_text()
+    else:
+        assert not isolated_error_log.exists()

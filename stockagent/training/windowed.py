@@ -137,6 +137,9 @@ class WindowedSplitTensors:
     short_capacity_shares: torch.Tensor | None = None
     short_margin_rate: torch.Tensor | None = None
     short_capacity_notional: torch.Tensor | None = None
+    # Feature-only rows preceding the first account/decision row.  Account
+    # tensors and valid_indices continue to use their own unshifted calendar.
+    feature_row_offset: int = 0
     _window_offsets: torch.Tensor = field(init=False, repr=False)
     _feature_lag: int = field(init=False, repr=False)
     _valid_indices_are_contiguous: bool = field(init=False, repr=False)
@@ -167,9 +170,22 @@ class WindowedSplitTensors:
             raise ValueError("lookback must be >= 1")
         if self.features.dim() != 3:
             raise ValueError(f"features must have shape [T,S,F], got {tuple(self.features.shape)}")
+        if isinstance(self.feature_row_offset, bool) or int(self.feature_row_offset) != self.feature_row_offset or self.feature_row_offset < 0:
+            raise ValueError("feature_row_offset must be a nonnegative integer")
+        self.feature_row_offset = int(self.feature_row_offset)
+        account_rows = int(self.features.size(0)) - self.feature_row_offset
+        if (self.future_log_returns.dim() != 2
+                or tuple(self.future_log_returns.shape) != (account_rows, int(self.features.size(1)))):
+            raise ValueError("feature history and account tensors have incompatible calendar or symbol axes")
         if self.valid_indices.dim() != 1:
             raise ValueError("valid_indices must be 1D")
         self._valid_indices_cpu = self.valid_indices.detach().to(device=torch.device("cpu"), dtype=torch.long)
+        if self.feature_row_offset and self._valid_indices_cpu.numel():
+            first = int(self._valid_indices_cpu.min())
+            last = int(self._valid_indices_cpu.max())
+            if (first < 0 or last >= account_rows
+                    or first + self.feature_row_offset - self._feature_lag - self.lookback + 1 < 0):
+                raise ValueError("feature history indices exceed the account calendar or causal window")
         if self.volume_notional is not None and self.volume_notional.shape != self.future_log_returns.shape:
             raise ValueError(
                 "volume_notional must have the same shape as future_log_returns: "
@@ -201,7 +217,7 @@ class WindowedSplitTensors:
             self.execution_mode == "tw_index_futures_day"
             and tuple(self.overnight_log_returns.shape)
             != (
-                int(self.features.size(0)),
+                account_rows,
                 TAIFEX_INDEX_FUTURES_ACTION_COUNT,
                 3,
             )
@@ -213,12 +229,12 @@ class WindowedSplitTensors:
             self.execution_mode
             in TW_STOCK_FUTURES_INTEGER_DAY_TRADE_EXECUTION_MODES
             and not (self.execution_mode == MINUTE_MODE and self.overnight_log_returns.ndim == 4
-                     and self.overnight_log_returns.shape[:2] == self.features.shape[:2]
+                     and tuple(self.overnight_log_returns.shape[:2]) == expected_symbol_shape
                      and self.overnight_log_returns.shape[2] >= 2
                      and self.overnight_log_returns.shape[3] in CARRY_SUPPORTED_TAPE_FIELDS)
             and tuple(self.overnight_log_returns.shape)
             not in {(
-                int(self.features.size(0)),
+                account_rows,
                 int(self.features.size(1)),
                 2,
                 fields,
@@ -254,19 +270,19 @@ class WindowedSplitTensors:
             tuple(self.overnight_log_returns.shape)
             not in {
                 (
-                    int(self.features.size(0)),
+                    account_rows,
                     futures_slots,
                     4,
                 ),
                 (
-                    int(self.features.size(0)),
+                    account_rows,
                     futures_slots,
                     11,
                 ),
-                *((int(self.features.size(0)), futures_slots, width)
+                *((account_rows, futures_slots, width)
                   for width in MARGIN_EXECUTION_WIDTHS),
                 (
-                    int(self.features.size(0)),
+                    account_rows,
                     futures_slots,
                     2,
                     TAPE_FIELDS,
@@ -283,7 +299,7 @@ class WindowedSplitTensors:
                 raise ValueError("dated futures split requires version-tracked decision execution")
             self._futures_execution_tensor_version = self.overnight_log_returns._version
         if self.execution_mode == "tw_index_derivatives_day":
-            expected_rows = int(self.features.size(0))
+            expected_rows = account_rows
             derivative_return_shape = tuple(self.overnight_log_returns.shape)
             if derivative_return_shape not in {
                 (expected_rows, TAIFEX_INDEX_DERIVATIVE_ACTION_COUNT_V4),
@@ -320,7 +336,7 @@ class WindowedSplitTensors:
                 dtype=torch.bool
             )
         elif self.execution_mode == "tw_index_futures_day":
-            expected_rows = int(self.features.size(0))
+            expected_rows = account_rows
             if self.derivative_candidate_features is None or tuple(
                 self.derivative_candidate_features.shape[:1]
             ) != (expected_rows,) or (
@@ -354,7 +370,7 @@ class WindowedSplitTensors:
             from stockagent.models.futures_account_policy import FUTURES_ACCOUNT_OBSERVATION_COLUMNS
             from stockagent.data.tw_futures_decision_clock import OPENING_REFERENCE_FEATURES
 
-            expected_rows = int(self.features.size(0))
+            expected_rows = account_rows
             expected_context_prefix = (
                 expected_rows,
                 futures_slots,
@@ -503,20 +519,20 @@ class WindowedSplitTensors:
             self.short_capacity_notional = capacity_notional
         if self.session_advance_mask is None:
             self.session_advance_mask = torch.ones(
-                int(self.features.size(0)),
+                account_rows,
                 dtype=torch.bool,
                 device=self.features.device,
             )
         else:
             self.session_advance_mask = self.session_advance_mask.to(dtype=torch.bool)
         if self.session_advance_mask.dim() != 1 or int(self.session_advance_mask.numel()) != int(
-            self.features.size(0)
+            account_rows
         ):
             raise ValueError(
                 "session_advance_mask must have shape [T] matching features: "
-                f"{tuple(self.session_advance_mask.shape)} != ({int(self.features.size(0))},)"
+                f"{tuple(self.session_advance_mask.shape)} != ({account_rows},)"
             )
-        row_count = int(self.features.size(0))
+        row_count = account_rows
         if self.session_month_ids is None:
             self.session_month_ids = torch.zeros(
                 row_count,
@@ -551,7 +567,7 @@ class WindowedSplitTensors:
         if self.day_trade_eligible_mask is not None:
             self.day_trade_eligible_mask = self.day_trade_eligible_mask.to(dtype=torch.bool)
             expected_eligibility_shape = (
-                int(self.features.size(0)),
+                account_rows,
                 int(self.features.size(1)),
             )
             if tuple(self.day_trade_eligible_mask.shape) != expected_eligibility_shape:
@@ -573,7 +589,7 @@ class WindowedSplitTensors:
                 value = value.to(dtype=torch.bool)
                 setattr(self, name, value)
                 expected_shape = (
-                    int(self.features.size(0)),
+                    account_rows,
                     int(self.features.size(1)),
                 )
                 if tuple(value.shape) != expected_shape:
@@ -594,7 +610,7 @@ class WindowedSplitTensors:
                 self.unresolved_corporate_action_mask.to(dtype=torch.bool)
             )
             expected_shape = (
-                int(self.features.size(0)),
+                account_rows,
                 int(self.features.size(1)),
             )
             if tuple(self.unresolved_corporate_action_mask.shape) != expected_shape:
@@ -621,7 +637,7 @@ class WindowedSplitTensors:
             )
         if self.cash_dividend_yield is not None:
             expected_shape = (
-                int(self.features.size(0)),
+                account_rows,
                 int(self.features.size(1)),
             )
             self.cash_dividend_yield = self.cash_dividend_yield.to(
@@ -1096,6 +1112,7 @@ class WindowedSplitTensors:
             can_sell_mask=self.can_sell_mask.to(device=device, non_blocking=non_blocking),
             benchmark=self.benchmark.to(device=device, non_blocking=non_blocking),
             lookback=self.lookback,
+            feature_row_offset=self.feature_row_offset,
             volume_notional=(
                 None
                 if self.volume_notional is None
@@ -1206,6 +1223,7 @@ class WindowedSplitTensors:
             can_sell_mask=_pin(self.can_sell_mask),
             benchmark=_pin(self.benchmark),
             lookback=self.lookback,
+            feature_row_offset=self.feature_row_offset,
             volume_notional=None if self.volume_notional is None else _pin(self.volume_notional),
             can_short_open_mask=_pin(self.can_short_open_mask),
             can_short_open_open_mask=_pin(
@@ -1286,6 +1304,7 @@ class WindowedSplitTensors:
             can_sell_mask=self.can_sell_mask.index_select(1, local_indices),
             benchmark=self.benchmark,
             lookback=self.lookback,
+            feature_row_offset=self.feature_row_offset,
             volume_notional=(
                 None
                 if self.volume_notional is None
@@ -1403,6 +1422,7 @@ class WindowedSplitTensors:
             can_sell_mask=_pad_symbol_dim(self.can_sell_mask, False),
             benchmark=self.benchmark,
             lookback=self.lookback,
+            feature_row_offset=self.feature_row_offset,
             volume_notional=None if self.volume_notional is None else _pad_symbol_dim(self.volume_notional, 0.0),
             can_short_open_mask=_pad_symbol_dim(self.can_short_open_mask, False),
             can_short_open_open_mask=_pad_symbol_dim(
@@ -1486,6 +1506,7 @@ class WindowedSplitTensors:
             can_sell_mask=self.can_sell_mask,
             benchmark=self.benchmark,
             lookback=self.lookback,
+            feature_row_offset=self.feature_row_offset,
             volume_notional=self.volume_notional,
             can_short_open_mask=self.can_short_open_mask,
             can_short_open_open_mask=self.can_short_open_open_mask,
@@ -1517,7 +1538,7 @@ class WindowedSplitTensors:
     def _window_indices_for_rows(self, row_indices: torch.Tensor) -> torch.Tensor:
         row_indices = row_indices.to(device=self.valid_indices.device, dtype=torch.long)
         date_idx = self.valid_indices[row_indices]
-        return date_idx[:, None] - self._feature_lag - self._window_offsets[None, :]
+        return date_idx[:, None] + self.feature_row_offset - self._feature_lag - self._window_offsets[None, :]
 
     def _window_view_for_contiguous_rows(
         self,
@@ -1530,7 +1551,7 @@ class WindowedSplitTensors:
         batch_rows = int(end) - int(start)
         source_device = self.features.device
         date_start = self._first_valid_index + int(start)
-        feature_start = date_start - self._feature_lag - self.lookback + 1
+        feature_start = date_start + self.feature_row_offset - self._feature_lag - self.lookback + 1
         if batch_rows <= 0 or feature_start < 0:
             raise ValueError("invalid contiguous window slice")
         timer = self._prepare_timer_start()
@@ -2325,7 +2346,7 @@ class WindowedSplitTensors:
         if rows <= 0:
             return None
         date_start = self._first_valid_index + int(start)
-        feature_start = date_start - self._feature_lag - self.lookback + 1
+        feature_start = date_start + self.feature_row_offset - self._feature_lag - self.lookback + 1
         slab_rows = rows + self.lookback - 1
         if feature_start < 0 or feature_start + slab_rows > int(self.features.size(0)):
             return None
@@ -2501,7 +2522,7 @@ class WindowedSplitTensors:
             return None
 
         date_start = self._first_valid_index + int(start)
-        feature_start = date_start - self._feature_lag - self.lookback + 1
+        feature_start = date_start + self.feature_row_offset - self._feature_lag - self.lookback + 1
         source_rows = real_rows + self.lookback - 1
         if feature_start < 0 or feature_start + source_rows > int(self.features.size(0)):
             return None
@@ -2547,7 +2568,7 @@ class WindowedSplitTensors:
             return None
 
         last_date = int(self._valid_indices_cpu[self._contiguous_prefix_len - 1].item())
-        last_feature_date = last_date - self._feature_lag
+        last_feature_date = last_date + self.feature_row_offset - self._feature_lag
         if last_feature_date < 0 or last_feature_date >= int(self.features.size(0)):
             return None
         timer = self._prepare_timer_start()
@@ -2699,6 +2720,7 @@ def dataset_to_windowed_tensors(dataset: CrossSectionalDataset) -> WindowedSplit
         can_sell_mask=dataset.can_sell_mask_t,
         benchmark=dataset.benchmark_t,
         lookback=dataset.lookback,
+        feature_row_offset=getattr(dataset, "feature_row_offset", 0),
         volume_notional=dataset.volume_notional_t,
         can_short_open_mask=dataset.can_short_open_mask_t,
         can_short_open_open_mask=dataset.can_short_open_open_mask_t,

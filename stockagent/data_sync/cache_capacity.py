@@ -23,6 +23,7 @@ from typing import Callable
 
 from stockagent.data_sync.completed_forward_capacity import CapacityDeferred, reserve_capacity
 from stockagent.data_sync.desync_snapshots import SnapshotError
+from stockagent.service_layout import canonical_service_path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 POLICY_PATH = REPO_ROOT / "configs/data_sync/cache_capacity.json"
@@ -32,6 +33,14 @@ MATERIALIZED_ROOT = Path("/srv/stockagent-packed-materialized")
 ARTIFACT_CACHE_ROOT = REPO_ROOT / "artifacts/cache"
 PANEL_COMPATIBILITY_ROOT = REPO_ROOT / "data_tw_public"
 PREPARED_ROOT = REPO_ROOT / "artifacts/data_preparation"
+# Only the existing protected day-trade source unit opts into this physical
+# floor.  Its separate guest filesystem reservation remains unchanged.  The
+# released part of the backup reserve is usable by the higher-priority source;
+# the complete generation budget and other active leases are still counted.
+TRADING_PREPARED_ROOT = PREPARED_ROOT / "tw_factorized_scale_cash_live_v1"
+TRADING_PANEL_ROOT = ARTIFACT_CACHE_ROOT / "tw_factorized_live/base/panel_cache_v2"
+TRADING_PHYSICAL_FLOOR = 20 * 1024**3
+TRADING_PRIORITY_ENV = "STOCKAGENT_TW_DAY_TRADE_PRIORITY_SOURCE"
 # Not /tmp or /var/tmp: PrivateTmp services must see the SAME reservations.
 CONTROL_ROOT = Path("/var/lib") if os.geteuid() == 0 else Path.home() / ".cache"
 CONTRACT = "bounded_cache_writes_v1"
@@ -264,12 +273,26 @@ def acquisition_dispatch_status(root: Path, *, maximum_growth_bytes: int = 0) ->
     return {**result, "state": "admitted", "backing_volume": backing}
 
 
+def _cache_root(root: Path) -> Path:
+    """Keep registered service aliases in the same capacity namespace.
+
+    Do not resolve arbitrary symlinks: the caller still rejects descendant
+    redirects. Both the admission policy and its leases must use this identity.
+    """
+    try:
+        return canonical_service_path(root)
+    except ValueError as error:
+        raise CapacityDeferred("redirected_cache_namespace") from error
+
+
 def _enrolled_capacity(root: Path, family: str, policy: dict) -> int | None:
     if socket.gethostname() not in policy["nodes"]:
         return None
+    root = _cache_root(root)
+    artifact_cache_root = _cache_root(ARTIFACT_CACHE_ROOT)
     if family == "materialized" and root == MATERIALIZED_ROOT:
         return policy["materialized_capacity_bytes"]
-    if family == "panel" and root.is_relative_to(ARTIFACT_CACHE_ROOT) and root != ARTIFACT_CACHE_ROOT:
+    if family == "panel" and root.is_relative_to(artifact_cache_root) and root != artifact_cache_root:
         return policy["panel_family_capacity_bytes"]
     # The native service reader still supports panels next to the public
     # Parquets when no explicit cache root was selected. Do not leave that
@@ -284,7 +307,7 @@ def _enrolled_capacity(root: Path, family: str, policy: dict) -> int | None:
 
 def cache_capacity_status(root: Path, *, family: str = "materialized") -> dict:
     """Bounded observation of enrolled cache allocations; no payload mutation."""
-    root = root.absolute()
+    root = _cache_root(root)
     policy = load_capacity_policy()
     limit = _enrolled_capacity(root, family, policy)
     if limit is None:
@@ -326,7 +349,7 @@ def reserve_cache_write(root: Path, *, key: str, maximum_growth_bytes: int | Cal
         return
     if family not in {"materialized", "panel", "prepared"}:
         raise ValueError("unknown enrolled cache family")
-    root = root.absolute()
+    root = _cache_root(root)
     configured = load_capacity_policy() if policy is None else policy
     capacity = (_enrolled_capacity(root, family, configured) if policy is None else
                 load_prepared_capacity_policy()["family_capacity_bytes"] if family == "prepared" else
@@ -352,9 +375,15 @@ def reserve_cache_write(root: Path, *, key: str, maximum_growth_bytes: int | Cal
             filesystem_controls, key=token, maximum_growth_bytes=maximum_growth_bytes,
             capacity_bytes=2**63 - 1, minimum_free_bytes=configured["minimum_free_bytes"],
         ))
+        physical_floor = configured["minimum_free_bytes"]
+        priority_path = (TRADING_PREPARED_ROOT if family == "prepared" else
+                         TRADING_PANEL_ROOT if family == "panel" else None)
+        if (priority_path is not None and os.environ.get(TRADING_PRIORITY_ENV) == "1"
+                and root == _cache_root(priority_path)):
+            physical_floor = min(physical_floor, TRADING_PHYSICAL_FLOOR)
         backing = _admit_backing_volume(existing, maximum_growth_bytes
             + filesystem["other_reserved_growth_bytes"] + filesystem["control_bytes"]
-            + configured["minimum_free_bytes"])
+            + physical_floor)
         cache = leases.enter_context(reserve_capacity(
             controls, key=token, maximum_growth_bytes=maximum_growth_bytes,
             capacity_bytes=capacity,
@@ -363,6 +392,7 @@ def reserve_cache_write(root: Path, *, key: str, maximum_growth_bytes: int | Cal
                 maximum_seconds=configured["maximum_inventory_seconds"]),
         ))
         yield {"contract": CONTRACT, "filesystem": filesystem, "backing_volume": backing, "cache": cache,
+               "physical_reserve_bytes": physical_floor,
                "data_paths_removed": 0}
 
 

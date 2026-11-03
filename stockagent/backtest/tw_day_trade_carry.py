@@ -523,6 +523,7 @@ def _compiled_session_execution(
         require_minute_nav_grad,
         session.daily_proxy_mask is not None,
         session.terminal_liquidation_price is not None,
+        session.short_limit_up_penalty_per_share is not None,
         bool(event_compression),
         bool(sparse_events),
         int(
@@ -557,6 +558,7 @@ def _compiled_session_execution(
                 exit_capacity: Tensor,
                 marks: Tensor,
                 terminal_liquidation_price: Tensor,
+                short_limit_up_penalty_per_share: Tensor,
                 exit_symbol_indices: Tensor,
                 exit_sides: Tensor,
                 symbol_event_starts: Tensor,
@@ -795,6 +797,10 @@ def _compiled_session_execution(
                         path.minute_filled_shares
                         * torch.nan_to_num(prices, nan=0)
                     ).sum()
+                if session.short_limit_up_penalty_per_share is not None:
+                    path_state = _charge_short_limit_up_close_penalty(
+                        path_state, short_limit_up_penalty_per_share
+                    )
                 if session.terminal_liquidation_price is not None:
                     path_state, terminal_notional = (
                         _liquidate_terminal_inventory_without_capacity(
@@ -891,6 +897,11 @@ def _compiled_session_execution(
                     if session.terminal_liquidation_price is None
                     else session.terminal_liquidation_price
                 ),
+                (
+                    torch.zeros_like(session.official_open)
+                    if session.short_limit_up_penalty_per_share is None
+                    else session.short_limit_up_penalty_per_share
+                ),
                 *sparse_values,
                 can_enter,
                 buy_fee_rate,
@@ -967,6 +978,28 @@ def _run_inventory_path(
         marks=marks,
         initial_capital=initial_capital,
         require_minute_nav_grad=require_minute_nav_grad,
+    )
+
+
+def _charge_short_limit_up_close_penalty(
+    state: DayTradeInventoryState, per_share: Tensor,
+) -> DayTradeInventoryState:
+    """Charge the source-uncovered short once at this session's close.
+
+    The adapter supplies official-close * rate only for limit-up symbols. This
+    is an execution expense, not a fabricated cover or an overnight interest
+    charge. Keeping it in realized net PNL preserves the certified flat-day
+    affine account used by the parallel CUDA forward and parameter VJPs.
+    """
+    valid = _require(
+        torch.isfinite(per_share) & (per_share >= 0),
+        "short limit-up penalty per share must be finite and nonnegative",
+    )
+    charge = ((-state.shares).clamp_min(0) * per_share).sum()
+    return replace(
+        state,
+        realized_net_pnl=state.realized_net_pnl - charge,
+        failed=torch.maximum(state.failed, (~valid).to(state.failed.dtype)),
     )
 
 
@@ -1144,6 +1177,9 @@ class DayTradeCarrySession:
     # close and ignores market-volume capacity.  None preserves historical
     # residual-to-margin behavior and old artifacts exactly.
     terminal_liquidation_price: Tensor | None = None
+    # Adapter-owned official close * configured rate on limit-up symbols only.
+    # Assessed after source fills and before the optional synthetic final fill.
+    short_limit_up_penalty_per_share: Tensor | None = None
     # Opt-in daily frozen-order execution, including missing first-minute fills.
     # [S,270,(VWAP,volume_shares)] and fresh long/short stop observations.
     entry_path: Tensor | None = None
@@ -2031,6 +2067,11 @@ def execute_carry_session(
             buy_fee_rate=buy_fee_rate, day_sell_fee_rate=day_sell_fee_rate,
             normal_sell_fee_rate=normal_sell_fee_rate, rebate_rate=rebate_rate,
             initial_capital=initial_capital)
+        if session.short_limit_up_penalty_per_share is not None:
+            path_inventory = _charge_short_limit_up_close_penalty(
+                path_inventory, session.short_limit_up_penalty_per_share
+            )
+            converted = convert_inventory_to_margin(path_inventory, day=session.day)
         if session.terminal_liquidation_price is not None:
             # Only the terminal reducer is unbounded. Run it against the
             # pre-conversion FIFO state, so today's shorts never pay an
@@ -2167,6 +2208,10 @@ def execute_carry_session(
             exit_notional = (
                 path.minute_filled_shares * torch.nan_to_num(prices, nan=0)
             ).sum()
+        if session.short_limit_up_penalty_per_share is not None:
+            path_inventory = _charge_short_limit_up_close_penalty(
+                path_inventory, session.short_limit_up_penalty_per_share
+            )
         if session.terminal_liquidation_price is not None:
             path_inventory, terminal_notional = (
                 _liquidate_terminal_inventory_without_capacity(

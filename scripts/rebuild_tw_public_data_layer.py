@@ -1434,7 +1434,9 @@ def main() -> None:
             args.end_date,
         )
         if args.mode == "daily":
-            feature_build_command.append("--allow-daily-publication-lag")
+            feature_build_command.extend([
+                "--allow-daily-publication-lag", "--incremental-auto",
+            ])
         runner.run(
             "build_public_features",
             feature_build_command,

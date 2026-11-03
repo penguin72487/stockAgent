@@ -20,6 +20,35 @@ Use for split ownership, model horizons, benchmark returns and stitched reportin
   close and compute the new row from that new contract's own preceding close;
   never book the old/new calendar-spread price gap as return. Persist the fold
   roll path in `futures_benchmark_audit.npz`.
+- For the explicitly requested TX one-contract continuously rolled margin
+  account, record external margin top-ups separately from trading profit and
+  chain returns at the actual funding boundaries. An independent evaluation
+  fold starts a new account with its own sourced entry and funding; a stitched
+  deployment keeps one continuous account. Do not derive independent-fold
+  returns by slicing another account's equity or concatenate reset accounts as
+  a continuous position. Exact source, calendar, costs, benchmark adapter and
+  report admission remain separate from the arithmetic primitive. This selected
+  contract does not retroactively relabel the legacy 1x gross comparator.
+  The optional `tx_one_contract_account_calendar_replay_v1` report input
+  is an explicit report adapter: it requires the strategy's identical
+  dated calendar and binds both account-day and decision-day returns. A fresh
+  independent account is flat before its explicitly sourced first opening;
+  replay of a continuous slice with leading account-only events requires an
+  incoming physical state and is rejected. The adapter is not a
+  source-admission receipt or a trainer integration. The opt-in
+  `tx_one_contract_source_bound_replay_artifact_v1` payload in the same canonical
+  benchmark module can persist the tape, independent opening, funding, marks
+  and returns using the existing atomic JSON writer. Its reader requires the
+  caller's separate source, execution, calendar and exact replay-input pins,
+  rebuilds the account and checks every output/dtype/scope before report use.
+  This persistence gate does not validate historical source interpretation,
+  enable a training benchmark mode, or change existing optimizer/NPZ contracts.
+  The `tx_verified_continuous_report_segment_v1` adapter derives a segment
+  only after checking the whole source-pinned continuous tape. It preserves the
+  incoming account's dated return and funding history, including account-only
+  nodes before the first owned decision; it is not an independent-reset replay
+  or a complete physical state for restarting the executor. The current
+  trainer does not yet wire this adapter into its persisted reports.
 - The active exact TX/MTX/TMF integer audit capital is TWD 100,000,000. Keep it
   in the mode-specific checkpoint contract and use a fresh artifact root when
   changing it. Do not force a minimum one-contract trade to hide granularity;
@@ -79,6 +108,19 @@ Use for split ownership, model horizons, benchmark returns and stitched reportin
   report contract, stitched and deferred fold IDs. Session gaps within a fold or
   between adjacent folds remain hard errors. This is report-only and does not
   invalidate compatible model/optimizer checkpoints.
+- Daily equity plots use `observed_account_session_equity_v2`: show every
+  observed account valuation, including days without trades and any actual
+  account-only valuation. Do not add calendar-day as-of values. A flat line
+  requires an observed unchanged equity; an open position can change value
+  without a new trade. A missing date must not be represented as an inferred
+  zero return. Report metadata identifies this display version; the model and
+  optimizer checkpoints are unchanged.
+- The stock-context TX gross-reference loader checks session coverage in both
+  directions within the selected panel horizon. A TX source session absent from
+  the market panel is an error: skipping it would drop a real benchmark return.
+  Account-only dates remain distinct and do not imply a TX trade. The corresponding
+  `futures_benchmark_audit.npz` uses schema 2 and records this calendar check;
+  matching dates do not by themselves prove an authoritative complete calendar.
 - Derive stitched deployment prefix ownership from the authoritative
   `CrossSectionalDataset.valid_indices` of the full fold test. Do not recompute
   mode-specific row eligibility inside the report helper: in particular, the

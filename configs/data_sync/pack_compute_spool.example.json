@@ -1,0 +1,16 @@
+{
+  "contract": "stockagent.pack_compute_spool.v1",
+  "enabled": false,
+  "cold_root": "/srv/stockagent-packed/.local-state/private-history",
+  "dataset": "local-tw-index-futures",
+  "installed_since_utc": "2026-11-01T02:56:00+00:00",
+  "additional_sources": [
+    {
+      "cold_root": "/srv/stockagent-packed",
+      "dataset": "tw-index-futures",
+      "installed_since_utc": "2026-11-01T12:28:00+00:00"
+    }
+  ],
+  "maximum_jobs_per_cycle": 32,
+  "verification_policy": "/etc/stockagent/pack-verification.json"
+}

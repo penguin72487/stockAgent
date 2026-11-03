@@ -12,6 +12,7 @@ import json
 import os
 from pathlib import Path
 import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -35,6 +36,14 @@ from stockagent.data_sync.packed_snapshots import resolve_packed_snapshot_id
 COORDINATOR_LOCK = Path("/run/lock/stockagent-vast-bulk-organizer.lock")
 COORDINATOR_STATUS = Path("/var/lib/stockagent-vast-bulk-return/status.json")
 BATCH_NAME = re.compile(r"[0-9]{8}T[0-9]{6}-[0-9a-f]{12}\Z")
+PRECONNECT_UNAVAILABLE = re.compile(
+    r"\Assh: connect to host [^\r\n]+ port [0-9]+: "
+    r"(?:No route to host|Network is unreachable|Connection timed out|Connection refused)\s*\Z"
+)
+
+
+class RemotePreservationUnavailable(SnapshotError):
+    """The SSH transport proved it could not connect before remote work began."""
 
 
 def received_batches():
@@ -75,6 +84,9 @@ def _private_request(args, body, request_identity):
             request_identity + "-" + str(time.time_ns()) + ".json")
         atomic_write_json(error_path, {"stderr": process.stderr, "returncode": process.returncode,
                                       "ack_identity_sha256": request_identity, "observed_at_epoch": time.time()})
+        if process.returncode == 255 and PRECONNECT_UNAVAILABLE.fullmatch(process.stderr):
+            raise RemotePreservationUnavailable(
+                "remote preservation connection unavailable before execution; private receipt " + str(error_path))
         raise SnapshotError("remote preservation retirement rejected; private receipt " + str(error_path))
     return json.loads(process.stdout.splitlines()[-1])
 
@@ -345,9 +357,24 @@ def run_batches(args):
                                        "observed_at_epoch": time.time()})
                     print(json.dumps({"scope": scope, "state": "organization_failed_source_preserved", "error": str(error)}), flush=True)
                     failed = True
-        for directory, receipt in retirement_queue:
+        for index, (directory, receipt) in enumerate(retirement_queue):
             try:
                 pending = not organize(args, directory, receipt) or pending
+            except RemotePreservationUnavailable as error:
+                # Every local preservation candidate has already had its own
+                # proof checked. Do not repeat the same failed SSH connect for
+                # the remaining candidates in this cycle; no remote retirement
+                # was started by this request and the sources stay protected.
+                pending = True
+                atomic_write_json(directory / (receipt["scope"] + ".organization-deferred.json"),
+                                  {"state": "remote_preservation_connection_unavailable",
+                                   "error": str(error), "observed_at_epoch": time.time(),
+                                   "source_deleted_by_failed_request": False})
+                print(json.dumps({"scope": receipt["scope"],
+                                  "state": "remote_preservation_connection_unavailable",
+                                  "remaining_remote_candidates": len(retirement_queue) - index - 1,
+                                  "source_deleted_by_failed_request": False}), flush=True)
+                break
             except (SnapshotError, subprocess.TimeoutExpired) as error:
                 atomic_write_json(directory / (receipt["scope"] + ".organization-error.json"),
                                   {"state": "source_preserved_organization_failed", "error": str(error),
@@ -394,6 +421,19 @@ def main():
         COORDINATOR_STATUS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         atomic_write_json(COORDINATOR_STATUS, {"state": "checking_received_cohorts", "observed_at_epoch": time.time()})
         try:
+            # This owner writes its organization/index receipts on D before it
+            # can preserve or retire anything. With a full D, repeatedly
+            # decoding remote cohorts cannot progress and only fails at the
+            # first receipt write. Defer before that work; the original timer
+            # rechecks capacity and no source or proof is modified.
+            available = shutil.disk_usage(metadata_path(SYNC_ROOT)).free
+            minimum = 64 * 1024**2
+            if available < minimum:
+                atomic_write_json(COORDINATOR_STATUS, {'state': 'waiting_cold_physical_capacity',
+                    'available_bytes': available, 'minimum_write_headroom_bytes': minimum,
+                    'observed_at_epoch': time.time(), 'source_deleted': False,
+                    'full_history_verified': False})
+                return 75
             code = run_batches(args)
             if args.capture_inactive_caches:
                 from scripts.capture_inactive_training_cache import capture

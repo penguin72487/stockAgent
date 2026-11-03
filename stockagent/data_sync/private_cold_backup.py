@@ -7,24 +7,48 @@ original local-only marker keep their original meanings and bytes.
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import stat
 import time
 import uuid
 
-from scripts.backup_delivery_receipt import read_json, validate_readiness
+from scripts.backup_delivery_receipt import RelayReadinessClockError, read_json, validate_readiness
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.offhost_backup import _regular, export_incremental_delivery, private_json
 from stockagent.runtime_identity import identity_sha256
 
 CONTRACT = 'stockagent.private_cold_NAS_enrollment.v1'
+COVERAGE_CONTRACT = 'stockagent.private_cold_NAS_coverage.v1'
 NAMESPACE = 'private-history/'
 KIND = 'private_immutable_cold_backup'
-WAVE_BYTES = 512 * 1024**2
+
+
+def receiver_ready(queue, ready: dict) -> bool:
+    """An expired lease is a wait, not corrupt data or permission to allocate.
+
+    Every signature, pairing, mount and runtime check still runs. Invalid
+    receipts other than the explicit clock/age condition continue to fail.
+    """
+    try:
+        validate_readiness(ready, queue.config)
+    except RelayReadinessClockError:
+        return False
+    return True
+
+
+def _receiver_clock_wait(queue, ready: dict, checked: str) -> dict:
+    """Describe the already validated clock failure without renewing its lease."""
+    observed = datetime.fromisoformat(ready['observed_at_utc'])
+    expires = observed + timedelta(seconds=queue.config['readiness_max_age_seconds'])
+    return {'state': 'expired' if expires < datetime.fromisoformat(checked) else 'future',
+            'observed_at_utc': ready['observed_at_utc'],
+            'valid_until_utc': expires.isoformat(), 'checked_at_utc': checked}
 
 
 @contextmanager
@@ -117,7 +141,25 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
     if capture_lock.is_symlink():
         raise SnapshotError('private capture lock is redirected')
     with capture_lock.open('a') as capture_owner:
-        fcntl.flock(capture_owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        # Explicit supervised waiters join the same kernel queue before any
+        # catalog read. Normal timer turns still defer instead of duplicating
+        # a capture while its current owner progresses.
+        fcntl.flock(capture_owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
+        status_path = queue.state / 'private-status.json'
+        previous = json.loads(_regular(status_path).read_bytes()) if status_path.exists() else {}
+        if publish and previous.get('state') == 'private_backup_waiting_receiver_readiness':
+            # A previous real cycle already ingested/recorded its coverage.
+            # Revalidate the tiny lease first instead of rereading the large
+            # frozen catalog/ledger every timer turn. A fresh lease resumes
+            # immediately; the public owner's receipt ingestion keeps running.
+            ready = read_json(queue.receipts / 'readiness.json')
+            if not receiver_ready(queue, ready):
+                checked = datetime.now(timezone.utc).isoformat()
+                result = {**previous, 'activity_at_utc': checked,
+                          'receiver_readiness': _receiver_clock_wait(queue, ready, checked),
+                          'source_files_deleted': 0, 'all_project_sources_NAS_verified': False}
+                private_json(status_path, result, compact=True)
+                return result  # Preserve observed_at_utc: no new coverage was measured.
         plan_path = queue.state / 'private-catalog.json'
         lock = queue.state / 'owner.lock'
         if lock.is_symlink():
@@ -167,7 +209,10 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
                 'canonical_private_reconstruction_verified': False,
                 'all_project_sources_NAS_verified': False, 'source_files_deleted': 0}, compact=True)
         notifications = []
-        with publication_owner(queue, lock, wait_for_owner=wait_for_owner):
+        # Enter the scanner first: its shutdown/join runs after the publication
+        # owner releases. A slow notification must not retain that owner.
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix='private-transport-scan') as scanner, \
+                publication_owner(queue, lock, wait_for_owner=wait_for_owner) as owner:
             private_json(queue.state / 'private-status.json', {
                 'contract': CONTRACT, 'state': 'private_original_owner_acquired',
                 'catalog_identity_sha256': catalog['identity_sha256'],
@@ -183,13 +228,14 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
             errors = queue.ingest(ledger)
             result = {'contract': CONTRACT, 'catalog_identity_sha256': catalog['identity_sha256'],
                       'catalog_observed_at_utc': catalog['observed_at_utc'], 'state': 'inspected',
+                      'transport_scan_mode': 'per_closed_wave_async',
                       'published_waves': [], 'receipt_errors': errors,
                       'unpublished_sources_included': False, 'all_project_sources_NAS_verified': False,
                       'canonical_private_reconstruction_verified': False,
                       'source_files_deleted': 0, 'shared_publication_changed': False}
             retries = ledger.setdefault('private_export_retries', {})
             if publish and not errors and queue.config.get('cold_transport_cache', {}).get('enabled'):
-                result['transport_cache'] = queue.retire_transport_cache(ledger)
+                result['transport_cache'] = queue.retire_transport_cache(ledger, owner=owner)
             usage = None
             for _ in range(queue.pipeline.get('maximum_waves_per_cycle', 1) if publish and not errors else 0):
                 errors.extend(queue.ingest(ledger))
@@ -199,30 +245,70 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
                 covered = coverage(catalog, ledger)
                 sent = covered['published_file_keys'] | covered['accepted_file_keys']
                 deferred = {k for k, v in retries.items() if v['next_attempt_epoch'] > time.time()}
-                if not any(file_key(r) not in sent | deferred for r in catalog['files']):
+                excluded = sent | deferred
+                eligible = [r for r in catalog['files'] if file_key(r) not in excluded]
+                if not eligible:
                     result['state'] = ('private_backup_waiting_export_retry' if deferred
                                        else 'private_files_published_waiting_NAS_ACK')
                     break  # No allocation: no full transport census/capacity query.
                 ready = read_json(queue.receipts / 'readiness.json')
-                validate_readiness(ready, queue.config)
+                if not receiver_ready(queue, ready):
+                    checked = datetime.now(timezone.utc).isoformat()
+                    result.update(state='private_backup_waiting_receiver_readiness',
+                                  activity_at_utc=checked,
+                                  receiver_readiness=_receiver_clock_wait(queue, ready, checked))
+                    break  # No new wave; retain the real coverage/ACK work below.
                 reserve = max(queue.config['reserve_bytes'], ready['reserve_bytes'])
+                source_reserve = queue.private_backup_reserve_bytes
+                reserve_options = ({'reserve_bytes': source_reserve}
+                    if source_reserve != queue.config['reserve_bytes'] else {})
+                # Every term is an independent upper bound. If any already
+                # forbids a wave, an expensive full transport census cannot
+                # change the result. Readiness and receipt checks still run;
+                # the full census remains mandatory before any allocation.
+                bounds = {
+                    'source_batch': queue.config['maximum_batch_bytes'],
+                    'receiver_batch': ready['maximum_batch_bytes'],
+                    'pending_window': queue.config['maximum_pending_bytes'] - covered['pending_bytes'],
+                    'receiver_ingress': ready['ingress_free_bytes'] - reserve - covered['pending_bytes'],
+                    'receiver_nas': ready['nas_free_bytes'] - reserve - covered['pending_bytes'],
+                    # A full metadata census cannot make an already full
+                    # physical volume writable. Keep all logical accounting
+                    # and the complete census before any admitted allocation.
+                    'source_physical': shutil.disk_usage(queue.transport).free - source_reserve,
+                }
+                limit = min(bounds.values())
+                minimum_required = min(r['bytes'] for r in eligible) + 1024**2
+                negotiated_limit = min(bounds['source_batch'], bounds['receiver_batch'])
+                result['wave_budget'] = {
+                    'bounds_bytes': bounds, 'available_bytes': limit,
+                    'minimum_required_bytes': minimum_required,
+                    'pending_bytes': covered['pending_bytes'],
+                    'limiting_factors': [k for k, v in bounds.items() if v == limit],
+                    'capacity_census_performed': False,
+                    'source_reserve_bytes': source_reserve,
+                    'uses_backup_reserve': bool(reserve_options),
+                }
+                if limit < minimum_required or limit <= 1024**2:
+                    result['state'] = ('private_object_exceeds_negotiated_batch_limit'
+                        if minimum_required > negotiated_limit else 'private_backup_waiting_capacity')
+                    break
                 if usage is None:
                     usage = queue.transport_usage()
-                limit = min(queue.config['maximum_batch_bytes'], ready['maximum_batch_bytes'],
-                            queue.staging_room(usage),
-                            queue.config['maximum_pending_bytes'] - covered['pending_bytes'],
-                            ready['ingress_free_bytes'] - reserve - covered['pending_bytes'],
-                            ready['nas_free_bytes'] - reserve - covered['pending_bytes'])
-                if limit <= 1024**2:
+                bounds['transport_and_physical_room'] = queue.staging_room(usage, **reserve_options)
+                limit = min(bounds.values())
+                result['wave_budget'].update(available_bytes=limit, capacity_census_performed=True,
+                    transport_detail_bounds_bytes=queue.staging_bounds(usage, **reserve_options),
+                    limiting_factors=[k for k, v in bounds.items() if v == limit])
+                if limit < minimum_required or limit <= 1024**2:
                     result['state'] = 'private_backup_waiting_capacity'
                     break
-                selected = select_wave(catalog, sent | deferred, maximum_bytes=min(limit, WAVE_BYTES),
+                # Use the negotiated capacity rather than an unrelated small
+                # latency target. Every selected wave still reserves envelope
+                # space and obeys both peers, pending bytes, staging, physical
+                # free space and the original per-wave file bound.
+                selected = select_wave(catalog, excluded, maximum_bytes=limit,
                                        maximum_files=queue.config['maximum_batch_files'])
-                if not selected:
-                    # A latency target must never become a hard size limit for
-                    # a valid older pack. Admit it within the original quota.
-                    selected = select_wave(catalog, sent | deferred, maximum_bytes=limit,
-                                           maximum_files=queue.config['maximum_batch_files'])
                 if not selected:
                     unsent = any(file_key(r) not in sent for r in catalog['files'])
                     result['state'] = ('private_backup_waiting_export_retry' if unsent and deferred
@@ -231,6 +317,10 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
                     break
                 original = [{**r, 'relative': r['relative'][len(NAMESPACE):]} for r in selected]
                 staging = queue.transport / '.staging' / ('private-cold-' + uuid.uuid4().hex)
+                # An earlier failed wave remains visible as last_failed_wave;
+                # its error must not be mistaken for the new in-flight wave.
+                for field in ('error_type', 'error_reason', 'retained_staging'):
+                    result.pop(field, None)
                 result.update(state='copying_and_independently_verifying_private_wave',
                               current_wave_files=len(selected),
                               current_wave_bytes=sum(row['bytes'] for row in selected),
@@ -239,10 +329,16 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
                               observed_at_utc=datetime.now(timezone.utc).isoformat())
                 private_json(queue.state / 'private-status.json', result, compact=True)
                 try:
+                    def guard_private_source():
+                        queue.storage_guard()
+                        validate_private_root(root, policy)
+
                     exported = export_incremental_delivery(root, original, staging,
                         catalog_identity=catalog['identity_sha256'], namespace='private-history',
                         copy_workers=queue.pipeline.get('copy_workers', 1),
-                        verify_workers=queue.pipeline.get('verify_workers', 1), native_windows_io=True)
+                        verify_workers=queue.pipeline.get('verify_workers', 1), native_windows_io=True,
+                        source_authority_guard=guard_private_source,
+                        **({'native_reserve_bytes': source_reserve} if reserve_options else {}))
                     key = exported['envelope_identity_sha256']
                     queue.publish_closed(ledger, selected, staging, key, catalog['identity_sha256'], KIND,
                                          native_windows_io=True)
@@ -255,7 +351,11 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
                              + ledger['deliveries'][key]['dispatch']['complete_bytes']}
                     for row in selected:
                         retries.pop(file_key(row), None)
-                    notifications.append({'deliveries': {key: ledger['deliveries'][key]}})
+                    # Reuse the public controller's per-wave scan protocol.
+                    # The immutable dispatch is durable before this snapshot;
+                    # the network thread never reads or mutates our ledger.
+                    one = {'deliveries': {key: json.loads(json.dumps(ledger['deliveries'][key]))}}
+                    notifications.append(scanner.submit(queue.scan_transport, one))
                     result['published_waves'].append(key)
                     result['state'] = 'private_files_published_waiting_NAS_ACK'
                     result['observed_at_utc'] = datetime.now(timezone.utc).isoformat()
@@ -265,7 +365,11 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
                     # Preserve the exact failed stage. Do not let one bad
                     # private wave block the normal public metadata controller.
                     result.update(state='private_export_retry_required', error_type=type(error).__name__,
-                                  error_reason=str(error)[:512], retained_staging=str(staging))
+                                  error_reason=str(error)[:512], retained_staging=str(staging),
+                                  observed_at_utc=datetime.now(timezone.utc).isoformat())
+                    result['last_failed_wave'] = {
+                        field: result[field] for field in ('error_type', 'error_reason', 'retained_staging',
+                                                           'observed_at_utc')}
                     for row in selected:
                         file = file_key(row)
                         attempt = retries.get(file, {}).get('attempts', 0) + 1
@@ -274,6 +378,9 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
                                         'next_attempt_epoch': time.time() + delays[min(attempt - 1, len(delays) - 1)],
                                         'retained_staging': str(staging)}
                     queue._save_ledger(ledger)
+                    # Publish the failure before the next possibly slow
+                    # capacity census; failed data and staging stay intact.
+                    private_json(queue.state / 'private-status.json', result, compact=True)
                     continue
             queue._save_ledger(ledger)
             covered = coverage(catalog, ledger)
@@ -290,11 +397,38 @@ def cycle(queue, *, publish: bool = True, wait_for_owner: bool = False) -> dict:
             if result['registered_private_closure_NAS_verified']:
                 result['state'] = 'registered_private_files_NAS_ACK_verified'
             result['observed_at_utc'] = datetime.now(timezone.utc).isoformat()
+            # A subsequent activity heartbeat must not erase or freshen this
+            # measured coverage. This small original-owner projection carries
+            # the exact catalog generation and keeps its actual evidence clock.
+            private_json(queue.state / 'private-coverage.json', {
+                **{k: result[k] for k in ('catalog_identity_sha256', 'observed_at_utc',
+                    'available_file_count', 'available_bytes', 'nas_covered_file_count',
+                    'nas_covered_bytes', 'registered_private_closure_NAS_verified')},
+                'contract': COVERAGE_CONTRACT, 'all_project_sources_NAS_verified': False,
+                'source_files_deleted': 0}, compact=True)
             private_json(queue.state / 'private-status.json', result, compact=True)
-        # The original durable dispatches/ledger are the notification journal;
-        # normal notify-transport also retries them after interruption.
-        for notification in notifications:
-            queue.scan_transport(notification)
+        # The original durable dispatches retry notifications after a crash.
+        # Collect scan requests only after releasing the publication owner,
+        # then reload its ledger before recording their exact dispatch pins.
+        scans, scan_errors = [], []
+        for future in notifications:
+            try:
+                notification = future.result()
+                if notification is not None:
+                    scans.append(notification)
+            except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
+                scan_errors.append(type(error).__name__)
+        if scans:
+            with publication_owner(queue, lock, wait_for_owner=True):
+                queue.storage_guard()
+                fresh = queue.load_ledger()
+                for notification in scans:
+                    queue.record_transport_scan(fresh, notification)
+                queue._save_ledger(fresh)
+        result['transport_scan_notifications'] = scans
+        result['transport_scan_errors'] = scan_errors
+        result['observed_at_utc'] = datetime.now(timezone.utc).isoformat()
+        private_json(queue.state / 'private-status.json', result, compact=True)
         return result
 
 

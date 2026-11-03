@@ -1,5 +1,6 @@
 """Source-backed CMNews SSR scope: no related/schema/hydration text fallback."""
 import json
+from copy import deepcopy
 from dataclasses import replace
 from pathlib import Path
 from bs4 import BeautifulSoup
@@ -7,7 +8,9 @@ from bs4 import BeautifulSoup
 import pytest
 
 from downloader.news_fulltext import load_config
+from downloader import news_fulltext_policy as policy
 from downloader.news_fulltext_policy import NewsError, PolicyRegistry, extract_article
+from downloader.news_fulltext_queue import NewsQueue, parser_repair_changed, parser_repair_identity
 
 UUID = "82e568db-c3a9-11f1-b154-4965150594c4"
 SLUG = "forumnews-" + UUID
@@ -57,6 +60,91 @@ def test_current_public_ssr_scope_and_matching_precise_source_clock(source):
     assert result["published_at_raw"] == "2026-10-09T14:20:23+08:00"
     assert result["extraction_method"] == "css:.articleContent__textContent"
     assert result["historical_point_in_time"] is False
+
+
+@pytest.mark.parametrize('published,modified', [
+    ('2026-10-09T14:20:23+08:00', '2026-10-09T14:25:56+08:00'),
+    ('2026-10-09T14:20:23', '2026-10-09T14:25:56'),
+])
+def test_matching_schema_clock_reports_its_actual_provenance_without_inventing_a_timezone(source, published, modified):
+    soup = BeautifulSoup(page(clock='2026-10-09 14:20 (更新：2026-10-09 14:25)',
+                              schema_clock=published), 'lxml')
+    script = soup.select_one('script[type="application/ld+json"]')
+    declaration = json.loads(script.string)
+    declaration['dateModified'] = modified
+    script.string = json.dumps(declaration, ensure_ascii=False)
+    result = extract_article(str(soup).encode(), source, page_url=URL)
+    assert result['published_at_raw'] == published
+    assert result['modified_at_raw'] == modified
+    assert result['published_time_basis'] == (
+        'publisher_NewsArticle_matches_visible_minute; source_declared_clock_preserved_without_timezone_inference')
+
+
+def test_unmatched_schema_update_keeps_visible_clocks_and_their_basis(source):
+    soup = BeautifulSoup(page(clock='2026-10-09 14:20 (更新：2026-10-09 14:25)'), 'lxml')
+    script = soup.select_one('script[type="application/ld+json"]')
+    declaration = json.loads(script.string)
+    declaration['dateModified'] = '2026-10-09T14:26:00+08:00'
+    script.string = json.dumps(declaration, ensure_ascii=False)
+    result = extract_article(str(soup).encode(), source, page_url=URL)
+    assert result['published_at_raw'] == '2026-10-09 14:20'
+    assert result['modified_at_raw'] == '2026-10-09 14:25'
+    assert result['published_time_basis'] == (
+        'publisher_visible_separate_published_and_updated_minute_clocks; source_precision_preserved')
+
+
+def test_clock_basis_contract_changes_only_cmnews_capture_not_http_or_parser_identity(monkeypatch):
+    config = load_config(Path('configs/news_fulltext.json'))[0]
+    monkeypatch.setattr(policy, 'CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION', 0)
+    old_registry = PolicyRegistry(config, base=Path.cwd())
+    old = old_registry.sources['cmnews']
+    monkeypatch.setattr(policy, 'CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION', 1)
+    registry = PolicyRegistry(config, base=Path.cwd())
+    new = registry.sources['cmnews']
+    assert new.data_fingerprint != old.data_fingerprint
+    assert new.parser_repair_capture_history == (old.data_fingerprint,)
+    assert new.parser_repair_prior_capture_fingerprint == old.parser_repair_prior_capture_fingerprint
+    assert new.http_capacity_source_fingerprint == old.http_capacity_source_fingerprint
+    assert new.authorization_fingerprint == old.authorization_fingerprint
+    assert new.parser_repair_fingerprint == old.parser_repair_fingerprint
+    assert not parser_repair_changed(new, old.data_fingerprint, json.dumps(parser_repair_identity(old)))
+    assert all(registry.sources[name].data_fingerprint == original.data_fingerprint
+               for name, original in old_registry.sources.items() if name != 'cmnews')
+    changed = deepcopy(config)
+    entry = next(item for item in changed['providers'] if item['id'] == 'cmnews')
+    entry['article_selectors'] = ['.different-source-container']
+    actual_parser_change = PolicyRegistry(changed, base=Path.cwd()).sources['cmnews']
+    assert actual_parser_change.parser_repair_fingerprint != new.parser_repair_fingerprint
+    assert parser_repair_changed(actual_parser_change, old.data_fingerprint, json.dumps(parser_repair_identity(old)))
+
+
+def test_clock_basis_upgrade_preserves_old_heads_refusals_and_deadlines(monkeypatch, tmp_path):
+    config = deepcopy(load_config(Path('configs/news_fulltext.json'))[0])
+    config['providers'] = [item for item in config['providers'] if item['id'] == 'cmnews']
+    config.pop('provider_catalog', None)
+    config.update(root=str(tmp_path), min_free_disk_bytes=1)
+    monkeypatch.setattr(policy, 'CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION', 0)
+    old = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
+    urls = [URL.replace(UUID, f'82e568db-c3a9-11f1-b154-{i:012d}') for i in range(4)]
+    states = ['body_not_found', 'paywall_or_login', 'article_identity_not_verified', 'complete']
+    old.add_articles([{'url': url} for url in urls])
+    with old.db:
+        for index, (url, state) in enumerate(zip(urls, states)):
+            old.db.execute('UPDATE articles SET state=?,error_code=?,attempts=?,due=?,last_checked_at_utc=? WHERE url=?',
+                           (state, None if state == 'complete' else state, index + 2, 1900000000 + index,
+                            '2026-10-14T04:00:00+00:00', url))
+    heads = {row['url']: dict(row) for row in old.db.execute('SELECT * FROM articles')}
+    old.close()
+    monkeypatch.setattr(policy, 'CMNEWS_SCHEMA_CLOCK_BASIS_CONTRACT_VERSION', 1)
+    monkeypatch.setattr(NewsQueue, '_activate_authorized_metadata',
+                        lambda *args: pytest.fail('metadata-only clock label must not reactivate other work'))
+    new = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
+    try:
+        assert {row['url']: dict(row) for row in new.db.execute('SELECT * FROM articles')} == heads
+        setting = new.db.execute("SELECT value FROM queue_settings WHERE key='source_parser_repair_fingerprint:cmnews'").fetchone()[0]
+        assert json.loads(setting) == parser_repair_identity(new.registry.sources['cmnews'])
+    finally:
+        new.close()
 
 
 def explicit_empty_byline_page(**options):

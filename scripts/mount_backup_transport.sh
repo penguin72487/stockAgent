@@ -2,6 +2,14 @@
 # Source-side transport staging on the already enrolled D: volume.
 set -euo pipefail
 backup_mount_repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+if /usr/bin/python3 - "$backup_mount_repo/configs/data_sync/backup_transport_volume.json" <<'PY'
+import json,sys
+sys.exit(0 if json.load(open(sys.argv[1]))['physical_volume']=='E:' else 1)
+PY
+then
+  source "$backup_mount_repo/scripts/runtime_env.sh"
+  exec_fintech_python "$backup_mount_repo/scripts/manage_backup_transport_mount.py" "$@"
+fi
 backup_backing=/srv/stockagent-d-volume/stockagent-backup-ingress-lab203
 backup_transport=/srv/stockagent-backup-ingress-lab203
 [[ $# -eq 1 ]] || exit 2

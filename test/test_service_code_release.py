@@ -421,7 +421,7 @@ def test_namespace_probe_rechecks_verification_inputs_after_execution(workspace,
         release.run_in_namespace(code, workspace, ["-c", "pass"], verification_inputs=receipt)
 
 
-@pytest.mark.parametrize("change", ["contents", "added", "deleted", "writable", "symlink", "hardlink", "bundle"])
+@pytest.mark.parametrize("change", ["contents", "added", "bytecode", "deleted", "writable", "symlink", "hardlink", "bundle"])
 def test_actual_pinned_source_drift_still_fails_closed(workspace, change):
     receipt = prepare(workspace)
     source = receipt.parent / "source"
@@ -433,6 +433,10 @@ def test_actual_pinned_source_drift_still_fails_closed(workspace, change):
         target.chmod(0o444)
     elif change == "added":
         target.with_name("unexpected.py").write_text("# unrecorded lazy import\n")
+    elif change == "bytecode":
+        cache = target.parent / "__pycache__"
+        cache.mkdir()
+        (cache / "example.cpython-312.pyc").write_bytes(b"unrecorded bytecode")
     elif change == "deleted":
         target.unlink()
     elif change == "writable":

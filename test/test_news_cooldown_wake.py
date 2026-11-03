@@ -132,6 +132,119 @@ def test_stale_circuit_can_wake_once_but_never_spin(queue, clock):
     assert queue.next_wake_delay({}, maximum=60) == 60
 
 
+def test_inflight_dispatch_deadlines_filter_lanes_providers_and_old_work(config, tmp_path, clock):
+    other = deepcopy(config['providers'][0])
+    other.update(id='other', domains=['other.test'])
+    config['providers'].append(other)
+    q = NewsQueue(tmp_path, PolicyRegistry(config, base=tmp_path))
+    try:
+        with q.db:
+            q.add_articles([{'url': 'https://publisher.test/old'},
+                            {'url': 'https://other.test/old'}, {'url': 'https://other.test/future'}])
+            q.db.execute("UPDATE articles SET due=104 WHERE url='https://other.test/future'")
+            q.db.execute("INSERT INTO discovery(url,kind,provider,due) VALUES (?,'feed','other',102)",
+                         ('https://other.test/feed',))
+        common = dict(provider_ids={'other'}, include_local=False, dispatch_after=100)
+        assert q.next_wake_delay({}, maximum=60, include_discovery=False, **common) == 4
+        assert q.next_wake_delay({}, maximum=60, include_articles=False, **common) == 2
+        assert q.next_wake_delay({'other': 108}, maximum=60, include_discovery=False, **common) == 8
+        scopes = {'other': {'hosts': {'other.test': 106}, 'origins': {}}}
+        assert q.next_wake_delay({}, maximum=60, include_discovery=False,
+                                 request_scope_cooldowns=scopes, **common) == 6
+        # A deadline that passed since the dispatch attempt needs one retry.
+        clock[0] = 103
+        assert q.next_wake_delay({}, maximum=60, include_articles=False, **common) == 0
+        # An already offered (but unclaimable) row cannot spin forever or hide
+        # a later deadline in the same provider's indexed queue.
+        assert q.next_wake_delay({}, maximum=60, include_discovery=False,
+                                 provider_ids={'other'}, include_local=False, dispatch_after=103) == 1
+        clock[0] = 105
+        assert q.next_wake_delay({}, maximum=60, provider_ids={'other'}, include_local=False,
+                                 dispatch_after=105) == 60
+        assert q.next_wake_delay({}, maximum=60, provider_ids={'publisher'}, include_local=False,
+                                 dispatch_after=105) == 60
+    finally:
+        q.close()
+
+
+def test_article_wake_many_sources_preserves_deadlines_with_bounded_queries(config, tmp_path, clock):
+    """Multiple sources must agree with a row-level oracle without per-state SQL calls."""
+    template = config['providers'][0]
+    config['providers'] = []
+    for number in range(132):
+        source = deepcopy(template)
+        source.update(id=f'source_{number:03}',
+                      domains=[f'p{number:03}.test', f'alt{number:03}.test'])
+        config['providers'].append(source)
+    registry = PolicyRegistry(config, base=tmp_path)
+    q = NewsQueue(tmp_path, registry)
+    rows = []
+    for number in range(132):
+        for index, state in enumerate(('pending', 'retry', 'retry_cooldown', 'complete')):
+            host = f'{"alt" if index % 2 else "p"}{number:03}.test'
+            url = f'https://{host}/story/{index}'
+            due = (90, 104 + number % 6, 105 + number % 8, 101)[index]
+            rows.append((f'source_{number:03}', url, host, state, due))
+    try:
+        with q.db:
+            q.add_articles([{'url': url} for _, url, _, _, _ in rows])
+            q.db.executemany('UPDATE articles SET state=?,due=? WHERE url=?',
+                             [(state, due, url) for _, url, _, state, due in rows])
+        registry.sources['source_005'] = replace(registry.sources['source_005'], allowed=False, metadata_feeds=())
+        registry.sources['source_006'] = replace(registry.sources['source_006'], allowed=False,
+            metadata_feeds=('https://p006.test/feed',))
+        scopes = {
+            'source_003': {'hosts': {'p003.test': 104}, 'origins': {'https://alt003.test': 106}},
+            'source_006': {'hosts': {'p006.test': 107}, 'origins': {}},
+            'source_007': {'hosts': {'p007.test': 99}, 'origins': {}},
+        }
+        provider_cooldowns = {'source_000': 109, 'source_003': 108}
+
+        def oracle(selected, after):
+            deadlines = []
+            for provider, source in registry.sources.items():
+                if not source.request_enabled or selected is not None and provider not in selected:
+                    continue
+                scope = scopes.get(provider, {})
+                hosts = {host: due for host, due in scope.get('hosts', {}).items() if due > clock[0]}
+                origins = {origin: due for origin, due in scope.get('origins', {}).items() if due > clock[0]}
+                earliest = [*hosts.values(), *origins.values()]
+                if source.allowed:
+                    earliest.extend(due for row_provider, url, host, state, due in rows
+                        if row_provider == provider and state in {'pending', 'retry', 'retry_cooldown'}
+                        and (after is None or due > after) and host not in hosts
+                        and not any(url.startswith(origin + '/') for origin in origins))
+                if earliest:
+                    deadlines.append(max(min(earliest), provider_cooldowns.get(provider, 0)))
+            return min(60, max(0, min(deadlines) - clock[0])) if deadlines else 60
+
+        cases = [(None, None), (None, 100), (None, 107), ({'source_003', 'source_004'}, 100),
+                 ({'source_003'}, 100), ({'source_005'}, None), ({'source_006'}, None), (set(), 100)]
+        statements = []
+        for selected, after in cases:
+            q.db.set_trace_callback(statements.append)
+            try:
+                actual = q.next_wake_delay(provider_cooldowns, maximum=60,
+                    request_scope_cooldowns=scopes, provider_ids=selected, include_discovery=False,
+                    include_local=False, dispatch_after=after)
+            finally:
+                q.db.set_trace_callback(None)
+            assert actual == oracle(selected, after)
+        # Query count should scale by bounded provider batches, not by three
+        # statements per provider. Scoped hosts retain the ordinary filter.
+        statements.clear()
+        q.db.set_trace_callback(statements.append)
+        try:
+            q.next_wake_delay(provider_cooldowns, maximum=60, request_scope_cooldowns=scopes,
+                              include_discovery=False, include_local=False, dispatch_after=100)
+        finally:
+            q.db.set_trace_callback(None)
+        article_queries = [sql for sql in statements if 'FROM ARTICLES' in sql.upper()]
+        assert len(article_queries) < 10
+    finally:
+        q.close()
+
+
 def test_resident_owner_wakes_and_accepts_original_after_cnyes_cooldown(cfg, tmp_path, monkeypatch):
     """Exercise the resident loop, HTTP owner, parser and durable receipt offline."""
     from downloader import news_fulltext as owner

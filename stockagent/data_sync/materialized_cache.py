@@ -502,7 +502,14 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
             except OSError as error:
                 _reference_read_error(process / name, error)
                 continue
-            if matches_path(value):
+            matches = matches_path(value)
+            if inode_keys and not matches:
+                try:
+                    info = (process / name).stat()
+                    matches = (info.st_dev, info.st_ino) in inode_keys
+                except OSError as error:
+                    _reference_read_error(process / name, error)
+            if matches:
                 references.append(f"pid={pid}:{name}:{value}")
                 if len(references) >= limit:
                     return references

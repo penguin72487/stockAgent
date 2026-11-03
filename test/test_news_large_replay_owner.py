@@ -67,6 +67,24 @@ def test_large_replay_accepts_only_after_independent_proof_and_keeps_original(cf
         assert verify_bodies(tmp_path)['accepted']
 
 
+def test_large_replay_does_not_complete_when_current_head_refuses_adoption(cfg, tmp_path, small_limit, monkeypatch):
+    with closing(NewsQueue(tmp_path, PolicyRegistry(cfg, base=tmp_path))) as queue:
+        original = oversized_head(queue, small_limit)
+        accept = queue._accept_records
+        def refused(records, relative, receipt, **kwargs):
+            with queue.db:
+                queue.db.execute("UPDATE articles SET state='retry',error_code='http_429',due=4102444800")
+            return accept(records, relative, receipt, **kwargs)
+        monkeypatch.setattr(queue, '_accept_records', refused)
+        step(queue, small_limit)
+        wait_for(queue, small_limit, lambda: queue.db.execute(
+            "SELECT 1 FROM retained_metadata_large_retries WHERE last_error='metadata_acceptance_not_adopted'").fetchone())
+        current = dict(queue.db.execute('SELECT * FROM articles').fetchone())
+        assert current['parquet_path'] == original['parquet_path'] and current['error_code'] == 'http_429'
+        assert queue.db.execute('SELECT state FROM retained_metadata_replays').fetchone()[0] == 'resource_wait'
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 2
+
+
 def test_megabyte_original_roundtrips_through_full_owner_without_changing_wire(cfg, tmp_path, small_limit):
     # Compression keeps the private fixture small on disk; the individual
     # original response stays below the configured 8 MiB source limit.

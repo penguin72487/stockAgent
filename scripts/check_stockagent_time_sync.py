@@ -28,6 +28,8 @@ from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TAIPEI = ZoneInfo("Asia/Taipei")
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 
 def parse_args() -> argparse.Namespace:
@@ -102,6 +104,40 @@ def _powershell_path() -> str | None:
     return str(candidate) if candidate.is_file() else None
 
 
+def _interop_signature(path: str | Path) -> tuple | None:
+    # Reuse the native I/O owner's socket, owner, and /init identity checks.
+    from stockagent.data_sync.windows_cold_io import _interop_socket
+
+    return _interop_socket(path)
+
+
+def _windows_interop_candidates() -> list[tuple]:
+    """Find bounded, structurally trusted bridges, including systemd's case."""
+
+    from stockagent.data_sync.windows_cold_io import _INTEROP_DIRECTORY
+
+    preferred = os.environ.get("WSL_INTEROP")
+    paths = ([Path(preferred)] if preferred else []) + [
+        _INTEROP_DIRECTORY / "1_interop",
+        *sorted(_INTEROP_DIRECTORY.glob("*_interop"), reverse=True),
+    ]
+    candidates: list[tuple] = []
+    seen: set[tuple] = set()
+    for path in paths:
+        signature = _interop_signature(path)
+        if signature is None or signature in seen:
+            continue
+        seen.add(signature)
+        candidates.append(signature)
+        if len(candidates) == 4:
+            break
+    return candidates
+
+
+class _WindowsClockHandshakeError(RuntimeError):
+    """A candidate bridge could not start the host clock sampler."""
+
+
 def _sample_windows_host_offset(
     *,
     samples: int,
@@ -119,19 +155,55 @@ def _sample_windows_host_offset(
         "[Console]::Out.WriteLine([DateTimeOffset]::UtcNow.ToUnixTimeMilliseconds()); "
         "[Console]::Out.Flush() }"
     )
-    process = subprocess.Popen(
-        [executable, "-NoProfile", "-NonInteractive", "-Command", command],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-        bufsize=0,
+    candidates = _windows_interop_candidates()
+    if not candidates:
+        raise RuntimeError("no trusted local WSL interop bridge for Windows host clock")
+    # The guardian has a 20 s deadline, including chrony and receipt I/O.
+    # A broken bridge must not stall the next opening readiness check.
+    deadline = time.monotonic() + 12.0
+    handshake_errors: list[str] = []
+    for signature in candidates:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        try:
+            return _sample_windows_clock_process(
+                executable=executable,
+                command=command,
+                signature=signature,
+                samples=samples,
+                deadline=deadline,
+            )
+        except _WindowsClockHandshakeError as exc:
+            handshake_errors.append(str(exc))
+    raise RuntimeError(
+        "Windows host clock bridge handshake failed: "
+        + "; ".join(handshake_errors or ["deadline exhausted"])
     )
+
+
+def _sample_windows_clock_process(
+    *, executable: str, command: str, signature: tuple, samples: int, deadline: float,
+) -> dict[str, Any]:
+    bridge = str(signature[0])
+    if _interop_signature(bridge) != signature:
+        raise _WindowsClockHandshakeError("WSL interop identity changed before startup")
+    try:
+        process = subprocess.Popen(
+            [executable, "-NoProfile", "-NonInteractive", "-Command", command],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+            bufsize=0, env={**os.environ, "WSL_INTEROP": bridge},
+        )
+    except OSError as exc:
+        raise _WindowsClockHandshakeError(f"Windows host process start: {type(exc).__name__}") from exc
     rows: list[dict[str, float]] = []
     pending = b""
 
     def read_line(timeout: float) -> bytes:
         nonlocal pending
-        deadline = time.monotonic() + timeout
+        read_deadline = min(deadline, time.monotonic() + timeout)
         while b"\n" not in pending:
-            remaining = deadline - time.monotonic()
+            remaining = read_deadline - time.monotonic()
             if remaining <= 0 or not select.select([process.stdout], [], [], remaining)[0]:
                 raise TimeoutError("Windows host clock response timed out")
             chunk = os.read(process.stdout.fileno(), 128)
@@ -144,8 +216,13 @@ def _sample_windows_host_offset(
         return line.strip()
 
     try:
-        if read_line(10.0) != b"READY":
-            raise RuntimeError("Windows host clock did not acknowledge startup")
+        try:
+            if read_line(6.0) != b"READY":
+                raise RuntimeError("Windows host clock did not acknowledge startup")
+            if _interop_signature(bridge) != signature:
+                raise RuntimeError("WSL interop identity changed during startup")
+        except (RuntimeError, TimeoutError, ValueError) as exc:
+            raise _WindowsClockHandshakeError(str(exc)) from exc
         for _ in range(max(1, int(samples))):
             before = time.time()
             before_mono = time.monotonic()
@@ -164,13 +241,15 @@ def _sample_windows_host_offset(
                 # Host milliseconds are truncated; include their quantization.
                 "uncertainty_seconds": elapsed / 2.0 + 0.001,
             })
+        if _interop_signature(bridge) != signature:
+            raise RuntimeError("WSL interop identity changed during clock sampling")
     finally:
         process.terminate()
         try:
-            process.wait(timeout=2)
+            process.wait(timeout=0.5)
         except subprocess.TimeoutExpired:
             process.kill()
-            process.wait(timeout=2)
+            process.wait(timeout=0.5)
         if process.stdin is not None:
             process.stdin.close()
         if process.stdout is not None:

@@ -19,6 +19,7 @@ from stockagent.data_sync.completed_forward_publication import (
     fixed_pin_path, select_entry, validate_key,
 )
 from stockagent.data_sync.desync_snapshots import SnapshotError, _fsync_directory
+from stockagent.service_layout import canonical_service_path
 from stockagent.data_sync.packed_snapshots import (
     _check_packed_read_authority, _load_inventory, _validate_inventory,
     resolve_packed_pin, stage_packed_root_files,
@@ -72,7 +73,8 @@ def production_binding(root: Path) -> ForwardColdBinding | None:
     Keep the publication catalog and retention config authoritative. A valid
     hot hit never calls this loader or needs D/config availability.
     """
-    if root.absolute() != REPO_ROOT / CANONICAL_CACHE:
+    root = canonical_service_path(root, root=REPO_ROOT)
+    if root != canonical_service_path(REPO_ROOT / CANONICAL_CACHE, root=REPO_ROOT):
         return None
     from scripts.publish_data_releases import _load_catalog
     from stockagent.data_sync.packed_retention import RetentionConfig
@@ -86,7 +88,8 @@ def production_binding(root: Path) -> ForwardColdBinding | None:
         raise SnapshotError("canonical completed-forward catalog family is missing or disabled")
     entry = entries[0]
     source = Path(entry["source"])
-    if (source if source.is_absolute() else REPO_ROOT / source) != root.absolute():
+    if canonical_service_path(source if source.is_absolute() else REPO_ROOT / source,
+                              root=REPO_ROOT) != root:
         raise SnapshotError("completed-forward catalog source differs from the canonical writer")
     config = RetentionConfig.load(retention, repo_root=REPO_ROOT)
     result = ForwardColdBinding(entry, config.sync_root, retention, REPO_ROOT, generations)
@@ -133,14 +136,15 @@ def restore_completed_forward(
     validate_key(key)
     if identity_digest(identity) != key or type(maximum_payload_bytes) is not int or maximum_payload_bytes <= 0:
         raise SnapshotError("cold restore identity or payload bound is invalid")
-    root = root.absolute()
+    root = canonical_service_path(root, root=binding.repo_root)
     root_generation = _root_generation(root)
     key_guard = _key_guard(root, key, key_descriptor)
     entry = select_entry(binding.entry, key)
     if entry.get("publish") is not True:
         raise SnapshotError("cold restore requires an enabled original catalog family")
     source = Path(entry["source"])
-    if (source if source.is_absolute() else binding.repo_root / source) != root:
+    if canonical_service_path(source if source.is_absolute() else binding.repo_root / source,
+                              root=binding.repo_root) != root:
         raise SnapshotError("cold restore catalog source does not match the writer")
     binding.guard()
     _check_packed_read_authority(binding.sync_root)

@@ -38,7 +38,7 @@ def test_stale_existing_endpoint_selects_verified_bridge_then_reuses_it(monkeypa
         assert command == native._native_command([], batched=True) + "\n[Console]::Write('stockagent-cold-interop-v1')"
         assert native.SCRIPT.read_text() in command
         assert kwargs['input'] == b'[]\n'  # Execute the actual wrapper, with no files.
-        assert kwargs['timeout'] == 5
+        assert kwargs['timeout'] == 15
         ok = calls[-1] == good
         return SimpleNamespace(returncode=0 if ok else 1,
                                stdout=native._INTEROP_MARKER if ok else b'')
@@ -61,6 +61,24 @@ def test_success_exit_with_wrong_marker_is_not_a_usable_bridge(monkeypatch, tmp_
                         SimpleNamespace(returncode=0, stdout=b'other process output'))
     with pytest.raises(SnapshotError, match='not started'):
         native._windows_process_environment()
+
+
+def test_healthy_bridge_with_eleven_second_startup_is_admitted_without_file_io(monkeypatch, tmp_path):
+    endpoints(monkeypatch, tmp_path, ['20_interop'])
+    good = str(tmp_path / '20_interop')
+    monkeypatch.setenv('WSL_INTEROP', good)
+    calls = []
+
+    def probe(argv, **kwargs):
+        calls.append(kwargs['input'])
+        if kwargs['timeout'] < 11:
+            raise native.subprocess.TimeoutExpired(argv, kwargs['timeout'])
+        return SimpleNamespace(returncode=0, stdout=native._INTEROP_MARKER)
+
+    monkeypatch.setattr(native.subprocess, 'run', probe)
+    monkeypatch.setattr(native.subprocess, 'Popen', lambda *a, **k: pytest.fail('file I/O started'))
+    assert native._windows_process_environment()['WSL_INTEROP'] == good
+    assert calls == [b'[]\n']
 
 
 def test_probe_and_file_launch_do_not_depend_on_login_windows_path(monkeypatch, tmp_path):

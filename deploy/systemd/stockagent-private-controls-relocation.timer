@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume fixed private control handoffs after interruption
+
+[Timer]
+OnBootSec=45
+OnUnitInactiveSec=60
+AccuracySec=1
+Unit=stockagent-private-controls-relocation.service
+
+[Install]
+WantedBy=timers.target

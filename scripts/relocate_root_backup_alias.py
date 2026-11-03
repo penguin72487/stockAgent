@@ -62,6 +62,17 @@ def _syncdir(parent: Path):
         os.close(descriptor)
 
 
+def exchange_names(source: Path, target: Path) -> None:
+    """Linux atomic name exchange; callers fence names, owners and identities."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    fn = libc.renameat2
+    fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
+    fn.restype = ctypes.c_int
+    if fn(-100, os.fsencode(source), -100, os.fsencode(target), 2) != 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
 def exchange(source: Path, target: Path, *, source_parent: Path, target_parent: Path,
              expected_directory_id: tuple[int, int]):
     """Swap a directory with a private self-link in one Linux renameat2 call."""
@@ -72,13 +83,7 @@ def exchange(source: Path, target: Path, *, source_parent: Path, target_parent: 
     placeholder = target.lstat()
     performed = False
     try:
-        libc = ctypes.CDLL(None, use_errno=True)
-        fn = libc.renameat2
-        fn.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_int, ctypes.c_char_p, ctypes.c_uint]
-        fn.restype = ctypes.c_int
-        if fn(-100, os.fsencode(source), -100, os.fsencode(target), 2) != 0:
-            error = ctypes.get_errno()
-            raise OSError(error, os.strerror(error))
+        exchange_names(source, target)
         performed = True
         _syncdir(source_parent)
         _syncdir(target_parent)

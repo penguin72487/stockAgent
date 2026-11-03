@@ -7,6 +7,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -239,6 +240,21 @@ def test_orphaned_running_job_can_wake_canonical_owner(receipt_scope):
     assert runner.retry_probe(observed=NOW)["due_keys"] == [key]
 
 
+@pytest.mark.parametrize("deadline,due", [
+    ("2026-10-01T00:00:01+00:00", False),
+    ("2026-10-01T00:00:00+00:00", True),
+])
+def test_source_wait_retries_only_after_its_deadline(receipt_scope, deadline, due):
+    _, path, _ = receipt_scope
+    key, job = _job(status="waiting_source", deadline=deadline)
+    _write(path, (key, job))
+    before = path.read_bytes()
+    result = runner.retry_probe(observed=NOW)
+    assert result["due"] is due
+    assert result["due_keys"] == ([key] if due else [])
+    assert path.read_bytes() == before
+
+
 @pytest.mark.parametrize("selection", ["all", "ALL", "*", ""])
 def test_all_market_selection_matches_canonical_case_insensitive_scope(
     receipt_scope, monkeypatch, selection
@@ -276,7 +292,7 @@ def test_probe_cli_skips_without_torch_import_or_receipt_write(receipt_scope):
     assert path.read_bytes() == before
 
 
-def test_coalesced_cli_never_calls_systemctl_or_imports_torch(
+def test_coalesced_cli_never_starts_systemctl_or_imports_torch(
     receipt_scope, monkeypatch
 ):
     root, path, _ = receipt_scope
@@ -285,7 +301,11 @@ def test_coalesced_cli_never_calls_systemctl_or_imports_torch(
     fake_bin = root / "fake_bin"
     fake_bin.mkdir()
     guarded_systemctl = fake_bin / "systemctl"
-    guarded_systemctl.write_text("#!/bin/sh\nexit 89\n")
+    guarded_systemctl.write_text(
+        "#!/bin/sh\nif [ \"$1\" = show ]; then\n"
+        "  printf 'ActiveState=failed\\nJob=\\nInvocationID=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\\n'\n"
+        "  exit 0\nfi\nexit 89\n"
+    )
     guarded_systemctl.chmod(0o755)
     monkeypatch.setenv("PATH", f"{fake_bin}:{os.environ['PATH']}")
     check = subprocess.run(
@@ -303,6 +323,7 @@ def test_coalesced_cli_never_calls_systemctl_or_imports_torch(
             {
                 "dispatch_accepted_at": datetime.now(timezone.utc).isoformat(),
                 "wakeup_fingerprint": probe["wakeup_fingerprint"],
+                "owner_invocation_id_before": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             }
         )
     )
@@ -342,6 +363,8 @@ def test_request_rechecks_market_runway_before_exact_owner_dispatch(
         return {"allowed": allowed}
 
     monkeypatch.setattr(window, "evaluate", checked)
+    monkeypatch.setattr(runner, "_retry_owner_invocation", lambda _: {
+        "active_state": "inactive", "invocation_id": "old", "job": ""})
     monkeypatch.setattr(
         runner.subprocess, "run", lambda *a, **kw: calls.append((a, kw))
     )
@@ -364,7 +387,56 @@ def _permit_dispatch(monkeypatch):
     calls = []
     monkeypatch.setattr(window, "evaluate", lambda *a, **kw: {"allowed": True})
     monkeypatch.setattr(runner.subprocess, "run", lambda *a, **kw: calls.append(a))
+    monkeypatch.setattr(runner, "_retry_owner_invocation", lambda _: {
+        "active_state": "failed", "invocation_id": f"invocation-{len(calls)}", "job": ""})
     return calls
+
+
+@pytest.mark.parametrize("state,job", [("active", ""), ("activating", ""),
+                                        ("deactivating", ""), ("failed", "1/start")])
+def test_retry_does_not_dispatch_or_persist_when_unit_busy(receipt_scope, monkeypatch, capsys, state, job):
+    _, path, _ = receipt_scope
+    _write(path, _job())
+    calls = _permit_dispatch(monkeypatch)
+    monkeypatch.setattr(runner, "_retry_owner_invocation", lambda _: {
+        "active_state": state, "invocation_id": "old", "job": job})
+    assert runner.request_due_retry() == 0
+    assert calls == [] and not runner._retry_dispatch_state_path().exists()
+    result = json.loads(capsys.readouterr().out)
+    assert result["dispatch_reason"] == "owner_unit_busy_or_job_pending"
+    assert not result["requested"]
+
+
+def test_retry_request_without_new_invocation_is_not_coalesced(receipt_scope, monkeypatch, capsys):
+    _, path, _ = receipt_scope
+    _write(path, _job())
+    calls = _permit_dispatch(monkeypatch)
+    monkeypatch.setattr(runner, "_retry_owner_invocation", lambda _: {
+        "active_state": "failed", "invocation_id": "same-old-run", "job": ""})
+    assert runner.request_due_retry() == 0
+    assert runner.request_due_retry() == 0
+    assert len(calls) == 2
+    assert all(json.loads(line)["requested"] for line in capsys.readouterr().out.splitlines())
+
+
+def test_legacy_dispatch_without_invocation_proof_gets_one_safe_retry(receipt_scope, monkeypatch):
+    _, path, _ = receipt_scope
+    _write(path, _job())
+    calls = _permit_dispatch(monkeypatch)
+    probe = runner.retry_probe()
+    runner._retry_dispatch_state_path().write_text(json.dumps({
+        "dispatch_accepted_at": datetime.now(timezone.utc).isoformat(),
+        "wakeup_fingerprint": probe["wakeup_fingerprint"],
+    }))
+    assert runner.request_due_retry() == 0
+    assert runner.request_due_retry() == 0
+    assert len(calls) == 1
+
+
+def test_retry_owner_readback_rejects_incomplete_systemd_response(monkeypatch):
+    monkeypatch.setattr(runner.subprocess, "run", lambda *a, **kw: SimpleNamespace(stdout="ActiveState=inactive\n"))
+    with pytest.raises(ValueError, match="incomplete"):
+        runner._retry_owner_invocation(runner.ARTIFACT_OWNER_UNIT)
 
 
 def test_unchanged_source_defer_coalesces_without_job_mutation(

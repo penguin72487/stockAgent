@@ -1,6 +1,7 @@
 """Idle ownership includes CPU caches and a deferred allocator obligation."""
 from collections import OrderedDict
 import gc
+from types import SimpleNamespace
 
 import pytest
 
@@ -18,6 +19,7 @@ CACHES = (
 def isolated(monkeypatch):
     for name in CACHES:
         monkeypatch.setattr(engine, name, OrderedDict())
+    monkeypatch.setattr(engine, "_LIVE_DENSE_DEVICE_CACHE", OrderedDict())
     monkeypatch.setattr(engine, "_LIVE_RAW_TAIL_SOURCE_CACHE", None)
     monkeypatch.setattr(engine, "_LIVE_CUDA_CACHE_RELEASE_PENDING", False)
 
@@ -37,6 +39,30 @@ def fake_cuda(monkeypatch, events):
                         lambda: events.append("blas"))
     monkeypatch.setattr(engine.torch.cuda, "empty_cache", lambda: events.append("device"))
     monkeypatch.setattr(engine.torch.accelerator, "empty_host_cache", lambda: events.append("host"))
+
+
+def test_allocator_observation_does_not_initialize_cuda_or_wait_for_model_lock(monkeypatch):
+    monkeypatch.setattr(engine.torch.cuda, "is_initialized", lambda: False)
+    monkeypatch.setattr(engine.torch.cuda, "current_device",
+                        lambda: pytest.fail("must not initialize CUDA"))
+    with engine._LIVE_MODEL_CACHE_LOCK:
+        result = engine.live_cuda_allocator_observation()
+    assert result == {"status": "uninitialized", "device": None, "allocated_bytes": None,
+                      "reserved_bytes": None, "model_cache_entries": None}
+
+
+def test_allocator_observation_reports_process_counters_and_survives_errors(monkeypatch):
+    engine._LIVE_MODEL_CACHE["model"] = object()
+    monkeypatch.setattr(engine.torch.cuda, "is_initialized", lambda: True)
+    monkeypatch.setattr(engine.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(engine.torch.cuda, "memory_stats", lambda device: {
+        "allocated_bytes.all.current": 1024, "reserved_bytes.all.current": 2048})
+    result = engine.live_cuda_allocator_observation()
+    assert result == {"status": "available", "device": 0, "allocated_bytes": 1024,
+                      "reserved_bytes": 2048, "model_cache_entries": 1}
+    def fail(device): raise RuntimeError("transient telemetry error")
+    monkeypatch.setattr(engine.torch.cuda, "memory_stats", fail)
+    assert engine.live_cuda_allocator_observation()["status"] == "unavailable"
 
 
 def test_empty_idle_never_collects_or_probes(monkeypatch):
@@ -89,6 +115,39 @@ def test_model_invalidation_keeps_allocator_release_pending(monkeypatch):
     assert engine._LIVE_CUDA_CACHE_RELEASE_PENDING is False
     forbid_cuda(monkeypatch)
     assert engine.release_idle_live_cuda_cache() is False
+
+
+@pytest.mark.parametrize("cache_type", ["dense", "factorized"])
+def test_device_input_without_model_still_flushes_allocator(monkeypatch, cache_type):
+    events = []
+    fake_cuda(monkeypatch, events)
+    if cache_type == "dense":
+        engine._LIVE_DENSE_DEVICE_CACHE["input"] = object()
+    else:
+        cache = SimpleNamespace(retire_live_device_packets=lambda: True)
+        engine._LIVE_FACTORIZED_PANEL_CACHE["panel"] = SimpleNamespace(
+            features=SimpleNamespace(_cache=cache))
+    assert not engine._LIVE_MODEL_CACHE and not engine._LIVE_CUDA_CACHE_RELEASE_PENDING
+    assert engine.release_idle_live_cuda_cache() is True
+    assert events == ["synchronize", "blas", "device", "host"]
+    assert engine._LIVE_CUDA_CACHE_RELEASE_PENDING is False
+
+
+def test_new_allocator_obligation_during_flush_survives_for_next_idle(monkeypatch):
+    events = []
+    fake_cuda(monkeypatch, events)
+    engine._LIVE_MODEL_CACHE["model"] = object()
+    def concurrent_invalidation():
+        events.append("device")
+        with engine._LIVE_MODEL_CACHE_LOCK:
+            engine._LIVE_CUDA_CACHE_RELEASE_PENDING = True
+    monkeypatch.setattr(engine.torch.cuda, "empty_cache", concurrent_invalidation)
+    assert engine.release_idle_live_cuda_cache() is True
+    assert engine._LIVE_CUDA_CACHE_RELEASE_PENDING is True
+    fake_cuda(monkeypatch, events)
+    assert engine.release_idle_live_cuda_cache() is True
+    assert engine._LIVE_CUDA_CACHE_RELEASE_PENDING is False
+    assert events == ["synchronize", "blas", "device", "host"] * 2
 
 
 def test_failed_host_flush_keeps_pending_obligation_for_next_idle(monkeypatch):

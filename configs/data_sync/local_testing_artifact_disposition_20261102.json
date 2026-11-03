@@ -1,0 +1,430 @@
+{
+  "contract": "explicit-local-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "2026-11-02 使用者：效能驗證資料都可以刪除沒有問題。逐項固定目前舊實測副本，可不經冷庫備份直接丟棄；保留精簡比較與失敗收據。沿原 discard owner 檢查現行程序、服務、配置、pin 與檔案世代；只 unlink 範圍內的符號連結，絕不跟隨或刪除外部目標；不刪 D、NAS、原始下載資料或正式服務帳本。",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {
+      "base": "artifact",
+      "relative": "operations/incremental_followup_20261027",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round4",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/factorized-real-daily-20261020-v40",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round18",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round5",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/project_data_processing_20261011",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/shioaji_full_audit_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/shioaji_canonical_audit_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/taifex_history_columns_race_final_fixture_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/taifex_history_columns_final_fixture_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/taifex_history_columns_fixture_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/tw_public_full_assembly_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/factorized-real-daily-20261020-v34",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/finmind_eta_v2",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/finmind_eta",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_live_owner_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round177",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/five_mode_live_base_panel_cutoff_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round17",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/cex_date_normalization_full_20261016",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round2",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/cex_timestamp_overlap_20261015.vmdjKiUu",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_causal_projection_slices_take_abba_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/finmind-group-status-abba-20261015-fixture",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_20261021",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round141",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/factorized-real-daily-20261020-v36",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/closed_generation_20261014_1930",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/postclose_current_code_20261015",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/ohlcv_tail",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round188",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round183",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/ledger_block_optimization_20261015",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round3",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_canonical_owner_observed_pools_abba_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_prefix_causal_owner_abba_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/dashboards",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round16",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/public-input-reuse-20261016b",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_causal_projection_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round25",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/language_workflows_20261021",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/public-input-reuse-20261016c",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/lakehouse-source-wave-v5-20261015b",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_prefix_causal_cache_cold_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_prepared_coordinates_cold_v2_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/factorized-independent-base-20261020-v47",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/history_source",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_prefix_causal_owner_prime_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/collection_v3",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/collection_v2",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/collection",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_prefix_causal_cache_warm_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/finlab_minute_admission_20261015.WddHfnc6",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/finlab_canonical_effective_relation_final_20261015",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/finlab_effective_relation_20261015",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/finlab_canonical_effective_relation_20261015",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/catalog-identity-20261015c",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/catalog-identity-20261015b",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_canonical_owner_guarded_warm_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_canonical_owner_warm_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/factorized_canonical_owner_cold_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/gpu_architecture_rewrite_20261014",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/ledger_critical_path_20261015",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/workflow_speed_optimization_20261021/round159",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/metadata-ingestion-20261015c",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/corporate-bulk-cache-20261015d",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/corporate-bulk-cache-20261015c",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/running_services_20261013/lakehouse-source-wave-v4-20261015b",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "benchmarks/dashboard-daily-incremental-20261020-native-v19",
+      "kind": "directory",
+      "reason": "benchmark"
+    }
+  ],
+  "identity_sha256": "a90661b4870b465b0066e62ca1ba53b24b11c978c3e397f88863947929725b9c"
+}

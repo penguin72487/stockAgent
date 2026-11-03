@@ -10,9 +10,11 @@ from types import SimpleNamespace
 import pytest
 
 from downloader import news_fulltext_queue as queue_module
+from downloader.news_fulltext import fetch_article
 from scripts import benchmark_news_acceptance_recovery as benchmark_module
 from stockagent.private_json import loads
-from test_news_acceptance_recovery import accepted_queue, config
+from test_news_acceptance_recovery import URL, accepted_queue, config
+from test_news_fulltext import FakeResponse, article_html, http_fixture
 
 
 @pytest.mark.parametrize('raw', [
@@ -103,13 +105,23 @@ def test_readall_keeps_later_short_pipe_writes_until_real_eof():
 
 @pytest.mark.parametrize('corruption', ['', 'digest', 'rows', 'contract', 'json'])
 def test_candidate_retains_canonical_orphan_admission(config, tmp_path, monkeypatch, corruption):
-    queue, http = accepted_queue(config, tmp_path)
+    http, _ = http_fixture(config, tmp_path, {
+        'https://publisher.test/robots.txt': FakeResponse(b'User-agent: *\nAllow: /'),
+        URL: FakeResponse(article_html())})
+    queue = queue_module.NewsQueue(tmp_path, http.registry)
     try:
         monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input',
             benchmark_module._unbuffered_complete_receipt_input)
-        relative, receipt_relative = queue.db.execute(
-            'SELECT path,receipt_path FROM accepted_batches').fetchone()
-        path = tmp_path / receipt_relative
+        queue.add_articles([{'url': URL}])
+        record = fetch_article(http, queue.claim_url(URL, 300))
+        # Preserve the real pre-commit lease witness instead of editing a
+        # previously committed article into an impossible restart state.
+        with monkeypatch.context() as patch:
+            patch.setattr(queue, '_accept_records', lambda *a, **k: (
+                _ for _ in ()).throw(OSError('simulated interruption')))
+            with pytest.raises(OSError, match='simulated interruption'):
+                queue.accept([record])
+        path = next((tmp_path / 'receipts').glob('*.json'))
         receipt = json.loads(path.read_text())
         if corruption == 'digest':
             receipt['sha256'] = '0' * 64
@@ -119,8 +131,7 @@ def test_candidate_retains_canonical_orphan_admission(config, tmp_path, monkeypa
             receipt['contract_version'] = -1
         path.write_text('{invalid}' if corruption == 'json' else json.dumps(receipt))
         with queue.db:
-            queue.db.execute('DELETE FROM accepted_batches')
-            queue.db.execute("UPDATE articles SET state='pending',body_sha256=NULL,body_bytes=NULL,parquet_path=NULL")
+            queue.db.execute(queue_module.ABANDONED_WORK_RECOVERY_SQL)
         if corruption:
             with pytest.raises(ValueError):
                 queue.recover_acceptance(read_ahead_workers=0)
@@ -129,6 +140,24 @@ def test_candidate_retains_canonical_orphan_admission(config, tmp_path, monkeypa
             queue.recover_acceptance(read_ahead_workers=0)
             assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
             assert queue.db.execute('SELECT state FROM articles').fetchone()[0] == 'complete'
+    finally:
+        queue.close()
+        http.close()
+
+
+def test_unbuffered_orphan_replay_does_not_overwrite_superseded_head(config, tmp_path, monkeypatch):
+    queue, http = accepted_queue(config, tmp_path)
+    try:
+        monkeypatch.setattr(queue_module, 'read_acceptance_receipt_input',
+            benchmark_module._unbuffered_complete_receipt_input)
+        with queue.db:
+            queue.db.execute('DELETE FROM accepted_batches')
+            queue.db.execute("UPDATE articles SET state='pending',body_sha256=NULL,body_bytes=NULL,parquet_path=NULL")
+        before = tuple(queue.db.execute('SELECT state,captured_at_utc,last_checked_at_utc,body_sha256,parquet_path FROM articles').fetchone())
+        queue.recover_acceptance(read_ahead_workers=0)
+        assert queue.db.execute('SELECT count(*) FROM accepted_batches').fetchone()[0] == 1
+        assert tuple(queue.db.execute('SELECT state,captured_at_utc,last_checked_at_utc,body_sha256,parquet_path FROM articles').fetchone()) == before
+        assert queue.db.execute("SELECT value FROM counters WHERE key='article_capture_superseded_at_commit'").fetchone()[0] == 1
     finally:
         queue.close()
         http.close()

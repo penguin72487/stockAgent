@@ -1186,7 +1186,7 @@ def _run_index_derivatives_tick_training_impl(
                 1,
                 int(
                     math.ceil(
-                        config.training.epochs
+                        (config.training.early_stopping_reference_epochs or config.training.epochs)
                         * config.training.early_stopping_no_improve_ratio
                     )
                 ),

@@ -316,6 +316,44 @@ def test_verified_end_keeps_factorized_prefix_and_training_slabs_lazy(tmp_path, 
                 np.testing.assert_array_equal(actual, reference)
 
 
+@pytest.mark.parametrize("start,stop", [(0, 3), (1, 6), (3, 9)])
+def test_attach_contiguous_source_calendar_slice_preserves_exact_training_values(tmp_path, start, stop):
+    from stockagent.data.panel import slice_panel_end, slice_panel_start
+
+    panel, path, dense = example(tmp_path)
+    panel = slice_panel_end(panel, panel.dates[stop - 1])
+    panel = slice_panel_start(panel, panel.dates[start])
+    attached = attach_factorized_features(panel, path)
+    assert attached.features._row_offset == start
+    assert attached.features.shape == dense[start:stop].shape
+    np.testing.assert_array_equal(attached.features[:].view(np.uint32), dense[start:stop].view(np.uint32))
+    for row in range(stop - start):
+        slab = attached.features.as_torch().slab(row, 1).stock_chunk(0, 3)
+        np.testing.assert_array_equal(slab.numpy().view(np.uint32), dense[start + row:start + row + 1].view(np.uint32))
+    if stop - start > 2:
+        sub = attached.features.slice_dates(1, stop - start - 1)
+        np.testing.assert_array_equal(sub[:].view(np.uint32), dense[start + 1:stop - 1].view(np.uint32))
+
+
+def test_attach_source_calendar_slice_rejects_holes_reordering_and_symbol_changes(tmp_path):
+    from copy import copy
+    from stockagent.data.panel import slice_panel_end, slice_panel_start
+
+    original, path, _ = example(tmp_path)
+    panel = slice_panel_end(original, original.dates[5])
+    panel = slice_panel_start(panel, original.dates[1])
+    for invalid_days in (panel.dates[[0, 1, 3, 4]], panel.dates[::-1],
+                         panel.dates + np.timedelta64(100, "D")):
+        invalid = copy(panel)
+        invalid.dates = invalid_days
+        with pytest.raises(ValueError, match="universe/calendar"):
+            attach_factorized_features(invalid, path)
+    invalid = copy(panel)
+    invalid.symbols = panel.symbols[::-1]
+    with pytest.raises(ValueError, match="universe/calendar"):
+        attach_factorized_features(invalid, path)
+
+
 def test_bounded_reads_common_broadcast_masks_and_fingerprint(tmp_path, capsys):
     from stockagent.training.trainer import _panel_training_transform_fingerprint
     panel, path, dense = example(tmp_path)

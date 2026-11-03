@@ -3,6 +3,7 @@ import hashlib
 import fcntl
 from pathlib import Path
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -99,6 +100,17 @@ def test_real_catalog_lock_contention_has_a_distinct_busy_reason(tmp_path, monke
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         with pytest.raises(lakehouse.CatalogOwnerBusy, match='catalog owner is busy'):
             lakehouse.register({'state_root': str(tmp_path)})
+
+
+def test_full_guarded_lake_waits_before_scanning_or_writing(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(lakehouse, 'guard', lambda _config: None)
+    monkeypatch.setattr(lakehouse.shutil, 'disk_usage', lambda _path: SimpleNamespace(free=0))
+    from stockagent.data_sync import backup_stream
+    monkeypatch.setattr(backup_stream, 'capture_catalog', lambda *_a, **_k: pytest.fail('unexpected source scan'))
+    monkeypatch.setattr(lakehouse, 'connect', lambda *_a, **_k: pytest.fail('unexpected DuckLake write'))
+    with pytest.raises(lakehouse.CatalogColdCapacity, match='no writable capacity'):
+        lakehouse.register({'state_root': str(tmp_path), 'lake_root': str(tmp_path / 'new-lake')})
 
 
 @pytest.mark.parametrize('kind', ['wrong_sha', 'wrong_length', 'invalid_utf8'])
@@ -205,6 +217,122 @@ def test_late_source_mutation_aborts_entire_transaction(captured):
         assert con.execute('SELECT count(*) FROM metadata').fetchone()[0] == 0
     finally:
         con.close()
+
+
+@pytest.mark.parametrize('scenario', ['unchanged', 'changed', 'unknown', 'duplicate', 'empty'])
+def test_prechecked_insert_matches_original_sql_with_snapshot_fallback(captured, scenario):
+    c, files = captured
+    connections = []
+    try:
+        results = []
+        for candidate in (False, True):
+            db = duckdb.connect()
+            connections.append(db)
+            db.execute("ATTACH ':memory:' AS lake")
+            db.execute('CREATE TABLE lake.source_metadata(relative VARCHAR,sha256 VARCHAR,bytes BIGINT,content_utf8 VARCHAR)')
+            first = lakehouse._metadata_value(c, files[0])
+            db.register('seed', pa.Table.from_pylist([first]))
+            db.execute('INSERT INTO lake.source_metadata SELECT * FROM seed')
+            keys = set(db.execute('SELECT relative,sha256 FROM lake.source_metadata').fetchall())
+            incoming = lakehouse._new_metadata_descriptors(c, files[:3], keys)
+            if scenario == 'duplicate':
+                incoming.append(incoming[0])
+            if scenario == 'empty':
+                incoming = []
+            if scenario in ('changed', 'unknown'):
+                # A later commit made the first incoming key already present.
+                db.register('late', pa.Table.from_pylist([lakehouse._metadata_value(c, incoming[0])]))
+                db.execute('INSERT INTO lake.source_metadata SELECT * FROM late')
+
+            class SnapshotConnection:
+                def __init__(self, connection):
+                    self.connection = connection
+                    self.insert_sql = []
+                def execute(self, sql, *args):
+                    if "ducklake_snapshots('lake')" in sql:
+                        return SimpleNamespace(fetchone=lambda: (2 if scenario == 'changed' else 1,))
+                    if sql.startswith('INSERT INTO lake.source_metadata'):
+                        self.insert_sql.append(sql)
+                    return self.connection.execute(sql, *args)
+                def register(self, *args):
+                    return self.connection.register(*args)
+
+            con = SnapshotConnection(db)
+            db.execute('BEGIN')
+            if candidate:
+                lakehouse._insert_new_metadata(con, c, incoming, None if scenario == 'unknown' else 1)
+                if scenario == 'empty':
+                    assert con.insert_sql == []
+                else:
+                    assert ('WHERE NOT EXISTS' in con.insert_sql[0]) == (scenario in ('changed', 'unknown'))
+            else:
+                con.register('incoming_metadata', lakehouse._metadata_arrow_reader(c, incoming))
+                con.execute('INSERT INTO lake.source_metadata SELECT i.* FROM incoming_metadata i '
+                            'WHERE NOT EXISTS (SELECT 1 FROM lake.source_metadata o '
+                            'WHERE o.relative=i.relative AND o.sha256=i.sha256)')
+            db.execute('COMMIT')
+            rows = db.execute('SELECT * FROM lake.source_metadata ORDER BY ALL').fetchall()
+            results.append((rows, lakehouse._registered_table_digest(db, 'source_metadata')))
+        assert results[0] == results[1]
+    finally:
+        for db in connections:
+            db.close()
+
+
+def test_prechecked_insert_preserves_atomic_rollback_after_late_mutation(captured):
+    c, files = captured
+    incoming = lakehouse._new_metadata_descriptors(c, files, set())
+    (Path(c['cold_root']) / files[-1]['relative']).write_bytes(b'changed after admission')
+    db = duckdb.connect()
+    try:
+        db.execute("ATTACH ':memory:' AS lake")
+        db.execute('CREATE TABLE lake.source_metadata(relative VARCHAR,sha256 VARCHAR,bytes BIGINT,content_utf8 VARCHAR)')
+        class SnapshotConnection:
+            def execute(self, sql, *args):
+                if "ducklake_snapshots('lake')" in sql:
+                    return SimpleNamespace(fetchone=lambda: (1,))
+                return db.execute(sql, *args)
+            def register(self, *args):
+                return db.register(*args)
+        db.execute('BEGIN')
+        with pytest.raises(duckdb.Error, match='source metadata changed'):
+            lakehouse._insert_new_metadata(SnapshotConnection(), c, incoming, 1)
+        db.execute('ROLLBACK')
+        assert db.execute('SELECT count(*) FROM lake.source_metadata').fetchone()[0] == 0
+    finally:
+        db.close()
+
+
+@pytest.mark.parametrize('targets', [[], ['objects/a'], ['objects/a', 'objects/a', None],
+                                      ['objects/a', '不存在', 'objects/股']])
+def test_disposition_set_delete_matches_each_original_statement(targets):
+    results = []
+    for candidate in (False, True):
+        db = duckdb.connect()
+        try:
+            db.execute("ATTACH ':memory:' AS lake")
+            db.execute('CREATE TABLE lake.source_objects(relative VARCHAR,sha256 VARCHAR,bytes BIGINT,role VARCHAR)')
+            db.executemany('INSERT INTO lake.source_objects VALUES (?,?,?,?)', [
+                ('objects/a', 'old', 1, 'packed_object'),
+                ('objects/a', 'new', 2, 'packed_object'),
+                ('objects/股', 'sha', 3, 'packed_object'),
+                ('objects/b', 'sha', 4, 'packed_object'),
+                (None, 'unknown', 5, 'packed_object')])
+            before = lakehouse._registered_table_digest(db, 'source_objects')
+            db.execute('BEGIN')
+            if candidate:
+                lakehouse._delete_discarded_source_objects(db, targets)
+            else:
+                for relative in targets:
+                    db.execute('DELETE FROM lake.source_objects WHERE relative=?', [relative])
+            rows = db.execute('SELECT * FROM lake.source_objects ORDER BY ALL').fetchall()
+            digest = lakehouse._registered_table_digest(db, 'source_objects')
+            db.execute('ROLLBACK')
+            assert lakehouse._registered_table_digest(db, 'source_objects') == before
+            results.append((rows, digest))
+        finally:
+            db.close()
+    assert results[0] == results[1]
 
 
 def test_registration_comparator_refuses_unrelated_hash_or_source_scope_changes():

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from http.client import HTTPConnection
+import hashlib
 import json
 from pathlib import Path
 import threading
@@ -16,6 +18,53 @@ from stockagent.live.news_dashboard import build_news_public_status, news_snapsh
 
 NOW = datetime(2026, 10, 8, 15, tzinfo=UTC)
 REPO = Path(__file__).resolve().parents[1]
+
+
+@pytest.mark.parametrize('source,version,value,total,expected', [
+    ('finmind', 5, 0, 0, 0), ('finmind', 5, 1, 3, 1), ('finmind', 5, 1, 0, None),
+    ('finmind', 4, 0, 0, None), ('finmind', 5, True, 1, None), ('finmind', 5, -1, 1, None),
+    ('finmind', True, 1, 1, None), ('finmind', 5, None, 1, None),
+    ('finmind', 6, 1, 1, 1), ('finlab', 5, 0, 0, None), ('finlab', 6, 1, 2, 1),
+    ('finlab', 6, 2, 1, None), ('finlab', 6, False, 1, None),
+    ('finmind', 7, 1, 2, 1), ('finlab', 7, 1, 2, 1),
+])
+def test_finmind_catalog_error_projection_is_scoped_and_validated(tmp_path, source, version, value, total, expected):
+    status = _seed(tmp_path)
+    status['metadata_inventory'] = {'contract_version': version, source + '_catalog_errors': value,
+                                    'private_path': '/PRIVATE_FINMIND_PATH'}
+    status['metadata_partition_errors'] = total
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['acquisition'][source + '_catalog_errors'] == expected
+    assert 'PRIVATE_FINMIND_PATH' not in json.dumps(result)
+
+
+def test_source_catalog_errors_do_not_exceed_total_metadata_errors(tmp_path):
+    status = _seed(tmp_path)
+    status['metadata_inventory'] = {'contract_version': 6, 'finlab_catalog_errors': 1, 'finmind_catalog_errors': 1}
+    status['metadata_partition_errors'] = 1
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['acquisition']['finlab_catalog_errors'] is None
+    assert result['acquisition']['finmind_catalog_errors'] is None
+
+
+@pytest.mark.parametrize('version,pending,expected_count,expected_pending', [
+    (6, None, 7, None), (7, 0, 7, 0), (7, 2, None, 2),
+    (7, None, None, None), (7, True, None, None), (7, -1, None, None),
+    (8, 0, None, None),
+])
+def test_metadata_alias_pending_masks_unverified_dashboard_counts(tmp_path, version, pending,
+                                                                  expected_count, expected_pending):
+    status = _seed(tmp_path)
+    status['metadata_inventory'] = {'contract_version': version, 'receipt_alias_retargets_pending': pending}
+    status['metadata_partitions'] = 7
+    status['metadata_association_rows'] = 7
+    atomic_write_json(tmp_path / 'data_news_fulltext/status.json', status)
+    acquisition = build_news_public_status(tmp_path, now=NOW)['acquisition']
+    assert acquisition['metadata_partitions'] == expected_count
+    assert acquisition['metadata_association_rows'] == expected_count
+    assert acquisition['metadata_selection_pending'] == expected_pending
 
 
 def local_replay_sample():
@@ -205,6 +254,60 @@ def test_url_inbox_projection_is_bounded_private_and_separate_from_articles(tmp_
     assert 'PRIVATE_' not in json.dumps(result)
 
 
+def finlab_cnyes_priority_sample():
+    return {'contract_version': 1, 'raw_unique_delta': 10, 'raw_hints_examined': 10,
+        'targets': 3, 'request_state': 'processing', 'owner_checked': 2,
+        'recorded_at_utc': NOW.isoformat(),
+        'outcomes': {'metadata_registered': 1, 'existing_head_preserved': 1,
+                     'source_contract_changed': 0, 'other': 0},
+        'body_completion_proven': False, 'association_completion_proven': False,
+        'request_id': 'PRIVATE_REQUEST', 'url': 'PRIVATE_URL'}
+
+
+def test_finlab_cnyes_priority_projection_is_bounded_and_not_body_progress(tmp_path):
+    status = _seed(tmp_path)
+    status['finlab_cnyes_priority'] = finlab_cnyes_priority_sample()
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    priority = result['finlab_cnyes_priority']
+    assert priority['targets'] == 3 and priority['owner_checked'] == 2
+    assert priority['outcomes'] == {'metadata_registered': 1, 'existing_head_preserved': 1,
+                                    'source_contract_changed': 0, 'other': 0}
+    assert not priority['body_completion_proven'] and not priority['association_completion_proven']
+    assert result['acquisition']['known_urls'] == 10 and result['acquisition']['stored_body_articles'] == 2
+    assert 'PRIVATE_' not in json.dumps(result)
+
+
+def test_finlab_cnyes_priority_projects_unverified_origin_as_subset(tmp_path):
+    status = _seed(tmp_path)
+    priority = finlab_cnyes_priority_sample()
+    priority.update(unverified_origin=1, outcomes={'metadata_registered': 0, 'existing_head_preserved': 1,
+        'source_contract_changed': 0, 'other': 1})
+    status['finlab_cnyes_priority'] = priority
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    projected = build_news_public_status(tmp_path, now=NOW)['finlab_cnyes_priority']
+    assert projected['unverified_origin'] == 1 and projected['outcomes']['other'] == 1
+    assert sum(projected['outcomes'].values()) == projected['owner_checked']
+    assert 'PRIVATE_' not in json.dumps(projected)
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'raw_unique_delta': -1}, {'raw_hints_examined': 9},
+    {'targets': 513}, {'request_state': 'checked'}, {'request_state': []}, {'owner_checked': True},
+    {'recorded_at_utc': 'bad'}, {'recorded_at_utc': (NOW + timedelta(minutes=1)).isoformat()},
+    {'owner_checked': 3}, {'outcomes': {'metadata_registered': 2}},
+    {'outcomes': {'metadata_registered': 1, 'existing_head_preserved': 1,
+                  'source_contract_changed': 0, 'other': 0, 'unexpected': 99}},
+    {'body_completion_proven': True}, {'association_completion_proven': True},
+    {'unverified_origin': True}, {'unverified_origin': -1}, {'unverified_origin': 1},
+])
+def test_finlab_cnyes_priority_inconsistent_projection_is_unknown(tmp_path, patch):
+    status = _seed(tmp_path)
+    status['finlab_cnyes_priority'] = {**finlab_cnyes_priority_sample(), **patch}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    assert build_news_public_status(tmp_path, now=NOW)['finlab_cnyes_priority'] is None
+
+
 @pytest.mark.parametrize('patch', [
     {'contract_version': True}, {'available': False}, {'request_files': 65},
     {'request_files': 3}, {'pending_requests': -1}, {'targets_unexamined': True},
@@ -247,6 +350,58 @@ def test_candidate_work_projection_is_private_and_separate_from_article_progress
     assert result['acquisition']['known_urls'] == 10 and result['acquisition']['stored_body_articles'] == 2
     assert not result['scope']['publisher_calls_on_page_view']
     assert 'PRIVATE_' not in json.dumps(result)
+
+
+def test_retained_handoff_projection_separates_private_plan_from_runtime(tmp_path):
+    from stockagent.live.news_dashboard import _retained_handoff_projection
+    path = tmp_path / 'artifacts/private/certificate.json'
+    path.parent.mkdir(parents=True)
+    payload = json.dumps({'contract': 'cmnews_retained_link_handoff_v1',
+        'source_root': str((tmp_path / 'data_news_fulltext').resolve()),
+        'candidate_count': 3, 'requests': [{'url': 'PRIVATE_URL'}],
+        'target_identity_or_body_verified': False, 'private_path': 'PRIVATE_PATH'}).encode()
+    path.write_bytes(payload)
+    path.chmod(0o600)
+    config = {'root': 'data_news_fulltext', 'retained_link_handoff': {
+        'path': 'artifacts/private/certificate.json', 'sha256': hashlib.sha256(payload).hexdigest()}}
+    runtime = {'contract_version': 1, 'provider': 'cmnews', 'state': 'submitted', 'candidates': 3,
+               'requests': 1, 'submitted_requests': 1, 'reason': None, 'body_verified': False,
+               'plan_sha256': config['retained_link_handoff']['sha256'],
+               'private': 'PRIVATE_RUNTIME'}
+    result = _retained_handoff_projection(tmp_path, config, runtime)
+    assert result['plan'] == {'provider': 'cmnews', 'candidates': 3, 'requests': 1,
+                              'source_and_policy_revalidation_required': True, 'body_verified': False}
+    assert result['runtime']['state'] == 'submitted' and not result['runtime']['body_verified']
+    assert 'PRIVATE_' not in json.dumps(result)
+    path.write_bytes(payload + b'changed')
+    assert _retained_handoff_projection(tmp_path, config, runtime)['plan'] is None
+    assert _retained_handoff_projection(tmp_path, config, {**runtime, 'submitted_requests': 2})['runtime'] is None
+
+
+def test_candidate_local_retry_projection_preserves_reason_without_private_payload(tmp_path):
+    status = _seed(tmp_path)
+    status['candidate_diagnostic_progress'] = {**candidate_work_sample(),
+        'local_retry': {'request_io': 1, 'quarantine': 0, 'archive': 1, 'path': 'PRIVATE_RETRY_PATH'}}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    work = build_news_public_status(tmp_path, now=NOW)['candidate_diagnostic_progress']
+    assert work['local_retry'] == {'request_io': 1, 'quarantine': 0, 'archive': 1}
+    assert work['pending_unadmitted'] == 1 and 'PRIVATE_' not in json.dumps(work)
+
+
+@pytest.mark.parametrize('retry', [
+    {'request_io': True, 'quarantine': 0, 'archive': 0},
+    {'request_io': -1, 'quarantine': 0, 'archive': 0},
+    {'request_io': 2, 'quarantine': 1, 'archive': 1},
+    {'request_io': 1, 'quarantine': 0},
+    'PRIVATE_RETRY_PATH',
+])
+def test_invalid_candidate_local_retry_is_unknown_without_hiding_other_progress(tmp_path, retry):
+    status = _seed(tmp_path)
+    status['candidate_diagnostic_progress'] = {**candidate_work_sample(), 'local_retry': retry}
+    atomic_write_json(tmp_path/'data_news_fulltext/status.json', status)
+    work = build_news_public_status(tmp_path, now=NOW)['candidate_diagnostic_progress']
+    assert work['local_retry'] is None and work['pending_unadmitted'] == 1
+    assert 'PRIVATE_' not in json.dumps(work)
 
 
 @pytest.mark.parametrize('patch', [
@@ -477,6 +632,23 @@ def test_discovery_error_rollup_is_per_provider_and_preserves_snapshot_semantics
     assert 'PRIVATE_' not in json.dumps(result)
 
 
+@pytest.mark.parametrize(('value', 'expected'), [
+    (None, None), (0, 0), (2, 2), (True, None), (-1, None), ('2', None), (2**53, None),
+])
+def test_local_sqlite_busy_events_are_scoped_and_validated(tmp_path, value, expected):
+    status = _seed(tmp_path)
+    counts = status['performance']['providers']['cnyes']['counts']
+    if value is not None:
+        counts['local_sqlite_busy_commit_events'] = value
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    sources = {source['id']: source for source in result['providers']}
+    assert sources['cnyes']['owner_local_sqlite_busy_commit_events'] == expected
+    assert sources['unregistered:example.org']['owner_local_sqlite_busy_commit_events'] is None
+    assert sources['cnyes']['state'] == 'backfilling'
+    assert 'PRIVATE_' not in json.dumps(result)
+
+
 @pytest.mark.parametrize('variant', ['old', 'building', 'bad_total', 'unknown_reason', 'bad_provider', 'bad_count'])
 def test_discovery_error_old_partial_or_invalid_snapshots_never_become_zero(tmp_path, variant):
     status = _discovery_error_snapshot(tmp_path)
@@ -624,6 +796,50 @@ def _work_snapshot():
             'existing_primary_body_candidates': 2, 'no_known_primary_body_urls': 1,
             'candidate_views_accepted_by_hint': False, 'candidate_body_equivalence_verified': False,
             'states': [{'url': 'PRIVATE_ARTICLE', 'body': 'PRIVATE_BODY'}], 'token': 'PRIVATE_TOKEN'}
+
+
+def _lookup_recheck_snapshot():
+    return {'contract_version': 1, 'pending_records_lower_bound': 3, 'count_exact': True,
+            'records_are_article_completion': False, 'source_lookup_performed': False,
+            'url': 'PRIVATE_URL', 'token': 'PRIVATE_TOKEN'}
+
+
+def test_lookup_recheck_projection_preserves_scope_and_privacy(tmp_path):
+    status = _seed(tmp_path)
+    status['providers']['cnyes']['native_lookup_recheck_progress'] = _lookup_recheck_snapshot()
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['native_lookup_recheck_progress'] == {
+        key: value for key, value in _lookup_recheck_snapshot().items() if key not in {'url', 'token'}}
+    assert all(row['native_lookup_recheck_progress'] is None for row in result['providers'] if row['id'] != 'cnyes')
+    assert result['acquisition']['stored_body_articles'] == 2 and 'PRIVATE_' not in json.dumps(result)
+    status['providers']['cnyes']['native_lookup_recheck_progress'].update(
+        pending_records_lower_bound=2049, count_exact=False)
+    _save(tmp_path, status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['native_lookup_recheck_progress']['pending_records_lower_bound'] == 2049
+    assert source['native_lookup_recheck_progress']['count_exact'] is False
+
+
+@pytest.mark.parametrize('patch', [
+    {'contract_version': True}, {'pending_records_lower_bound': -1},
+    {'pending_records_lower_bound': True}, {'pending_records_lower_bound': 2050},
+    {'pending_records_lower_bound': 2049, 'count_exact': True},
+    {'pending_records_lower_bound': 3, 'count_exact': False},
+    {'count_exact': 1}, {'records_are_article_completion': True},
+    {'source_lookup_performed': True},
+])
+def test_invalid_or_missing_lookup_recheck_snapshot_is_unknown(tmp_path, patch):
+    status = _seed(tmp_path)
+    status['providers']['cnyes']['native_lookup_recheck_progress'] = {**_lookup_recheck_snapshot(), **patch}
+    _save(tmp_path, status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['native_lookup_recheck_progress'] is None
+    del status['providers']['cnyes']['native_lookup_recheck_progress']
+    _save(tmp_path, status)
+    source = next(row for row in build_news_public_status(tmp_path, now=NOW)['providers'] if row['id'] == 'cnyes')
+    assert source['native_lookup_recheck_progress'] is None
 
 
 def test_body_work_split_preserves_ready_total_and_never_calls_hints_completed(tmp_path):
@@ -963,6 +1179,90 @@ def _origin_pause_status(tmp_path, origins):
     return status
 
 
+@pytest.mark.parametrize('provider', ['cnyes', 'globalvoices', 'cmnews'])
+@pytest.mark.parametrize(('gate', 'value'), [
+    ('temporarily_paused_robots_origins', {'https://private-source.test': NOW.timestamp() + 30}),
+    ('temporarily_paused_gateway_hosts', {'private-source.test': NOW.timestamp() + 30}),
+    ('unverified_robots_origins', {'https://private-source.test': NOW.timestamp() - 30}),
+    ('unverified_gateway_hosts', {'private-source.test': NOW.timestamp() - 30}),
+    ('unverified_robots_origins_overflow', True),
+    ('unverified_robots_origins_overflow', 0),
+    ('temporarily_paused_robots_origins', []),
+    ('unverified_gateway_hosts', None),
+])
+def test_unscoped_provider_gates_withdraw_whole_pending_eta(tmp_path, provider, gate, value):
+    status = _seed(tmp_path)
+    if provider != 'cnyes':
+        status['providers'][provider] = status['providers'].pop('cnyes')
+        status['performance']['providers'][provider] = status['performance']['providers'].pop('cnyes')
+        status['http_requests_this_run'][provider] = status['http_requests_this_run'].pop('cnyes')
+        config = json.loads((tmp_path / 'configs/news_fulltext.json').read_text())
+        config['providers'][0]['id'] = provider
+        atomic_write_json(tmp_path / 'configs/news_fulltext.json', config)
+    status['performance']['robots_origin_policy_contract_version'] = 1
+    status['http_capacity'] = {'providers': {provider: {
+        'effective_interval_seconds': 0.5, 'parallelism': 2, gate: value}}}
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == provider)
+    assert source['state'] == 'backfilling' and source['owner_articles_per_second'] == .1
+    assert source['conditional_eta_seconds'] is None and source['conditional_finish_at_utc'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
+    assert result['acquisition']['eligible_eta_seconds'] is None
+    assert 'private-source.test' not in json.dumps(result)
+
+
+def test_empty_provider_gate_maps_do_not_withdraw_eta(tmp_path):
+    status = _seed(tmp_path)
+    status['http_capacity'] = {'providers': {'cnyes': {
+        'temporarily_paused_robots_origins': {}, 'temporarily_paused_gateway_hosts': {},
+        'unverified_robots_origins': {}, 'unverified_gateway_hosts': {},
+        'unverified_robots_origins_overflow': False}}}
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['conditional_eta_seconds'] == 40
+    assert source['conditional_eta_unavailable_reason'] is None
+    assert result['acquisition']['eligible_eta_seconds'] == 40
+
+
+@pytest.mark.parametrize('capacity', [None, [], {'providers': None}, {'providers': []},
+    {'providers': {'cnyes': None}}, {'providers': {'cnyes': []}}])
+def test_malformed_capacity_or_provider_control_withdraws_eta(tmp_path, capacity):
+    status = _seed(tmp_path)
+    status['http_capacity'] = capacity
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['state'] == 'backfilling' and source['owner_articles_per_second'] == .1
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
+    assert result['acquisition']['eligible_eta_seconds'] is None
+
+
+def test_unknown_source_scope_does_not_withdraw_healthy_provider_eta(tmp_path):
+    status = _seed(tmp_path)
+    status['providers']['globalvoices'] = deepcopy(status['providers']['cnyes'])
+    status['performance']['providers']['globalvoices'] = deepcopy(status['performance']['providers']['cnyes'])
+    status['http_requests_this_run']['globalvoices'] = 12
+    status['unique_articles'] = 16
+    status['articles_with_stored_body'] = 4
+    status['states']['complete'] = 4
+    status['states']['pending'] = 8
+    status['http_capacity'] = {'providers': {
+        'cnyes': {'unverified_gateway_hosts': {'private-source.test': NOW.timestamp() - 30}},
+        'globalvoices': {'unverified_gateway_hosts': {}}}}
+    config = json.loads((tmp_path / 'configs/news_fulltext.json').read_text())
+    config['providers'].append({'id': 'globalvoices', 'enabled': True})
+    atomic_write_json(tmp_path / 'configs/news_fulltext.json', config)
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    sources = {row['id']: row for row in result['providers']}
+    assert sources['cnyes']['conditional_eta_seconds'] is None
+    assert sources['globalvoices']['conditional_eta_seconds'] == 40
+    assert result['acquisition']['eligible_eta_seconds'] is None
+
+
 def test_origin_pause_is_private_count_and_probe_clock_not_provider_stop_or_permission(tmp_path):
     status = _origin_pause_status(tmp_path, {
         'https://amp-news.cnyes.com': NOW.timestamp() + 240,
@@ -972,7 +1272,8 @@ def test_origin_pause_is_private_count_and_probe_clock_not_provider_stop_or_perm
     result = build_news_public_status(tmp_path, now=NOW)
     source = next(p for p in result['providers'] if p['id'] == 'cnyes')
     assert source['state'] == 'backfilling' and source['next_attempt_at_utc'] is None
-    assert source['conditional_eta_seconds'] == 40
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
     assert source['robots_origin_policy_pause'] == {
         'contract_version': 1, 'scope': 'initial_origin_policy', 'active_origin_count': 2,
         'next_policy_probe_at_utc': (NOW + timedelta(seconds=30)).isoformat(),
@@ -1091,6 +1392,38 @@ def test_unaffected_missing_scopes_keep_rate_and_eta_despite_unrelated_origin_pa
     assert source['conditional_eta_seconds'] == 40 and source['conditional_eta_unavailable_reason'] is None
     assert source['body_request_scope_progress']['other_missing_body_urls'] == 4
     assert source['robots_origin_policy_pause']['active_origin_count'] == 1
+
+
+def test_malformed_control_withdraws_eta_even_with_saved_precise_scope(tmp_path):
+    status = _request_scope_status(tmp_path, paused=0)
+    status['http_capacity']['providers']['cnyes'] = None
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['body_request_scope_progress']['available']
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
+    assert result['acquisition']['eligible_eta_seconds'] is None
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('temporarily_paused_robots_origins', []),
+    ('unverified_gateway_hosts', None),
+    ('unverified_gateway_hosts', {'private-source.test': 'bad'}),
+    ('unverified_gateway_hosts', {'private-source.test': True}),
+    ('unverified_robots_origins_overflow', True),
+    ('unverified_robots_origins_overflow', 0),
+])
+def test_malformed_gate_withdraws_eta_even_with_saved_precise_scope(tmp_path, field, value):
+    status = _request_scope_status(tmp_path, paused=0)
+    status['http_capacity']['providers']['cnyes'][field] = value
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert source['body_request_scope_progress']['available']
+    assert source['conditional_eta_seconds'] is None
+    assert source['conditional_eta_unavailable_reason'] == 'source_request_scope_unknown'
+    assert result['acquisition']['eligible_eta_seconds'] is None
 
 
 def test_expired_unverified_source_never_borrows_other_lane_speed(tmp_path):
@@ -1285,6 +1618,101 @@ def test_inconsistent_counts_fail_closed_and_forecasts_are_suppressed(tmp_path):
     assert result["health"] == "degraded"
     assert result["acquisition"]["progress_ratio"] is None
     assert all(source["conditional_eta_seconds"] is None for source in result["providers"])
+
+
+def test_equal_total_but_different_provider_states_does_not_claim_completion(tmp_path):
+    status = _seed(tmp_path)
+    # The global count is still ten. The provider snapshot, however, claims
+    # that the four globally pending CNYES URLs are already complete.
+    status['providers']['cnyes']['states'] = {'complete': 6}
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert result['health'] == 'degraded' and not result['snapshot_consistent']
+    assert not result['provider_state_totals_reconciled']
+    assert result['acquisition']['progress_ratio'] is None
+    assert result['acquisition']['known_urls'] is result['acquisition']['stored_body_articles'] is None
+    assert result['acquisition']['remaining_urls'] is result['acquisition']['text_bytes'] is None
+    assert result['outcome_progress'] is None
+    assert source['state'] == 'unavailable'
+    assert source['progress_ratio'] is source['stored_body_progress_ratio'] is None
+    assert source['conditional_eta_seconds'] is source['completion_forecast'] is None
+    assert source['known_urls'] is source['complete_urls'] is source['remaining_urls'] is None
+    assert source['states'] == {} and source['outcome_progress'] is None
+    assert source['adapter_acceptance'] is None
+
+
+def test_inconsistent_snapshot_cannot_claim_a_finite_cohort_is_complete(tmp_path):
+    status = _seed(tmp_path)
+    source = status['providers']['cnyes']
+    source.update(states={'complete': 6}, acquisition_mode='finite',
+                  finite_cohort={'urls': 6, 'stored_bodies': 6})
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert not result['snapshot_consistent']
+    assert source['state'] == 'unavailable' and source['finite_cohort'] is None
+
+
+@pytest.mark.parametrize('where,value', [
+    ('global', -1), ('global', True), ('global', '1'),
+    ('provider', -1), ('provider', True), ('provider', '1'),
+])
+def test_invalid_state_value_cannot_be_dropped_to_create_consistency(tmp_path, where, value):
+    status = _seed(tmp_path)
+    states = status['states'] if where == 'global' else status['providers']['cnyes']['states']
+    states['invalid_extra_state'] = value
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['health'] == 'degraded' and not result['snapshot_consistent']
+    assert result['acquisition']['progress_ratio'] is None
+
+
+def test_unknown_states_are_reconciled_without_leaking_private_names(tmp_path):
+    status = _seed(tmp_path)
+    for states in (status['states'], status['providers']['cnyes']['states']):
+        states['pending'] -= 1
+        states['private_unrecognized_state'] = 1
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['snapshot_consistent'] and result['provider_state_totals_reconciled']
+    assert result['states']['other'] == 1
+    assert 'private_unrecognized_state' not in json.dumps(result)
+
+
+def test_redacted_unknown_states_cannot_hide_mismatched_original_names(tmp_path):
+    status = _seed(tmp_path)
+    status['states']['pending'] -= 1
+    status['states']['private_unknown_one'] = 1
+    provider_states = status['providers']['cnyes']['states']
+    provider_states['pending'] -= 1
+    provider_states['private_unknown_two'] = 1
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert not result['snapshot_consistent'] and not result['provider_state_totals_reconciled']
+    assert result['health'] == 'degraded' and 'private_unknown_' not in json.dumps(result)
+
+
+@pytest.mark.parametrize('invalid', [None, [], 'bad'])
+def test_missing_or_malformed_provider_states_are_not_zero(tmp_path, invalid):
+    status = _seed(tmp_path)
+    status['providers']['cnyes']['states'] = invalid
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    assert result['health'] == 'degraded' and not result['snapshot_consistent']
+    assert not result['provider_state_totals_reconciled']
+
+
+def test_inconsistent_snapshot_preserves_confirmed_stopped_state(tmp_path):
+    status = _seed(tmp_path)
+    status['activity'] = 'stopped'
+    status['providers']['cnyes']['states'] = {'complete': 6}
+    _save(tmp_path, status)
+    result = build_news_public_status(tmp_path, now=NOW)
+    source = next(row for row in result['providers'] if row['id'] == 'cnyes')
+    assert result['health'] == 'degraded' and not result['snapshot_consistent']
+    assert source['state'] == 'stopped'
+    assert source['progress_ratio'] is None and source['conditional_eta_seconds'] is None
 
 
 def test_all_sources_remain_in_the_inventory_and_never_publish_free_form_errors(tmp_path):
@@ -1511,6 +1939,51 @@ def test_news_browser_shows_discovery_errors_without_calling_publishers(tmp_path
                 assert page.evaluate('document.activeElement === document.querySelector(\'[data-news-discovery-provider="cnyes"] > summary\')')
                 page.locator('[data-news-filter=attention]').click()
                 assert page.locator('[data-news-discovery-provider="cnyes"]').count() == 1
+                assert 'PRIVATE_' not in page.locator('body').text_content()
+                assert not remote and not errors
+            finally:
+                browser.close()
+    finally:
+        server.shutdown(); server.server_close(); thread.join(timeout=2)
+
+
+def test_news_browser_labels_local_sqlite_busy_as_past_event(tmp_path):
+    from playwright.sync_api import sync_playwright
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+
+    now = datetime.now(UTC)
+    status = _seed(tmp_path, now=now)
+    status['performance']['providers']['cnyes']['counts']['local_sqlite_busy_commit_events'] = 2
+    _save(tmp_path, status)
+    server = _server(tmp_path)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f'http://127.0.0.1:{server.server_address[1]}'
+    try:
+        with sync_playwright() as runtime:
+            browser = runtime.chromium.launch(**browser_profile_launch_options('cpu-2d'), timeout=10000)
+            try:
+                page = browser.new_page(viewport={'width': 390, 'height': 900})
+                remote, errors = [], []
+                page.on('request', lambda request: remote.append(request.url) if not request.url.startswith(base) else None)
+                page.on('pageerror', lambda error: errors.append(str(error)))
+                page.goto(base + '/news/', wait_until='domcontentloaded')
+                page.locator('#news-health').get_by_text('正在抓取').wait_for(timeout=10000)
+                page.evaluate("StockAgentAcquisition.reveal('traffic')")
+                page.locator('#traffic').scroll_into_view_if_needed()
+                page.locator('#traffic-rows').get_by_text('本機批次提交曾遇資料庫鎖定', exact=False).wait_for(timeout=10000)
+                text = page.locator('#traffic-rows').text_content()
+                assert '本程序：本機批次提交曾遇資料庫鎖定 2 次' in text
+                assert '涉及此來源，非來源限流' in text
+                status['activity'] = 'stopped'
+                _save(tmp_path, status)
+                stopped = build_news_public_status(tmp_path, now=now)
+                assert stopped['health'] == 'stopped'
+                page.evaluate('(data) => render(data)', stopped)
+                page.locator('#traffic-rows').get_by_text('上次快照：本機批次提交曾遇資料庫鎖定', exact=False).wait_for(timeout=10000)
+                text = page.locator('#traffic-rows').text_content()
+                assert '上次快照：本機批次提交曾遇資料庫鎖定 2 次' in text
+                assert '本程序：本機批次提交曾遇資料庫鎖定' not in text
                 assert 'PRIVATE_' not in page.locator('body').text_content()
                 assert not remote and not errors
             finally:

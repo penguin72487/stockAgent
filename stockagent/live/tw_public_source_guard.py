@@ -9,10 +9,14 @@ from __future__ import annotations
 
 from contextlib import contextmanager
 from concurrent.futures import Future
+import json
 import os
 from pathlib import Path
 import threading
+import time
 from typing import Any, Callable, Iterator
+
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
 
 try:
     import fcntl
@@ -52,20 +56,121 @@ _READ_GENERATIONS_LOCK = threading.Lock()
 class TWPublicSourceUpdatePending(RuntimeError):
     """A real exclusive producer, not a stale progress file, owns the inputs."""
 
-    def __init__(self, root: Path, lock_path: Path):
+    def __init__(self, root: Path, lock_path: Path, *, observed_in_child: bool = False):
         self.source_root = root
         self.lock_path = lock_path
-        self.details = {
-            "reason": "canonical_tw_public_source_update_in_progress",
-            "source_root": str(root),
-            "source_lock": str(lock_path),
-            "producer_lock_held": True,
-            "retryable": True,
-        }
-        super().__init__(
-            "台股官方來源正在更新相依資料，等待一致版本完成；"
-            "尚未執行模型，不是資料已驗收。"
-        )
+        self.details = {"source_root": str(root), "source_lock": str(lock_path),
+                        "retryable": True}
+        if observed_in_child:
+            # The writer may have released the lock after the child exited.
+            # Report the observation, not an unverified current lock state.
+            self.details.update({
+                "reason": "canonical_tw_public_source_update_observed_in_child",
+                "producer_lock_held_at_child_observation": True,
+                "current_lock_state": "unverified",
+            })
+            message = "正式歷史子程序觀察到官方來源寫入鎖；等待後重試，尚未驗收。"
+        else:
+            self.details.update({
+                "reason": "canonical_tw_public_source_update_in_progress",
+                "producer_lock_held": True,
+            })
+            message = "台股官方來源正在更新相依資料，等待一致版本完成；尚未執行模型，不是資料已驗收。"
+        super().__init__(message)
+
+
+_PENDING_PIPE_ENV = "STOCKAGENT_TW_SOURCE_PENDING_PIPE"
+_PENDING_TOKEN_ENV = "STOCKAGENT_TW_SOURCE_PENDING_TOKEN"
+_PENDING_RECEIPT_LIMIT = 4096
+
+
+def report_maintenance_pending_to_parent(exc: TWPublicSourceUpdatePending | CapacityDeferred) -> bool:
+    """Report a *typed* child failure through the parent's private pipe.
+
+    Normal CLI failures retain their original traceback/exit status. A failed
+    or oversized report is ignored so it can never hide the original error.
+    """
+
+    try:
+        fd = int(os.environ.get(_PENDING_PIPE_ENV, ""))
+        token = os.environ.get(_PENDING_TOKEN_ENV, "")
+        if fd < 3 or len(token) != 32 or any(c not in "0123456789abcdef" for c in token):
+            return False
+        record = {"version": 1, "token": token, "observed_at_ns": time.time_ns()}
+        if isinstance(exc, TWPublicSourceUpdatePending):
+            record.update(kind="tw_public_source_update_pending", source_root=str(exc.source_root),
+                          source_lock=str(exc.lock_path))
+        elif isinstance(exc, CapacityDeferred):
+            # Scalar capacity diagnostics only, never exception text, account
+            # credentials or unbounded child output. The original error remains.
+            fields = {key: value for key, value in exc.details.items()
+                      if key not in {"reason", "contract", "retryable", "allocation_admitted"}
+                      and type(value) in (str, int, bool, type(None))}
+            record.update(kind="capacity_deferred", reason=exc.details["reason"], fields=fields)
+        else:
+            return False
+        payload = json.dumps(record, separators=(",", ":"), allow_nan=False).encode("utf-8")
+        if len(payload) > _PENDING_RECEIPT_LIMIT:
+            return False
+        return os.write(fd, payload) == len(payload)
+    except (OSError, TypeError, ValueError, OverflowError):
+        return False
+
+
+def read_maintenance_pending_from_child(fd: int, token: str) -> TWPublicSourceUpdatePending | CapacityDeferred | None:
+    """Accept only a bounded complete receipt from the current invocation."""
+
+    try:
+        os.set_blocking(fd, False)
+        payload = os.read(fd, _PENDING_RECEIPT_LIMIT + 1)
+        if not payload or len(payload) > _PENDING_RECEIPT_LIMIT:
+            return None
+        record = json.loads(payload)
+        if (not isinstance(record, dict) or type(record.get("version")) is not int
+                or record["version"] != 1 or record.get("token") != token
+                or type(record.get("observed_at_ns")) is not int or record["observed_at_ns"] <= 0):
+            return None
+        if record.get("kind") == "capacity_deferred":
+            if set(record) != {"version", "kind", "token", "reason", "fields", "observed_at_ns"}:
+                return None
+            reason, fields = record["reason"], record["fields"]
+            if (not isinstance(reason, str) or not reason or len(reason) > 160
+                    or any(c not in "abcdefghijklmnopqrstuvwxyz0123456789_" for c in reason)
+                    or not isinstance(fields, dict) or len(fields) > 24
+                    or any(not isinstance(key, str) or len(key) > 120
+                           or key in {"reason", "contract", "retryable", "allocation_admitted"}
+                           or type(value) not in (str, int, bool, type(None))
+                           for key, value in fields.items())):
+                return None
+            return CapacityDeferred(reason, **fields, observed_in_child=True,
+                                    child_observed_at_ns=record["observed_at_ns"],
+                                    current_capacity_state="unverified")
+        if set(record) != {"version", "kind", "token", "source_root", "source_lock", "observed_at_ns"}:
+            return None
+        root, lock = record["source_root"], record["source_lock"]
+        if (type(record["version"]) is not int or record["version"] != 1
+                or record["kind"] != "tw_public_source_update_pending"
+                or record["token"] != token or type(record["observed_at_ns"]) is not int
+                or record["observed_at_ns"] <= 0 or not isinstance(root, str)
+                or not isinstance(lock, str) or not Path(root).is_absolute()
+                or Path(lock) != Path(root).parent / ".locks" / "tw-public-refresh.lock"):
+            return None
+        result = TWPublicSourceUpdatePending(Path(root), Path(lock), observed_in_child=True)
+        result.details["child_observed_at_ns"] = record["observed_at_ns"]
+        return result
+    except (BlockingIOError, OSError, UnicodeDecodeError, ValueError, TypeError):
+        return None
+
+
+def report_source_pending_to_parent(exc: TWPublicSourceUpdatePending) -> bool:
+    """Compatibility entrypoint for source-only child callers."""
+    return report_maintenance_pending_to_parent(exc)
+
+
+def read_source_pending_from_child(fd: int, token: str) -> TWPublicSourceUpdatePending | None:
+    """Source-only compatibility reader; never mislabel capacity as source."""
+    pending = read_maintenance_pending_from_child(fd, token)
+    return pending if isinstance(pending, TWPublicSourceUpdatePending) else None
 
 
 @contextmanager

@@ -4,6 +4,8 @@ from __future__ import annotations
 from pathlib import Path
 
 
+# Legacy relocation-plan namespaces remain valid for pinned, resumable plans.
+# New mutable launch paths are selected through service_layout below.
 ROLE_DIRECTORIES = {
     "training": "artifacts/markets",
     "prepared": "artifacts/data_preparation",
@@ -50,16 +52,20 @@ def admit_output(path: Path, role: str) -> Path:
 
 def runtime_cache_path(path: str | Path, root: Path) -> Path:
     """Localize a legacy data-cache setting in a new mutable launch copy."""
+    from stockagent.service_layout import service_path
     owner = node_root(root)
     path = Path(path).expanduser()
     path = path if path.is_absolute() else owner / path
+    legacy_cache = owner / 'artifacts/cache'
+    if path == legacy_cache or legacy_cache in path.parents:
+        return admit_output(service_path(path.relative_to(legacy_cache), area='cache', root=owner), 'cache')
     for view in (path, path.resolve()):
         for index, (a, b) in enumerate(zip(view.parts, view.parts[1:])):
             if a == 'artifacts' and b == 'markets':
                 suffix = view.parts[index + 2:]
                 if not suffix:
                     raise ValueError('a runtime cache requires an experiment-specific path')
-                return admit_output(owner / 'artifacts/cache' / Path(*suffix), 'cache')
+                return admit_output(service_path(Path(*suffix), area='cache', root=owner), 'cache')
     return admit_output(path, 'cache')
 
 

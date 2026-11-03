@@ -23,6 +23,7 @@ EQUITY_CLOCK_DATASET = "tw_twd_equity_futures_carry_decision_clock_v2"
 WINDOW_CLOCK_DATASET = "tw_futures_carry_execution_window_v3"
 EXTENDED_WINDOW_CLOCK_DATASET = "tw_futures_carry_extended_execution_window_v4"
 ALL_TWD_CLOCK_DATASET = "tw_all_twd_futures_carry_execution_window_v5"
+PARTIAL_TWD_CLOCK_DATASET = "tw_all_twd_futures_observed_partial_window_v6"
 MAX_EXECUTION_WINDOW_MINUTES = 300
 QUARANTINE_CONTRACT = "tw_futures_unknown_entry_quarantine_v1"
 ENTRY_CAPACITY_POLICIES = ("previous_session", "single_contract_probe")
@@ -47,9 +48,13 @@ def clock_asset_classes(asset_scope: str) -> tuple[str, ...]:
     return ASSET_SCOPES[asset_scope]
 
 
-def clock_dataset(asset_scope: str, *, window_minutes=1, quarantine_unknown=False) -> str:
+def clock_dataset(asset_scope: str, *, window_minutes=1, quarantine_unknown=False,
+                  allow_partial_observations=False) -> str:
     clock_asset_classes(asset_scope)
     _validate_window_options(window_minutes, quarantine_unknown)
+    _validate_partial_options(asset_scope, quarantine_unknown, allow_partial_observations)
+    if allow_partial_observations:
+        return PARTIAL_TWD_CLOCK_DATASET
     if asset_scope == "all_twd":
         return ALL_TWD_CLOCK_DATASET
     if window_minutes > 60:
@@ -66,10 +71,18 @@ def _validate_window_options(window_minutes, quarantine_unknown):
         raise ValueError("execution window must be 1..300 whole minutes with an explicit quarantine flag")
 
 
+def _validate_partial_options(asset_scope, quarantine_unknown, allow_partial_observations):
+    if (not isinstance(allow_partial_observations, bool)
+            or allow_partial_observations and (asset_scope != 'all_twd' or not quarantine_unknown)):
+        raise ValueError('partial observations require the explicit all-TWD quarantine research clock')
+
+
 def decision_clock_contract(decision_time: str, *, asset_scope="stock_only",
-                            window_minutes=1, quarantine_unknown=False) -> dict:
+                            window_minutes=1, quarantine_unknown=False,
+                            allow_partial_observations=False) -> dict:
     classes = clock_asset_classes(asset_scope)
     _validate_window_options(window_minutes, quarantine_unknown)
+    _validate_partial_options(asset_scope, quarantine_unknown, allow_partial_observations)
     if decision_time not in {"08:45", "09:00"}:
         raise ValueError("supported futures decision times are 08:45 and 09:00")
     hour, minute = map(int, decision_time.split(":"))
@@ -115,6 +128,13 @@ def decision_clock_contract(decision_time: str, *, asset_scope="stock_only",
             entry_margin="dated_specification_quoted_full_or_face_value",
             source_session="dated_specification_regular_and_expiry_clocks",
             specification_source="local_content_pinned_dated_product_intervals")
+    if allow_partial_observations:
+        contract.update(version=6, allow_partial_observations=True,
+            price="observed_available_prints_vwap_research_proxy_incomplete_source",
+            missing_source="positive_bounded_observations_only_otherwise_unknown_zero_order_capacity",
+            partial_observation_scope="exact_quarantined_physical_contract_day_and_window",
+            partial_observation_capacity="observed_positive_volume_no_inferred_missing_prints",
+            partial_observation_is_not="full_window_certificate_opening_reference_or_broker_fill")
     return contract
 
 
@@ -126,7 +146,8 @@ def clock_contract_from_manifest(manifest: dict, decision_time: str) -> dict:
     declared = manifest["clock"]
     scope = declared.get("asset_scope", "stock_only")
     options = {"window_minutes": declared.get("window_minutes", 1),
-               "quarantine_unknown": declared.get("quarantine_unknown_execution", False)}
+               "quarantine_unknown": declared.get("quarantine_unknown_execution", False),
+               "allow_partial_observations": declared.get("allow_partial_observations", False)}
     try:
         expected = decision_clock_contract(decision_time, asset_scope=scope, **options)
         dataset = clock_dataset(scope, **options)
@@ -189,9 +210,11 @@ def observed_window_entries(minutes, clock):
         *keys, "entry_quote", "entry_volume", "source_file_sha256")
 
 
-def opening_reference_contract(decision_time: str) -> dict:
+def opening_reference_contract(decision_time: str, *, version: int = 1) -> dict:
     decision_clock_contract(decision_time)
-    return {
+    if isinstance(version, bool) or version not in (1, 2, 3):
+        raise ValueError("unsupported opening reference contract version")
+    contract = {
         "version": 1, "decision_time": decision_time, "timezone": "Asia/Taipei",
         "policy": "observed_session_open_else_last_observed_trade",
         "selection": "available_by_lte_decision_same_physical_contract",
@@ -202,9 +225,40 @@ def opening_reference_contract(decision_time: str) -> dict:
         "features": list(OPENING_REFERENCE_FEATURES),
         "execution": "reference_only_no_fill_volume_margin_or_settlement_rewrite",
     }
+    if version == 2:
+        contract.update(version=2,
+            fallback="latest_known_real_trade_including_prior_session_or_preopen_trades_fail_closed_on_unordered_last_second",
+            last_trade_ties="different_prices_in_same_last_second_unavailable_not_arbitrary_source_order",
+            fallback_evidence="explicit_per_event_ambiguity_required_unknown_is_not_assumed_false")
+    if version == 3:
+        contract.update(version=3,
+            unknown="withhold_reference_across_unverified_contract_days_or_before_covered_daily_axis",
+            session_open="unique_first_second_or_verified_single_price_first_minute_after_available",
+            fallback="unavailable_until_cross_session_and_last_second_continuity_are_certified",
+            prior_price="unavailable_until_cross_session_and_last_second_continuity_are_certified",
+            gap_scope="authenticated_daily_axis_exact_executable_contract_day_quarantine",
+            last_trade_ties="unproven_fallbacks_withheld_never_infer_source_order",
+            night_session="regular_session_source_does_not_certify_intervening_night_trades")
+    return contract
 
 
-def resolve_opening_references(decisions, trades, *, decision_time):
+def opening_reference_contract_from_manifest(manifest: dict, decision_time: str) -> dict:
+    """Read the actual reference ABI rather than assuming the legacy version."""
+    error = 'opening reference source/clock/pair identity is incompatible'
+    if not isinstance(manifest, dict) or not isinstance(manifest.get('contract'), dict):
+        raise ValueError(error)
+    declared = manifest['contract']
+    try:
+        expected = opening_reference_contract(decision_time, version=declared.get('version'))
+    except (TypeError, ValueError) as exc:
+        raise ValueError(error) from exc
+    if (manifest.get('dataset') != OPENING_REFERENCE_DATASET or manifest.get('status') != 'complete'
+            or declared != expected):
+        raise ValueError(error)
+    return expected
+
+
+def resolve_opening_references(decisions, trades, *, decision_time, version=1):
     """Causal as-of input selection; never select by a future availability time.
 
     An event's `available_by` is separate from its original `trade_ts` (nullable
@@ -212,13 +266,22 @@ def resolve_opening_references(decisions, trades, *, decision_time):
     without being a session-opening print. No event is invented for missing
     prices or an incomplete source. Callers own source authentication.
     """
-    opening_reference_contract(decision_time)
+    opening_reference_contract(decision_time, version=version)
+    if version == 3:
+        raise ValueError('version 3 requires the gap-aware reference preparation path')
     if 'opening_ambiguous' not in trades.columns:
         # Legacy producers with already certified individual events remain readable.
         trades = trades.with_columns(pl.lit(False).alias('opening_ambiguous'))
+    if version == 2 and 'fallback_ambiguous' not in trades.columns:
+        raise ValueError('opening reference contract v2 requires explicit fallback ambiguity')
+    if version == 1 and 'fallback_ambiguous' in trades.columns and trades.filter(
+            pl.col('fallback_ambiguous').fill_null(True)).height:
+        raise ValueError('ambiguous fallback trades require opening reference contract v2')
     keys = ["date", "physical_contract"]
     required = {"physical_contract", "price", "trade_date", "trade_ts", "available_by",
                 "source_sha256", "is_session_open", "opening_ambiguous"}
+    if version == 2:
+        required.add('fallback_ambiguous')
     if required - set(trades.columns) or decisions.select(keys).is_duplicated().any():
         raise ValueError("opening references require unique decisions and timed real-trade events")
     if trades.filter(pl.col("price").is_null() | ~pl.col("price").is_finite() | (pl.col("price") <= 0)
@@ -226,6 +289,8 @@ def resolve_opening_references(decisions, trades, *, decision_time):
             | pl.col("is_session_open").is_null()
             | pl.col("opening_ambiguous").is_null()
             | (pl.col("opening_ambiguous") & ~pl.col("is_session_open"))
+            | ((pl.col('fallback_ambiguous').is_null()
+                | (pl.col('fallback_ambiguous') & pl.col('is_session_open'))) if version == 2 else pl.lit(False))
             | pl.col("source_sha256").is_null()
             | (pl.col("source_sha256").str.len_chars() != 64)
             | (pl.col("trade_ts").is_not_null() & (pl.col("trade_ts") > pl.col("available_by")))
@@ -256,18 +321,22 @@ def resolve_opening_references(decisions, trades, *, decision_time):
         strategy="backward", check_sortedness=False)
     has_open = pl.col("_open_trade_date") == pl.col("date")
     known_open = has_open & ~pl.col("_open_opening_ambiguous")
+    fallback_unknown = pl.col('_last_fallback_ambiguous').fill_null(False) if version == 2 else pl.lit(False)
     for output, raw in (("reference_quote", "price"), ("reference_trade_date", "trade_date"),
                         ("reference_trade_ts", "trade_ts"), ("reference_available_by", "available_by"),
                         ("reference_source_sha256", "source_sha256")):
         left = left.with_columns(pl.when(known_open).then(pl.col("_open_" + raw))
                                  .when(has_open).then(None)
+                                 .when(fallback_unknown).then(None)
                                  .otherwise(pl.col("_last_" + raw)).alias(output))
     # The denominator is a real prior-session trade, never a settlement mark.
     prior_left = decisions.with_columns(pl.col("date").cast(pl.Datetime("us")).alias("_prior_cutoff"))
     prior_left = prior_left.sort("_prior_cutoff").join_asof(prior.sort("_last_available_by"),
         left_on="_prior_cutoff", right_on="_last_available_by", by="physical_contract",
         strategy="backward", allow_exact_matches=False, check_sortedness=False)
-    left = left.join(prior_left.select(*keys, pl.col("_last_price").alias("prior_trade_quote")),
+    prior_price = (pl.when(pl.col('_last_fallback_ambiguous').fill_null(False)).then(None)
+                   .otherwise(pl.col('_last_price')) if version == 2 else pl.col('_last_price'))
+    left = left.join(prior_left.select(*keys, prior_price.alias("prior_trade_quote")),
                      on=keys, how="left", validate="1:1")
     left = left.with_columns(
         pl.when(known_open).then(pl.lit("observed_session_open"))
@@ -289,9 +358,8 @@ def resolve_opening_references(decisions, trades, *, decision_time):
 def validate_opening_reference_source(path, *, daily_path, decision_time, entry_manifest):
     path = Path(path)
     manifest = json.loads(path.with_name("opening_reference_manifest.json").read_text())
-    if (manifest.get("dataset") != OPENING_REFERENCE_DATASET or manifest.get("status") != "complete"
-            or manifest.get("contract") != opening_reference_contract(decision_time)
-            or manifest.get("data_sha256") != sha256_file(path)
+    opening_reference_contract_from_manifest(manifest, decision_time)
+    if (manifest.get("data_sha256") != sha256_file(path)
             or manifest.get("source_daily_sha256") != sha256_file(daily_path)
             or manifest.get("pair_identity") != entry_manifest.get("pair_identity")):
         raise ValueError("opening reference source/clock/pair identity is incompatible")
@@ -325,6 +393,53 @@ def validate_opening_reference_source(path, *, daily_path, decision_time, entry_
     return refs, manifest
 
 
+def _validate_partial_observation_source(directory, manifest, entries, expected):
+    """Bind every partial execution to the immutable diagnostic and readback."""
+    item = manifest.get('partial_observations', {})
+    names = {'data_file': 'partial_observations.parquet',
+             'manifest_file': 'partial_observations_manifest.json',
+             'readback_file': 'partial_observations_readback.json'}
+    paths = {}
+    for field, name in names.items():
+        if item.get(field) != name:
+            raise ValueError('partial observations require local immutable evidence')
+        member = Path(directory) / name
+        if member.is_symlink() or not member.is_file() or sha256_file(member) != item.get(field.replace('_file', '_sha256')):
+            raise ValueError('partial observation evidence is missing or changed')
+        paths[field] = member
+    diagnostic = json.loads(paths['manifest_file'].read_text())
+    readback = json.loads(paths['readback_file'].read_text())
+    source = diagnostic.get('sources', {})
+    if (diagnostic.get('contract') != 'tw_futures_partial_window_observations_diagnostic_v1'
+            or diagnostic.get('research_only') is not True
+            or diagnostic.get('training_ready') is not False
+            or diagnostic.get('source_coverage_complete') is not False
+            or diagnostic.get('candidate_file', {}).get('sha256') != item['data_sha256']
+            or source.get('daily_sha256') != manifest['source_daily_sha256']
+            or source.get('rules_sha256') != manifest['source_rules_sha256']
+            or source.get('quarantine_sha256') != manifest['execution_quarantine']['sha256']
+            or readback.get('contract') != 'tw_futures_partial_window_independent_arithmetic_v1'
+            or readback.get('independent_implementation') is not True
+            or readback.get('candidate_sha256') != item['data_sha256']
+            or readback.get('diagnostic_manifest_sha256') != item['manifest_sha256']
+            or readback.get('rows_checked') != diagnostic.get('candidate_rows')):
+        raise ValueError('partial observation diagnostic or independent arithmetic is incompatible')
+    candidates = pl.read_parquet(paths['data_file'])
+    required = {'date', 'physical_contract', 'window_minutes', 'decision_time',
+                'entry_quote', 'entry_volume', 'source_file_sha256'}
+    if (required - set(candidates.columns)
+            or candidates.select('date', 'physical_contract', 'window_minutes', 'decision_time').is_duplicated().any()):
+        raise ValueError('invalid partial observation candidate identities')
+    columns = ['date', 'physical_contract', 'entry_quote', 'entry_volume', 'source_file_sha256']
+    observed = candidates.filter((pl.col('window_minutes') == expected.get('window_minutes', 1))
+        & (pl.col('decision_time') == expected['decision_time'])).select(columns).sort(columns[:2])
+    used = entries.filter(pl.col('status') == 'partial_observed_minute').select(columns).sort(columns[:2])
+    if not observed.equals(used):
+        raise ValueError('partial clock rows differ from the source-bound observed candidates')
+    if item.get('contract_days') != used.height:
+        raise ValueError('partial observed entry count differs')
+
+
 def validate_clock_source(path, *, daily_path, rules_path, decision_time):
     path = Path(path)
     manifest_path = path.with_name("manifest.json")
@@ -332,7 +447,8 @@ def validate_clock_source(path, *, daily_path, rules_path, decision_time):
     expected = clock_contract_from_manifest(manifest, decision_time)
     scope = expected.get("asset_scope", "stock_only")
     options = dict(window_minutes=expected.get("window_minutes", 1),
-                   quarantine_unknown=expected.get("quarantine_unknown_execution", False))
+                   quarantine_unknown=expected.get("quarantine_unknown_execution", False),
+                   allow_partial_observations=expected.get('allow_partial_observations', False))
     if (manifest.get("entries_sha256") != sha256_file(path)
             or manifest.get("source_daily_sha256") != sha256_file(daily_path)
             or manifest.get("source_rules_sha256") != sha256_file(rules_path)):
@@ -342,6 +458,8 @@ def validate_clock_source(path, *, daily_path, rules_path, decision_time):
     if required - set(entries.columns) or entries.select("date", "physical_contract").is_duplicated().any():
         raise ValueError("invalid futures entry clock schema or duplicate physical contract-day")
     accepted = ACCEPTED_STATUSES | ({"unverified_execution_quarantined"} if options["quarantine_unknown"] else set())
+    if options['allow_partial_observations']:
+        accepted = accepted | {'partial_observed_minute'}
     if entries.filter(~pl.col("status").is_in(accepted) | pl.col("status").is_null()).height:
         raise ValueError("unknown entry coverage cannot become a no-trade observation")
     if options["quarantine_unknown"]:
@@ -351,20 +469,27 @@ def validate_clock_source(path, *, daily_path, rules_path, decision_time):
         quarantine_path = path.parent / item.get("file", "")
         if not quarantine_path.is_file() or sha256_file(quarantine_path) != item.get("sha256"):
             raise ValueError("execution quarantine receipt is missing or changed")
-        validate_execution_quarantine(json.loads(quarantine_path.read_text()),
-            entries.filter(pl.col("status") == "unverified_execution_quarantined"),
+        unknown_statuses = ['unverified_execution_quarantined']
+        if options['allow_partial_observations']:
+            unknown_statuses.append('partial_observed_minute')
+        unknown = entries.filter(pl.col('status').is_in(unknown_statuses))
+        validate_execution_quarantine(json.loads(quarantine_path.read_text()), unknown,
             daily_sha256=manifest["source_daily_sha256"], rules_sha256=manifest["source_rules_sha256"])
-        count = entries.filter(pl.col('status') == 'unverified_execution_quarantined').height
+        count = unknown.height
         if (manifest.get('coverage_gaps') != count or item.get('contract_days') != count
                 or manifest.get('source_coverage_complete') is not False):
             raise ValueError('quarantined execution must retain its unknown source coverage')
-    observed = entries.filter(pl.col("status") == "observed_minute")
+    positive_statuses = ['observed_minute']
+    if options['allow_partial_observations']:
+        _validate_partial_observation_source(path.parent, manifest, entries, expected)
+        positive_statuses.append('partial_observed_minute')
+    observed = entries.filter(pl.col('status').is_in(positive_statuses))
     if observed.filter(pl.col("entry_quote").is_null() | ~pl.col("entry_quote").is_finite()
             | (pl.col("entry_quote") <= 0) | pl.col("entry_volume").is_null()
             | ~pl.col("entry_volume").is_finite() | (pl.col("entry_volume") <= 0)
             | (pl.col("entry_volume") != pl.col("entry_volume").floor())).height:
         raise ValueError("observed clock entries require finite positive prices and whole-contract volume")
-    if entries.filter((pl.col("status") != "observed_minute")
+    if entries.filter(~pl.col('status').is_in(positive_statuses)
             & (pl.col("entry_quote").is_not_null() | (pl.col("entry_volume") != 0))).height:
         raise ValueError("non-executable clock rows cannot contain a synthetic fill")
     if (entries.height != manifest.get("rows") or not entries.height
@@ -466,7 +591,8 @@ def dated_entry_sessions(source, *, unknown_final_mode="intersection"):
 
 
 def reprice_margin_entries(execution, source: pl.DataFrame, *, participation, broker_multiplier,
-                           asset_scope="stock_only", capacity_policy="previous_session"):
+                           asset_scope="stock_only", capacity_policy="previous_session",
+                           allow_partial_observations=False):
     """Change entry facts only; preserve prior, end, terminal and corporate state.
 
     `source` is aligned to the flattened execution rows. Dated stock-futures
@@ -491,7 +617,14 @@ def reprice_margin_entries(execution, source: pl.DataFrame, *, participation, br
     if ex.ndim != 2 or ex.shape[0] != source.height or ex.shape[1] < 33:
         raise ValueError("decision clock requires aligned corporate whole-contract margin execution")
     get = lambda name: source[name].to_numpy().astype(np.float64)
-    observed = source["status"].to_numpy() == "observed_minute"
+    if (not isinstance(allow_partial_observations, bool)
+            or allow_partial_observations and asset_scope != 'all_twd'):
+        raise ValueError('partial observations require the explicit all-TWD research clock')
+    statuses = source['status'].to_numpy()
+    if not allow_partial_observations and np.any(statuses == 'partial_observed_minute'):
+        raise ValueError('partial observations require the explicit research clock')
+    observed = (statuses == 'observed_minute') | (
+        (statuses == 'partial_observed_minute') & allow_partial_observations)
     quote, old_quote, multiplier = get("entry_quote"), get("open"), get("contract_multiplier")
     full, known = get("opening_contract_value_twd"), get("known_margin_contract_value_twd")
     base = get("opening_margin_value_twd")
@@ -651,12 +784,16 @@ def attach_futures_decision_clock(panel, path, *, decision_time, participation=.
     active = ~account_only & (daily.integer_execution[di, si, 3] > 0)
     accepted = ACCEPTED_STATUSES | ({"unverified_execution_quarantined"}
         if manifest["clock"].get("quarantine_unknown_execution") else set())
+    partial_observations = manifest['clock'].get('allow_partial_observations', False)
+    if partial_observations:
+        accepted = accepted | {'partial_observed_minute'}
     if source.filter(pl.Series(active) & ~pl.col("status").is_in(accepted)).height:
         raise ValueError("active carrying contracts have missing clock evidence")
     ex = daily.integer_execution.copy()
     ex[di[active], si[active]] = reprice_margin_entries(ex[di[active], si[active]],
         source.filter(pl.Series(active)), participation=participation, broker_multiplier=broker_multiplier,
-        asset_scope=scope, capacity_policy=capacity_policy)
+        asset_scope=scope, capacity_policy=capacity_policy,
+        allow_partial_observations=partial_observations)
     open_prices = daily.open_prices.copy()
     # No executable quote stays missing in reports, even though the ledger
     # uses a separately labelled official mark for carrying valuation.

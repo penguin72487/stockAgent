@@ -1,0 +1,14 @@
+[Unit]
+Description=Attach FinLab futures objects to the enrolled E workspace
+Requires=stockagent-e-workspace-mount.service
+After=stockagent-e-workspace-mount.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=__REPO_ROOT__
+ExecStart=/usr/bin/bash -c 'source __REPO_ROOT__/scripts/runtime_env.sh && run_fintech_python __REPO_ROOT__/scripts/manage_workspace_volume.py mount-finlab-futures'
+TimeoutStartSec=150
+
+[Install]
+WantedBy=multi-user.target

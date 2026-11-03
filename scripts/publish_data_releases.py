@@ -806,6 +806,8 @@ def _publish_entry(
             repo_root=REPO_ROOT,
             **({"progress": args.publication_progress}
                if getattr(args, "publication_progress", None) is not None else {}),
+            **({"sealed_pack_hints": args.sealed_pack_hints}
+               if getattr(args, "sealed_pack_hints", None) is not None else {}),
             **({"source_guard": source_guard} if source_guard is not None else {}),
             **({"defer_scan": True} if getattr(args, "defer_scan", False) else {}),
             **({"publication_lock_nonblocking": True}

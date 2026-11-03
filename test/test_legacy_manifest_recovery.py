@@ -48,6 +48,46 @@ def test_complete_interrupted_capture_recovers_identical_bytes_without_reencodin
                for name, (inode, raw) in before.items())
 
 
+@pytest.mark.parametrize('case', ['complete', 'missing-first', 'corrupt-first', 'symlink-first'])
+def test_parallel_receipt_resume_preserves_order_and_refuses_redirected_controls(tmp_path, monkeypatch, case):
+    # These cases exercise receipt order and byte recovery. The independent
+    # live-process and service gates have their own integration tests.
+    monkeypatch.setattr(archive, '_manual_capture_usage_gate', lambda *a, **kw: None)
+    monkeypatch.setattr(archive, 'artifact_process_references', lambda *a, **kw: [])
+    root, source, spec, expected, original_bytes, stage, target = capture(tmp_path)
+    receipts = [stage / 'receipts' / (hashlib.sha256(row['path'].encode()).hexdigest() + '.json')
+                for row in expected['files']]
+    if case in ('missing-first', 'corrupt-first'):
+        missing, damaged = (receipts if case == 'missing-first' else receipts[::-1])
+        missing.unlink()
+        bad = json.loads(damaged.read_bytes())
+        bad['codec'] = []
+        damaged.write_text(json.dumps(bad))
+    elif case == 'symlink-first':
+        receipts[0].unlink()
+        receipts[0].symlink_to(receipts[1])
+    monkeypatch.setattr(archive, '_prunable_stage', lambda _spec: True)
+    monkeypatch.setattr(archive, '_d_stage_file_workers', lambda *_: 4)
+    events = []
+    if case == 'complete':
+        assert archive.recover_complete_archive_manifest(spec, root, manual_capture=True,
+            progress=events.append) == expected
+        assert target.read_bytes() == original_bytes
+        assert events[-1]['state'] == 'receipt-scan-complete'
+        assert events[-1]['files_completed'] == events[-1]['files_total'] == 2
+    elif case == 'missing-first':
+        assert archive.recover_complete_archive_manifest(spec, root, manual_capture=True,
+            progress=events.append) is None
+        assert not target.exists()
+        assert events[-1]['state'] == 'incomplete' and events[-1]['files_completed'] == 0
+    else:
+        with pytest.raises(SnapshotError):
+            archive.recover_complete_archive_manifest(spec, root, manual_capture=True,
+                progress=events.append)
+        assert not target.exists()
+    assert events and all(event['acceptance'] is False for event in events)
+
+
 @pytest.mark.parametrize('drift', ['uniform', 'partial', 'inode', 'boolean'])
 def test_recovery_preserves_real_observations_and_admits_only_uniform_device_change(tmp_path, monkeypatch, drift):
     root, source, spec, expected, original_bytes, stage, target = capture(tmp_path)

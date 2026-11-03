@@ -271,6 +271,63 @@
       return `<tr><td>${esc(row.session_date)}<small>${shortTime(row.fill_at || row.recorded_at)}</small></td><td>${esc(strategyLabel(row))}<small>${esc(row.symbol)}</small></td><td>${esc(row.purpose)}</td><td>${esc(row.order_type || row.event_kind)}</td><td>${quoteText(row, "price", sourceNumber)} × ${number(row.quantity)}</td><td>${esc(row.status || row.event_kind)}</td></tr>`;
     }
 
+    // These projections are explicitly narrower than the ledger pages. In
+    // particular an absent fill is unknown, not a zero-share fill.
+    function fallbackInRange(date, selection) {
+      return !!date && (!selection.start || date >= selection.start) && (!selection.end || date <= selection.end);
+    }
+    function fallbackMatches(row, selection) {
+      return (selection.mode === "all" || row.market === selection.mode)
+        && (!selection.symbol || `${row.symbol} ${row.name || ""}`.toLowerCase().includes(selection.symbol.toLowerCase()));
+    }
+    function publishedSignalFallback(data, selection, {ledgerReady = false} = {}) {
+      // Published targets have their own preview. A successful ledger query,
+      // including an empty result, must never be replaced by a different
+      // producer revision or a later post-close model run.
+      if (ledgerReady || !data || !fallbackInRange(data.session_date, selection)) return null;
+      const modeMap = new Map(data.modes.map(mode => [mode.market, mode]));
+      const rows = selection.status === "all"
+        ? data.rows.filter(row => fallbackMatches(row, selection)).map(row => ({...row, fallbackMode: modeMap.get(row.market)}))
+        : [];
+      return {rows, note: selection.status === "all"
+        ? "僅已發布模型目標，模擬委託與成交待核對；非完整交易紀錄"
+        : "模型目標不含成交狀態，無法套用此狀態篩選；請等待完整帳本明細"};
+    }
+    function publishedSignalAhead(data, selection, ledgerRows) {
+      if (!data || selection.status !== "all" || selection.start !== data.session_date || selection.end !== data.session_date) return false;
+      for (const mode of data.modes) {
+        if (mode.status !== "published" || mode.stale || !mode.public_signal_key
+            || (selection.mode !== "all" && selection.mode !== mode.market)) continue;
+        const relevant = ledgerRows.filter(row => row.market === mode.market && row.session_date === data.session_date
+          && row.public_signal_key && fallbackMatches(row, selection));
+        if (!relevant.length || relevant.some(row => row.public_signal_key === mode.public_signal_key)) continue;
+        const readyAt = Date.parse(mode.signal_ready_at);
+        const observed = relevant.map(row => Date.parse(row.signal_at)).filter(Number.isFinite);
+        // Different identities alone cannot establish which projection is
+        // newer; require a comparable clock and preserve both sources.
+        if (Number.isFinite(readyAt) && observed.length === relevant.length && readyAt > Math.max(...observed)) return true;
+      }
+      return false;
+    }
+    function publishedSignalFallbackRow(row) {
+      const mode = row.fallbackMode || {};
+      const revision = mode.revision_index == null ? "" : `版本 ${number(mode.revision_index)} · `;
+      return `<tr data-public-signal-key="${esc(row.public_signal_key)}"><td><strong>${esc(mode.label || row.market)}</strong><small>${mode.stale ? "上一版 · " : ""}${revision}${shortTime(mode.signal_ready_at)}</small></td><td><strong>${esc(row.symbol)}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.name || "")}</small></td><td><strong>目標 ${pct(row.target_weight)}</strong></td><td>—<small>模擬委託及成交待核對</small></td><td>—<small>價格與盈虧待核對</small></td><td>—<small>不推論成交或損益</small></td></tr>`;
+    }
+    function livePositionFallback(data, selection) {
+      if (!data) return null;
+      const sessionDay = new Intl.DateTimeFormat("sv-SE", {timeZone: "Asia/Taipei",
+        year: "numeric", month: "2-digit", day: "2-digit"}).format(new Date(data.as_of));
+      if (!fallbackInRange(sessionDay, selection)) return null;
+      const modeMap = new Map(data.modes.map(mode => [mode.market, mode]));
+      const canShow = selection.status === "all" || selection.status === "open";
+      const rows = canShow ? data.rows.filter(row => fallbackInRange(row.session_date, selection) && fallbackMatches(row, selection))
+        .map(row => ({...row, label: modeMap.get(row.market)?.label}))
+        .sort((a, b) => Math.abs(Number(b.target_weight) || 0) - Math.abs(Number(a.target_weight) || 0)) : [];
+      return {rows, note: canShow ? "僅已確認的目前未平倉快照，不含完整生命週期"
+        : "此快照僅含目前未平倉，無法查詢已平倉或未執行；請等待完整帳本明細"};
+    }
+
     function pagedTable({id, rows, total, loading, hasMore, error, renderRow, emptyText, countDetail = ""}) {
       $(`${id}-body`).setAttribute("aria-busy", String(loading));
       $(`${id}-count`).textContent = `${number(rows.length)} / ${number(total)} 筆${error ? " · 更新失敗" : countDetail}`;
@@ -283,7 +340,8 @@
       setHtml(`${id}-body`, (error ? message(error) : "") + (markup || (error ? "" : message(emptyText))));
     }
 
-    return Object.freeze({positionRow, signalRow, eventRow, futuresBadge, pagedTable, quoteText, dailyReference, priceNoticeText, priceDistanceText, priceSources});
+    return Object.freeze({positionRow, signalRow, eventRow, futuresBadge, pagedTable, quoteText, dailyReference, priceNoticeText, priceDistanceText, priceSources,
+      publishedSignalFallback, publishedSignalAhead, publishedSignalFallbackRow, livePositionFallback});
   }
   global.StockAgentTwDetailComponents = Object.freeze({create});
 })(globalThis);

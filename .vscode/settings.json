@@ -4,11 +4,15 @@
   "workbench.editor.limit.perEditorGroup": false,
   "workbench.editor.limit.excludeDirty": true,
   "files.exclude": {
+    "service_data/**": true,
     "artifacts/**": true,
     "artifacts_*/**": true,
     "data_*/**": true
   },
   "files.watcherExclude": {
+    "**/service_data/**": true,
+    "/root/stockAgent/service_data/**": true,
+    "service_data/**": true,
     "**/artifacts/**": true,
     "**/artifacts_*/**": true,
     "**/data_*/**": true,
@@ -27,6 +31,8 @@
   },
   "js/ts.tsserver.watchOptions": {
     "excludeDirectories": [
+      "/root/stockAgent/service_data",
+      "/root/stockAgent/service_data/**",
       "/root/stockAgent/artifacts",
       "/root/stockAgent/artifacts/**",
       "/root/stockAgent/artifacts_*",
@@ -36,6 +42,7 @@
     ]
   },
   "search.exclude": {
+    "service_data/**": true,
     "artifacts/**": true,
     "artifacts_*/**": true,
     "data_*/**": true,

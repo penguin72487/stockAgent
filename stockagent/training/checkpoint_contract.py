@@ -426,6 +426,18 @@ def _configuration_fingerprint_snapshot(config: ExperimentConfig) -> dict[str, A
     """Return a semantic config snapshot while omitting disabled new branches."""
 
     snapshot = asdict(config)
+    if not snapshot["trading"]["tw_day_trade_short_limit_up_penalty_rate"]:
+        # The disabled stress-cost branch must preserve historical identities.
+        snapshot["trading"].pop("tw_day_trade_short_limit_up_penalty_rate")
+    if snapshot["trading"]["tw_futures_holiday_account_dates_source"] is None:
+        snapshot["trading"].pop("tw_futures_holiday_account_dates_source")
+    if snapshot["trading"]["tw_futures_holiday_valuation_source"] is None:
+        snapshot["trading"].pop("tw_futures_holiday_valuation_source")
+    if snapshot["trading"]["tw_futures_feature_history_contract"] is None:
+        # Preserve existing configuration identities when history is disabled.
+        snapshot["trading"].pop("tw_futures_feature_history_contract")
+    if not snapshot["training"]["early_stopping_reference_epochs"]:
+        snapshot["training"].pop("early_stopping_reference_epochs")
     if snapshot["training"]["sharpness_mode"] == "none":
         for key in ("sharpness_mode", "sharpness_radius", "sharpness_alpha"):
             snapshot["training"].pop(key)
@@ -896,7 +908,13 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
     # or fold warm-start state below. The normalized objective still determines
     # the persisted validation loss and objective-labelled evaluation artifacts.
     if _is_tree_model_name(training.model_name):
-        return {"objective": objective}
+        return {
+            "objective": objective,
+            **({"validation_and_stopping": {
+                "early_stopping_no_improve_ratio": float(training.early_stopping_no_improve_ratio),
+                "early_stopping_reference_epochs": int(training.early_stopping_reference_epochs),
+            }} if training.early_stopping_reference_epochs else {}),
+        }
 
     compaction_mode = _normalize_train_symbol_compaction(
         training.train_symbol_compaction
@@ -1000,6 +1018,8 @@ def _training_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             "early_stopping_no_improve_ratio": float(
                 training.early_stopping_no_improve_ratio
             ),
+            **({"early_stopping_reference_epochs": int(training.early_stopping_reference_epochs)}
+               if training.early_stopping_reference_epochs else {}),
             "early_stopping_min_delta": float(training.early_stopping_min_delta),
             "best_checkpoint_max_epoch": int(training.best_checkpoint_max_epoch),
             "val_interval_epochs": int(training.val_interval_epochs),
@@ -1147,6 +1167,8 @@ def _training_checkpoint_contract_schema_3(
 ) -> dict[str, Any]:
     """Exact training contract written by schema 3 before semantic layering."""
     contract = asdict(config.training)
+    # This control was introduced after schema 3.
+    contract.pop("early_stopping_reference_epochs", None)
     for config_name in (
         "transformer_base_portfolio",
         "financial_transformer",
@@ -1469,13 +1491,25 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                 "manifest_sha256": sha256_file(clock_manifest_path),
             }
             if trading.tw_futures_portfolio_opening_reference_path is not None:
-                from stockagent.data.tw_futures_decision_clock import opening_reference_contract
+                from stockagent.data.tw_futures_decision_clock import opening_reference_contract_from_manifest
                 reference_path = Path(trading.tw_futures_portfolio_opening_reference_path)
+                reference_manifest_path = reference_path.with_name("opening_reference_manifest.json")
+                reference_manifest = json.loads(reference_manifest_path.read_text(encoding="utf-8"))
+                reference_contract = opening_reference_contract_from_manifest(
+                    reference_manifest, trading.tw_futures_portfolio_decision_time)
+                reference_sha256 = sha256_file(reference_path)
+                pair = clock_manifest.get('pair_identity')
+                daily = clock_manifest.get('source_daily_sha256')
+                if (not isinstance(pair, str) or not pair or not isinstance(daily, str) or len(daily) != 64
+                        or reference_manifest.get('pair_identity') != pair
+                        or reference_manifest.get('source_daily_sha256') != daily
+                        or reference_manifest.get('data_sha256') != reference_sha256):
+                    raise ValueError('futures checkpoint opening reference differs from its paired source')
                 contract["futures_opening_reference"] = {
-                    **opening_reference_contract(trading.tw_futures_portfolio_decision_time),
+                    **reference_contract,
                     "model_encoder": "four_relative_reference_channels_linear_residual_v1",
-                    "source_path": str(reference_path), "source_sha256": sha256_file(reference_path),
-                    "manifest_sha256": sha256_file(reference_path.with_name("opening_reference_manifest.json")),
+                    "source_path": str(reference_path), "source_sha256": reference_sha256,
+                    "manifest_sha256": sha256_file(reference_manifest_path),
                 }
         if trading.tw_futures_portfolio_benchmark_mode == "tx_front_rolling_1x_gross":
             contract["futures_benchmark_contract"] = {
@@ -1511,6 +1545,40 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
                     training_event_credit="preceding_action_at_batch_boundary_v1",
                     evaluation_account="dated_events_with_contiguous_carry_v1",
                 )
+                holiday_path = getattr(trading, "tw_futures_holiday_account_dates_source", None)
+                if holiday_path is not None:
+                    from downloader.artifact_io import sha256_file
+                    from stockagent.data.tw_futures_holiday_account_dates import (
+                        HOLIDAY_ACCOUNT_DATES_ABI, load_holiday_account_dates,
+                    )
+                    holiday_source = load_holiday_account_dates(Path(holiday_path), workspace=Path.cwd())
+                    contract["futures_margin_contract"]["holiday_account_dates"] = {
+                        "contract": HOLIDAY_ACCOUNT_DATES_ABI,
+                        "source_path": str(holiday_path),
+                        "manifest_sha256": holiday_source.fingerprint,
+                        "implementation_sha256": sha256_file(Path(__file__).resolve().parents[1]
+                            / "data/tw_futures_holiday_account_dates.py"),
+                        "scope": "processing_calendar_only_separate_valuation_admission",
+                    }
+                valuation_path = getattr(trading, "tw_futures_holiday_valuation_source", None)
+                if valuation_path is not None:
+                    from downloader.artifact_io import sha256_file
+                    from stockagent.data.tw_futures_holiday_c11 import HOLIDAY_C11_ABI, load_holiday_c11
+                    valuation_source = load_holiday_c11(Path(valuation_path), workspace=Path.cwd())
+                    daily_path = Path(trading.tw_futures_portfolio_data_path)
+                    daily_sha = sha256_file(daily_path)
+                    if (valuation_source.financial_daily_sha256 is not None
+                            and daily_sha != valuation_source.financial_daily_sha256):
+                        raise ValueError("holiday C11 source belongs to another financial release")
+                    contract["futures_margin_contract"]["holiday_valuations"] = {
+                        "contract": HOLIDAY_C11_ABI,
+                        "source_path": str(valuation_path),
+                        "manifest_sha256": valuation_source.fingerprint,
+                        "financial_daily_sha256": daily_sha,
+                        "implementation_sha256": sha256_file(Path(__file__).resolve().parents[1]
+                            / "data/tw_futures_holiday_c11.py"),
+                        "scope": "complete_nonterminal_holiday_marks_separate_calendar_and_cash_admission",
+                    }
             if trading.tw_futures_portfolio_valuation_research_contract is not None:
                 contract["futures_margin_contract"]["valuation_research_contract"] = trading.tw_futures_portfolio_valuation_research_contract
         if (config.training.model_name == "financial_transformer"
@@ -2175,6 +2243,13 @@ def _trading_checkpoint_contract(config: ExperimentConfig) -> dict[str, Any]:
             contract["taiwan_execution"]["entry_remainder_policy"] = (
                 trading.tw_day_trade_entry_remainder_policy
             )
+        if trading.tw_day_trade_short_limit_up_penalty_rate:
+            contract["taiwan_execution"]["short_limit_up_close_penalty"] = {
+                "contract": "official_limit_up_close_source_residual_short_expense_v1",
+                "rate": float(trading.tw_day_trade_short_limit_up_penalty_rate),
+                "assessment": "after_source_capacity_before_synthetic_terminal_liquidation",
+                "base": "uncovered_short_shares_times_official_close",
+            }
         if bool(trading.tw_day_trade_terminal_liquidation_unlimited_capacity):
             contract["taiwan_execution"][
                 "day_trade_terminal_liquidation_unlimited_capacity"
@@ -2580,6 +2655,16 @@ def _checkpoint_manifest(
     execution_mode = normalize_execution_mode(config.trading.execution_mode)
     dated_futures_source = None
     calendar_contract = getattr(config.trading, "tw_futures_account_calendar_contract", None)
+    history_contract = getattr(config.trading, "tw_futures_feature_history_contract", None)
+    history = getattr(panel, "feature_history", None)
+    if history_contract is not None:
+        from stockagent.data.futures_feature_history import CONTRACT, FuturesFeatureHistory
+        if (history_contract != CONTRACT or calendar_contract != "dated_futures_account_calendar_v1"
+                or not isinstance(history, FuturesFeatureHistory)):
+            raise ValueError("futures feature history checkpoint requires its explicit history and account contracts")
+        history.verify(panel)
+    elif history is not None:
+        raise ValueError("futures feature history cannot enter an unversioned checkpoint")
     if execution_mode == "tw_stock_context_futures_portfolio":
         daily = getattr(panel, "stock_context_futures_portfolio_daily", None)
         has_dated_source = daily is not None and (
@@ -2653,6 +2738,8 @@ def _checkpoint_manifest(
             ),
             "force_exit_mask": fingerprint("force_exit_mask", effective_force_exit),
         }
+        if history is not None:
+            panel_arrays["futures_feature_history"] = history.fingerprint()
         if config.trading.tw_overnight_fixed_close_to_open:
             decision_tag = config.data.overnight_decision_time.replace(":", "")
             panel_arrays[f"overnight_{decision_tag}_available"] = fingerprint(
@@ -3078,6 +3165,8 @@ def _checkpoint_manifest(
     }
     if calendar_contract is not None:
         data_schema_contract["futures_account_calendar_contract"] = calendar_contract
+    if history_contract is not None:
+        data_schema_contract["futures_feature_history_contract"] = history_contract
     data_contract = {
         **data_schema_contract,
         "panel_arrays": panel_arrays,
@@ -3616,6 +3705,8 @@ def _validate_checkpoint_manifest(
         raise ValueError("A model-scope manifest cannot validate resume or artifacts")
 
     actual = checkpoint.get("experiment_manifest")
+    reference_epochs = expected.get("contracts", {}).get("training", {}).get(
+        "validation_and_stopping", {}).get("early_stopping_reference_epochs", 0)
     expected_calendar = expected.get("contracts", {}).get("data", {}).get(
         "futures_account_calendar_contract")
     continuation = expected.get("contracts", {}).get("training", {}).get("fold_continuation", {})
@@ -3624,6 +3715,8 @@ def _validate_checkpoint_manifest(
         "day_trade_annual_episode_sharding",
     ))
     if actual is None:
+        if reference_epochs and normalized_scope in {"resume", "artifact"}:
+            raise RuntimeError("legacy checkpoint lacks the early-stopping reference contract")
         if expected_calendar is not None:
             raise RuntimeError("checkpoint lacks the dated futures account calendar contract")
         if model_scope_only:
@@ -3690,6 +3783,8 @@ def _validate_checkpoint_manifest(
     if model_scope_only and actual_schema != 4:
         raise RuntimeError("A model-scope manifest requires a schema-4 checkpoint")
     if actual_schema < 4 and normalized_scope in {"resume", "artifact"}:
+        if reference_epochs:
+            raise RuntimeError("legacy checkpoint predates the early-stopping reference contract")
         if new_day_trade_training:
             raise RuntimeError(
                 f"Schema {actual_schema} checkpoint predates the new day-trade training "

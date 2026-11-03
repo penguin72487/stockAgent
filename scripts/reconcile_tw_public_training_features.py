@@ -4,8 +4,9 @@
 Mutable OpenAPI snapshots use complete source-byte receipts. Original release
 archives use a feature-semantic receipt so an unchanged value/clock does not
 rebuild 9.5 million rows merely because official HTML markup was rewrapped.
-Any changed input still requires a full-history rebuild: it could revise an
-arbitrarily old observation, so a blind tail rewrite is unsafe.
+Changed inputs are reused only when exact source-partition or audited
+non-feature proofs establish what can be preserved. Unproven changes fall
+back to a full-history rebuild, rather than a blind fixed-window rewrite.
 """
 
 from __future__ import annotations
@@ -199,7 +200,7 @@ def main() -> int:
                     sys.executable, str(REPO_ROOT / "scripts/build_tw_public_training_features.py"),
                     "--input-dir", str(args.input_dir), "--symbols-root", str(args.symbols_root),
                     "--output-path", str(args.output_path), "--end-date", end_date,
-                    "--incremental-tail-days", "7",
+                    "--incremental-auto",
                 ]
                 if allow_lag:
                     command.append("--allow-daily-publication-lag")

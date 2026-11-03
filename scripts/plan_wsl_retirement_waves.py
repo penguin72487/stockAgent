@@ -81,6 +81,70 @@ def observe_active_supervisors() -> list[dict] | None:
         return None
 
 
+def _owned_quarantine_candidate(data: dict, item: dict, receipt: Path) -> dict | None:
+    """Recognize an interrupted transaction for scheduling, not for deletion.
+
+    This checks only the small, fixed identity records and quarantine layout.
+    The existing retirement owner must independently revalidate the cold
+    release, all source bytes, references, transport and final unlink gates.
+    """
+    try:
+        if data.get('source_origin') is not None or item.get('existing_dataset'):
+            return None
+        relative = str(owner._safe_relative_path(item['relative_root'], 'frozen offline artifact'))
+        fingerprint = item['fingerprint']
+        if not isinstance(fingerprint, str) or not re.fullmatch(r'[0-9a-f]{64}', fingerprint):
+            return None
+        link_policy = data.get('symlink_policy')
+        dataset = owner.dataset_prefix(None) + hashlib.sha256(
+            (relative + fingerprint + ('\0' + link_policy if link_policy else '')).encode()
+        ).hexdigest()[:24]
+        owner.validate_slug(dataset, 'frozen offline dataset')
+        artifact, hot, states, _ = owner.source_layout(None)
+        source, mirror = artifact.resolve() / relative, hot.resolve() / relative
+        if (source.exists() or source.is_symlink() or mirror.exists() or mirror.is_symlink()
+                or source.resolve(strict=False) != source or mirror.resolve(strict=False) != mirror):
+            return None
+        state_path = states / 'retirements' / (dataset + '.json')
+        plan_path = receipt / dataset / 'retirement-plan.json'
+        if (state_path.resolve(strict=False) != state_path.absolute()
+                or plan_path.resolve(strict=False) != plan_path.absolute()
+                or not state_path.is_file() or not plan_path.is_file()):
+            return None
+        state, plan = json.loads(state_path.read_bytes()), json.loads(plan_path.read_bytes())
+        if (state.get('state') != 'retiring' or state.get('dataset') != dataset
+                or state.get('relative_root') != relative or plan.get('dataset') != dataset
+                or plan.get('relative_root') != relative or plan.get('source') != str(source)
+                or plan.get('hot_tree') != str(mirror) or plan.get('manual_immediate') is not True
+                or plan.get('manual_capture') is not True):
+            return None
+        for key in ('plan_fingerprint', 'snapshot_id', 'manifest_sha256'):
+            if not isinstance(plan.get(key), str) or not plan[key] or state.get(key) != plan[key]:
+                return None
+        if not re.fullmatch(r'[0-9a-f]{64}', plan['manifest_sha256']):
+            return None
+        binding = plan.get('full_verification', {}).get('binding', {})
+        if binding.get('dataset') != dataset or 'hot' not in binding:
+            return None
+        quarantine = Path(state.get('quarantine', ''))
+        parent = states / 'retirements' / 'quarantine' / dataset
+        expected = {'source'} | ({'hot'} if binding['hot'] != 'absent' else set())
+        if (quarantine.parent != parent or quarantine.resolve(strict=False) != quarantine
+                or not quarantine.is_dir() or quarantine.is_symlink()
+                or {p.name for p in parent.iterdir()} != {quarantine.name}
+                or {p.name for p in quarantine.iterdir()} != expected
+                or any(not (quarantine / name).is_dir() or (quarantine / name).is_symlink()
+                       or (quarantine / name).resolve() != quarantine / name
+                       or (quarantine / name).stat().st_dev != states.stat().st_dev
+                       for name in expected)):
+            return None
+        return {'dataset': dataset, 'path': str(quarantine),
+                'manifest_sha256': plan['manifest_sha256'],
+                'requires_fresh_owner_proofs': True}
+    except (OSError, ValueError, KeyError, TypeError, AttributeError, owner.SnapshotError):
+        return None
+
+
 def inspect_cohort(inventory: Path, receipt: Path, active_runs: list[dict] | None = None,
                    *, fixed_d_stage_only: bool = False, d_stage_recovery_only: bool = False) -> dict:
     raw = inventory.read_bytes()
@@ -113,9 +177,11 @@ def inspect_cohort(inventory: Path, receipt: Path, active_runs: list[dict] | Non
     for item in data['items']:
         relative = owner._safe_relative_path(item['relative_root'], 'frozen offline artifact')
         source = source_root / relative
+        present = source.exists() or source.is_symlink()
         sources.append({'relative_root': str(relative), 'path': str(source),
-                        'resolved_path': str(source.resolve(strict=False)),
-                        'present': source.exists() or source.is_symlink()})
+                        'resolved_path': str(source.resolve(strict=False)), 'present': present,
+                        'quarantine_resume_candidate': (None if present else
+                            _owned_quarantine_candidate(data, item, receipt))})
         for key in ('logical_bytes', 'files', 'allocated_unique_file_bytes'):
             if type(item.get(key)) is not int or item[key] < 0:
                 raise ValueError(f'invalid {key} in {inventory}')
@@ -147,7 +213,7 @@ def inspect_cohort(inventory: Path, receipt: Path, active_runs: list[dict] | Non
                       if any(needle in str(arg) for arg in run['argv'] for needle in needles)])
     fixed_publication = None
     fixed_error = None
-    if fixed_d_stage_only:
+    if fixed_d_stage_only and historical != 'retired_and_source_absent':
         try:
             if len(data['items']) != 1:
                 raise ValueError('fixed-stage mode admits exactly one frozen cohort item')
@@ -214,7 +280,11 @@ def capacity_observation() -> dict:
     return result
 
 
-def build_plan(cohorts: list[dict], parallelism: int, free: dict) -> dict:
+def build_plan(cohorts: list[dict], parallelism: int, free: dict, *,
+               use_backup_reserve: bool = False) -> dict:
+    if type(use_backup_reserve) is not bool or (use_backup_reserve and any(
+            not (c.get('fixed_d_stage_only') or c.get('d_stage_recovery_only')) for c in cohorts)):
+        raise ValueError('backup reserve use requires an explicit guarded-D recovery mode')
     if not 1 <= parallelism <= 8:
         raise ValueError('parallelism must be between 1 and 8')
     conflicts = []
@@ -243,13 +313,14 @@ def build_plan(cohorts: list[dict], parallelism: int, free: dict) -> dict:
             reasons.append('active_agent_supervisors_unobservable')
         elif cohort['observed_active_agent_runs']:
             reasons.append('active_or_waiting_agent_run_already_mentions_cohort')
-        if not all(source['present'] for source in cohort['sources']):
+        if not all(source['present'] or source.get('quarantine_resume_candidate')
+                   for source in cohort['sources']):
             reasons.append('one_or_more_sources_absent_or_already_retired')
         if cohort['historical_progress'] in ('retired_but_source_present_reconcile',
                 'different_inventory_do_not_reuse_without_reconciliation',
                 'unreadable_do_not_reuse_without_reconciliation'):
             reasons.append('receipt_requires_reconciliation')
-        if cohort.get('fixed_d_stage_only'):
+        if cohort.get('fixed_d_stage_only') and cohort['historical_progress'] != 'retired_and_source_absent':
             publication = cohort.get('fixed_d_publication')
             if (not isinstance(publication, dict)
                     or type(publication.get('max_temporary_object_bytes')) is not int
@@ -270,9 +341,8 @@ def build_plan(cohorts: list[dict], parallelism: int, free: dict) -> dict:
         forecast = logical + files * PER_FILE_FORECAST
         # An explicitly pinned, existing D stage cannot fall back to creating
         # any source-sized C workspace. Keep the same conservative per-file
-        # control budget, the largest possible individual cold-object scratch
-        # and the full 32 GiB floor; only omit the complete C recovery tree.
-        # D's original estimate remains unchanged.
+        # control budget and the largest possible individual cold-object
+        # scratch; only omit the complete C recovery tree.
         # New guarded-D recovery mode also forbids replacement C trees. Its
         # optional native object reader retains physical admission and falls
         # back to verified D reads, so that SSD payload is not mandatory.
@@ -282,11 +352,20 @@ def build_plan(cohorts: list[dict], parallelism: int, free: dict) -> dict:
              if cohorts[i].get('fixed_d_stage_only') else
              0 if cohorts[i].get('d_stage_recovery_only') else cohorts[i]['logical_bytes_frozen'])
             for i in indexes)
-        required = {'wsl': RESERVE + local_forecast, 'windows_c': RESERVE + local_forecast,
-                    'primary_d': RESERVE + 2 * forecast}
+        # The user earmarked this pool for backup/verification/retirement.
+        # An explicitly enrolled maintenance wave may spend it, while still
+        # admitting its entire forecast against both real backing volumes.
+        # Ordinary callers retain the original floor; this is no free-space
+        # credit and does not change any downloader's reserve.
+        retained_reserve = 0 if use_backup_reserve else RESERVE
+        workspace = {'wsl': local_forecast, 'windows_c': local_forecast,
+                     'primary_d': 2 * forecast}
+        required = {volume: amount + retained_reserve for volume, amount in workspace.items()}
         blockers = [key for key, value in required.items()
                     if free.get(key) is None or free[key] < value]
         waves.append({'cohorts': indexes, 'required_bytes_heuristic': required,
+                      'workspace_bytes_heuristic': workspace,
+                      'retained_reserve_bytes': retained_reserve,
                       'capacity_deferrals': blockers,
                       'capacity_is_reserved': False,
                       'local_forecast_mode': ('guarded_d_encoding_recovery_only'
@@ -297,6 +376,8 @@ def build_plan(cohorts: list[dict], parallelism: int, free: dict) -> dict:
     return {'contract': CONTRACT, 'observed_at_utc': datetime.now(timezone.utc).isoformat(),
             'parallelism': parallelism, 'cohorts': cohorts, 'overlap_conflicts': conflicts,
             'observed_free_bytes': free, 'waves': waves,
+            'capacity_reserve_policy': 'use_backup_reserve' if use_backup_reserve else 'retain_reserve',
+            'backup_reserve_pool_bytes': RESERVE,
             'fresh_source_consumer_and_cold_proofs_required': True,
             'other_supervisors_and_writers_not_excluded': True,
             'authorizes_launch_or_retirement': False,
@@ -312,13 +393,16 @@ def main() -> int:
                         help='Plan only existing pinned D stages without source-sized local workspaces')
     parser.add_argument('--d-stage-recovery-only', action='store_true',
                         help='Prepare on guarded D and disallow full local recovery-tree allocation')
+    parser.add_argument('--use-backup-reserve', action='store_true',
+                        help='Spend the maintenance reserve on this explicitly selected guarded-D recovery')
     args = parser.parse_args()
     active_runs = observe_active_supervisors()
     options = {'fixed_d_stage_only': True} if args.fixed_d_stage_only else {}
     if args.d_stage_recovery_only:
         options['d_stage_recovery_only'] = True
     cohorts = [inspect_cohort(Path(inv), Path(receipt), active_runs, **options) for inv, receipt in args.cohort]
-    print(json.dumps(build_plan(cohorts, args.parallelism, capacity_observation()),
+    print(json.dumps(build_plan(cohorts, args.parallelism, capacity_observation(),
+                                use_backup_reserve=args.use_backup_reserve),
                      ensure_ascii=False, indent=2))
     return 0
 

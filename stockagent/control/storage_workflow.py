@@ -7,7 +7,7 @@ with workflow.unsafe.imports_passed_through():
     from contextlib import contextmanager
     import contextvars
     import threading
-    from stockagent.control.lakehouse import CatalogOwnerBusy, configuration, register, export, acceptance, catalog_enrollment, stage_source_wave, retire_accepted_transport
+    from stockagent.control.lakehouse import CatalogColdCapacity, CatalogOwnerBusy, configuration, register, export, acceptance, catalog_enrollment, stage_source_wave, retire_accepted_transport
     from downloader.artifact_io import atomic_write_json
     from pathlib import Path
     from stockagent.data_sync.dataset_migration import advance_catalog_versions
@@ -41,6 +41,10 @@ def register_versions() -> dict:
         # Another canonical activity owns this exact lock. This is a normal
         # scheduling wait, not a failed source or permission to read latest.
         return {'state': 'waiting_catalog_owner', 'retry_after_seconds': 15}
+    except CatalogColdCapacity:
+        # The guarded D lake cannot accept its Parquet registry while full.
+        # Keep the committed snapshot and retry without creating a new one.
+        return {'state': 'waiting_cold_physical_capacity', 'retry_after_seconds': 60}
     activity.heartbeat(result["snapshot_id"])
     return result
 
@@ -78,7 +82,8 @@ def stage_source_replication() -> dict:
 def advance_dataset_versions() -> dict:
     activity.heartbeat("resuming catalog-backed incremental dataset versions")
     with activity_lease():
-        return advance_catalog_versions(Path(__file__).resolve().parents[2], configuration())
+        return advance_catalog_versions(Path(__file__).resolve().parents[2], configuration(),
+            stop_requested=lambda: activity.is_cancelled() or activity.is_worker_shutdown())
 
 
 @workflow.defn
@@ -161,7 +166,7 @@ class StorageLifecycle:
                 catalog = await workflow.execute_activity(register_versions,
                     start_to_close_timeout=timedelta(hours=24) if long_capture else timedelta(minutes=20),
                     heartbeat_timeout=timedelta(seconds=60), retry_policy=retry)
-            if catalog.get('state') == 'waiting_catalog_owner':
+            if catalog.get('state') in {'waiting_catalog_owner', 'waiting_cold_physical_capacity'}:
                 self.phase = catalog
                 await workflow.sleep(timedelta(seconds=catalog['retry_after_seconds']))
                 continue

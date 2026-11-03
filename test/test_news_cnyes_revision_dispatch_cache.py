@@ -8,10 +8,10 @@ import time
 
 import pytest
 
-from downloader.news_fulltext_bulk import cnyes_scope
+from downloader.news_fulltext_bulk import cnyes_scope, cnyes_url
 from downloader.news_fulltext_cnyes_index import ENDPOINT, request_url
 from downloader.news_fulltext_policy import NewsError
-from test_news_cnyes_public_index import DAY, cfg, queue
+from test_news_cnyes_public_index import BASE, DAY, cfg, queue
 from test_news_fulltext import FakeResponse, article_html, config, http_fixture
 
 
@@ -47,6 +47,26 @@ def test_empty_revision_is_reused_across_unrelated_provider_writes(blocked):
         queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES ('https://other.test/rss','feed','other')")
         queue.db.execute("INSERT INTO queue_settings VALUES ('unrelated','test')")
     assert traced_selection(queue, source) == ([], [])
+
+
+@pytest.mark.parametrize('release', ['delete', 'skip'])
+def test_released_local_page_checkpoint_invalidates_empty_proof(blocked, release):
+    queue, source, _, _ = blocked
+    url = cnyes_url(BASE, start=1388505600, end=1391212799)
+    with queue.db:
+        queue.db.execute("INSERT INTO discovery(url,kind,provider) VALUES (?,'cnyes_news','cnyes')", (url,))
+        queue.db.execute("INSERT INTO cnyes_interrupted_page_checkpoints "
+                         "(parquet_path,receipt_path,request_url,response_sha256,witness_json,state) "
+                         "VALUES ('batch','receipt',?,'sha','{}','pending')", (url,))
+    assert traced_selection(queue, source)[0] == []
+    assert traced_selection(queue, source) == ([], [])
+    with queue.db:
+        if release == 'delete':
+            queue.db.execute("DELETE FROM cnyes_interrupted_page_checkpoints WHERE parquet_path='batch'")
+        else:
+            queue.db.execute("UPDATE cnyes_interrupted_page_checkpoints SET state='skipped' WHERE parquet_path='batch'")
+    rows, scans = traced_selection(queue, source)
+    assert scans and url in {row['url'] for row in rows}
 
 
 def test_unrelated_cnyes_diagnostics_do_not_invalidate_empty_proof(blocked):

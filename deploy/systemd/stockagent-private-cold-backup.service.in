@@ -1,0 +1,15 @@
+[Unit]
+Description=Dispatch private immutable NAS waves independently of public catalog capture
+Requires=stockagent-backup-transport-mount.service
+After=stockagent-backup-transport-mount.service stockagent-service-layout.service syncthing@root.service
+ConditionPathExists=__BACKUP_ENV_FILE__
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+Environment="STOCKAGENT_BACKUP_STREAM_ENV_FILE=__BACKUP_ENV_FILE__"
+ExecStart=/usr/bin/bash __REPO_ROOT__/scripts/run_backup_stream.sh private-cycle --wait-for-owner
+SuccessExitStatus=75
+UMask=0077
+Nice=10
+TimeoutStartSec=infinity

@@ -102,6 +102,24 @@ def test_changed_loaded_code_rejects_before_realtime_freshness_or_source_refresh
         discord_bot._prepare_realtime_signal_sync(object(), force_refresh=True, completed_session=completed_session)
 
 
+@pytest.mark.parametrize("measured", [False, True])
+def test_opening_record_retains_existing_input_transport_spans_without_fake_zeros(measured):
+    cfg = SimpleNamespace(market="measured", timezone="Asia/Taipei", open_time="09:00")
+    spans = {
+        "pre_quote_local_prepare_steps_ms": {"panel_lookup": 3.5},
+        "post_quote_prepare_steps_ms": {"normalized_base_window": 7.25},
+        "factorized_input_transport": {"host_to_device_bytes": 128},
+        "dense_input_transport": {"base_cache_hit": True, "host_to_device_bytes": 0},
+    }
+    result = SimpleNamespace(summary={"live_latency": spans if measured else {}})
+    record = discord_bot._opening_signal_latency_record(
+        cfg=cfg, session_date="2026-11-02", schedule_key="measured:2026-11-02",
+        timing={}, result=result, error=None,
+    )
+    for name, value in spans.items():
+        assert record[name] == (value if measured else None)
+
+
 def test_restart_recovers_original_observed_clock_not_new_process_wake(monkeypatch, tmp_path):
     now = datetime.fromisoformat("2026-10-13T09:20:00+08:00")
 
@@ -197,20 +215,47 @@ def test_opening_repair_keeps_failed_attempt_and_retries_without_inference(monke
     monkeypatch.setattr(discord_bot, "repair_tw_opening_snapshot_receipt", lambda **kwargs: {
         "status": "complete", "valid_open_count": 2294, "missing_open_count": 0,
     })
-    second = discord_bot._opening_source_repair_sync(str(tmp_path), "2026-10-07", 2)
+    second = discord_bot._opening_source_repair_sync(str(tmp_path), "2026-10-07", 2,
+        {"contract": "opening_source_observer_dispatch_timing_v1", "config_count": 6}, 0.0)
     assert second["status"] == "complete"
     attempts = [__import__("json").loads(line) for line in (tmp_path / "opening_source_repair_latency.jsonl").read_text().splitlines()]
     assert [row["status"] for row in attempts] == ["failed", "complete"]
     assert all(not row["inference_performed"] and not row["orders_submitted"] for row in attempts)
     assert all(row["observer_policy"] == "shared_provider_backoff_no_source_wait_starvation_v1" for row in attempts)
     assert second["minimum_observer_retry_delay_seconds"] == 60.0
+    assert attempts[1]["observer_dispatch_timing"]["config_count"] == 6
+    assert attempts[1]["observer_dispatch_timing"]["thread_queue_ms"] >= 0
+    assert attempts[1]["observer_dispatch_timing"]["boundary"].endswith("not_exchange_clock")
+
+
+def test_opening_source_roots_deduplicate_configs_without_hiding_failed_retry(monkeypatch, tmp_path):
+    first, second, missing = tmp_path / "first.yaml", tmp_path / "second.yaml", tmp_path / "missing.yaml"
+    first.write_text("first", encoding="utf-8")
+    second.write_text("second", encoding="utf-8")
+    calls, errors = [], []
+
+    def resolve(path, mtime, size):
+        calls.append((path, mtime, size))
+        # A transient first failure must not cache a failed path as resolved.
+        if path == str(first) and sum(item[0] == path for item in calls) == 1:
+            raise OSError("transient config read")
+        return str(tmp_path / ("root-one" if path == str(first) else "root-two"))
+
+    monkeypatch.setattr(discord_bot, "_opening_source_repair_root", resolve)
+    monkeypatch.setattr(discord_bot, "_log_exception", lambda label, exc: errors.append((label, type(exc).__name__)))
+    configs = [SimpleNamespace(config_path=str(path)) for path in (first, first, first, second, second, missing)]
+    roots = discord_bot._opening_source_repair_roots(configs)
+    assert roots == {str(tmp_path / "root-one"), str(tmp_path / "root-two")}
+    assert [item[0] for item in calls].count(str(first)) == 2
+    assert [item[0] for item in calls].count(str(second)) == 1
+    assert len(errors) == 2
 
 
 @pytest.mark.parametrize("busy", [True, False])
 @pytest.mark.parametrize("started,stage,expected_calls", [
     (None, None, 1), (1.0, "preopen_catch_up", 1),
-    (1.0, "realtime_prepare", 1), (1.0, "inference", 0),
-    (1.0, "started", 0), (1.0, None, 0),
+    (1.0, "realtime_prepare", 1), (1.0, "inference", 1),
+    (1.0, "started", 1), (1.0, None, 1),
 ])
 def test_background_opening_repair_runs_between_retries_without_circular_wait(
     monkeypatch, tmp_path, busy, started, stage, expected_calls,
@@ -254,6 +299,7 @@ def test_background_opening_repair_runs_between_retries_without_circular_wait(
     ("09:00:59", "failed", 0, 20, 0.5),
     ("09:01:00", "waiting_source", 0, 20, 30.0),
     ("09:01:00", "awaiting_first_print", 1, 20, 0.5),
+    ("09:12:00", "awaiting_first_print", 0, 20, 1.0),
     ("09:00:10", "complete", 0, 1, 60.0),
 ])
 def test_opening_source_observer_delay_does_not_compound_provider_backoff(
@@ -319,13 +365,11 @@ def test_opening_observer_does_not_add_receipt_io_to_provider_retry(monkeypatch,
 @pytest.mark.parametrize("policies", [[], ["observed_session_or_no_first_v1"],
     ["known_prior_trade_provisional_v1"],
     ["observed_session_or_no_first_v1", "known_prior_trade_provisional_v1"]])
-def test_provisional_models_never_starve_the_existing_source_owner(monkeypatch, stage, policies):
+def test_strict_and_provisional_models_never_starve_the_existing_source_owner(monkeypatch, stage, policies):
     monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", 99.)
     monkeypatch.setattr(discord_bot.bot, "_opening_attempt_stage", stage)
     configs = [SimpleNamespace(day_trade_opening_reference_policy=policy) for policy in policies]
-    expected = ("known_prior_trade_provisional_v1" not in policies
-                and stage not in {"preopen_catch_up", "realtime_prepare"})
-    assert discord_bot._opening_source_repair_must_defer(configs) is expected
+    assert discord_bot._opening_source_repair_must_defer(configs) is False
 
 
 @pytest.mark.parametrize("at,interval", [("08:59:29", 1.), ("08:59:30", .1),
@@ -618,7 +662,57 @@ def test_catchup_error_keeps_original_error_timing_and_does_not_prepare_model(mo
     assert isinstance(result[1], OSError)
     assert result[4]["signal_stage"] == "preopen_catch_up"
     assert result[4]["preopen_catch_up_ms"] >= 0
+    assert datetime.fromisoformat(result[4]["input_result_ready_at"]).tzinfo is not None
+    assert result[4]["_input_result_ready_monotonic"] > 0
     assert stage["phase"] == "preopen_catch_up"
+
+
+def test_input_ready_is_stamped_by_producer_before_dispatch(monkeypatch):
+    async def prepare(_cfg):
+        return ("tw", "ready", False), None, 3.0, "quote", {"source_ms": 2.0}
+
+    monkeypatch.setattr(discord_bot, "_prepare_scheduled_inputs", prepare)
+    cfg = SimpleNamespace(market="ready")
+    inputs = asyncio.run(discord_bot._prepare_scheduled_attempt_inputs(
+        (cfg, None, "session", False), {}))
+    ready = datetime.fromisoformat(inputs[4]["input_result_ready_at"])
+    ready_mono = inputs[4]["_input_result_ready_monotonic"]
+    from datetime import timedelta
+    timing = discord_bot._scheduled_input_dispatch_timing(inputs[4],
+        gate=ready - timedelta(milliseconds=200), dispatched_at=ready + timedelta(seconds=4),
+        dispatched_monotonic=ready_mono + 4)
+    assert inputs[4]["source_ms"] == 2.0
+    assert timing["input_ready_from_open_ms"] == 200.0
+    assert timing["input_ready_dispatch_wait_ms"] == 4000.0
+    # The old from-scheduler span would include both, not just the 4 s queue.
+    record = discord_bot._opening_signal_latency_record(cfg=SimpleNamespace(
+        market="ready", timezone="Asia/Taipei", open_time="09:00"),
+        session_date="2026-11-02", schedule_key="ready:2026-11-02",
+        timing=timing, result=None, error=RuntimeError("fixture"))
+    assert record["stages"]["input_ready_dispatch_wait_ms"] == 4000.0
+    assert record["stages"]["input_ready_from_open_ms"] == 200.0
+    assert record["input_result_ready_at"] == ready.isoformat(timespec="microseconds")
+    assert "_input_result_ready_monotonic" not in record
+
+
+@pytest.mark.parametrize("clock", [None, True, "100.0", float("nan"), float("inf"), 101.0])
+def test_input_dispatch_missing_or_invalid_monotonic_is_unknown(clock):
+    gate = datetime.fromisoformat("2026-11-02T09:00:00+08:00")
+    timing = discord_bot._scheduled_input_dispatch_timing({
+        "input_result_ready_at": "2026-11-02T09:00:00.200+08:00",
+        "_input_result_ready_monotonic": clock,
+    }, gate=gate, dispatched_at=gate.replace(second=1), dispatched_monotonic=100.0)
+    assert timing["input_ready_dispatch_wait_ms"] is None
+
+
+@pytest.mark.parametrize("wall", [None, "bad", "2026-11-02T09:00:00.200", "2026-11-02T09:00:02+08:00"])
+def test_input_dispatch_invalid_wall_clock_does_not_erase_measured_queue(wall):
+    gate = datetime.fromisoformat("2026-11-02T09:00:00+08:00")
+    timing = discord_bot._scheduled_input_dispatch_timing({
+        "input_result_ready_at": wall, "_input_result_ready_monotonic": 100.0,
+    }, gate=gate, dispatched_at=gate.replace(second=1), dispatched_monotonic=100.25)
+    assert timing["input_ready_from_open_ms"] is None
+    assert timing["input_ready_dispatch_wait_ms"] == 250.0
 
 
 def test_scheduled_report_and_chat_queue_preserves_order_without_blocking_retries(monkeypatch):

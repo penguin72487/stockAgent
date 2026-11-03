@@ -24,6 +24,79 @@ def test_exact_key_type_scan_matches_legacy_without_custom_metaclass_effects():
 
 
 @pytest.mark.parametrize("native", [True, False])
+@pytest.mark.parametrize("value", [
+    {"名稱": "台灣😀\u2028\u2029", "controls": "".join(map(chr, range(32))),
+     "nested": [None, True, {"b": 2, "a": (-0.0, 5e-324)}]},
+    {"floats": [1e-7, 1e300, float("nan"), float("inf"), -float("inf")]},
+    {"integers": [2**128, -(2**128), 2**53 + 1]},
+    {1: "legacy numeric key", 2: "second key"},
+])
+def test_compact_sorted_private_cache_retains_exact_legacy_bytes(monkeypatch, native, value):
+    if not native:
+        monkeypatch.setattr(private_json, "_native", None)
+    expected = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    assert private_json.compact_sorted_bytes(value) == expected
+
+
+@pytest.mark.skipif(not private_json.native_available(), reason="optional native encoder unavailable")
+def test_compact_sorted_private_cache_uses_native_only_after_guard(monkeypatch):
+    from types import SimpleNamespace
+
+    encode = private_json._native.json.encode
+    calls = []
+    def observe(value, **kwargs):
+        calls.append((value, kwargs))
+        return encode(value, **kwargs)
+    monkeypatch.setattr(private_json, "_native", SimpleNamespace(json=SimpleNamespace(encode=observe)))
+    value = {"日期": "2026-10-29", "proof": [3, None, True], "fraction": 0.9}
+    assert private_json.compact_sorted_bytes(value) == json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    assert calls[-1] == (value, {"order": "sorted"})
+
+    calls.clear()
+    legacy = {"fraction": float("nan")}
+    assert private_json.compact_sorted_bytes(legacy) == json.dumps(
+        legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+    assert calls == []
+
+    calls.clear()
+    different_float = next((n for n in (1e-7, 1e-8, 1e20, 1e21, 1e-6)
+                            if encode(n).decode("ascii") != json.dumps(n)), None)
+    if different_float is not None:
+        legacy = {"fraction": different_float}
+        assert private_json.compact_sorted_bytes(legacy) == json.dumps(
+            legacy, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        assert all(not kwargs for _, kwargs in calls)
+
+
+@pytest.mark.parametrize("native", [True, False])
+def test_compact_sorted_private_cache_preserves_legacy_errors(monkeypatch, native):
+    if not native:
+        monkeypatch.setattr(private_json, "_native", None)
+    cycle = []
+    cycle.append(cycle)
+    for value, error in ((cycle, ValueError), ({"bytes": b"invalid"}, TypeError),
+                         ({1: "mixed", "x": 1}, TypeError), ({"bad": "\ud800"}, UnicodeEncodeError)):
+        with pytest.raises(error) as expected:
+            json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+        with pytest.raises(error) as observed:
+            private_json.compact_sorted_bytes(value)
+        assert str(observed.value) == str(expected.value)
+
+
+def test_compact_sorted_private_cache_unicode_and_float_wire_oracle():
+    rng = random.Random(20261029)
+    alphabet = ''.join(map(chr, range(128))) + "台灣😀\u2028\u2029"
+    for _ in range(1000):
+        value = {''.join(rng.choices(alphabet, k=rng.randrange(10))):
+                 [rng.choice([None, True, -0.0, 5e-324, 1e-7, 2**64-1]),
+                  ''.join(rng.choices(alphabet, k=rng.randrange(15)))]
+                 for _ in range(rng.randrange(6))}
+        assert private_json.compact_sorted_bytes(value) == json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()
+
+
+@pytest.mark.parametrize("native", [True, False])
 def test_ledger_encoder_preserves_all_finite_float_bits_and_unbounded_integers(monkeypatch, native):
     if not native:
         monkeypatch.setattr(private_json, "_native", None)

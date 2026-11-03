@@ -33,7 +33,7 @@ MAX_CELLS = 400_000
 NORMALIZATION_CONTRACT = "explicit_field_units_v2_exact_power10_with_scale_guard"
 PHASE_LABELS = {"P1": "候選新增特徵", "P2": "補歷史／口徑缺口", "P3": "多源校驗候選"}
 METADATA_RECOVERY_CONTRACT = "verified_metadata_only_isolation_reviewed_dns_v2"
-BATCH_SCHEDULER_CONTRACT = "phase_preserving_incremental_finite_query_v4"
+BATCH_SCHEDULER_CONTRACT = "phase_preserving_incremental_finite_query_v5"
 # Exact, independently reviewed TEJ notices. A notice never proves a query was
 # unsent: callers still need their original finished negative/metadata proof.
 # The native bridge checks this allowlist again against fresh owned controls.
@@ -1389,14 +1389,15 @@ def commit_evidence(root: Path, task: dict, payload: dict, output: Path, seconds
             timing_basis = "fresh_bridge_only" if event_id and seconds is not None else "recovery_or_unmeasured"
             con.execute("UPDATE tasks SET state='complete',completed_at_utc=?,actual_rows=?,actual_bytes=?,seconds=?,receipt_path=?,output_path=?,timing_basis=?,last_error_code=NULL WHERE task_id=?",
                         (complete, rows, size, seconds, receipt_path, str(output.relative_to(root)), timing_basis, task["task_id"]))
-        if not con.execute("SELECT 1 FROM tasks WHERE table_id=? AND state='blocked' LIMIT 1", (task["table_id"],)).fetchone():
-            con.execute("UPDATE tables SET last_error_code=NULL,state=CASE WHEN grid_rows>0 THEN 'backfilling' ELSE state END WHERE table_id=?", (task["table_id"],))
-        if event_id:
-            con.execute("UPDATE traffic SET completed_at_utc=?,state='complete' WHERE event_id=?", (complete, event_id))
         # A successful metadata retry must also release its table window;
         # otherwise its newly planned downloads would never become eligible.
         con.execute('DELETE FROM desktop_retry_windows WHERE table_id=? AND task_id=?',
                     (task['table_id'],task['task_id']))
+        if (not con.execute("SELECT 1 FROM tasks WHERE table_id=? AND state='blocked' LIMIT 1", (task["table_id"],)).fetchone()
+                and not con.execute("SELECT 1 FROM desktop_retry_windows WHERE table_id=? LIMIT 1", (task['table_id'],)).fetchone()):
+            con.execute("UPDATE tables SET last_error_code=NULL,state=CASE WHEN grid_rows>0 THEN 'backfilling' ELSE state END WHERE table_id=?", (task["table_id"],))
+        if event_id:
+            con.execute("UPDATE traffic SET completed_at_utc=?,state='complete' WHERE event_id=?", (complete, event_id))
         if task['kind']=='download':
             con.execute("UPDATE desktop_attempts SET state='adopted',finished_at_utc=? WHERE attempt_id="
                         "(SELECT active_attempt_id FROM tasks WHERE task_id=?)",(complete,task['task_id']))
@@ -2015,6 +2016,7 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
               'download_burst':config.get('download_burst_between_discoveries',4),
               'download_table_locality_burst':config.get('download_table_locality_burst',1),
               'finite_query_after_incremental_attempts':config.get('finite_query_after_incremental_attempts'),
+              'finite_retry_after_fresh_attempts':config.get('finite_retry_after_fresh_attempts'),
               'local_planning_batch_size':config.get('local_planning_batch_size',1),
               'auto_key3_replanning':config.get('auto_key3_replanning',False),
               'auto_snapshot_replanning':config.get('auto_snapshot_replanning',False),
@@ -2046,6 +2048,9 @@ def configure_runtime_policy(root: Path, config: dict) -> dict:
     finite_after = policy['finite_query_after_incremental_attempts']
     if finite_after is not None and (type(finite_after) is not int or not 1 <= finite_after <= 100):
         raise ValueError('Finite query rotation must be disabled or bounded to 1..100 attempts')
+    retry_after = policy['finite_retry_after_fresh_attempts']
+    if retry_after is not None and (type(retry_after) is not int or not 1 <= retry_after <= 100):
+        raise ValueError('Finite retry rotation must be disabled or bounded to 1..100 attempts')
     from downloader.tej_planning import SELECTOR_CONTRACT
     if policy['query_selector_contract'] not in (None, SELECTOR_CONTRACT):
         raise ValueError('Unreviewed source selector geometry contract')
@@ -2069,12 +2074,16 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
     # hundreds of old per-fragment due times must not each trigger a new UI
     # probe during the same shared backoff. Present/unchecked company scopes
     # still pass fresh native verification; no evidence or work is discarded.
+    from downloader.tej_finite_retry import retry_exception_sql
+    finite_retry = retry_exception_sql()
     isolation = (" AND NOT EXISTS (SELECT 1 FROM tasks AS blocked WHERE blocked.table_id=tasks.table_id "
                  "AND blocked.state='blocked' AND blocked.last_error_code='source_validation_failed_deferred')"
                  " AND NOT EXISTS (SELECT 1 FROM desktop_retry_windows AS retry WHERE retry.table_id=tasks.table_id "
-                 "AND ((retry.error_code<>'source_company_labels_absent_fragment' AND retry.task_id<>tasks.task_id) "
+                 "AND ((retry.error_code<>'source_company_labels_absent_fragment' AND retry.task_id<>tasks.task_id "
+                 "AND NOT (" + finite_retry + ")) "
                  "OR (retry.next_attempt_at_utc>? AND (retry.error_code<>'source_company_labels_absent_fragment' "
-                 "OR COALESCE(tasks.last_error_code,'')='source_company_labels_absent_fragment'))))")
+                 "OR COALESCE(tasks.last_error_code,'')='source_company_labels_absent_fragment') "
+                 "AND NOT (" + finite_retry + "))))")
     def candidate(selected: str):
         if table_id is not None:
             return con.execute("SELECT * FROM tasks WHERE state='pending' AND kind=? AND table_id=? AND (next_attempt_at_utc IS NULL OR next_attempt_at_utc<=?)"+isolation+" ORDER BY priority,task_id LIMIT 1",(selected,table_id,now,now)).fetchone()
@@ -2087,8 +2096,32 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
     if table_id is not None:
         extra += ' AND tasks.table_id=?'
         args += (table_id,)
-    requested = queued_candidate(con, now, provider='tej', where="tasks.state='pending' "
-        "AND (tasks.next_attempt_at_utc IS NULL OR tasks.next_attempt_at_utc<=?)" + isolation + extra, args=args)
+
+    def requested_candidate(where: str, requested_args: tuple):
+        # Older requests keep first-attempt precedence. Bounded fresh claims
+        # alternate with the oldest eligible committed retry, so neither new
+        # requests nor retries in later requests can starve indefinitely.
+        # Apply the same source, due, kind and table predicates to both lanes.
+        oldest = queued_candidate(con, now, provider='tej', where=where, args=requested_args)
+        limit = policy.get('finite_retry_after_fresh_attempts')
+        if oldest is None or limit is None:
+            return oldest
+        recorded = con.execute("SELECT value FROM meta WHERE key='scheduler_finite_fresh_claim_streak'").fetchone()
+        fresh = oldest if oldest['attempted_at_utc'] is None else queued_candidate(
+            con, now, provider='tej', where=where + ' AND tasks.attempted_at_utc IS NULL', args=requested_args)
+        if fresh is not None and (not recorded or int(recorded[0]) < limit):
+            return fresh
+        retry = con.execute(
+            "SELECT tasks.* FROM provider_query_intents p JOIN tasks ON tasks.task_id=p.task_key "
+            "WHERE p.created_at_utc<=? AND p.expires_at_utc>? AND " + where
+            + " AND tasks.attempted_at_utc IS NOT NULL "
+              "ORDER BY tasks.attempted_at_utc,p.created_at_utc,tasks.task_id LIMIT 1",
+            (now, now, *requested_args)).fetchone()
+        return retry if retry is not None else fresh
+
+    requested_where = ("tasks.state='pending' "
+        "AND (tasks.next_attempt_at_utc IS NULL OR tasks.next_attempt_at_utc<=?)" + isolation + extra)
+    requested = requested_candidate(requested_where, args)
     from downloader.tej_incremental import PRIORITY as incremental_priority
     finite_after = policy.get('finite_query_after_incremental_attempts')
     if finite_after is not None:
@@ -2097,9 +2130,9 @@ def _ready_task(con: sqlite3.Connection, now: str, kind: str | None, policy: dic
             # Reserve one turn for a bounded finite request after actual
             # incremental claims. Apply exactly the same due, table, kind,
             # quarantine and retry filters as the native selector.
-            finite_requested = queued_candidate(con, now, provider='tej', where="tasks.state='pending' "
+            finite_requested = requested_candidate(where="tasks.state='pending' "
                 "AND tasks.priority>? AND (tasks.next_attempt_at_utc IS NULL OR tasks.next_attempt_at_utc<=?)"
-                + isolation + extra, args=(incremental_priority, *args))
+                + isolation + extra, requested_args=(incremental_priority, *args))
             if finite_requested is not None:
                 return finite_requested
             if kind in (None, 'download'):
@@ -2157,6 +2190,23 @@ def _record_incremental_priority_claim(con: sqlite3.Connection, task: dict) -> N
     con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_incremental_attempt_streak',?)", (str(streak),))
 
 
+def _record_finite_priority_claim(con: sqlite3.Connection, task: dict, now: str, policy: dict) -> None:
+    """Track only committed active finite-request claims, in the claim transaction."""
+    from downloader.tej_incremental import PRIORITY as incremental_priority
+    from downloader.provider_priority import has_intents
+    limit = policy.get('finite_retry_after_fresh_attempts')
+    if limit is None or task['priority'] <= incremental_priority or not has_intents(con):
+        return
+    if not con.execute("SELECT 1 FROM provider_query_intents WHERE task_key=? "
+                       "AND created_at_utc<=? AND expires_at_utc>? LIMIT 1",
+                       (task['task_id'], now, now)).fetchone():
+        return
+    old = con.execute("SELECT value FROM meta WHERE key='scheduler_finite_fresh_claim_streak'").fetchone()
+    streak = min(limit, int(old[0]) + 1) if task['attempted_at_utc'] is None and old else (
+        1 if task['attempted_at_utc'] is None else 0)
+    con.execute("INSERT OR REPLACE INTO meta VALUES ('scheduler_finite_fresh_claim_streak',?)", (str(streak),))
+
+
 def _prepare_ready_task(con, root: Path, now: str, kind: str | None, policy: dict,
                         table_id: str | None) -> tuple[sqlite3.Row | None, str | None]:
     """Amortize local-only queue commits, without claiming a desktop attempt.
@@ -2177,6 +2227,15 @@ def _prepare_ready_task(con, root: Path, now: str, kind: str | None, policy: dic
         row = _ready_task(con, now, kind, policy, table_id)
         if row is None or row['kind'] != 'download':
             return row, result
+        # The SQL predicate is only a candidate prefilter. Verify the exact
+        # finite scope, original source pins and current no-Preview retry proof
+        # before any task claim or desktop operation.
+        from downloader.tej_finite_retry import reject_invalid_admission, validate_before_claim
+        try:
+            validate_before_claim(con, root, row)
+        except (OSError, ValueError, KeyError, TypeError) as error:
+            reject_invalid_admission(con, row, error, now)
+            return None, 'finite_admission_rejected_before_query'
         if policy.get('query_selector_contract') == SELECTOR_CONTRACT and repartition_selector_pending(con, root, row):
             result = 'selector_scope_repartitioned'
         elif repartition_pending(con, root, row):
@@ -2343,6 +2402,8 @@ def _run_one(root: Path, bridge: Any, *, kind: str | None = None, table_id: str 
         con.execute("UPDATE tasks SET state='running',attempted_at_utc=? WHERE task_id=?", (now, task["task_id"]))
         if replay is None and policy.get('finite_query_after_incremental_attempts') is not None:
             _record_incremental_priority_claim(con, task)
+        if replay is None and policy.get('finite_retry_after_fresh_attempts') is not None:
+            _record_finite_priority_claim(con, task, now, policy)
         event = uuid.uuid4().hex
         con.execute("INSERT INTO traffic VALUES (?,?,?,NULL,'running')", (event, task["kind"], now))
     atomic_write_json(root / "worker_status.json", {"contract_version": CONTRACT_VERSION, "state": "running",

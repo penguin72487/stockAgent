@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
 import contextlib
-from datetime import datetime, timezone
+from datetime import datetime, time as datetime_time, timezone
 import fcntl
 import hashlib
 import json
@@ -25,12 +25,17 @@ import time
 from zoneinfo import ZoneInfo
 
 from stockagent.data_sync.desync_snapshots import SnapshotError, atomic_write_json
+from stockagent.data_sync.storage_progress import public_status as public_operations
+from stockagent.data_sync.storage_progress import metadata as operation_metadata
+from stockagent.data_sync.storage_runtime import REMOTE_RUNTIME, public_status as public_runtime
 
 CONTRACT = "stockagent.storage_monitor.v1"
 VOLUMES = {
-    "penguin-wsl": ("penguin", "WSL 資料磁碟", "來源、服務及研究工作區"),
+    "penguin-wsl": ("penguin", "C 槽 WSL 服務磁碟", "程式、服務、帳本、資料庫與控制索引"),
     "penguin-c": ("penguin", "Windows C 槽", "Windows 系統與應用程式"),
-    "penguin-d": ("penguin", "Windows D 槽", "不可變冷庫、封閉資料與交付暫存"),
+    "penguin-d": ("penguin", "Windows D 槽 · 主冷庫", "不可變冷庫與封閉資料正本"),
+    "penguin-e": ("penguin", "Windows E 槽 · NVMe 工作磁碟", "進冷庫前的下載、增量、封裝、驗證與傳輸"),
+    "penguin-workspace": ("penguin", "E 槽 Linux 資料卷", "原生 ext4 工作資料；容量包含在 E 槽內"),
     "vastai1T-disk": ("vastai1T", "Vast 工作磁碟", "遠端訓練；實例回收後不保證留存"),
     "lab203-disk": ("lab203", "lab203 中繼磁碟", "封閉批次、備份與還原暫存"),
     "nas-disk": ("nas", "NAS 歸檔磁碟", "不可變歸檔與加密備份；共享磁碟使用量包含其他使用者"),
@@ -42,6 +47,8 @@ MAX_SNAPSHOT_BYTES = 8 * 1024**2
 CAPACITY_HISTORY_CONTRACT = "stockagent.storage_capacity_daily_history.v1"
 CAPACITY_HISTORY_DAYS = 120
 RETIREMENT_WAVE_LOCK = Path('/run/lock/stockagent-wsl-retirement-wave-scheduler.lock')
+DATASET_VERSION_OWNER_DIRECTORY = Path('/var/lib/stockagent/lakehouse-control/dataset-versions')
+CENSUS_PRIORITY_POLL_SECONDS = 5.0
 
 
 def utc() -> str:
@@ -62,6 +69,8 @@ def nonnegative(value):
 
 def read_snapshot(path: Path) -> dict:
     """Bounded, regular local metadata only; absent is unknown, never zero."""
+    from stockagent.service_layout import canonical_service_path
+    path = canonical_service_path(path)
     if any(part.is_symlink() for part in (path, *path.parents)):
         raise ValueError("redirected_snapshot")
     with path.open("rb") as stream:
@@ -98,8 +107,8 @@ def capacity(path: str, expected_filesystem: str | None = None) -> dict:
 
 REMOTE_CAPACITY = """import json,os,datetime
 s=os.statvfs('/')
-print(json.dumps({'state':'measured','observed_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':'ssh_statvfs','total_bytes':s.f_blocks*s.f_frsize,'used_bytes':(s.f_blocks-s.f_bfree)*s.f_frsize,'free_bytes':s.f_bfree*s.f_frsize,'available_bytes':s.f_bavail*s.f_frsize,'reserved_free_bytes':(s.f_bfree-s.f_bavail)*s.f_frsize}))
-"""
+capacity={'state':'measured','observed_at_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'source':'ssh_statvfs','total_bytes':s.f_blocks*s.f_frsize,'used_bytes':(s.f_blocks-s.f_bfree)*s.f_frsize,'free_bytes':s.f_bfree*s.f_frsize,'available_bytes':s.f_bavail*s.f_frsize,'reserved_free_bytes':(s.f_bfree-s.f_bavail)*s.f_frsize}
+""" + REMOTE_RUNTIME + "\ncapacity['runtime']=runtime\nprint(json.dumps(capacity))\n"
 
 
 def ssh_prefix(config: dict) -> list[str]:
@@ -115,13 +124,24 @@ def ssh_prefix(config: dict) -> list[str]:
 
 
 def remote_capacity(config: dict) -> dict:
+    """Reuse the enrolled probe; retry one transient SSH reset within 15 s."""
+    deadline = time.monotonic() + 15
     try:
-        result = subprocess.run(ssh_prefix(config) + ["python3 -c " + shlex.quote(REMOTE_CAPACITY)],
-            capture_output=True, text=True, timeout=15, check=True)
-        value = json.loads(result.stdout)
-        if not valid_capacity(value):
-            raise ValueError("invalid_remote_capacity")
-        return value
+        command = ssh_prefix(config) + ["python3 -c " + shlex.quote(REMOTE_CAPACITY)]
+        for attempt in range(2):
+            result = subprocess.run(command, capture_output=True, text=True,
+                                    timeout=max(.1, deadline - time.monotonic()))
+            if result.returncode:
+                transient = result.returncode == 255 and any(text in result.stderr for text in
+                    ('Connection reset by peer', 'kex_exchange_identification: read: Connection reset'))
+                if attempt == 0 and transient and deadline - time.monotonic() > 1:
+                    time.sleep(.25)
+                    continue
+                raise subprocess.CalledProcessError(result.returncode, command)
+            value = json.loads(result.stdout)
+            if not valid_capacity(value):
+                raise ValueError("invalid_remote_capacity")
+            return value
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         return {"state": "unavailable", "error_code": type(exc).__name__, "attempted_at_utc": utc()}
 
@@ -144,43 +164,111 @@ def windows_capacity() -> dict:
     # never interpolated as PowerShell or shell syntax.
     import base64
     script = r"""$ErrorActionPreference='Stop'
+$ProgressPreference='SilentlyContinue'
 $request=[Console]::In.ReadToEnd() | ConvertFrom-Json
-$disks=@(Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Name -in @('C','D')} | ForEach-Object {
+$disks=@(Get-PSDrive -PSProvider FileSystem | Where-Object {$_.Name -in @('C','D','E')} | ForEach-Object {
   @{drive=$_.Name;used_bytes=[long]$_.Used;free_bytes=[long]$_.Free}
 })
-$parents=@(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' -ErrorAction SilentlyContinue | Get-ItemProperty | Where-Object {$_.DistributionName -eq $request.distribution} | ForEach-Object {
+$registered=@(Get-ChildItem 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Lxss' -ErrorAction SilentlyContinue | Get-ItemProperty)
+$parents=@($registered | Where-Object {$_.DistributionName -eq $request.distribution} | ForEach-Object {
   $base=$_.BasePath -replace '^\\\?\\',''
-  if($base -match '^([CD]):\\'){$Matches[1]}
+  if($base -match '^([CDE]):\\'){$Matches[1]}
 })
-@{disks=$disks;backing_drives=$parents} | ConvertTo-Json -Compress -Depth 4
+$allocations=@()
+try {
+  Add-Type -TypeDefinition @'
+using System;using System.Runtime.InteropServices;using System.ComponentModel;
+public static class StockAgentAllocatedSize {
+ [DllImport("kernel32.dll",CharSet=CharSet.Unicode,SetLastError=true,ExactSpelling=true)]
+ private static extern uint GetCompressedFileSizeW(string path,out uint high);
+ public static ulong Read(string path) {
+  uint high;uint low=GetCompressedFileSizeW(path,out high);int error=Marshal.GetLastWin32Error();
+  if(low==uint.MaxValue && error!=0)throw new Win32Exception(error);
+  return ((ulong)high<<32)|low;
+ }
+}
+'@
+  foreach($disk in $disks){
+    $total=[long]0;$current=[long]0;$count=0;$currentCount=0;$complete=$true
+    foreach($distro in $registered){
+      if($distro.Version -ne 2){continue}
+      $base=$distro.BasePath -replace '^\\\?\\',''
+      if($base -notmatch ('^'+$disk.drive+':\\')){continue}
+      $count++
+      try {
+        $leaf=if($distro.VhdFileName){[string]$distro.VhdFileName}else{'ext4.vhdx'}
+        if($leaf -notmatch '^[^\\/:]+\.vhdx$'){throw 'invalid_vhd_leaf'}
+        $file=Get-Item -LiteralPath (Join-Path $base $leaf) -Force
+        if($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)){throw 'redirected_vhd'}
+        $bytes=[long][StockAgentAllocatedSize]::Read($file.FullName)
+        $total+=$bytes
+        if($distro.DistributionName -eq $request.distribution){$current+=$bytes;$currentCount++}
+      }catch{$complete=$false}
+    }
+    $allocations+=@{drive=$disk.drive;complete=$complete;distribution_count=$count;
+      current_distribution_count=$currentCount;current_distribution_allocated_bytes=$current;
+      all_distributions_allocated_bytes=$total}
+  }
+}catch{$allocations=@()}
+@{disks=$disks;backing_drives=$parents;wsl_allocations=$allocations} | ConvertTo-Json -Compress -Depth 5
 """
     try:
         env = _windows_process_environment()
         if env is None:
             return {}
-        result = subprocess.run(["powershell.exe", "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
+        from stockagent.data_sync.windows_cold_io import POWERSHELL
+        result = subprocess.run([POWERSHELL, "-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand",
             base64.b64encode(script.encode("utf-16le")).decode()],
             input=json.dumps({"distribution": os.environ.get("WSL_DISTRO_NAME", "")}).encode(),
             capture_output=True, timeout=10, env=env, check=True)
         value = json.loads(result.stdout.decode("utf-8-sig"))
         measured = {}
         for row in value["disks"]:
-            if row.get("drive") not in {"C", "D"} or any(nonnegative(row.get(k)) is None for k in ("used_bytes", "free_bytes")):
+            if row.get("drive") not in {"C", "D", "E"} or any(nonnegative(row.get(k)) is None for k in ("used_bytes", "free_bytes")):
                 raise ValueError("invalid_native_volume")
             measured["penguin-" + row["drive"].lower()] = {"state": "measured", "observed_at_utc": utc(), "source": "native_windows",
                 "total_bytes": row["used_bytes"] + row["free_bytes"], "used_bytes": row["used_bytes"],
                 "free_bytes": row["free_bytes"], "available_bytes": row["free_bytes"], "reserved_free_bytes": 0}
+        for row in value.get('wsl_allocations', []):
+            identity = 'penguin-' + str(row.get('drive', '')).lower()
+            if identity in measured:
+                measured[identity]['wsl_allocation'] = row
         drives = set(value.get("backing_drives", []))
-        if len(drives) == 1 and drives <= {"C", "D"}:
+        if len(drives) == 1 and drives <= {"C", "D", "E"}:
             measured["contained_in"] = "penguin-" + next(iter(drives)).lower()
         return measured
     except (OSError, ValueError, KeyError, TypeError, SnapshotError, subprocess.SubprocessError):
         return {}
 
 
+def windows_wsl_accounting(capacity: dict) -> dict:
+    """Separate existing VHD allocation from free growth; never credit it as free."""
+    raw = capacity.get('wsl_allocation')
+    unknown = {'state': 'unknown'}
+    if (not isinstance(raw, dict) or raw.get('complete') is not True
+            or raw.get('current_distribution_count') != 1):
+        return unknown
+    keys = ('distribution_count', 'current_distribution_allocated_bytes',
+            'all_distributions_allocated_bytes')
+    if any(nonnegative(raw.get(key)) is None for key in keys):
+        return unknown
+    used, free = (nonnegative(capacity.get(key)) for key in ('used_bytes', 'available_bytes'))
+    current, total = (raw[key] for key in keys[1:])
+    if used is None or free is None or not 1 <= raw['distribution_count'] <= 128 or not 0 < current <= total <= used:
+        return unknown
+    return {'state': 'measured', 'current_wsl_allocated_bytes': current,
+            'other_wsl_allocated_bytes': total-current, 'windows_and_other_used_bytes': used-total,
+            'physical_free_bytes': free, 'current_wsl_capacity_ceiling_bytes': current+free,
+            'basis': 'registered_vhd_physical_allocations_plus_host_free',
+            'capacity_ceiling_includes_existing_allocation': True}
+
+
 def guarded_volume(volume: dict) -> dict:
     """Receiver observations use the backup owner's exact CIFS identity guard."""
     if volume["id"] != "nas-disk":
+        if volume['id'] == 'penguin-workspace':
+            from stockagent.data_sync.workspace_volume import check
+            check()
         return volume
     from stockagent.data_sync.nas_target import NasTarget
     from stockagent.data_sync.packed_backup import mounted_volume
@@ -262,7 +350,7 @@ def classify_name(name: str, inherited="other") -> str:
         return "cache"
     if name in {"training_prepared", "prepared", "features", "panels"} or name.startswith("research_dataset"):
         return "materialized"
-    if name in {"live", "runtime"}:
+    if name in {"live", "runtime", "service_data", "stockagent-live", "discord_bot"}:
         return "runtime"
     if name in {"markets", "ablations", "datasets", "checkpoints", "results"}:
         return "results"
@@ -504,8 +592,17 @@ def census(volume: dict, repo: Path, *, depth: int, timeout: int, remote: dict |
                 fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
             except BlockingIOError:
                 return {'state': 'deferred', 'reason': 'retirement_wave_active'}
+            reason = local_census_priority_reason(volume, repo)
+            if reason:
+                return {'state': 'deferred', 'reason': reason}
+            interrupted_by = None
+            def preempt():
+                nonlocal interrupted_by
+                interrupted_by = local_census_priority_reason(volume, repo)
+                return interrupted_by is not None
             return _census(volume, repo, depth=depth, timeout=timeout, remote=remote,
-                           previous=previous, progress=progress)
+                           previous=previous, progress=progress,
+                           preempt=preempt, preempt_reason=lambda: interrupted_by)
         finally:
             os.close(fd)
     except (OSError, ValueError) as exc:
@@ -513,8 +610,44 @@ def census(volume: dict, repo: Path, *, depth: int, timeout: int, remote: dict |
                 'error_code': type(exc).__name__}
 
 
+def _interruptible_local_census(command, output, errors, timeout, preempt):
+    """Reap the owned read-only scan before releasing its shared wave lock."""
+    child = subprocess.Popen(command, stdout=output, stderr=errors, start_new_session=True)
+    deadline = time.monotonic() + timeout
+    def stop():
+        try:
+            child.terminate()
+        except ProcessLookupError:
+            pass
+        try:
+            child.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            try:
+                child.kill()
+            except ProcessLookupError:
+                pass
+            child.wait()  # Never release the scan lock with this child alive.
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                stop()
+                return None, True, False
+            try:
+                return child.wait(timeout=min(CENSUS_PRIORITY_POLL_SECONDS, remaining)), False, False
+            except subprocess.TimeoutExpired:
+                if preempt():
+                    stop()
+                    return child.returncode, False, True
+    except BaseException:
+        if child.poll() is None:
+            stop()
+        raise
+
+
 def _census(volume: dict, repo: Path, *, depth: int, timeout: int, remote: dict | None = None,
-            previous: dict | None = None, progress: CensusProgress | None = None) -> dict:
+            previous: dict | None = None, progress: CensusProgress | None = None,
+            preempt=None, preempt_reason=None) -> dict:
     started = utc()
     try:
         if remote:
@@ -544,30 +677,39 @@ def _census(volume: dict, repo: Path, *, depth: int, timeout: int, remote: dict 
             errors = stack.enter_context(tempfile.TemporaryFile())
             if progress is not None:
                 stack.enter_context(progress.capture(output, roots, started, check_mount))
-            timed_out = False
+            timed_out = preempted = False
             try:
-                result = subprocess.run(command, stdout=output, stderr=errors, timeout=timeout+10 if remote else timeout,
-                                        start_new_session=True)
-                exit_code = result.returncode
-                timed_out = remote is not None and exit_code in {124, 137}
+                if preempt is not None and remote is None:
+                    exit_code, timed_out, preempted = _interruptible_local_census(
+                        command, output, errors, timeout, preempt)
+                else:
+                    result = subprocess.run(command, stdout=output, stderr=errors,
+                                            timeout=timeout+10 if remote else timeout,
+                                            start_new_session=True)
+                    exit_code = result.returncode
+                    timed_out = remote is not None and exit_code in {124, 137}
             except subprocess.TimeoutExpired:
                 # subprocess.run terminates and reaps its own command. Local
                 # nice/ionice exec into du, so no local scan child is orphaned.
                 timed_out, exit_code = True, None
-            if output.tell() > MAX_SNAPSHOT_BYTES or (not timed_out and exit_code not in {0, 1}):
+            if output.tell() > MAX_SNAPSHOT_BYTES or (not timed_out and not preempted and exit_code not in {0, 1}):
                 raise ValueError("classification_output_invalid")
             output.seek(0)
             raw = output.read(MAX_SNAPSHOT_BYTES + 1)
-            if timed_out:
+            if timed_out or preempted:
                 raw = raw[:raw.rfind(b"\0") + 1]  # An unfinished record is not an observation.
-            parsed = parse_du(raw, roots, allow_missing=timed_out or exit_code == 1, partial_output=timed_out)
+            if preempted and not raw:
+                return {'state': 'deferred', 'reason': preempt_reason() if preempt_reason else 'retirement_wave_pending'}
+            parsed = parse_du(raw, roots, allow_missing=timed_out or preempted or exit_code == 1,
+                              partial_output=timed_out or preempted)
         if not remote and os.stat(volume["path"]).st_dev != before_device:
             raise ValueError("classification_mount_changed")
         if not remote:
             guarded_volume(volume)
-        return {**parsed, "state": "complete" if exit_code == 0 and not parsed["concurrent_change_detected"] else "partial",
+        return {**parsed, "state": "complete" if not preempted and exit_code == 0 and not parsed["concurrent_change_detected"] else "partial",
                 "started_at_utc": started, "observed_at_utc": utc(), "exit_code": exit_code,
-                "timed_out": timed_out}
+                "timed_out": timed_out, "preempted": preempted,
+                **({'reason': preempt_reason() if preempt_reason else 'retirement_wave_pending'} if preempted else {})}
     except (OSError, ValueError, KeyError, subprocess.SubprocessError) as exc:
         return {"state": "unavailable", "error_code": type(exc).__name__, "attempted_at_utc": utc(),
                 "started_at_utc": started}
@@ -638,6 +780,11 @@ def public_status(value: dict, *, now: float | None = None) -> dict:
         value = {}
     raw_rows = value.get("volumes")
     rows = {r.get("id"): r for r in raw_rows if isinstance(r, dict) and isinstance(r.get("id"), str)} if isinstance(raw_rows, list) else {}
+    placement = value.get("service_layout_generation")
+    changed = (epoch(placement.get("changed_at_utc")) if isinstance(placement, dict)
+               and placement.get("contract") == "stockagent.service_layout_generation.v1" else None)
+    if changed is not None and changed > now + 300:
+        changed = None
     nodes = {key: {"id": key, "label": label, "volumes": []} for key, label in NODE_LABELS.items()}
     for identity, (owner, label, role) in VOLUMES.items():
         row = rows.get(identity, {})
@@ -669,17 +816,54 @@ def public_status(value: dict, *, now: float | None = None) -> dict:
             "allocated_bytes_is_lower_bound": group.get("allocated_bytes_is_lower_bound") is True,
             "roots_total": roots_total, "roots_completed": roots_completed,
             "reclaimable_bytes": None, "metric": "allocated_bytes", "scope": "registered_project_roots_only"}
+        classification["layout_changed"] = (identity == "penguin-wsl" and changed is not None
+                                             and group_time is not None and changed > group_time)
+        if classification["layout_changed"]:
+            classification["stale"] = True
+        deferred = group.get('deferred_reason')
+        classification['deferred_reason'] = deferred if isinstance(deferred, str) and deferred in {
+            'retirement_wave_active', 'retirement_wave_pending', 'retirement_wave_lock_unobservable',
+            'dataset_version_owner_active', 'dataset_version_owner_unobservable',
+            'transport_relocation_owner_active',
+            'tw_opening_guard_active', 'tw_opening_guard_unknown'} else None
         nodes[owner]["volumes"].append({"id": identity, "label": label, "role": role, "capacity": projected_cap,
             "classification": classification, "contained_in": row.get("contained_in") if row.get("contained_in") in VOLUMES else None})
+    projected = {row["id"]: row for node in nodes.values() for row in node["volumes"]}
+    guest = projected["penguin-wsl"]
+    backing = projected.get(guest["contained_in"])
+    # A VHD's guest free blocks are not unallocated bytes on the Windows host.
+    # Derive this only from the whitelisted, fresh observations, never from an
+    # injected precomputed field. Do not add guest and host capacity together.
+    fresh = lambda cap: cap["complete"] and cap["state"] == "measured"
+    writable = None
+    if backing is not None and backing["id"] in {"penguin-c", "penguin-d"}:
+        if fresh(guest["capacity"]) and fresh(backing["capacity"]):
+            writable = min(guest["capacity"]["available_bytes"], backing["capacity"]["available_bytes"])
+    guest["writable_headroom"] = {
+        "state": "measured" if writable is not None else "unknown",
+        "available_bytes": writable,
+        "backing_volume_id": backing["id"] if backing is not None else None,
+        "basis": "minimum_guest_and_backing_available_bytes",
+        "conservative": True,
+        "includes_application_reserve": False,
+    }
+    guest['host_storage_accounting'] = (
+        windows_wsl_accounting(rows.get(backing['id'], {}).get('capacity', {}))
+        if backing is not None and fresh(backing['capacity']) and fresh(guest['capacity'])
+        else {'state': 'unknown'})
     return {"contract": CONTRACT, "read_only": True, "production_control_possible": False,
         "generated_at_utc": value.get("generated_at_utc") if epoch(value.get("generated_at_utc")) else None,
         "capacity_interval_seconds": 60, "classification_interval_seconds": interval,
         "nodes": list(nodes.values()), "aggregate_capacity_bytes": None,
         "efficiency": public_efficiency(value.get("efficiency")) if isinstance(value.get("efficiency"), dict) else None,
         "cold_tiers": public_cold_tiers(value.get("cold_tiers"), now=now),
+        "operations": public_operations(value.get("operations"), now=now),
+        "runtime": public_runtime(value.get("runtime"), now=now),
         "definitions": {"capacity": "磁碟整體實測容量；NAS 可能與他人共享。未量測不當作零。",
             "classification": "已登錄專案目錄的實際配置空間；單次掃描內 hardlink 只算一次。部分清點的 ≥ 是已量測下限，未掃描不當作零；掃描不是原子快照。",
             "containment": "WSL 位於 Windows 虛擬磁碟內；同磁碟掛載別名與跨節點副本不合併加總。",
+            "writable_headroom": "保守寫入餘量取近期客體與 Windows 實體磁碟可用空間的較小值；未估算 VHD 內已配置區塊可重用量，未扣各服務保留量，也不保證其他程式不會同時寫入。缺少近期任一量測時不推測。",
+            "host_storage_accounting": "按原生 VHD 實體配置區分 WSL、其他 WSL 及 Windows／其他檔案。WSL 配置上限包含既有占用，不是額外可用空間；客體可用與主機新增配置空間分開呈現。",
             "retirement": "目錄大小與壓縮率不是可刪除空間；需另通過引用、恢復、收據及來源保護檢查。"}}
 
 
@@ -691,7 +875,7 @@ def load_config(path: Path) -> dict:
             ("classification_timeout_seconds", 30, 3600), ("classification_depth", 1, 3)):
         if type(value.get(field)) is not int or not low <= value[field] <= high:
             raise ValueError("invalid_observer_bounds:" + field)
-    allowed = {"penguin-wsl", "penguin-c", "penguin-d"} if value["observer_node_id"] == "penguin" else {"lab203-disk", "nas-disk"}
+    allowed = {"penguin-wsl", "penguin-c", "penguin-d", "penguin-e", "penguin-workspace"} if value["observer_node_id"] == "penguin" else {"lab203-disk", "nas-disk"}
     ids = [row.get("id") for row in value["volumes"]]
     if len(ids) != len(set(ids)) or not set(ids) <= allowed:
         raise ValueError("foreign_or_duplicate_volume")
@@ -707,7 +891,7 @@ def observe_capacities(config: dict) -> dict:
             guarded_volume(volume)
             if row["id"] == "nas-disk" and measured[row["id"]].get("state") == "measured":
                 measured[row["id"]]["source"] = "guarded_nas_statvfs"
-        except (OSError, ValueError, KeyError, RuntimeError) as exc:
+        except (OSError, ValueError, KeyError, RuntimeError, SnapshotError) as exc:
             measured[row["id"]] = {"state": "unavailable", "error_code": type(exc).__name__, "attempted_at_utc": utc()}
     if config["observer_node_id"] == "penguin":
         measured.update(windows_capacity())
@@ -720,6 +904,21 @@ def observe_capacities(config: dict) -> dict:
 
 def priority_retirement_wave_pending(repo: Path) -> bool:
     """Defer a new WSL census for a runnable supervised cleanup, not capacity waits."""
+    # The installed timer is not an agent run. Its short nonblocking write-lock
+    # attempt can otherwise collide with the same census every minute forever.
+    configuration = operation_metadata(repo / 'configs/data_sync/wsl_retirement_queue.json')
+    relative = configuration.get('state_root')
+    if (configuration.get('contract') == 'stockagent.frozen_retirement_queue.v1'
+            and configuration.get('enabled') is True and isinstance(relative, str)
+            and not Path(relative).is_absolute() and '..' not in Path(relative).parts
+            and Path(relative).is_relative_to('service_data')):
+        queued = operation_metadata(repo / relative / 'status.json')
+        observed = epoch(queued.get('observed_at_utc'))
+        if (queued.get('contract') == 'stockagent.frozen_retirement_queue.v1'
+                and observed is not None and -120 <= time.time() - observed <= 180
+                and queued.get('all_enrolled_accepted') is False
+                and queued.get('state') in {'waiting_existing_wave', 'dispatching_original_owner', 'inspecting'}):
+            return True
     from scripts.plan_wsl_retirement_waves import observe_active_supervisors
     active = observe_active_supervisors()
     if active is None:
@@ -740,6 +939,98 @@ def priority_retirement_wave_pending(repo: Path) -> bool:
         if latest.get('event') != 'waiting_for_capacity':
             return True
     return False
+
+
+def trading_opening_census_reason(repo: Path, *, now: datetime | None = None) -> str | None:
+    """Yield only optional scans to the existing day-trade opening guard.
+
+    The guardian owns the session calendar and protected-window decision. Its
+    fresh receipt can release the scan on a closed day. If the receipt is not
+    trustworthy, the documented 08:20-09:10 Taipei window is a conservative
+    fallback; it does not stop capacity or service observations.
+    """
+    observed = now or datetime.now(timezone.utc)
+    if observed.tzinfo is None:
+        raise ValueError('opening_guard_clock_requires_timezone')
+    local = observed.astimezone(ZoneInfo('Asia/Taipei'))
+    in_fallback_window = datetime_time(8, 20) <= local.time().replace(tzinfo=None) < datetime_time(9, 10)
+    receipt = operation_metadata(repo / 'artifacts/operations/tw_day_trade_guardian/latest.json')
+    stamp = epoch(receipt.get('observed_at_taipei'))
+    components = receipt.get('components')
+    guard = components.get('opening_resource_guard') if isinstance(components, dict) else None
+    protected = guard.get('protected') if isinstance(guard, dict) else None
+    session = receipt.get('session_state')
+    if (receipt.get('schema_version') == 1 and receipt.get('session_date') == local.date().isoformat()
+            and stamp is not None and -120 <= observed.timestamp() - stamp <= 180
+            and session in {'open', 'closed', 'unknown'} and type(protected) is bool):
+        if protected:
+            return 'tw_opening_guard_active'
+        if not in_fallback_window or session == 'closed':
+            return None
+        # A fresh open/unknown session contradicting the documented window
+        # cannot safely release a metadata scan ahead of trading.
+    return 'tw_opening_guard_unknown' if in_fallback_window else None
+
+
+def local_census_priority_reason(volume: dict, repo: Path) -> str | None:
+    """Keep optional recursive metadata scans out of a live publication's way.
+
+    This observes the canonical owner's existing lock without creating or
+    holding it. Capacity observations are independent and continue every tick.
+    A failed observation defers the optional scan, not the publication.
+    """
+    opening = trading_opening_census_reason(repo)
+    if opening:
+        return opening
+    if volume.get('id') in {'penguin-wsl', 'penguin-d', 'penguin-workspace'}:
+        # A recursive du competes with the exact readback/retirement needed
+        # to release D. Reuse bounded owner observations, never walk payloads
+        # to decide whether another payload walk should start.
+        options = operation_metadata(repo/'configs/data_sync/storage_monitor.json').get('operations', {})
+        if not isinstance(options, dict):
+            options = {}
+        root = options.get('workspace_relocation_state_root')
+        if isinstance(root, str):
+            waiting = operation_metadata(Path(root)/'attempt.json')
+            retiring = operation_metadata(Path(root)/'retirement-status.json')
+            for observed, states in ((waiting, {'waiting_for_original_owner_or_reader'}),
+                                     (retiring, {'verifying_and_retiring'})):
+                timestamp = observed.get('observed_at_epoch')
+                if (isinstance(timestamp, (int, float)) and not isinstance(timestamp, bool)
+                        and -120 <= time.time() - timestamp <= 120
+                        and observed.get('state') in states):
+                    return 'transport_relocation_owner_active'
+            backup_root = options.get('backup_state_root')
+            if retiring.get('state') == 'verifying_and_retiring' and isinstance(backup_root, str):
+                # A large batch can outlive the progress heartbeat. Observe
+                # the existing kernel lock without creating it or holding a
+                # lease; a stale counter is not proof the owner has exited.
+                try:
+                    fd = os.open(Path(backup_root)/'cycle.lock',
+                                 os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+                    try:
+                        info = os.fstat(fd)
+                        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
+                            return 'retirement_wave_lock_unobservable'
+                        try:
+                            fcntl.flock(fd, fcntl.LOCK_SH | fcntl.LOCK_NB)
+                        except BlockingIOError:
+                            return 'transport_relocation_owner_active'
+                    finally:
+                        os.close(fd)
+                except OSError:
+                    return 'retirement_wave_lock_unobservable'
+    if priority_retirement_wave_pending(repo):
+        return 'retirement_wave_pending'
+    if volume.get('id') in {'penguin-wsl', 'penguin-d'}:
+        from stockagent.data_sync.dataset_migration import migration_owner_observation
+        try:
+            observation = migration_owner_observation(DATASET_VERSION_OWNER_DIRECTORY, None)
+        except (OSError, ValueError):
+            return 'dataset_version_owner_unobservable'
+        if observation['lock_held']:
+            return 'dataset_version_owner_active'
+    return None
 
 
 def record_daily_capacity(history_path: Path, volumes: list[dict], *, now: datetime | None = None) -> bool:
@@ -812,6 +1103,8 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
         except (OSError, ValueError):
             previous = {}
         rows = {row["id"]: row for row in previous.get("volumes", []) if isinstance(row, dict) and row.get("id") in VOLUMES}
+        if any(v['id']=='penguin-workspace' for v in config['volumes']):
+            rows.setdefault('penguin-workspace', {'id': 'penguin-workspace'})['contained_in'] = 'penguin-e'
         interrupted = set()
         for identity, row in rows.items():
             group = row.get('classification')
@@ -824,6 +1117,14 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
                     and nonnegative(group.get('allocated_bytes')) is not None
                     else {'state': 'not_scanned', 'reason': 'previous_census_interrupted', 'tree': []})
         tier_status = previous.get("cold_tiers")
+        operations = previous.get("operations")
+        runtime = previous.get("runtime")
+        receiver_runtime = {}  # Private in-memory CPU delta; never serialized into a receipt.
+        history_path = output.with_name("storage_operations_history.json")
+        try:
+            operation_history = read_snapshot(history_path)
+        except (OSError, ValueError):
+            operation_history = {}
         with ThreadPoolExecutor(max_workers=1, thread_name_prefix="storage-census") as pool:
             job = None
             job_progress = None
@@ -837,14 +1138,18 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
                 remote = config.get("remote") if volume["id"] == (config.get("remote") or {}).get("id") else None
                 compatible = (group.get('state') in {'complete', 'partial'}
                               and group.get("fingerprint") == census_fingerprint(config, volume, remote))
+                needs_resume = (volume['id'] in interrupted or group.get('preempted') is True
+                                or group.get('deferred_reason') is not None
+                                or group.get('reason') == 'previous_census_interrupted')
                 due[volume["id"]] = (last + config["classification_interval_seconds"]) if (
-                    volume['id'] not in interrupted and compatible and last and last <= time.time()+300) else 0.
+                    not needs_resume and compatible and last and last <= time.time()+300) else 0.
             job_identity = None
             job_fingerprint = None
             job_previous = None
             while True:
                 started = time.monotonic()
-                for identity, cap in observe_capacities(config).items():
+                observations = observe_capacities(config)
+                for identity, cap in observations.items():
                     if identity == "contained_in":
                         rows.setdefault("penguin-wsl", {"id": "penguin-wsl"})["contained_in"] = cap
                         continue
@@ -858,11 +1163,15 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
                     group["fingerprint"] = job_fingerprint
                     row = rows.setdefault(job_identity, {"id": job_identity})
                     if group['state'] == 'deferred':
-                        row['classification'] = job_previous or {'state': 'not_scanned', 'reason': group['reason']}
+                        row['classification'] = {**(job_previous or {'state': 'not_scanned'}),
+                                                 'deferred_reason': group['reason']}
                         due[job_identity] = time.time() + 60
                     else:
                         row["classification"] = retain_observation(row.get("classification") or {}, group)
-                        due[job_identity] = time.time() + (900 if group["state"] == "unavailable" else config["classification_interval_seconds"])
+                        if group.get('preempted'):
+                            row['classification']['deferred_reason'] = group['reason']
+                        due[job_identity] = time.time() + (60 if group.get('preempted') else
+                            900 if group["state"] == "unavailable" else config["classification_interval_seconds"])
                     job = None
                     job_progress = None
                     job_previous = None
@@ -877,12 +1186,16 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
                         if time.time() < due[identity]:
                             continue
                         is_local = config['observer_node_id'] == 'penguin' and remote is None
-                        if is_local and priority_retirement_wave_pending(repo):
+                        row = rows.setdefault(identity, {"id": identity})
+                        reason = local_census_priority_reason(volume, repo) if is_local else None
+                        if reason:
+                            row['classification'] = {**(row.get('classification') or {'state': 'not_scanned'}),
+                                                     'deferred_reason': reason}
                             due[identity] = time.time() + 60
                             continue
-                        row = rows.setdefault(identity, {"id": identity})
                         previous_group = row.get('classification') or {}
                         row["classification"] = {**previous_group, "state": "scanning", "started_at_utc": utc()}
+                        row['classification'].pop('deferred_reason', None)
                         job_progress = CensusProgress()
                         options = {'wave_lock': RETIREMENT_WAVE_LOCK} if is_local else {}
                         job = pool.submit(census, volume, repo, depth=config["classification_depth"],
@@ -895,6 +1208,25 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
                 snapshot = {"contract": CONTRACT, "observer_node_id": config["observer_node_id"], "generated_at_utc": utc(),
                             "classification_interval_seconds": config["classification_interval_seconds"], "volumes": list(rows.values())}
                 if config["observer_node_id"] == "penguin":
+                    from stockagent.data_sync.storage_runtime import collect as collect_runtime
+                    try:
+                        receiver = receiver_snapshot(Path(config["receipt_root"])) if config.get("receipt_root") else None
+                    except (OSError, ValueError, KeyError, TypeError):
+                        receiver = None
+                    runtime = collect_runtime(runtime, observations.get("vastai1T-disk"), receiver=receiver)
+                    snapshot["runtime"] = runtime
+                    if isinstance(config.get("operations"), dict):
+                        from stockagent.data_sync.storage_progress import collect
+                        try:
+                            operations, operation_history = collect(repo, config, operation_history,
+                                runtime=runtime, capacities=observations)
+                            atomic_write_json(history_path, operation_history)
+                        except (OSError, ValueError, TypeError) as exc:
+                            # Don't hide capacity or refresh an old progress clock.
+                            print(json.dumps({"state": "operations_observer_unavailable",
+                                              "error_code": type(exc).__name__}), flush=True)
+                    if isinstance(operations, dict):
+                        snapshot["operations"] = operations
                     try:
                         candidate = read_snapshot(Path("/var/lib/stockagent-cold-tiers/status.json"))
                         if public_cold_tiers(candidate, now=time.time()) is not None:
@@ -903,6 +1235,10 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
                         pass  # Missing tier metadata does not hide disk capacity.
                     if isinstance(tier_status, dict):
                         snapshot["cold_tiers"] = tier_status
+                elif config["observer_node_id"] == "lab203":
+                    from stockagent.data_sync.storage_runtime import receiver_host_observation
+                    receiver_runtime, snapshot["host_runtime"] = receiver_host_observation(
+                        receiver_runtime, now=time.time())
                 if config.get("pairing"):
                     from scripts.backup_delivery_receipt import signed
                     snapshot = signed({**snapshot, "pairing": config["pairing"]})

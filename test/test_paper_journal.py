@@ -13,7 +13,7 @@ from stockagent.live import paper_journal as journal
 from stockagent.live import tw_day_trade_simulation as simulation
 from stockagent.live import tw_day_trade_dashboard as dashboard
 from stockagent.live.tw_day_trade_service_sync import (
-    PaperReadChanged, committed_paper_read_guard, paper_journal_generations,
+    PaperReadChanged, committed_paper_read_guard, committed_paper_history_read_guard, paper_journal_generations,
 )
 from test_paper_mode_snapshot import CLOCK, state
 
@@ -277,6 +277,69 @@ def test_commit_binds_small_heads_not_only_unchanged_flat_projection(tmp_path):
     engine._persist(CLOCK + timedelta(seconds=1))
     with committed_paper_read_guard(tmp_path):
         pass
+
+
+@pytest.mark.parametrize("managed", [False, True])
+def test_history_scope_accepts_unrelated_commits_not_uncommitted_marks(tmp_path, managed):
+    engine = simulation.TwDayTradeSimulationEngine(tmp_path)
+    engine.state = state()
+    for name in journal.FILENAMES:
+        if managed:
+            seed(tmp_path, name=name)
+        else:
+            (tmp_path / name).write_bytes(b'{"session_date":"2026-10-06"}\n')
+    engine._persist(CLOCK)
+    with committed_paper_history_read_guard(tmp_path) as captured:
+        assert captured == {"product": "tw_day_trade", "enabled_markets": None}
+        journal.append_paper_journal(tmp_path / "orders.jsonl", b'{"quantity":1000}\n')
+        # A normal order/position commit changes state/status/positions and the
+        # global revision. Neither changes any complete-minute curve input.
+        engine._persist(CLOCK + timedelta(seconds=1))
+    with committed_paper_history_read_guard(tmp_path):
+        pass
+    journal.append_paper_journal(tmp_path / "orders.jsonl", b'{"quantity":2000}\n')
+    with committed_paper_history_read_guard(tmp_path):
+        pass
+    with pytest.raises(PaperReadChanged):
+        with committed_paper_read_guard(tmp_path):
+            pass  # The broader financial DTO fence is deliberately unchanged.
+    journal.append_paper_journal(tmp_path / "marks.jsonl", b'{"equity_twd":1000}\n')
+    with pytest.raises(PaperReadChanged, match="ahead"):
+        with committed_paper_history_read_guard(tmp_path):
+            pass
+
+
+@pytest.mark.parametrize("name", ["marks.jsonl", "benchmark_marks.jsonl"])
+def test_history_scope_rejects_relevant_committed_changes_during_read(tmp_path, name):
+    engine = simulation.TwDayTradeSimulationEngine(tmp_path)
+    engine.state = state()
+    engine._persist(CLOCK)
+    with pytest.raises(PaperReadChanged, match="history inputs changed"):
+        with committed_paper_history_read_guard(tmp_path):
+            journal.append_paper_journal(tmp_path / name, b'{"equity_twd":1000}\n')
+            engine._persist(CLOCK + timedelta(seconds=1))
+
+
+def test_history_scope_rejects_removed_immutable_head_and_owner_change(tmp_path):
+    engine = simulation.TwDayTradeSimulationEngine(tmp_path)
+    engine.state = state()
+    path, _ = seed(tmp_path, name="marks.jsonl")
+    engine._persist(CLOCK)
+    with committed_paper_history_read_guard(tmp_path):
+        pass
+    head = journal._head_path(path)
+    saved = head.read_bytes()
+    head.unlink()
+    with pytest.raises(PaperReadChanged, match="history journal"):
+        with committed_paper_history_read_guard(tmp_path):
+            pass
+    head.write_bytes(saved)
+    engine._persist(CLOCK + timedelta(seconds=1))
+    with pytest.raises(PaperReadChanged, match="owner"):
+        with committed_paper_history_read_guard(tmp_path):
+            value = json.loads(engine.state_path.read_bytes())
+            value["engine_run_id"] = "new-owner"
+            engine.state_path.write_text(json.dumps(value))
 
 
 def test_source_mutation_during_seal_never_publishes_head(tmp_path, monkeypatch):

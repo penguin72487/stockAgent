@@ -95,6 +95,20 @@ Guidelines:
   never claim the refreshed raw bytes stayed unchanged.
   Evidence: `artifacts/operations/tw_factorized_replay_20261014/acceptance.json`.
 
+- An explicitly authorized missing-session progressive replay uses the scoped
+  repair owner's `plan-published-revisions` and `--published-revisions`, not a
+  single last-signal opening reconstruction. Pin every original publication,
+  including restarted roots. Retain superseded decisions without inventing
+  fills. The first 09:01 cohort is an explicit opening counterfactual; later
+  target changes may consume only a full minute beginning after their
+  conservative publication bound. Keep original roots/clocks/weights separate
+  from the repair lineage. The engine's offline-only opt-in requires the named
+  plan contract and matching digest; it does not weaken live quote admission.
+  Before append, reconcile every cohort's shares, original TP/SL, net fees/PnL,
+  shared minute volume and exactly 270 source-backed marks. Keep the live
+  journals and unrelated modes unchanged. See the 10/29 report's scoped replay
+  acceptance for the actual source gaps and deployment boundary.
+
 - Every day-trade ledger replay/backfill must rebuild and validate one-minute
   curves before promotion. Each completed session and active paper mode must
   contain exactly 270 right-labelled points from 09:01 through 13:30; a daily
@@ -379,6 +393,22 @@ Rules:
   minimum-cash capacity-feasible basket also exceeds equity.  Fixed fees and
   reversals can make the discrete frontier non-monotone, so the search must
   retain that minimum-cash fallback and recheck the final account inequality.
+- A dated futures account may opt into `tw_futures_holiday_account_dates_source`
+  only with the existing source-bound holiday notice loader. A 2011 or 2012
+  closure crosses its calendar gate only when the reviewed notice identifies
+  that exact last/reopening interval and every processing date exists as an
+  account-only source day. The notice and its inputs are verified again and
+  fingerprinted in the checkpoint. This establishes processing dates only:
+  nonterminal valuations, cash events, margin and executions need independent
+  admission. The currently available notices do not admit the 2011/2012 dates.
+- `tw_futures_holiday_valuation_source` uses the original C11/CB1 and dated
+  P08/PA8 loader in `stockagent/data/tw_futures_holiday_c11.py`. It must match
+  every nonterminal physical contract in the selected holiday scope; a partial
+  night-price tag cannot admit the account. Price decimals come from the dated
+  product definition. Valuation changes run through a fresh canonical
+  accounting-only preparation (`--holiday-valuation-source`), with new source
+  fingerprints; training never patches marks. Calendar, final cash, historical
+  layout compatibility and publication remain independent acceptance steps.
 - For exact futures, live account equity is the sole owner of hard denomination
   rounding.  The model may encode denomination/cost features, but a fixed-
   reference-capital model projection followed by executor rounding is forbidden

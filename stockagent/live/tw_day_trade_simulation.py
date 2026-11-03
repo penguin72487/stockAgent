@@ -88,7 +88,8 @@ from stockagent.live.quote_provider import PriceSnapshot
 from stockagent.live.market_config import (OPENING_OBSERVED_REFERENCE_POLICY,
     OPENING_PROVISIONAL_REFERENCE_POLICY, SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE)
 from stockagent.live.opening_execution_latency import (
-    OpeningExecutionObserver, signal_registration_committed, unsized_target_count,
+    OpeningExecutionObserver, nonnegative_duration_ms, residual_duration_ms,
+    signal_registration_committed, unsized_target_count,
 )
 from stockagent.live.tw_day_trade_monitor_projection import build_shioaji_monitor_projection
 from stockagent.live.tw_day_trade_service_sync import (
@@ -125,6 +126,9 @@ AUCTION_OBSERVATION_DEADLINE: Final[time] = time(13, 35)
 STRICT_INTRADAY_CONTRACT: Final[str] = "flatten_same_day_adverse_limit_exception_only_v1"
 REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT: Final[str] = (
     "counterfactual_open_origin_then_causal_progressive_revisions_v1"
+)
+PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT: Final[str] = (
+    "published_signal_revisions_completed_minute_counterfactual_v1"
 )
 ENTRY_FILL_POLICY_CAUSAL_BOOK: Final[str] = "causal_best_quote"
 ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK: Final[str] = "synthetic_open_tick"
@@ -1212,6 +1216,7 @@ class ModeSpec:
     terminal_liquidation_unlimited_capacity: bool = False
     opening_reference_policy: str = OPENING_OBSERVED_REFERENCE_POLICY
     signal_update_policy: str = SIGNAL_UPDATE_ONCE
+    historical_progressive_revision_replay: bool = False
 
     @property
     def uses_realistic_execution(self) -> bool:
@@ -1224,9 +1229,15 @@ class ModeSpec:
     def __post_init__(self) -> None:
         if self.signal_update_policy not in {SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE}:
             raise ValueError("unknown signal update policy")
+        if self.historical_progressive_revision_replay and (
+                self.signal_update_policy != SIGNAL_UPDATE_PROGRESSIVE
+                or self.entry_fill_policy != ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+                or self.historical_full_fill_at_0901):
+            raise ValueError("historical progressive replay requires volume-capped minute execution")
         if self.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE and (
                 self.opening_reference_policy != OPENING_PROVISIONAL_REFERENCE_POLICY
-                or self.entry_fill_policy != ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET):
+                or (self.entry_fill_policy != ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
+                    and not self.historical_progressive_revision_replay)):
             raise ValueError("progressive rebalance requires causal full-target paper execution")
         if self.opening_reference_policy not in {OPENING_OBSERVED_REFERENCE_POLICY, OPENING_PROVISIONAL_REFERENCE_POLICY}:
             raise ValueError("unknown opening reference policy")
@@ -1835,6 +1846,7 @@ class TwDayTradeSimulationEngine:
             return
         latest_started: dict[str, tuple[tuple[str, str, int], str, str]] = {}
         latest_registered: dict[str, tuple[tuple[str, str, int], str, str]] = {}
+        explicit_aborts: dict[tuple[str, str], dict[str, Any]] = {}
         with open_paper_journal(self.events_path, "r", encoding="utf-8") as handle:
             for sequence, line in enumerate(handle):
                 try:
@@ -1869,6 +1881,8 @@ class TwDayTradeSimulationEngine:
                         market, (("0000-00-00", "", -1), "", "")
                     ):
                         latest_registered[market] = ordered
+                elif event_name == "signal_commit_aborted_unwritten":
+                    explicit_aborts[(market, signal_id)] = event
 
         markets = set(latest_started) | set(latest_registered)
         for market in markets:
@@ -1876,6 +1890,18 @@ class TwDayTradeSimulationEngine:
             raw_registered = latest_registered.get(market)
             started = raw_started[1:] if raw_started is not None else None
             registered = raw_registered[1:] if raw_registered is not None else None
+            if started is not None and registered is not None and started != registered:
+                abort = explicit_aborts.get((market, started[0]))
+                if abort is not None:
+                    from stockagent.live.paper_signal_commit_recovery import accepted_abort
+
+                    if accepted_abort(self.state_dir, abort, signal_id=started[0],
+                                      previous_signal_id=registered[0], market=market,
+                                      session_date=started[1]):
+                        # An offline, user-authorized abort is not a fill or a
+                        # registration. The previously committed signal remains
+                        # authoritative; its state consistency is checked below.
+                        started = registered
             divergence_kind: str | None = None
             signal_id = ""
             session_date = ""
@@ -3934,17 +3960,17 @@ class TwDayTradeSimulationEngine:
             summary.get("artifact_published_at") or summary.get("signal_ready_at")
         )
         live_latency = dict(summary.get("live_latency") or {})
-        signal_quote_ms = _finite(live_latency.get("quote_fetch_ms"))
-        model_inference_ms = _finite(live_latency.get("model_inference_ms"))
-        signal_total_ms = _finite(live_latency.get("compute_before_publish_ms"))
+        signal_quote_ms = nonnegative_duration_ms(live_latency.get("quote_fetch_ms"))
+        model_inference_ms = nonnegative_duration_ms(live_latency.get("model_inference_ms"))
+        signal_total_ms = nonnegative_duration_ms(live_latency.get("compute_before_publish_ms"))
         detailed_signal_stages = {
-            "signal_pre_quote_prepare_ms": _finite(
+            "signal_pre_quote_prepare_ms": nonnegative_duration_ms(
                 live_latency.get("pre_quote_prepare_ms")
             ),
-            "signal_pre_inference_prepare_ms": _finite(
+            "signal_pre_inference_prepare_ms": nonnegative_duration_ms(
                 live_latency.get("pre_inference_prepare_ms")
             ),
-            "signal_post_inference_format_ms": _finite(
+            "signal_post_inference_format_ms": nonnegative_duration_ms(
                 live_latency.get("post_inference_format_ms")
             ),
         }
@@ -3953,12 +3979,7 @@ class TwDayTradeSimulationEngine:
         )
         signal_other_ms = None
         if signal_total_ms is not None and not has_detailed_signal_stages:
-            signal_other_ms = max(
-                0.0,
-                signal_total_ms
-                - float(signal_quote_ms or 0.0)
-                - float(model_inference_ms or 0.0),
-            )
+            signal_other_ms = residual_duration_ms(signal_total_ms, signal_quote_ms, model_inference_ms)
 
         def elapsed_ms(start: datetime | None, end: datetime | None) -> float | None:
             if start is None or end is None:
@@ -3977,14 +3998,14 @@ class TwDayTradeSimulationEngine:
             if opening_delay_seconds >= 0.0
             else None
         )
-        opening_commit_slo_ms = 15_000.0
+        opening_commit_slo_ms = 1_000.0
 
         stages = {
             **detailed_signal_stages,
             "signal_quote_fetch_ms": signal_quote_ms,
             "model_inference_ms": model_inference_ms,
             "signal_other_compute_ms": signal_other_ms,
-            "artifact_publish_ms": _finite(live_latency.get("artifact_publish_ms")),
+            "artifact_publish_ms": nonnegative_duration_ms(live_latency.get("artifact_publish_ms")),
             "artifact_discovery_ms": elapsed_ms(published_at, consumer_detected_at),
             "source_recovery_wait_ms": elapsed_ms(
                 consumer_detected_at, signal_commit_attempt_at or consumer_detected_at
@@ -4039,8 +4060,9 @@ class TwDayTradeSimulationEngine:
                 "ready_to_ledger_ms": elapsed_ms(ready_at, ledger_persisted_at),
                 "opening_gate_to_ledger_ms": opening_gate_to_ledger_ms,
                 "opening_commit_slo_ms": opening_commit_slo_ms,
+                "opening_commit_slo_contract": "one_mode_signal_registration_only_not_full_target_v1",
                 "opening_commit_slo_met": (
-                    opening_gate_to_ledger_ms is not None
+                    result == "registered" and opening_gate_to_ledger_ms is not None
                     and opening_gate_to_ledger_ms <= opening_commit_slo_ms
                 ),
                 "signal_compute_total_ms": signal_total_ms,
@@ -4171,12 +4193,46 @@ class TwDayTradeSimulationEngine:
             return "blocked_ledger_state_divergence"
         if signal_id in set(mode.get("processed_signal_ids") or ()):
             return "already_processed"
+        historical_revision = spec.historical_progressive_revision_replay
+        historical_revision_proof = summary.get("published_revision_replay") or {}
+        if historical_revision:
+            # This opt-in is supplied only by the scoped, source-pinned repair
+            # owner, never by normal market configuration. Publication clocks
+            # remain immutable; later revisions may consume only a FULL minute
+            # after their conservative publication bound. The first 09:01 cohort
+            # is the separately disclosed historical opening counterfactual.
+            proof = historical_revision_proof
+            digest = proof.get("plan_sha256")
+            published = _parse_timestamp(proof.get("publication_upper_bound"))
+            first = not (mode.get("session_date") == observed.date().isoformat()
+                         and mode.get("entry_completed_at"))
+            invalid = (
+                not counterfactual_open_replay
+                or summary.get("simulation_replay") is not True
+                or summary.get("historical_minute_valuation") is not True
+                or summary.get("simulation_only") is not True
+                or summary.get("production_order_possible") is not False
+                or proof.get("contract") != PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT
+                or not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)
+                or not proof.get("source_signal_id")
+                or published is None or published.date() != observed.date()
+                or observed.second != 0 or observed.microsecond != 0
+                or (first and (observed.time() != ENTRY_GATE or published >= observed))
+                or (not first and (
+                    published is not None and published > observed - timedelta(minutes=1)
+                    or (mode.get("published_revision_replay") or {}).get("plan_sha256") != digest
+                    or mode.get("simulation_replay") is not True))
+            )
+            if invalid:
+                return self._block_signal(mode, signal_id, "invalid_published_revision_replay_proof", observed)
         from stockagent.live.opening_signal_revision import revision_admission
         # A late-opening counterfactual is a distinct first cohort. Later
         # revisions may change its surviving paper inventory, but only with
         # proven original lineage and a subsequently observed live pointer.
         revision_mode: Mapping[str, Any] = mode
         if (spec.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
+                and not historical_revision
                 and mode.get("simulation_replay") is True
                 and mode.get("session_date") == observed.date().isoformat()
                 and mode.get("entry_completed_at")):
@@ -4212,9 +4268,10 @@ class TwDayTradeSimulationEngine:
             session_date=observed.date().isoformat())
         if revision_error:
             return self._block_signal(mode, signal_id, revision_error, observed)
-        if progressive_revision and (counterfactual_open_replay or summary.get("simulation_replay")):
+        if progressive_revision and not historical_revision and (counterfactual_open_replay or summary.get("simulation_replay")):
             return self._block_signal(mode, signal_id, "live_revision_cannot_rewrite_replay", observed)
         if (progressive_revision and mode.get("simulation_replay") is True
+                and not historical_revision
                 and summary.get("execution_pointer_observed_at") is None):
             mode["pending_signal_id"] = signal_id
             mode["pending_wait_reason"] = "live_revision_pointer_observation_required"
@@ -4298,7 +4355,7 @@ class TwDayTradeSimulationEngine:
                     f"{required_replay_fill_contract!r}, got "
                     f"{replay_fill_contract!r}"
                 )
-            if wall_time != ENTRY_GATE:
+            if wall_time != ENTRY_GATE and not historical_revision:
                 raise ValueError(
                     "counterfactual open replay must be recorded exactly at 09:01"
                 )
@@ -4686,6 +4743,10 @@ class TwDayTradeSimulationEngine:
         mode["config_fingerprint"] = summary.get("config_fingerprint")
         mode["eligibility_coverage"] = dict(eligibility_coverage)
         mode["simulation_replay"] = bool(summary.get("simulation_replay", False))
+        if historical_revision:
+            mode["published_revision_replay"] = dict(historical_revision_proof)
+        elif not progressive_revision:
+            mode.pop("published_revision_replay", None)
         mode["historical_minute_valuation"] = bool(summary.get("historical_minute_valuation", False))
         mode["replay_basis"] = summary.get("replay_basis")
         mode["replay_source"] = summary.get("replay_source")
@@ -5513,7 +5574,7 @@ class TwDayTradeSimulationEngine:
                 ),
                 counterfactual_open_replay=bool(counterfactual_open_replay),
             )
-            self._mark_mode(spec.market, observed, quotes)
+            self._mark_mode(spec.market, observed, quotes, append_history=not historical_revision)
             self._persist(observed)
         except Exception as exc:
             mode["ledger_state_divergence"] = {
@@ -5982,7 +6043,10 @@ class TwDayTradeSimulationEngine:
             filled = 0
             sweep_quote = {
                 **quote,
-                "fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
+                # Preserve the observed bar's evidence ABI. Replacing it with
+                # the entry-policy name makes strict exits reject a valid
+                # historical minute as though it lacked live L1 evidence.
+                "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
                 "depth_assumption": (
                     "50pct_observed_completed_minute_volume_whole_lot_shared_"
                     "by_reduction_then_addition"
@@ -8449,6 +8513,10 @@ class TwDayTradeSimulationEngine:
         if terminal:
             mode["terminal_curve_mark"] = terminal_signature
 
+    def _status_projection(self, status: dict[str, Any]) -> dict[str, Any]:
+        """Customize product metadata BEFORE the shared durable commit fence."""
+        return status
+
     def _persist(self, now: datetime | None = None) -> None:
         persist_started = perf_counter()
         self.last_persist_metrics = None
@@ -8483,6 +8551,8 @@ class TwDayTradeSimulationEngine:
                 if path == self.state_path and self._mode_snapshot_writer is not None:
                     payload = self._mode_snapshot_writer.prepare(payload)
                     object_generations = dict(self._mode_snapshot_writer.object_generations)
+                if path == self.status_path:
+                    payload = self._status_projection(dict(payload))
                 _atomic_json(path, payload, timings=timing, sync_directory=False)
                 writes.append(timing)
 

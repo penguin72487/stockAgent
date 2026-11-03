@@ -43,6 +43,160 @@ CATALOG = "retained_packed_backup_catalog_v1"
 LEDGER = "bounded_nas_backup_stream_ledger_v1"
 TRANSPORT_SCAN = "backup_transport_scan_notification_v1"
 MAX_TRANSPORT_SCAN_BATCHES = 64
+# A changing working tree cannot be published as a frozen generation.  It is
+# nevertheless a transient race: retry it once in the same owner cycle rather
+# than waiting for another complete catalog capture. Other failures keep their
+# existing fail-closed behaviour and every attempt repeats capacity admission.
+_AUXILIARY_TRANSIENT_TREE_RACES = frozenset({
+    "code changed during its frozen working-tree backup",
+    "working tree changed during backup; READY withheld",
+    "configuration changed during privacy classification",
+})
+# Encoding a small retained history through a reuse table cost more CPU in the
+# measured complete capture. The large history crosses this work threshold;
+# small catalogs keep the original stdlib encoder and perform all checks.
+_CATALOG_REUSE_MIN_REFERENCES = 1_000_000
+_CATALOG_OBSERVATION = 'stockagent.backup_catalog_observation.v1'
+
+
+def transport_placement_pending(config: dict, *, evidence=None, now=None) -> bool:
+    """Yield a new full inventory to a queued, enrolled sender cutover.
+
+    Receipt ingestion/retirement still runs before this check. A fresh waiting
+    observation gives the original placement owner its short lock boundary;
+    no source inventory, signature or NAS acceptance is renewed by this hint.
+    """
+    if config.get('transport_namespace_handoff_contract') != 'stockagent.transport_namespace_handoff.v1':
+        return False
+    if evidence is None:
+        from stockagent.data_sync.workspace_volume import ENROLLMENT
+        evidence = ENROLLMENT.parent/'transport-relocation-v1'
+    try:
+        path = _regular(Path(evidence)/'attempt.json')
+        if path.stat().st_size > 16384:
+            return False
+        waiting = json.loads(path.read_bytes())
+        if not isinstance(waiting, dict):
+            return False
+        timestamp = waiting.get('observed_at_epoch')
+        current = time.time() if now is None else now
+        return (waiting.get('state') == 'waiting_for_original_owner_or_reader'
+                and type(timestamp) in (int, float) and -5 <= current - timestamp <= 120)
+    except (OSError, ValueError, KeyError, TypeError, SnapshotError):
+        return False
+
+
+def _catalog_file_signatures_identity(catalog: dict) -> str | None:
+    """Bind the execution pins excluded from the normal catalog identity."""
+    rows = catalog.get('files')
+    if not isinstance(rows, list):
+        return None
+    digest = hashlib.sha256()
+    for row in rows:
+        if (not isinstance(row, dict) or not isinstance(row.get('relative'), str)
+                or not isinstance(row.get('signature'), list)
+                or len(row['signature']) != 5
+                or any(type(part) is not int for part in row['signature'])):
+            return None
+        raw = json.dumps([row['relative'], row['signature']], ensure_ascii=True,
+                         separators=(',', ':')).encode('ascii')
+        digest.update(len(raw).to_bytes(8, 'big'))
+        digest.update(raw)
+    return digest.hexdigest()
+
+
+def _private_catalog_generation(path: Path) -> list[int] | None:
+    """Observe an owner-private, regular name without reading its contents."""
+    try:
+        if any(part.is_symlink() for part in path.parents):
+            return None
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        try:
+            opened = os.fstat(descriptor)
+            named = os.stat(path, follow_symlinks=False)
+        finally:
+            os.close(descriptor)
+        fields = lambda s: [s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns,
+                            s.st_ctime_ns, s.st_uid, s.st_gid, s.st_nlink]
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.geteuid()
+                or opened.st_mode & 0o077 or fields(opened) != fields(named)):
+            return None
+        return fields(opened)
+    except OSError:
+        return None
+
+
+def _catalog_observation(path: Path) -> dict:
+    generation = _private_catalog_generation(path)
+    if generation is None or generation[3] > 16384:
+        return {}
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+        with os.fdopen(descriptor, 'rb') as stream:
+            value = json.loads(stream.read(16385))
+        return value if isinstance(value, dict) and _private_catalog_generation(path) == generation else {}
+    except (OSError, ValueError, TypeError):
+        return {}
+
+
+def save_catalog_snapshot(state: Path, catalog: dict) -> dict:
+    """Reuse only unchanged private snapshot bytes after a full fresh capture.
+
+    Content identity intentionally excludes source file execution signatures;
+    compare those separately and pin the saved file's actual generation. The
+    small observation has its own clock and is never a recovery or NAS ACK.
+    A missing/invalid observation simply retains the original full write.
+    """
+    target, marker = state / 'catalog.json', state / 'catalog-observation.json'
+    identity = catalog.get('identity_sha256')
+    signatures = _catalog_file_signatures_identity(catalog)
+    reusable = isinstance(identity, str) and HASH.fullmatch(identity) and signatures is not None
+    previous = _catalog_observation(marker) if reusable else {}
+    generation = _private_catalog_generation(target) if previous else None
+    reuse = bool(generation is not None and previous.get('contract') == _CATALOG_OBSERVATION
+                 and previous.get('catalog_identity_sha256') == identity
+                 and previous.get('file_signatures_sha256') == signatures
+                 and previous.get('catalog_generation') == generation
+                 and isinstance(previous.get('persisted_observed_at_utc'), str))
+    if not reuse:
+        private_json(target, catalog, compact=True)
+        generation = _private_catalog_generation(target)
+    persisted_at = previous['persisted_observed_at_utc'] if reuse else catalog.get('observed_at_utc')
+    state_name = 'unchanged_snapshot_reused' if reuse else 'fresh_snapshot_written'
+    if reusable and generation is not None and isinstance(persisted_at, str):
+        try:
+            private_json(marker, {'contract': _CATALOG_OBSERVATION,
+                'catalog_identity_sha256': identity, 'file_signatures_sha256': signatures,
+                'catalog_generation': generation, 'persisted_observed_at_utc': persisted_at,
+                'observed_at_utc': catalog.get('observed_at_utc'), 'state': state_name,
+                'NAS_backup_verified': False}, compact=True)
+        except (OSError, ValueError, TypeError):
+            # A missing optimization receipt never substitutes for the full
+            # catalog or prevents the existing backup workflow from proceeding.
+            state_name += '_observation_unavailable'
+    return {'state': state_name, 'persisted_observed_at_utc': persisted_at}
+
+
+def _owner_has_waiters(owner) -> bool:
+    """Yield only when a kernel-queued publisher actually needs this owner.
+
+    A missing/unreadable proc view falls back to yielding: lack of diagnostics
+    must not turn a long sequence of verified retirements into starvation.
+    """
+    item = os.fstat(owner.fileno())
+    expected = (os.major(item.st_dev), os.minor(item.st_dev), item.st_ino)
+    try:
+        with open("/proc/locks", encoding="ascii") as locks:
+            for line in locks:
+                parts = line.split()
+                if len(parts) < 9 or parts[1:3] != ["->", "FLOCK"]:
+                    continue
+                device = parts[-3].split(":")
+                if len(device) == 3 and (int(device[0], 16), int(device[1], 16), int(device[2])) == expected:
+                    return True
+    except (OSError, ValueError):
+        return True
+    return False
 
 
 def _scan_error_details(error: Exception) -> dict:
@@ -57,6 +211,39 @@ def file_key(row: dict) -> str:
     return row["relative"] + "@" + row["sha256"]
 
 
+def _catalog_release_bytes(encoder, member, eligible_keys, encoded_keys):
+    """Encode repeated file keys once while retaining stdlib canonical bytes.
+
+    The fast path accepts only plain string-keyed release objects whose key
+    list contains plain strings. All other values and any nonstandard release
+    retain the original JSONEncoder behavior. Cache entries are restricted to
+    files and missing objects already present in this catalog, so temporary
+    memory grows with distinct catalog objects, not historical references.
+    """
+    if type(member) is not dict or not set(map(type, member)).issubset({str}):
+        return encoder.encode(member).encode("utf-8")
+    references = member.get("required_file_keys")
+    if (type(references) not in (list, tuple)
+            or not set(map(type, references)).issubset({str})):
+        return encoder.encode(member).encode("utf-8")
+    fields = []
+    for key in sorted(member):
+        name = encoder.encode(key).encode("utf-8") + b":"
+        if key != "required_file_keys":
+            fields.append(name + encoder.encode(member[key]).encode("utf-8"))
+            continue
+        encoded = []
+        for reference in references:
+            body = encoded_keys.get(reference)
+            if body is None:
+                body = encoder.encode(reference).encode("utf-8")
+                if reference in eligible_keys:
+                    encoded_keys[reference] = body
+            encoded.append(body)
+        fields.append(name + b"[" + b",".join(encoded) + b"]")
+    return b"{" + b",".join(fields) + b"}"
+
+
 def catalog_identity(content: dict, *, omit_file_signatures: bool = False) -> str:
     """Hash the existing canonical JSON bytes without one catalog-sized buffer.
 
@@ -69,6 +256,26 @@ def catalog_identity(content: dict, *, omit_file_signatures: bool = False) -> st
         raise ValueError("catalog content requires string field names")
     encoder = json.JSONEncoder(ensure_ascii=False, sort_keys=True,
                                separators=(",", ":"), allow_nan=False)
+    eligible_keys = set()
+    releases = content.get("releases")
+    reference_count = 0
+    if type(releases) in (list, tuple) and len(releases) > 1:
+        for release in releases:
+            references = release.get("required_file_keys") if type(release) is dict else None
+            if type(references) in (list, tuple):
+                reference_count += len(references)
+    collections = (content.get("files"), content.get("missing_objects"))
+    objects = sum(len(rows) for rows in collections if type(rows) in (list, tuple))
+    if (reference_count >= _CATALOG_REUSE_MIN_REFERENCES
+            and reference_count >= 2 * objects):
+        for collection in collections:
+            if type(collection) not in (list, tuple):
+                continue
+            for row in collection:
+                if (type(row) is dict and type(row.get("relative")) is str
+                        and type(row.get("sha256")) is str):
+                    eligible_keys.add(row["relative"] + "@" + row["sha256"])
+    encoded_keys = {}
     digest = hashlib.sha256(b"{")
     for index, key in enumerate(sorted(content)):
         if index:
@@ -83,7 +290,10 @@ def catalog_identity(content: dict, *, omit_file_signatures: bool = False) -> st
                     digest.update(b",")
                 if omit_file_signatures and key == "files":
                     member = {k: v for k, v in member.items() if k != "signature"}
-                digest.update(encoder.encode(member).encode("utf-8"))
+                if key == "releases" and eligible_keys:
+                    digest.update(_catalog_release_bytes(encoder, member, eligible_keys, encoded_keys))
+                else:
+                    digest.update(encoder.encode(member).encode("utf-8"))
             digest.update(b"]")
         else:
             digest.update(encoder.encode(value).encode("utf-8"))
@@ -151,7 +361,7 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
     workers = _catalog_metadata_workers(cold) if metadata_workers is None else metadata_workers
     if type(workers) is not int or not 1 <= workers <= 4:
         raise SnapshotError("catalog metadata workers must be between one and four")
-    with PinnedObjectSignatures(cold) as metadata_pins:
+    with PinnedObjectSignatures(cold, parallel_signatures=workers > 1) as metadata_pins:
         result = _capture_catalog(cold, publication_catalog, history_disposition,
             include_unreferenced_objects=include_unreferenced_objects,
             testing_disposition=testing_disposition, metadata_pins=metadata_pins,
@@ -190,19 +400,19 @@ def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition:
     discarded_testing_metadata = {}
     discarded_testing_objects = set()
 
-    def add_metadata(path: Path) -> tuple[bytes, dict]:
+    def add_metadata(path: Path, observed: tuple[bytes, tuple[int, ...]] | None = None) -> tuple[bytes, dict]:
         relative = path.relative_to(cold).as_posix()
-        raw, before = metadata_pins.read_metadata(relative)
+        raw, before = observed if observed is not None else metadata_pins.read_metadata(relative)
         row = {"relative": relative, "sha256": hashlib.sha256(raw).hexdigest(),
                "bytes": len(raw), "signature": list(before), "role": "cold_metadata"}
         rows[relative] = row
         return raw, row
 
-    def observe_manifest(path: Path) -> bool:
+    def observe_manifest(path: Path, observed: tuple[bytes, tuple[int, ...]] | None = None) -> bool:
         if path.parent.parent != cold / "manifests":
             raise SnapshotError("head references a non-manifest path")
         relative = path.relative_to(cold).as_posix()
-        raw, row = add_metadata(path)
+        raw, row = add_metadata(path, observed)
         manifest = json.loads(raw)
         _validate_manifest(manifest, object_validation_cache=object_validation_cache)
         if manifest["dataset"] != path.parent.name or manifest["snapshot_id"] != path.stem:
@@ -224,27 +434,47 @@ def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition:
 
     if private_backup_policy is not None:
         add_metadata(cold / 'private-history.json')
-    for path in sorted((cold / "manifests").glob("*/*.json")):
-        relative = path.relative_to(cold).as_posix()
+    def prefetch_manifest(path: Path):
         if path.parent.name in excluded:
-            excluded_manifests.append(relative)
-            if include_unreferenced_objects:
-                try:
-                    manifest = json.loads(_regular(path).read_bytes())
-                    _validate_manifest(manifest)
-                    all_referenced_objects.update(r["relpath"] for r in [
-                        manifest["archive"]["inventory"], *manifest["archive"]["objects"]])
-                    retained_referenced_objects.update(r["relpath"] for r in [
-                        manifest["archive"]["inventory"], *manifest["archive"]["objects"]])
-                except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
-                    orphan_scan_blocked = True
-                    errors.append({"relative": relative, "reason": type(error).__name__})
-            continue
+            return None, None
         try:
-            observe_manifest(path)
+            return metadata_pins.read_metadata(path.relative_to(cold).as_posix()), None
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
-            rows.pop(relative, None)
-            errors.append({"relative": relative, "reason": type(error).__name__})
+            return None, error
+
+    # Each leaf is independently opened without following links and its parent
+    # FD remains pinned through the final name check. Only byte transport is
+    # parallel: validation, error ordering, reductions and publication stay on
+    # this thread. Limit read-ahead to the worker count, not the catalog size.
+    manifest_pool = (ThreadPoolExecutor(max_workers=metadata_workers)
+                     if metadata_workers > 1 else nullcontext(None))
+    with manifest_pool as pool:
+        paths = iter(sorted((cold / "manifests").glob("*/*.json")))
+        while batch := list(itertools.islice(paths, metadata_workers)):
+            fetched = pool.map(prefetch_manifest, batch) if pool is not None else map(prefetch_manifest, batch)
+            for path, (observed, read_error) in zip(batch, fetched, strict=True):
+                relative = path.relative_to(cold).as_posix()
+                if path.parent.name in excluded:
+                    excluded_manifests.append(relative)
+                    if include_unreferenced_objects:
+                        try:
+                            manifest = json.loads(_regular(path).read_bytes())
+                            _validate_manifest(manifest)
+                            all_referenced_objects.update(r["relpath"] for r in [
+                                manifest["archive"]["inventory"], *manifest["archive"]["objects"]])
+                            retained_referenced_objects.update(r["relpath"] for r in [
+                                manifest["archive"]["inventory"], *manifest["archive"]["objects"]])
+                        except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
+                            orphan_scan_blocked = True
+                            errors.append({"relative": relative, "reason": type(error).__name__})
+                    continue
+                try:
+                    if read_error is not None:
+                        raise read_error
+                    observe_manifest(path, observed)
+                except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
+                    rows.pop(relative, None)
+                    errors.append({"relative": relative, "reason": type(error).__name__})
     for path in sorted((cold / "heads").glob("*/*.json")):
         if path.parent.name in excluded:
             continue
@@ -476,6 +706,19 @@ def reported_baseline(delivery: Path, report_path: Path, repository_id: str) -> 
         "original_remote_receipts_received": False, "machine_acknowledged": False}
 
 
+def _release_file_covered(release: dict, accepted: set[str]) -> bool:
+    if release["missing_objects"]:
+        return False
+    keys = release["required_file_keys"]
+    # Normal catalog references are plain strings.  Check membership directly
+    # instead of rebuilding an often-repeated set for every historical version.
+    # Fall back to the original conversion for unusual inputs: in particular,
+    # it must still reject an unhashable key even after an earlier missing key.
+    if type(keys) in (list, tuple) and all(type(key) is str for key in keys):
+        return accepted.issuperset(keys)
+    return set(keys) <= accepted
+
+
 def coverage(catalog: dict, ledger: dict) -> dict:
     confirmed = set()
     reported = set()
@@ -493,7 +736,7 @@ def coverage(catalog: dict, ledger: dict) -> dict:
     accepted = confirmed | reported
     available = {file_key(row) for row in catalog["files"]}
     current = [r for r in catalog["releases"] if r["current_head"]]
-    recovered = lambda r: not r["missing_objects"] and set(r["required_file_keys"]) <= accepted
+    recovered = lambda r: _release_file_covered(r, accepted)
     return {"available_file_count": len(available), "available_bytes": sum(r["bytes"] for r in catalog["files"]),
         "machine_acknowledged_files": len(available & confirmed),
         "user_reported_baseline_files": len(available & reported),
@@ -574,6 +817,11 @@ class BackupStream:
         if type(configuration.get('cold_metadata_replication_enabled', False)) is not bool:
             raise SnapshotError('cold metadata replication must be an explicit boolean')
         cache = configuration.get("cold_transport_cache", {})
+        if type(cache.get('allow_scanning_when_fully_converged', False)) is not bool:
+            raise SnapshotError('scanning cache retirement must be an explicit boolean')
+        retirement_turn = cache.get('maximum_retirements_per_cycle')
+        if retirement_turn is not None and (type(retirement_turn) is not int or not 1 <= retirement_turn <= 1024):
+            raise SnapshotError('transport retirement turn must contain 1..1024 complete transactions')
         if cache.get("enabled") is True and configuration.get("automatic_batch_deletion") is not True:
             raise SnapshotError("cold cache retirement must be reported as automatic batch deletion")
         if (configuration.get("schema_version") != 1 or configuration.get("automatic_pruning") is not False
@@ -603,6 +851,23 @@ class BackupStream:
         if "maximum_staging_bytes" in configuration and (type(configuration["maximum_staging_bytes"]) is not int
                                                        or configuration["maximum_staging_bytes"] <= 0):
             raise SnapshotError("staging capacity must be a positive integer")
+        self.private_backup_reserve_bytes = configuration['reserve_bytes']
+        backup_capacity = configuration.get('private_backup_capacity')
+        if backup_capacity is not None:
+            private = configuration.get('private_history_backup', {})
+            if (not isinstance(backup_capacity, dict)
+                    or set(backup_capacity) != {'contract', 'use_backup_reserve', 'minimum_free_bytes', 'user_instruction'}
+                    or backup_capacity.get('contract') != 'private_closed_wave_backup_reserve_v1'
+                    or backup_capacity.get('use_backup_reserve') is not True
+                    or type(backup_capacity.get('minimum_free_bytes')) is not int
+                    or not 32 * 1024**3 <= backup_capacity['minimum_free_bytes'] <= min(configuration['reserve_bytes'], 64 * 1024**3)
+                    or not isinstance(backup_capacity.get('user_instruction'), str)
+                    or not backup_capacity['user_instruction'].strip()
+                    or not isinstance(private, dict) or private.get('enabled') is not True
+                    or private.get('private_backup_authorized') is not True
+                    or private.get('public_publish_allowed') is not False):
+                raise SnapshotError('private backup reserve requires an authorized bounded closed-wave policy')
+            self.private_backup_reserve_bytes = backup_capacity['minimum_free_bytes']
         self.pipeline = configuration.get("pipeline", {})
         if self.pipeline:
             if set(self.pipeline) != {"maximum_waves_per_cycle", "copy_workers", "verify_workers", "retry_delays_seconds"}:
@@ -615,7 +880,13 @@ class BackupStream:
                 raise SnapshotError("source pipeline retry delays must be bounded")
 
     def storage_guard(self) -> None:
+        from stockagent.data_sync.transport_placement import CANONICAL, on_e, check_transport
+        e_transport = self.transport == CANONICAL and on_e()
+        if e_transport:
+            check_transport()
         for mount_name, expected_source in self.config.get("required_mounts", {}).items():
+            if e_transport and Path(mount_name) == CANONICAL:
+                continue  # E uses its pinned VHD/UUID/alias, not a drive-letter source.
             if mounted_volume(Path(mount_name))[2] != expected_source:
                 raise SnapshotError("backup transport has the wrong physical storage volume")
         if self.config.get("require_transport_mount", True):
@@ -711,10 +982,18 @@ class BackupStream:
 
     def _transport_usage_once(self) -> dict:
         return measure_transport_usage(self.transport)
-    def staging_room(self, usage: dict) -> int:
-        return min(self.config.get("maximum_staging_bytes", self.config["maximum_pending_bytes"]) - usage["retained_staging_bytes"],
-                   self.config["maximum_retained_transport_bytes"] - usage["retained_transport_bytes"],
-                   shutil.disk_usage(self.transport).free - self.config["reserve_bytes"])
+    def staging_room(self, usage: dict, *, reserve_bytes: int | None = None) -> int:
+        return min(self.staging_bounds(usage, **({} if reserve_bytes is None else {'reserve_bytes': reserve_bytes})).values())
+
+    def staging_bounds(self, usage: dict, *, reserve_bytes: int | None = None) -> dict:
+        """Independent bounds, measured in the same units; never summed."""
+        if reserve_bytes is not None and reserve_bytes != self.private_backup_reserve_bytes:
+            raise SnapshotError('transport reserve differs from its enrolled private backup policy')
+        return {
+            "staging": self.config.get("maximum_staging_bytes", self.config["maximum_pending_bytes"]) - usage["retained_staging_bytes"],
+            "retained_transport": self.config["maximum_retained_transport_bytes"] - usage["retained_transport_bytes"],
+            "physical": shutil.disk_usage(self.transport).free - (self.config['reserve_bytes'] if reserve_bytes is None else reserve_bytes),
+        }
 
     def ingest(self, ledger: dict) -> list[dict]:
         errors = []
@@ -745,8 +1024,39 @@ class BackupStream:
         atomic_write_bytes(self.state / "status.json", payload, mode=0o600)
         atomic_write_bytes(self.transport / "tools/source-status.json", payload, mode=0o600)
 
+    def _catalog_capacity_wait(self) -> dict | None:
+        """Do not recapture history when no public wave can be allocated.
+
+        ACK ingestion and verified transport retirement run before this check.
+        This is only a conservative no-write decision, never an allocation
+        admission. A resumed wave still takes the complete catalog, transport
+        census and native copy checks. Retained counters keep their own clock.
+        """
+        free = shutil.disk_usage(self.transport).free
+        reserve = self.config['reserve_bytes']
+        if free - reserve > 1024**2:
+            return None
+        path = self.state / 'status.json'
+        previous = read_json(path) if path.exists() else {}
+        checked = datetime.now(timezone.utc).isoformat()
+        return {**previous, 'state': 'backpressure', 'activity_at_utc': checked,
+            'observed_at_utc': previous.get('observed_at_utc'),
+            'all_history_backup_verified': False, 'canonical_reconstruction_verified': False,
+            'source_cleanup_authorized': False, 'unpublished_sources_included': False,
+            'catalog_refresh': {
+                'contract': 'stockagent.backup_catalog_refresh.v1',
+                'state': 'deferred_physical_capacity', 'observed_at_utc': checked,
+                'source_free_bytes': free, 'source_reserve_bytes': reserve,
+                'source_available_bytes': free - reserve,
+                'coverage_recomputed': False,
+                'catalog_identity_sha256': previous.get('catalog_identity_sha256'),
+                'catalog_observed_at_utc': previous.get('catalog_observed_at_utc')}}
+
     def cycle(self, *, publish: bool = True) -> dict:
         self.storage_guard()
+        private_schedule = self.config.get('private_history_schedule', 'inline')
+        if private_schedule not in {'inline', 'independent_timer'}:
+            raise SnapshotError('unknown private backup schedule')
         # A read-only catalog pass yields the publication owner, but must not
         # admit another complete controller/capture in the meantime. This
         # guard never participates in independent closed-wave publication.
@@ -759,13 +1069,23 @@ class BackupStream:
             except BlockingIOError as error:
                 raise SnapshotError("another source stream cycle is active") from error
             private_backup = None
-            if self.config.get('private_history_backup', {}).get('enabled'):
+            if self.config.get('private_history_backup', {}).get('enabled') and private_schedule == 'inline':
                 try:
                     private_backup = self.private_history_cycle(publish=publish)
                 except (OSError, ValueError, RuntimeError) as error:
                     private_backup = {'state': 'private_scope_deferred', 'error_type': type(error).__name__,
                                       'reason': str(error)[:512], 'all_project_sources_NAS_verified': False}
             result = self._cycle(publish=publish)
+            if self.config.get('private_history_backup', {}).get('enabled') and private_schedule == 'independent_timer':
+                status_path = self.state / 'private-status.json'
+                try:
+                    private_backup = json.loads(_regular(status_path).read_bytes())
+                    if not isinstance(private_backup, dict):
+                        raise ValueError('private backup status is not an object')
+                except (OSError, ValueError):
+                    private_backup = {'state': 'private_timer_status_unavailable',
+                                      'all_project_sources_NAS_verified': False}
+                private_backup = {**private_backup, 'schedule': 'independent_timer'}
             if private_backup is not None:
                 result['private_history_backup'] = private_backup
                 self._publish_cycle_status(result)
@@ -796,15 +1116,48 @@ class BackupStream:
                     automatic_recovery = publish_requests(self.config, self.transport, ledger)
                 except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
                     automatic_recovery = {"state": "request_publication_failed", "error_type": type(error).__name__}
-            cache_result = self.retire_transport_cache(ledger) if (
+            cache_result = self.retire_transport_cache(ledger, owner=owner) if (
                 publish and not receipt_errors and self.config.get("cold_transport_cache", {}).get("enabled")) else {
                 "retired_deliveries": 0, "retired_logical_bytes": 0, "errors": [],
                 "deferred": bool(receipt_errors) or not publish}
+            if publish and transport_placement_pending(self.config):
+                self._save_ledger(ledger)
+                path = self.state / 'status.json'
+                previous = read_json(path) if path.exists() else {}
+                checked = datetime.now(timezone.utc).isoformat()
+                result = {**previous, 'state': 'waiting_for_transport_placement',
+                          'observed_at_utc': previous.get('observed_at_utc'),
+                          'activity_at_utc': checked,
+                          'receipt_errors': receipt_errors, 'cold_transport_cache': cache_result,
+                          'automatic_recovery_requests': automatic_recovery,
+                          'catalog_capture_started': False, 'prior_catalog_preserved': True,
+                          'auxiliary_attempts': 0, 'auxiliary_deferred_reason': 'transport_placement',
+                          'all_history_backup_verified': False, 'source_cleanup_authorized': False,
+                          'catalog_refresh': {
+                              'contract': 'stockagent.backup_catalog_refresh.v1',
+                              'state': 'deferred_transport_placement', 'observed_at_utc': checked,
+                              'coverage_recomputed': False,
+                              'catalog_identity_sha256': previous.get('catalog_identity_sha256'),
+                              'catalog_observed_at_utc': previous.get('catalog_observed_at_utc')},
+                          'complete_cycle_seconds': time.perf_counter() - started}
+                self._publish_cycle_status(result)
+                return result
+            capacity_wait = self._catalog_capacity_wait() if publish else None
             auxiliary_error = None
             auxiliary_error_detail = None
-            if self.config.get("auxiliary"):
+            auxiliary_attempts = 0
+            auxiliary_retry_reasons = []
+            if self.config.get("auxiliary") and capacity_wait is None:
                 try:
-                    self.stage_auxiliary(ledger)
+                    for attempt in range(2):
+                        auxiliary_attempts += 1
+                        try:
+                            self.stage_auxiliary(ledger)
+                            break
+                        except SnapshotError as error:
+                            if attempt or str(error) not in _AUXILIARY_TRANSIENT_TREE_RACES:
+                                raise
+                            auxiliary_retry_reasons.append(str(error))
                 except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
                     auxiliary_error = type(error).__name__
                     auxiliary_error_detail = {"error_type": auxiliary_error}
@@ -815,6 +1168,29 @@ class BackupStream:
             # after the full pinned capture, reload the journal under its
             # original owner so concurrent publications/ACKs are never lost.
             self._save_ledger(ledger)
+            if publish and capacity_wait is None:
+                # Auxiliary capture can itself consume space. A second small
+                # observation still avoids an inadmissible full history pass.
+                capacity_wait = self._catalog_capacity_wait()
+            if capacity_wait is not None:
+                # Keep the owner for the small status commit; there is no new
+                # catalog, allocation or notification to wait for. The normal
+                # timer retries against fresh physical capacity next turn.
+                if capacity_wait.get('auxiliary_error') and 'last_auxiliary_failure' not in capacity_wait:
+                    capacity_wait['last_auxiliary_failure'] = {
+                        'error_type': capacity_wait['auxiliary_error'],
+                        'detail': capacity_wait.get('auxiliary_error_detail'),
+                        'observed_at_utc': capacity_wait.get('observed_at_utc')}
+                capacity_wait.update(
+                    receipt_errors=receipt_errors, cold_transport_cache=cache_result,
+                    automatic_recovery_requests=automatic_recovery,
+                    auxiliary_error=auxiliary_error, auxiliary_error_detail=auxiliary_error_detail,
+                    auxiliary_attempts=auxiliary_attempts, auxiliary_retry_reasons=auxiliary_retry_reasons,
+                    auxiliary_deferred_reason='physical_capacity',
+                    auxiliary_pending=bool(ledger.get('auxiliary_pending')),
+                    complete_cycle_seconds=time.perf_counter() - started)
+                self._publish_cycle_status(capacity_wait)
+                return capacity_wait
             fcntl.flock(owner, fcntl.LOCK_UN)
             try:
                 catalog = capture_catalog(self.backup_read_root(), Path(self.config["publication_catalog"]),
@@ -826,7 +1202,7 @@ class BackupStream:
             ledger = self.load_ledger()
             self.recover_publications(ledger)
             receipt_errors.extend(self.ingest(ledger))
-            private_json(self.state / "catalog.json", catalog, compact=True)
+            catalog_storage = save_catalog_snapshot(self.state, catalog)
             covered = coverage(catalog, ledger)
             state = "inspected"
             readiness_error = None
@@ -837,12 +1213,13 @@ class BackupStream:
             # The single controller still owns every ledger mutation.
             with ThreadPoolExecutor(max_workers=1, thread_name_prefix="backup-scan") as scanner:
                 scans = []
-                for _ in range(self.pipeline.get("maximum_waves_per_cycle", 1) if publish else 0):
+                for wave_index in range(self.pipeline.get("maximum_waves_per_cycle", 1) if publish else 0):
                     # NAS ACKs can arrive while the preceding wave is copied.
                     # Reconcile on this controller before applying admission.
                     if published_waves:
                         receipt_errors.extend(self.ingest(ledger))
-                    covered = coverage(catalog, ledger)
+                    if wave_index:
+                        covered = coverage(catalog, ledger)
                     try:
                         ready = read_json(self.receipts / "readiness.json")
                         independent = not self.config.get('publication_requires_receiver_ready', True)
@@ -984,6 +1361,8 @@ class BackupStream:
                 "receipt_errors": receipt_errors, "readiness_error": readiness_error,
                 "auxiliary_error": auxiliary_error,
                 "auxiliary_error_detail": auxiliary_error_detail,
+                "auxiliary_attempts": auxiliary_attempts,
+                "auxiliary_retry_reasons": auxiliary_retry_reasons,
                 "pipeline": {"published_waves": published_waves, "export_errors": export_errors,
                     "scan_errors": scan_errors, "scan_notifications": scan_notifications,
                     "deferred_files": sum(
@@ -1001,6 +1380,7 @@ class BackupStream:
                 "automatic_batch_deletion_scope": self.config.get("cold_transport_cache", {}).get("scope"),
                 "source_cleanup_authorized": False, "complete_cycle_seconds": time.perf_counter() - started,
                 "catalog_observed_at_utc": catalog["observed_at_utc"],
+                "catalog_storage": catalog_storage,
                 "observed_at_utc": datetime.now(timezone.utc).isoformat()}
             from stockagent.data_sync.nas_recovery_acceptance import recovery_status
             if self.config.get('immutable_archive_state_root'):
@@ -1061,13 +1441,45 @@ class BackupStream:
             self._publish_cycle_status(result)
             return result
 
-    def notify_transport(self, *, wait_for_owner: bool = False) -> dict:
+    def notify_transport(self, *, wait_for_owner: bool = False, idle_preflight: bool = False) -> dict:
         """Retry durable notifications without exporting or recapturing cold history."""
+        if type(idle_preflight) is not bool:
+            raise ValueError("notification idle preflight must be explicit")
+        queue_busy = self.config.get("busy_scan_notification_enabled", False)
+        if type(queue_busy) is not bool:
+            raise SnapshotError("busy scan notification setting must be boolean")
         self.storage_guard()
+        if idle_preflight and self.config.get("syncthing_folder_id"):
+            from scripts.configure_artifact_ingress_syncthing import request
+            timeout = self.config.get("scan_timeout_seconds", 30)
+            if type(timeout) not in {int, float} or not 1 <= timeout <= 1800:
+                raise SnapshotError("backup transport scan timeout must be bounded")
+            base, key, folder_id = self.paired_transport()
+            status = request(base, key, "/rest/db/status", {"folder": folder_id}, timeout=min(5, timeout))
+            state = status.get("state") if isinstance(status, dict) else None
+            if ((state == "scanning" and (not queue_busy or self._busy_scan_unconfirmed()))
+                    or not isinstance(state, str) or not state):
+                # A minute retry must not parse/save the large durable ledger
+                # while the original scanner is busy. Unknown pending count is
+                # intentionally null; this is neither scan nor NAS acceptance.
+                notification = {"contract": TRANSPORT_SCAN,
+                    "state": "deferred_existing_folder_scan" if state == "scanning"
+                             else "deferred_invalid_folder_state",
+                    "observed_folder_state": state, "idle_preflight_only": True,
+                    "pending_batch_scans": None, "batch_scan_receipts": [],
+                    "tools_scan_requested": False, "NAS_backup_verified": False,
+                    "observed_at_utc": datetime.now(timezone.utc).isoformat()}
+                private_json(self.state / "transport-scan-status.json", notification)
+                return notification
         lock = self.state / "owner.lock"
         if lock.is_symlink():
             raise SnapshotError("stream owner lock is redirected")
         with lock.open("a") as owner:
+            if wait_for_owner:
+                private_json(self.state / "transport-scan-status.json", {
+                    "contract": TRANSPORT_SCAN, "state": "waiting_source_publication_owner",
+                    "pending_batch_scans": None, "batch_scan_receipts": [], "tools_scan_requested": False,
+                    "NAS_backup_verified": False, "observed_at_utc": datetime.now(timezone.utc).isoformat()})
             fcntl.flock(owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
             self.storage_guard()
             ledger = self.load_ledger()
@@ -1075,7 +1487,8 @@ class BackupStream:
             self._save_ledger(ledger)
             fcntl.flock(owner, fcntl.LOCK_UN)
             try:
-                notification = self.scan_transport(ledger)
+                notification = (self.scan_transport(ledger, queue_busy_scanner=True) if queue_busy
+                                else self.scan_transport(ledger))
             finally:
                 fcntl.flock(owner, fcntl.LOCK_EX)
                 self.storage_guard()
@@ -1122,54 +1535,159 @@ class BackupStream:
                     "automatic_recovery": queue_status(self.config, self.transport, self.receipts)}
 
 
-    def retire_transport_cache(self, ledger: dict) -> dict:
-        from stockagent.data_sync.backup_transport_cache import retire
+    def retire_transport_cache(self, ledger: dict, *, owner=None) -> dict:
+        from stockagent.data_sync.backup_transport_cache import retire, retirement_failure_reason
         candidates = [(key, d) for key, d in ledger["deliveries"].items()
                       if d.get("acceptance") and d["dispatch"]["delivery_kind"] in (
                           "incremental_cold_objects", 'private_immutable_cold_backup')
                       and d.get("cache_retirement", {}).get("state") != "retired"]
         result = {"retired_deliveries": 0, "retired_logical_bytes": 0, "errors": [], "deferred": False}
-        unscanned = [d for d in ledger["deliveries"].values()
+        def report(state='running', reason=None):
+            if not candidates:
+                return
+            done = {key for key, _ in candidates
+                    if ledger['deliveries'].get(key, {}).get('cache_retirement', {}).get('state') == 'retired'}
+            finished = len(done) == len(candidates) and not result['errors']
+            observation = {
+                'contract': 'stockagent.transport_cache_retirement_progress.v1',
+                'scope': 'fixed_accepted_transport_candidates',
+                'generation_sha256': identity_sha256(sorted(key for key, _ in candidates)),
+                'state': 'completed' if finished else state,
+                'reason_code': None if finished else reason or (
+                    result['errors'][0].get('reason_code') if result['errors'] else None),
+                'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+                'completed_items': len(done), 'total_items': len(candidates),
+                'completed_bytes': sum(d['dispatch']['complete_bytes'] for key, d in candidates if key in done),
+                'total_bytes': sum(d['dispatch']['complete_bytes'] for _, d in candidates),
+                'all_candidate_retirements_verified': finished,
+                'source_objects_deleted': 0, 'NAS_snapshots_deleted': 0,
+                'logical_transport_bytes_not_allocated_WSL_reclamation': True,
+                'blocked_items': len(result['errors']),
+            }
+            try:
+                # Tiny derived observation; journal/ACK proofs stay authoritative.
+                private_json(self.state / 'transport-cache-progress.json', observation, compact=True)
+            except (OSError, ValueError, TypeError) as error:
+                result['progress_observation_error'] = type(error).__name__
+        unscanned = [(key, d) for key, d in ledger["deliveries"].items()
                      if d.get("cache_retirement", {}).get("state") == "retired"
                      and not d["cache_retirement"].get("deletion_scan_requested")]
         if not candidates and not unscanned:
             return result
+        report()
         from scripts.configure_artifact_ingress_syncthing import request
         base, key, folder = self.paired_transport()
-        status = request(base, key, "/rest/db/status", {"folder": folder})
-        peer = request(base, key, "/rest/db/completion", {"folder": folder, "device": self.config["receiver_device_id"]})
-        if (status["state"] != "idle" or any(status.get(k, 0) for k in (
+        def synchronized():
+            status = request(base, key, "/rest/db/status", {"folder": folder})
+            peer = request(base, key, "/rest/db/completion", {"folder": folder, "device": self.config["receiver_device_id"]})
+            states = {'idle'}
+            if self.config.get('cold_transport_cache', {}).get('allow_scanning_when_fully_converged') is True:
+                # A scanner traversing other immutable names does not invalidate
+                # this batch's paired full-restore ACK. All convergence/error
+                # checks and exact source/member/FD proofs still apply in retire.
+                states.add('scanning')
+            return not (status["state"] not in states or any(status.get(k, 0) for k in (
                 "errors", "pullErrors", "needBytes", "needTotalItems", "needDeletes"))
                 or status.get("watchError") or status.get("error")
                 or peer["completion"] != 100 or peer["remoteState"] != "valid"
-                or any(peer.get(k, 0) for k in ("needBytes", "needItems", "needDeletes"))):
+                or any(peer.get(k, 0) for k in ("needBytes", "needItems", "needDeletes")))
+        if not synchronized():
             result["deferred"] = True
+            report('waiting', 'transport_not_converged')
             return result
-        for envelope, delivery in candidates:
+        turn_limit = self.config.get('cold_transport_cache', {}).get('maximum_retirements_per_cycle')
+        for envelope, _ in candidates:
+            delivery = ledger["deliveries"].get(envelope)
+            if (delivery is None or not delivery.get("acceptance")
+                    or delivery["dispatch"]["delivery_kind"] not in (
+                        "incremental_cold_objects", "private_immutable_cold_backup")
+                    or delivery.get("cache_retirement", {}).get("state") == "retired"):
+                continue
+            retirement_committed = False
             try:
                 plan = retire(self, ledger, envelope)
+                retirement_committed = True
                 result["retired_deliveries"] += 1
                 result["retired_logical_bytes"] += plan["complete_bytes"]
             except (OSError, ValueError, KeyError, TypeError, RuntimeError) as error:
-                result["errors"].append({"envelope": envelope, "reason": type(error).__name__})
-        unscanned = [d for d in ledger["deliveries"].values()
+                result["errors"].append({"envelope": envelope, "reason": type(error).__name__,
+                    'reason_code': retirement_failure_reason(error), 'detail': str(error)[:512]})
+            report()
+            # Each retirement is an independently journalled transaction.
+            # Let a kernel-queued publisher run between transactions; then
+            # reload the owner ledger so neither side can overwrite new work.
+            if retirement_committed and owner is not None and _owner_has_waiters(owner):
+                self._save_ledger(ledger)
+                fcntl.flock(owner, fcntl.LOCK_UN)
+                try:
+                    time.sleep(0.01)
+                finally:
+                    fcntl.flock(owner, fcntl.LOCK_EX)
+                    self.storage_guard()
+                    fresh = self.load_ledger()
+                    self.recover_publications(fresh)
+                    ledger.clear()
+                    ledger.update(fresh)
+                    self._save_ledger(ledger)
+                # A concurrent publisher may have changed the transport.
+                base, key, folder = self.paired_transport()
+                if not synchronized():
+                    result["deferred"] = True
+                    report('waiting', 'transport_not_converged')
+                    return result
+            if turn_limit is not None and result['retired_deliveries'] >= turn_limit:
+                # Finish each exact transaction, then let this same owner copy
+                # the next wave. A large accepted backlog must not postpone
+                # publication until every historical cache copy is retired.
+                result['yielded_to_publication_turn'] = True
+                break
+        unscanned = [(key, d) for key, d in ledger["deliveries"].items()
                      if d.get("cache_retirement", {}).get("state") == "retired"
                      and not d["cache_retirement"].get("deletion_scan_requested")]
         if unscanned:
-            # DrvFs does not supply reliable watcher events. Explicitly index
-            # source-owned deletions before creating another large batch.
-            try:
-                request(base, key, "/rest/db/scan", {"folder": folder}, method="POST",
-                        timeout=self.config.get("scan_timeout_seconds", 30))
-            except OSError as error:
-                # Retirement was already committed. Its existing false scan
-                # flag remains the durable retry; never repeat the unlink.
-                result["deferred"] = True
-                result["scan_notification"] = _scan_error_details(error)
+            # Never queue another scan behind a busy scanner while holding the
+            # publication owner. Deleted-name intents remain in the journal;
+            # an idle turn issues their existing exact-subpath notification.
+            if request(base, key, '/rest/db/status', {'folder': folder})['state'] != 'idle':
+                result.update(deferred=True, deletion_scan_deferred=True)
+                report('waiting', 'deletion_scan_pending')
                 return result
-            for delivery in unscanned:
-                delivery["cache_retirement"]["deletion_scan_requested"] = True
-            self._save_ledger(ledger)
+            # Syncthing supports scanning deleted paths. A full folder scan
+            # needlessly walks every unrelated in-flight backup while holding
+            # the publication owner. Validate each immutable identity first;
+            # the API accepts repeated sub parameters in a single request.
+            for envelope, delivery in unscanned:
+                if (not HASH.fullmatch(envelope)
+                        or delivery["dispatch"]["batch_relative"] != "batch-" + envelope):
+                    raise SnapshotError("invalid retired backup batch scan path")
+            timeout = self.config.get("scan_timeout_seconds", 30)
+            if type(timeout) not in {int, float} or not 1 <= timeout <= 1800:
+                raise SnapshotError("backup transport scan timeout must be bounded")
+            deadline = time.monotonic() + timeout
+            result["deletion_scan_batches_acknowledged"] = 0
+            for offset in range(0, len(unscanned), 64):
+                group = unscanned[offset:offset + 64]
+                remaining = deadline - time.monotonic()
+                try:
+                    if remaining < 1:
+                        raise TimeoutError("retired batch scan budget exhausted")
+                    query = [("folder", folder)] + [
+                        ("sub", delivery["dispatch"]["batch_relative"])
+                        for _, delivery in group
+                    ]
+                    request(base, key, "/rest/db/scan", query, method="POST", timeout=remaining)
+                except OSError as error:
+                    # Previously acknowledged groups remain journalled; this
+                    # group and later paths remain pending without re-unlink.
+                    result["deferred"] = True
+                    result["scan_notification"] = _scan_error_details(error)
+                    report('waiting', 'deletion_scan_pending')
+                    return result
+                for _, delivery in group:
+                    delivery["cache_retirement"]["deletion_scan_requested"] = True
+                self._save_ledger(ledger)
+                result["deletion_scan_batches_acknowledged"] += len(group)
+        report('blocked' if result['errors'] else 'waiting')
         return result
 
     def paired_transport(self) -> tuple[str, str, str]:
@@ -1197,7 +1715,79 @@ class BackupStream:
                     and delivery["dispatch"]["batch_relative"] == proof["batch_relative"]):
                 delivery["transport_scan_notification"] = proof
 
-    def scan_transport(self, ledger: dict) -> dict | None:
+    def _busy_scan_unconfirmed(self) -> bool:
+        path = self.state / "transport-busy-scan-intent.json"
+        if path.is_symlink():
+            raise SnapshotError("busy scan intent is redirected")
+        if not path.exists():
+            return False
+        intent = read_json(path)
+        if (intent.get("contract") != "backup_busy_scan_intent_v1"
+                or intent.get("state") not in {"requesting", "waiting_idle", "acknowledged", "idle_observed"}):
+            raise SnapshotError("invalid busy scan intent")
+        return intent["state"] in {"requesting", "waiting_idle"}
+
+    def _busy_transport_scan(self, pending, result, base, key, folder_id, deadline):
+        """Queue one closed batch behind the existing scanner, never interrupt it.
+
+        Syncthing keeps a queued scan even if its HTTP client times out. Persist
+        that uncertainty before POST and do not enqueue another until idle is
+        observed. A dedicated notification lock excludes concurrent notifiers;
+        the publication owner is already released throughout the network wait.
+        """
+        from scripts.configure_artifact_ingress_syncthing import request
+        lock = self.state / "transport-busy-scan.lock"
+        if lock.is_symlink():
+            raise SnapshotError("busy scan lock is redirected")
+        result["state"] = "deferred_existing_folder_scan"
+        with lock.open("a") as owner:
+            try:
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return result
+            path = self.state / "transport-busy-scan-intent.json"
+            unconfirmed = self._busy_scan_unconfirmed()
+            if result["observed_folder_state"] != "scanning":
+                if unconfirmed:
+                    if result["observed_folder_state"] != "idle":
+                        result["state"] = "deferred_unconfirmed_scan_waiting_idle"
+                        return result
+                    private_json(path, {"contract": "backup_busy_scan_intent_v1", "state": "idle_observed",
+                                       "observed_at_utc": datetime.now(timezone.utc).isoformat()})
+                return None
+            if unconfirmed or not pending:
+                return result
+            remaining = deadline - time.monotonic()
+            if remaining < 1:
+                result["state"] = "deferred_scan_budget"
+                return result
+            envelope, dispatch = pending[0]
+            intent = {"contract": "backup_busy_scan_intent_v1", "state": "requesting",
+                      "envelope": envelope, "dispatch_identity_sha256": dispatch["identity_sha256"],
+                      "batch_relative": dispatch["batch_relative"], "NAS_backup_verified": False,
+                      "observed_at_utc": datetime.now(timezone.utc).isoformat()}
+            private_json(path, intent)
+            private_json(self.state / "transport-scan-status.json", {
+                **result, "state": "waiting_existing_scanner_queued_scan", "envelope": envelope,
+                "observed_at_utc": datetime.now(timezone.utc).isoformat()})
+            query = [("folder", folder_id), ("sub", "tools"), ("sub", dispatch["batch_relative"])]
+            try:
+                request(base, key, "/rest/db/scan", query, method="POST", timeout=remaining)
+            except OSError:
+                private_json(path, {**intent, "state": "waiting_idle"})
+                raise
+            private_json(path, {**intent, "state": "acknowledged"})
+            result["tools_scan_requested"] = True
+            result["batch_scan_receipts"] = [{"state": "scan_request_acknowledged", "envelope": envelope,
+                "batch_relative": dispatch["batch_relative"], "dispatch_identity_sha256": dispatch["identity_sha256"],
+                "observed_at_utc": datetime.now(timezone.utc).isoformat()}]
+            result["pending_batch_scans"] -= 1
+            result["state"] = "deferred_scan_budget" if result["pending_batch_scans"] else "scan_request_acknowledged"
+            return result
+
+    def scan_transport(self, ledger: dict, *, queue_busy_scanner: bool = False) -> dict | None:
+        if type(queue_busy_scanner) is not bool:
+            raise SnapshotError("busy scanner scheduling must be explicit")
         if not self.config.get("syncthing_folder_id"):
             return
         from scripts.configure_artifact_ingress_syncthing import request
@@ -1231,6 +1821,11 @@ class BackupStream:
             status = request(base, key, "/rest/db/status", {"folder": folder_id}, timeout=remaining)
             folder_state = status.get("state") if isinstance(status, dict) else None
             result["observed_folder_state"] = folder_state
+            if queue_busy_scanner and isinstance(folder_state, str) and folder_state:
+                queued = self._busy_transport_scan(pending, result, base, key, folder_id, deadline)
+                if queued is not None:
+                    return queued
+                result["state"] = "scan_request_acknowledged"
             if folder_state == "scanning":
                 result["state"] = "deferred_existing_folder_scan"
                 return result
@@ -1317,7 +1912,7 @@ class BackupStream:
         content_identity = identity_sha256({"code": tree["identity_sha256"], "control": control})
         if content_identity == ledger.get("last_auxiliary_content_identity"):
             ledger["auxiliary_last_capture_epoch"] = time.time()
-            ledger["auxiliary_source_control_receipt_sha256"] = receipt_sha
+            ledger["auxiliary_source_control_receipt_sha256"] = control["source_receipt_sha256"]
             return
         # An unchanged logical snapshot creates no payload. Do not traverse all
         # retained transport files, or reject it for capacity needed only by an
@@ -1335,7 +1930,9 @@ class BackupStream:
             "files": [{**r, "relative": "auxiliary/" + result["content_identity_sha256"] + "/" + r["relative"],
                        "role": "auxiliary"} for r in envelope["files"]]}
         ledger["auxiliary_last_capture_epoch"] = time.time()
-        ledger["auxiliary_source_control_receipt_sha256"] = receipt_sha
+        # The control receipt can change between preflight and export. Record
+        # the exact bytes parsed into the closed delivery, not the old probe.
+        ledger["auxiliary_source_control_receipt_sha256"] = result["control_source_receipt_sha256"]
         ledger["last_auxiliary_content_identity"] = result["content_identity_sha256"]
         self._save_ledger(ledger)
 

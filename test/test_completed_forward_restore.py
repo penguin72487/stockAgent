@@ -302,3 +302,82 @@ def test_production_binding_uses_existing_catalog_and_retention_and_fences_chang
     path.write_bytes(path.read_bytes() + b" ")
     with pytest.raises(SnapshotError, match="configuration changed"):
         binding.guard()
+
+
+def test_registered_service_alias_keeps_production_admission_and_one_cache_owner(tmp_path, monkeypatch):
+    from stockagent import service_layout
+
+    source, _, _, catalog, _, _, retention = _fixture(tmp_path, monkeypatch)
+    config_dir = tmp_path / "configs/data_sync"
+    config_dir.mkdir(parents=True)
+    catalog.rename(config_dir / "packed_datasets.json")
+    retention.rename(config_dir / "packed_retention.json")
+    destination = tmp_path / "service_data/cache"
+    destination.parent.mkdir()
+    source.rename(destination)
+    source.symlink_to(destination, target_is_directory=True)
+    monkeypatch.setattr(service_layout, "service_moves", lambda _root: {source: destination})
+    monkeypatch.setattr(restore, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(restore, "CANONICAL_CACHE", Path("cache"))
+    for path in (source, destination):
+        assert restore.production_binding(path) is not None
+
+    admissions = []
+
+    @contextmanager
+    def admit(root, key, maximum):
+        admissions.append(root)
+        with reserve_capacity(root, key=key, maximum_growth_bytes=maximum * 2,
+                              capacity_bytes=2**63 - 1):
+            yield {"test": "real namespace lease"}
+
+    monkeypatch.setattr(restore, "forward_miss_admission", admit)
+    monkeypatch.setattr(restore, "restore_completed_forward", lambda *_a, **_k: None)
+    identity = {"service_alias_regression": 1}
+    value, receipt = cache.cached_forward(source, identity, lambda: {"scores": torch.tensor([3.0])})
+    assert value["scores"].item() == 3.0
+    assert admissions == [destination]
+    value, receipt = cache.cached_forward(destination, identity, lambda: pytest.fail("same physical cache"))
+    assert receipt["state"] == "disk_hit" and value["scores"].item() == 3.0
+    assert admissions == [destination]
+
+
+def test_registered_service_alias_must_not_redirect_to_an_unregistered_owner(tmp_path, monkeypatch):
+    from stockagent import service_layout
+
+    source = tmp_path / "cache"
+    destination = tmp_path / "service_data/cache"
+    destination.mkdir(parents=True)
+    other = tmp_path / "other"
+    other.mkdir()
+    source.symlink_to(other, target_is_directory=True)
+    monkeypatch.setattr(service_layout, "service_moves", lambda _root: {source: destination})
+    monkeypatch.setattr(restore, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(restore, "CANONICAL_CACHE", Path("cache"))
+    with pytest.raises(ValueError, match="unregistered"):
+        restore.production_binding(destination)
+    with pytest.raises(ValueError, match="unregistered"):
+        cache.cached_forward(source, {"test": 1}, lambda: pytest.fail("must not compute"))
+
+
+def test_registered_service_alias_cold_restore_preserves_original_payload(tmp_path, monkeypatch, capsys):
+    from stockagent import service_layout
+
+    fixture, binding, _, preserved = _published(tmp_path, monkeypatch, capsys)
+    source, identity, key, *_ = fixture
+    destination = tmp_path / "service_data/cache"
+    destination.parent.mkdir()
+    source.rename(destination)
+    source.symlink_to(destination, target_is_directory=True)
+    monkeypatch.setattr(service_layout, "service_moves", lambda _root: {source: destination})
+    with _owner(source, key) as descriptor, reserve_capacity(
+            destination, key=key, maximum_growth_bytes=2 * 1024**2, capacity_bytes=128 * 1024**2):
+        result = restore.restore_completed_forward(
+            source, key, identity, binding=binding, key_descriptor=descriptor,
+            read=cache._read, validate_before_commit=None,
+            maximum_payload_bytes=cache.MAX_PAYLOAD_BYTES)
+    assert result is not None and result[1]["gpu_forward_calls"] == 0
+    assert result[1]["consumer_commit"] is True
+    for suffix, content in preserved.items():
+        assert (destination / f"{key}.{suffix}").read_bytes() == content
+        assert os.path.samefile(destination / f"{key}.{suffix}", source / f"{key}.{suffix}")

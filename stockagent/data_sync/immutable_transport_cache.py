@@ -13,6 +13,8 @@ import resource
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import nullcontext
 from itertools import islice
+from collections import OrderedDict
+import threading
 
 from downloader.artifact_io import atomic_write_json
 from stockagent.data_sync.backup_transport_cache import process_roots, same_ntfs_signature
@@ -22,8 +24,65 @@ from stockagent.data_sync.immutable_replication import (
 from stockagent.data_sync.materialized_cache import process_references_many
 from stockagent.data_sync.packed_backup import signature
 from stockagent.runtime_identity import identity_sha256
+from stockagent.data_sync.work_progress import report_work
 
 PHYSICAL_TRANSPORT_ROOT = Path('/srv/stockagent-d-volume/stockagent-backup-ingress-lab203')
+VALIDATION_CONTRACT = 'immutable_transport_full_sha_read_generation_v2'
+_RETIREMENT_SUMMARIES = OrderedDict()
+_RETIREMENT_SUMMARIES_LOCK = threading.Lock()
+_RETIREMENT_SUMMARIES_LIMIT = 4096
+
+
+def retirement_summary(path: Path) -> dict | None:
+    """Small scheduling projection of an unchanged, completed local audit.
+
+    The canonical replication owner calls this under its existing owner lock.
+    Every use checks the receipt's inode/type/size/mtime/ctime/link generation;
+    replacements, missing files and in-place changes invalidate reuse. Retain
+    only four result fields, never the large plan or a renewed progress clock.
+    This is not recovery evidence or permission for a deletion transaction.
+    """
+    def generation(info):
+        return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_nlink,
+                info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+    path = Path(path)
+    key = str(path.absolute())
+    try:
+        before = path.lstat()
+    except FileNotFoundError:
+        with _RETIREMENT_SUMMARIES_LOCK:
+            _RETIREMENT_SUMMARIES.pop(key, None)
+        return None
+    if not stat.S_ISREG(before.st_mode):
+        raise ValueError('transport retirement audit is not a regular file')
+    stamp = generation(before)
+    with _RETIREMENT_SUMMARIES_LOCK:
+        cached = _RETIREMENT_SUMMARIES.get(key)
+        if cached is not None and cached[0] == stamp:
+            _RETIREMENT_SUMMARIES.move_to_end(key)
+            return dict(cached[1])
+        _RETIREMENT_SUMMARIES.pop(key, None)
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, 'rb') as stream:
+        if generation(os.fstat(stream.fileno())) != stamp:
+            raise ValueError('transport retirement audit changed before read')
+        value = json.loads(stream.read())
+        if (generation(os.fstat(stream.fileno())) != stamp
+                or generation(path.lstat()) != stamp):
+            raise ValueError('transport retirement audit changed during read')
+    summary = {k: value[k] for k in (
+        'state', 'reclaimed_bytes', 'primary_source_files_deleted', 'nas_archive_files_deleted')}
+    if (summary['state'] == 'retired' and type(summary['reclaimed_bytes']) is int
+            and summary['reclaimed_bytes'] >= 0
+            and summary['primary_source_files_deleted'] == 0
+            and summary['nas_archive_files_deleted'] == 0):
+        with _RETIREMENT_SUMMARIES_LOCK:
+            _RETIREMENT_SUMMARIES[key] = stamp, summary
+            _RETIREMENT_SUMMARIES.move_to_end(key)
+            while len(_RETIREMENT_SUMMARIES) > _RETIREMENT_SUMMARIES_LIMIT:
+                _RETIREMENT_SUMMARIES.popitem(last=False)
+    return dict(summary)
 
 
 def validate_archive_receipt(c, identity, manifest, manifest_bytes):
@@ -84,6 +143,13 @@ def _bounded_source_map(function, values, executor):
 
 
 def validate_sources(c, identity, manifest, recorded=None, *, file_workers=None):
+    """Reconstruct exact source bytes, rehashing metadata-only ctime drift.
+
+    Original receipts stay unchanged. A changed inode, size or mtime still
+    rejects the recorded generation. Only ctime/device drift may replace the
+    metadata fast path with a fresh complete SHA and before/after generation
+    check; subsequent checks use the exact signature returned by this pass.
+    """
     from stockagent.data_sync.windows_cold_io import hash_many, windows_path
     root = primary_root(c, identity, manifest)
     proofs = {}
@@ -101,24 +167,54 @@ def validate_sources(c, identity, manifest, recorded=None, *, file_workers=None)
         path = safe(root, original)
         before = signature(path)
         return relative, row, path, before
+    entries = []
+    report_work('observe_primary_sources', total=len(manifest['files']))
     with (ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else nullcontext(None)) as executor:
-        entries = list(_bounded_source_map(observe, manifest['files'].items(), executor))
+        for entry in _bounded_source_map(observe, manifest['files'].items(), executor):
+            entries.append(entry)
+            report_work('observe_primary_sources', done=len(entries), total=len(manifest['files']))
+    full_reads = set()
+    for relative, row, path, before in entries:
+        if recorded and relative in recorded:
+            old = recorded[relative]
+            if same_ntfs_signature(before, old):
+                continue
+            if len(old) != 5 or tuple(before)[1:4] != tuple(old)[1:4]:
+                raise ValueError('primary source changed since the full SHA recovery gate')
+        full_reads.add(relative)
     native = list(dict.fromkeys(path for relative, row, path, before in entries
-        if not (recorded and relative in recorded)
+        if relative in full_reads
         and NATIVE_HASH_MIN_BYTES <= row['bytes'] <= 8*1024**3 and windows_path(path) is not None))
-    hashes = {}
+    listed = {path: before for relative, row, path, before in entries}
+    def before_read(path):
+        current = signature(path)
+        if tuple(current)[1:4] != tuple(listed[path])[1:4]:
+            raise ValueError('primary source changed before its fresh full SHA recovery read')
+        return current
+    hashes, native_generations = {}, {}
+    report_work('hash_primary_sources', total=len(native))
     for offset in range(0, len(native), 16):
-        hashes.update(hash_many(native[offset:offset+16]))
+        batch = native[offset:offset+16]
+        native_generations.update({path: before_read(path) for path in batch})
+        hashes.update(hash_many(batch))
+        report_work('hash_primary_sources', done=len(hashes), total=len(full_reads))
     def verify_entry(entry):
         relative, row, path, before = entry
-        if recorded and relative in recorded:
-            if not same_ntfs_signature(before, recorded[relative]):
-                raise ValueError('primary source changed since the full SHA recovery gate')
-        elif path.stat().st_size != row['bytes'] or (hashes[path] if path in hashes else digest(path)) != row['sha256'] or signature(path) != before:
-            raise ValueError('primary source cannot reconstruct its immutable transport bytes')
+        if relative in full_reads:
+            # Listing thousands of members can precede this exact read by
+            # seconds. Rebase only metadata-only drift *before* the full SHA;
+            # any generation change during that read still rejects it.
+            before = native_generations[path] if path in hashes else before_read(path)
+            if (path.stat().st_size != row['bytes']
+                    or (hashes[path] if path in hashes else digest(path)) != row['sha256']
+                    or signature(path) != before):
+                raise ValueError('primary source cannot reconstruct its immutable transport bytes')
         return relative, list(before)
+    report_work('verify_primary_sources', total=len(entries))
     with (ThreadPoolExecutor(max_workers=file_workers) if file_workers > 1 else nullcontext(None)) as executor:
-        proofs.update(_bounded_source_map(verify_entry, entries, executor))
+        for relative, proof in _bounded_source_map(verify_entry, entries, executor):
+            proofs[relative] = proof
+            report_work('verify_primary_sources', done=len(proofs), total=len(entries))
     return proofs
 
 
@@ -135,7 +231,13 @@ def _retire(c: dict, identity: str, proof: dict, *, apply=False) -> dict:
         raise ValueError('transport retirement requires an exact paired NAS recovery proof')
     if c.get('transport_cache_retirement') is not True:
         return {'state': 'disabled'}
+    from stockagent.data_sync.transport_placement import D_BACKING, on_e, backing, check_transport
     physical = PHYSICAL_TRANSPORT_ROOT
+    # Only the enrolled canonical transport follows the D-to-E placement.
+    # Explicit isolated roots must not inherit this machine's live volume.
+    if physical == D_BACKING and on_e():
+        check_transport()
+        physical = backing()
     if not physical.samefile(Path(c['transport_root']).parent):
         raise ValueError('lake transport physical/bind roots differ')
     key = 'lake-' + identity
@@ -181,6 +283,7 @@ def _retire(c: dict, identity: str, proof: dict, *, apply=False) -> dict:
     # An interrupted unlink may leave a subset. Unknown/shared/redirected files
     # are retained; signatures are checked immediately before each unlink.
     seen = set()
+    report_work('inspect_transport_members', total=len(prior['files']))
     for p in root.rglob('*'):
         relative = p.relative_to(root).as_posix()
         safe(root, relative)
@@ -191,12 +294,15 @@ def _retire(c: dict, identity: str, proof: dict, *, apply=False) -> dict:
                 or not same_ntfs_signature(signature(p), prior['transport_signatures'][relative])):
             raise ValueError('transport changed, shared, or has unknown files')
         seen.add(relative)
+        report_work('inspect_transport_members', done=len(seen), total=len(prior['files']))
     if not stage.exists() and seen != set(prior['files']):
         raise ValueError('unretired transport is incomplete')
     public = Path(c['transport_root']) / key
     aliases = (*process_roots(Path(c['transport_root']).parent, public), root)
+    report_work('check_process_references', total=1)
     if process_references_many(aliases):
         raise ValueError('transport has active process references')
+    report_work('check_process_references', done=1, total=1)
     validate_sources(c, identity, manifest, sources)
     if not apply:
         return {**prior, 'apply': False, 'inventory_and_process_gates_verified': True}
@@ -205,13 +311,23 @@ def _retire(c: dict, identity: str, proof: dict, *, apply=False) -> dict:
         root = stage
         prior['state'] = 'renamed'
         atomic_write_json(journal, prior, durable=True)
-    for relative in sorted(seen):
+    total_bytes = sum(prior['files'][relative]['bytes'] for relative in seen)
+    done_bytes = 0
+    report_work('unlink_verified_transport', total=len(seen), done_bytes=0, total_bytes=total_bytes)
+    for index, relative in enumerate(sorted(seen), 1):
         path = safe(root, relative)
         if not same_ntfs_signature(signature(path), prior['transport_signatures'][relative]):
             raise ValueError('transport changed immediately before unlink')
         path.unlink()
-    for parent, _, _ in sorted(os.walk(root), key=lambda row: len(Path(row[0]).parts), reverse=True):
+        done_bytes += prior['files'][relative]['bytes']
+        report_work('unlink_verified_transport', done=index, total=len(seen),
+                    done_bytes=done_bytes, total_bytes=total_bytes)
+    report_work('remove_transport_directories')
+    directories = sorted(os.walk(root), key=lambda row: len(Path(row[0]).parts), reverse=True)
+    report_work('remove_transport_directories', total=len(directories))
+    for index, (parent, _, _) in enumerate(directories, 1):
         Path(parent).rmdir()
+        report_work('remove_transport_directories', done=index, total=len(directories))
     prior['state'] = 'retired'
     atomic_write_json(journal, prior, durable=True)
     return prior

@@ -312,6 +312,18 @@ def _validate_fixed_contract_units(frame: Any) -> None:
     if adjusted.height:
         raise ValueError('fixed-unit futures ABI lacks dated adjusted deliverables: '
                          + ','.join(sorted(adjusted['product'].unique().to_list())))
+    # The legacy v4 master stores the current XIF point value (10 TWD) as a
+    # product-wide constant. TAIFEX changed it from 100 to 10 on 2026-07-06,
+    # converting each outstanding contract to ten. The fixed-unit tape has no
+    # dated terms or carry split, so accepting earlier XIF would silently value
+    # historical fees/exposure with the wrong unit. A dated corporate-margin
+    # release can represent this boundary and is validated on its own path.
+    xif = frame.filter(pl.col('product') == 'XIF')
+    if xif.height:
+        if ('date' not in xif.columns or xif['date'].null_count()
+                or xif.filter(pl.col('date').cast(pl.Date) <= date(2026, 7, 6)).height):
+            raise ValueError('fixed-unit futures ABI lacks dated XIF multiplier and position split; '
+                             'use a dated corporate-margin release')
 
 
 def _require_dependencies() -> None:

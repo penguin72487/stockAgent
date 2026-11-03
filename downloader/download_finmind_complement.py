@@ -46,6 +46,7 @@ from downloader.finmind_parent_recovery import repair_content_addressed_collisio
 from downloader.common import SharedRateLimiter, load_env_file
 from downloader.download_finmind_free import API_URL, TAIPEI, ProviderError, _record_request_start
 from downloader.finmind_account import backfill_budget, pacing_interval, rate_limiter, verified_account, refresh_dispatch_account
+from downloader.finmind_errors import SourceError
 from downloader.finmind_batching import RangeBatch
 from downloader.finmind_scheduling import (
     PRODUCT_HISTORY_STARTS, incremental_reservation, next_release_check, _read_metadata,
@@ -107,13 +108,6 @@ class Task:
     kind: str
     priority: int
     state: str
-
-
-class SourceError(RuntimeError):
-    def __init__(self, code: str, *, retry_after: int = 300) -> None:
-        super().__init__(code)
-        self.code = code
-        self.retry_after = retry_after
 
 
 def _publication_error(exception):
@@ -1306,6 +1300,9 @@ def _sha256(path: Path) -> str:
 def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
            request_metadata: dict[str, Any] | None = None,
            correction: dict[str, Any] | None = None) -> dict[str, Any]:
+    from downloader.finmind_option_stream import StreamedOptionRows
+    if isinstance(rows, StreamedOptionRows):
+        return _store_streamed_option(root, task, rows, now, request_metadata=request_metadata, correction=correction)
     if isinstance(rows, storage_objects.StorageObject):
         return _store_storage_object(root, task, rows, now, request_metadata=request_metadata, correction=correction)
     if isinstance(rows, pa.Table) and (task.kind != 'derived' or task.dataset != 'TaiwanStockTradingDailyReportSecIdAgg'):
@@ -1408,7 +1405,8 @@ def _store(root: Path, task: Task, rows: list[dict[str, Any]], now: datetime, *,
 
 
 def _publish_receipt(root: Path, task: Task, rows, receipt: dict, now: datetime, *,
-                     transport=None, fingerprint=None) -> dict:
+                     transport=None, fingerprint=None,
+                     fingerprint_basis='provider_parquet_bytes_v1_not_semantic_rows') -> dict:
     """One append-only receipt/update publication path for JSON and Parquet."""
     receipt_path = root / "receipts" / task.dataset / (
         hashlib.sha256(task.data_id.encode()).hexdigest()[:12] if task.data_id else "all"
@@ -1427,13 +1425,57 @@ def _publish_receipt(root: Path, task: Task, rows, receipt: dict, now: datetime,
             atomic_write_bytes(archived, previous, durable=True)
     observation = record_success(root, task, rows, receipt, now, transport=transport,
                                  **({'fingerprint': fingerprint,
-                                     'fingerprint_basis': 'provider_parquet_bytes_v1_not_semantic_rows'}
+                                     'fingerprint_basis': fingerprint_basis}
                                     if fingerprint else {}))
     if observation is not None:
         receipt['update_observation'] = observation
     atomic_write_json(receipt_path, receipt)
     receipt["receipt_path"] = str(receipt_path.relative_to(root))
     return receipt
+
+
+def _store_streamed_option(root: Path, task: Task, value, now: datetime, *, request_metadata, correction=None) -> dict:
+    """Install a validated exact-day stream under the normal receipt owner."""
+    if (task.dataset != 'TaiwanOptionTick' or task.kind != 'id_day' or not task.data_id
+            or value.source_date != task.partition or not value.rows):
+        value.path.unlink(missing_ok=True)
+        raise SourceError('option_stream_identity_mismatch')
+    if correction and any(correction.get(key) != getattr(task, key) for key in ('dataset', 'data_id', 'partition')):
+        value.path.unlink(missing_ok=True)
+        raise SourceError('correction_identity_mismatch')
+    identifier = hashlib.sha256(task.data_id.encode()).hexdigest()[:12]
+    folder = root / 'parquet' / task.dataset / identifier / task.partition
+    try:
+        folder.mkdir(parents=True, exist_ok=True)
+        final = folder / f'{value.sha256}.parquet'
+        if final.exists():
+            if _sha256(final) != value.sha256:
+                repair_content_addressed_collision(value.path, final, root)
+            else:
+                value.path.unlink()
+        else:
+            durable_replace(value.path, final)
+        receipt = {
+            'schema_version': 1, 'dataset': task.dataset, 'data_id': task.data_id,
+            'partition': task.partition, 'kind': task.kind, 'status': 'complete', 'rows': value.rows,
+            'source_first_date': task.partition, 'source_last_date': task.partition,
+            'fetched_at_utc': _iso(now), 'historical_point_in_time': False,
+            'coverage_claim': 'observed_response_only_not_provider_completeness',
+            'volume_units': annotate_stock_share_units(task.dataset, [])[1],
+            'request': request_metadata, 'parquet_path': str(final.relative_to(root)),
+            'parquet_size_bytes': final.stat().st_size, 'sha256': value.sha256,
+            'storage_contract_version': 2,
+            'field_non_null_counts': value.field_non_null_counts,
+            'all_null_fields': [key for key, count in value.field_non_null_counts.items() if not count],
+        }
+        if correction:
+            from downloader.finmind_corrections import correction_receipt_metadata
+            receipt.update(correction_receipt_metadata(correction, authoritative_empty=False))
+        return _publish_receipt(root, task, value, receipt, now, transport=value.observation,
+                                fingerprint=value.row_fingerprint,
+                                fingerprint_basis='canonical_row_multiset_v1')
+    finally:
+        value.path.unlink(missing_ok=True)
 
 
 def _store_storage_object(root: Path, task: Task, value: storage_objects.StorageObject,
@@ -1924,6 +1966,34 @@ def _capacity_pause(root: Path, admission: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
+def _finite_status(connection: sqlite3.Connection, root: Path, *, state: str,
+                   active: Task | None = None, last: dict[str, Any] | None = None,
+                   delegated: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """Report exact-key worker activity without relabelling old global counts.
+
+    Global queue aggregates and frontier estimates remain the most recent full
+    snapshot, with their original clock. The exact tasks and their receipts
+    remain authoritative; this heartbeat is not a fresh whole-queue readback.
+    """
+    del connection  # The finite source task is checked by the canonical owner.
+    previous = _read_metadata(root / 'status.json')
+    source_stamp = previous.get('source_status_observed_at_utc', previous.get('observed_at_utc'))
+    if last is None and isinstance(previous.get('last_task'), dict):
+        last = previous['last_task']
+    result = {**previous, 'schema_version': 1, 'state': state, 'observed_at_utc': _iso(_now()),
+              'dispatch_contract_version': DISPATCH_CONTRACT_VERSION,
+              'source_status_observed_at_utc': source_stamp,
+              'status_aggregate_state': 'carried_previous_snapshot' if source_stamp else 'unavailable',
+              'status_scope': 'finite_exact_keys',
+              'current_delegated_to_sponsor': sorted(delegated),
+              'active_task': {'dataset': active.dataset, 'data_id': active.data_id,
+                              'partition': active.partition} if active else None,
+              'next_task': None, 'last_task': last}
+    result.pop('capacity_admission', None)
+    atomic_write_json(root / 'status.json', result)
+    return result
+
+
 def _interrupt_on_sigterm(_signum: int, _frame: Any) -> None:
     """Let owner contexts drain and close their pools during service shutdown."""
     raise KeyboardInterrupt
@@ -1990,6 +2060,7 @@ def run_once(root: Path, *, max_requests: int = 0,
             finite_option_priority or datasets is not None or not required_keys
             or not 0 < max_requests <= len(required_keys)):
         raise ValueError('registered priority requires bounded exact keys and no capacity exception')
+    report_status = _finite_status if required_keys is not None else _status
     root.mkdir(parents=True, exist_ok=True)
     if capacity_sampler is not None and capacity_sampler.root != root.absolute():
         raise ValueError('capacity sampler belongs to a different workspace')
@@ -2042,7 +2113,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                      if finite_option_priority or finite_priority_request_id is not None else capacity.initial_sample())
         if admission.get('state') not in {'admitted', 'not_enrolled'}:
             return _capacity_pause(root, admission)
-        _status(connection, root, state="running", delegated=delegated)
+        report_status(connection, root, state="running", delegated=delegated)
         last_status_at = time.monotonic()
         while not max_requests or completed < max_requests:
             now = _now()
@@ -2061,13 +2132,13 @@ def run_once(root: Path, *, max_requests: int = 0,
             delegated = _sponsor_delegated(root, now) if account["tier"] in {"Sponsor", "SponsorPro"} else frozenset()
             local = now.astimezone(TAIPEI)
             if shutil.disk_usage(root).free < MIN_FREE_BYTES:
-                return _status(connection, root, state="disk_guard", last=last, delegated=delegated)
+                return report_status(connection, root, state="disk_guard", last=last, delegated=delegated)
             admission = capacity.sample()
             if admission.get('state') not in {'admitted', 'not_enrolled'}:
-                _status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
                 return _capacity_pause(root, admission)
             if protected_stock_opening(now):
-                return _status(connection, root, state="protected_opening", last=last, delegated=delegated)
+                return report_status(connection, root, state="protected_opening", last=last, delegated=delegated)
             reservation = incremental_reservation(root.parent, now)
             if required_keys is None and datasets is None:
                 from downloader import finmind_product_query_verification as product_verification
@@ -2086,7 +2157,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 in_flight=0, now=now, prioritize_due=True, reservation_plan=reservation,
             )
             if budget.get('remaining', 1) <= 0:
-                return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
+                return report_status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
             allow_requested = budget['allowed']
             if finite_option_priority and not allow_requested:
                 from downloader.finmind_option_finite_priority import capacity_deferred_priority_allowed
@@ -2112,7 +2183,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                     # audits after every short cross-lane preemption. The same
                     # 1,200-call quantum and all next-dispatch checks remain.
                     connection.commit()
-                    waiting = _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
+                    waiting = report_status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
                     waiting_started = time.monotonic()
                     wait_for_next_cycle(root, waiting, 60, sources=supplemental.SOURCES.values(),
                         snapshot_hours=(0, 8, 14, 17),
@@ -2121,22 +2192,23 @@ def run_once(root: Path, *, max_requests: int = 0,
                     cycle_costs.exclude_elapsed(waiting_started)
                     last_status_at = time.monotonic()
                     continue
-                first_history = first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
+                first_history = (first_unfinished_dataset(connection, now, delegated=delegated, datasets=datasets)
+                                 if required_keys is None else None)
                 if first_history and connection.execute(
                         "SELECT 1 FROM tasks WHERE dataset=? AND state='failed' "
                         "AND next_attempt_at_utc>? LIMIT 1", (first_history, _iso(now))).fetchone():
-                    return _status(connection, root, state='waiting_history_retry', last=last, delegated=delegated)
-                if budget['allowed'] and datasets is None and any(
+                    return report_status(connection, root, state='waiting_history_retry', last=last, delegated=delegated)
+                if budget['allowed'] and required_keys is None and datasets is None and any(
                     item.get('unseeded_partition_candidates', 0) for item in supplemental.frontier_status(connection, now).values()
                 ):
                     # A holiday-only working set still has an older frontier.
                     # Seed the next bounded batch instead of sleeping an hour.
-                    return _status(connection, root, state='batch_complete', last=last, delegated=delegated)
-                return _status(connection, root,
+                    return report_status(connection, root, state='batch_complete', last=last, delegated=delegated)
+                return report_status(connection, root,
                                state="current_queue" if budget["allowed"] else "incremental_reserve",
                                last=last, delegated=delegated)
             if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
-                _status(connection, root, state="running", active=task, last=last, delegated=delegated)
+                report_status(connection, root, state="running", active=task, last=last, delegated=delegated)
                 last_status_at = time.monotonic()
             other_started = time.monotonic()
             dispatch_keys = required_keys
@@ -2151,7 +2223,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 config=pipeline_config, max_calls=max_requests-completed if max_requests else pipeline_config['max_batch_requests'],
                 delegated=delegated, datasets=datasets, required_keys=dispatch_keys,
                 capacity_sampler=capacity,
-                heartbeat=lambda active, result: _status(connection, root, state='running', active=active,
+                heartbeat=lambda active, result: report_status(connection, root, state='running', active=active,
                                                          last=result or last, delegated=delegated))
             if parallel is not None:
                 completed += parallel['calls']
@@ -2163,10 +2235,10 @@ def run_once(root: Path, *, max_requests: int = 0,
                     if parallel['state'] == 'disk_guard':
                         admission = capacity.sample()
                         if admission.get('state') not in {'admitted', 'not_enrolled'}:
-                            _status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                            report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
                             return _capacity_pause(root, admission)
-                    return _status(connection, root, state=parallel['state'], last=last, delegated=delegated)
-                _status(connection, root, state='running', last=last, delegated=delegated)
+                    return report_status(connection, root, state=parallel['state'], last=last, delegated=delegated)
+                report_status(connection, root, state='running', last=last, delegated=delegated)
                 last_status_at = time.monotonic()
                 cycle_costs.exclude_elapsed(other_started)
                 continue
@@ -2175,7 +2247,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                 config=json_config, max_calls=max_requests-completed if max_requests else json_config['max_batch_requests'],
                 delegated=delegated, datasets=datasets, required_keys=dispatch_keys,
                 capacity_sampler=capacity,
-                heartbeat=lambda active, result: _status(connection, root, state='running', active=active,
+                heartbeat=lambda active, result: report_status(connection, root, state='running', active=active,
                                                          last=result or last, delegated=delegated))
             if parallel_json is not None:
                 if parallel_json['failed_tasks'] or parallel_json['accepted_requests'] != parallel_json['calls']:
@@ -2189,13 +2261,13 @@ def run_once(root: Path, *, max_requests: int = 0,
                         cycle_costs.calibration_invalid = True
                         admission = capacity.sample()
                         if admission.get('state') not in {'admitted', 'not_enrolled'}:
-                            _status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                            report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
                             return _capacity_pause(root, admission)
-                    return _status(connection, root, state=parallel_json['state'], last=last, delegated=delegated)
+                    return report_status(connection, root, state=parallel_json['state'], last=last, delegated=delegated)
                 if parallel_json['state'] == 'incremental_reserve' and not parallel_json['calls']:
-                    return _status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
+                    return report_status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
                 if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
-                    _status(connection, root, state='running', last=last, delegated=delegated)
+                    report_status(connection, root, state='running', last=last, delegated=delegated)
                     last_status_at = time.monotonic()
                 continue
             other_started = time.monotonic()
@@ -2217,10 +2289,24 @@ def run_once(root: Path, *, max_requests: int = 0,
                     elif task.dataset in storage_objects.active_datasets(connection) and not task.data_id:
                         rows, history_metadata = storage_objects.fetch(
                             session, limiter, root, task, token,
-                            heartbeat=lambda: _status(connection, root, state='running', active=task,
+                            heartbeat=lambda: report_status(connection, root, state='running', active=task,
                                                       last=last, delegated=delegated))
                     elif task.dataset == news.DATASET or task.dataset in supplemental.SOURCES:
-                        rows, history_metadata = _request_independent(session, limiter, root, task, token, today=local.date())
+                        previous_error = connection.execute(
+                            'SELECT error_code FROM tasks WHERE dataset=? AND data_id=? AND partition=?',
+                            (task.dataset, task.data_id, task.partition)).fetchone()
+                        if task.dataset == 'TaiwanOptionTick' and task.kind == 'id_day':
+                            from downloader.finmind_option_stream import requires_stream
+                            large_option = requires_stream(connection, task,
+                                previous_error[0] if previous_error else None, _now())
+                        else:
+                            large_option = False
+                        if large_option:
+                            from downloader.finmind_option_stream import fetch as fetch_large_option
+                            rows, history_metadata = fetch_large_option(
+                                session, limiter, root, task, token, today=local.date(), capacity_sampler=capacity)
+                        else:
+                            rows, history_metadata = _request_independent(session, limiter, root, task, token, today=local.date())
                     elif task.dataset in DAILY_EQUITY and task.kind == "id_history":
                         baseline_error = None
                         try:
@@ -2323,7 +2409,7 @@ def run_once(root: Path, *, max_requests: int = 0,
                         "partition": task.partition, "status": "failed", "error_code": error.code,
                         "observed_at_utc": _iso(_now())}
                 if error.code in {"rate_limited", "invalid_token", "ip_banned"}:
-                    return _status(connection, root, state=error.code, last=last, delegated=delegated)
+                    return report_status(connection, root, state=error.code, last=last, delegated=delegated)
             except (OSError, ValueError, pa.ArrowException) as exc:
                 cycle_costs.calibration_invalid = True
                 # Only allowlisted parser codes are persisted; arbitrary
@@ -2343,9 +2429,9 @@ def run_once(root: Path, *, max_requests: int = 0,
                 cycle_costs.exclude_elapsed(other_started)
             completed += int(task.kind != "derived")
             if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
-                _status(connection, root, state="running", last=last, delegated=delegated)
+                report_status(connection, root, state="running", last=last, delegated=delegated)
                 last_status_at = time.monotonic()
-        return _status(connection, root, state="batch_complete", last=last, delegated=delegated)
+        return report_status(connection, root, state="batch_complete", last=last, delegated=delegated)
 
 
 def _retry_blocked(root: Path, datasets: tuple[str, ...] | None = None) -> int:
@@ -2384,7 +2470,14 @@ def main(argv: list[str] | None = None) -> int:
                         help="after correcting token/parameters, explicitly requeue blocked per-ID tasks")
     parser.add_argument('--reopen-exhausted', action='store_true',
                         help='Explicitly reopen exhausted tasks in --dataset scopes, then exit without any API call')
+    parser.add_argument('--refill-frontier-only', choices=sorted(supplemental.SOURCES),
+                        help='Advance one existing canonical source frontier without dispatch or API calls')
     args = parser.parse_args(argv)
+    if args.refill_frontier_only and (args.dataset or args.task_key or args.loop or args.retry_blocked
+                                      or args.reopen_exhausted or args.max_requests is not None
+                                      or args.option_finite_priority_verification or args.option_finite_priority_plan
+                                      or args.finite_priority_request_id):
+        parser.error('--refill-frontier-only cannot be combined with dispatch or retry options')
     if args.max_requests is None:
         args.max_requests = json_pipeline.settings()['max_requests_per_cycle']
     if args.max_requests < 0:
@@ -2409,8 +2502,8 @@ def main(argv: list[str] | None = None) -> int:
     # Only this dedicated CLI owns these pools. Object CPU workers retain
     # their separately configured pools; raw source semantics do not change.
     object_pipeline.initialize_cpu(1)
-    if args.reopen_exhausted and not (root / 'queue.sqlite3').is_file():
-        parser.error('--reopen-exhausted requires an existing owner queue')
+    if (args.reopen_exhausted or args.refill_frontier_only) and not (root / 'queue.sqlite3').is_file():
+        parser.error('queue-only operations require an existing owner queue')
     root.mkdir(parents=True, exist_ok=True)
     with (root / "worker.lock").open("a+") as handle:
         try:
@@ -2422,6 +2515,17 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if threading.current_thread() is threading.main_thread():
                 old_term_handler = signal.signal(signal.SIGTERM, _interrupt_on_sigterm)
+            if args.refill_frontier_only:
+                with closing(_db(root / 'queue.sqlite3')) as connection, connection:
+                    if not connection.execute(
+                            "SELECT 1 FROM sqlite_master WHERE name='finmind_source_frontiers'").fetchone() or not connection.execute(
+                            'SELECT 1 FROM finmind_source_frontiers WHERE dataset=? LIMIT 1',
+                            (args.refill_frontier_only,)).fetchone():
+                        raise ValueError('refill requires an existing canonical source frontier')
+                    inserted = supplemental.refill_history(connection, args.refill_frontier_only, _now())
+                print(json.dumps({'state': 'frontier_refilled', 'dataset': args.refill_frontier_only,
+                                  'inserted_tasks': inserted, 'provider_calls': 0}, ensure_ascii=False), flush=True)
+                return 0
             if args.reopen_exhausted:
                 with closing(_db(root / 'queue.sqlite3')) as connection, connection:
                     changed = retry_policy.reopen(connection, tuple(args.dataset), _now())

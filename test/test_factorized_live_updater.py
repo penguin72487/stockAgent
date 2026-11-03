@@ -266,7 +266,7 @@ def test_projection_rejects_an_uncovered_earlier_horizon(tmp_path, monkeypatch):
         updater._projection_start_date(tmp_path / "config.yaml", parent)
 
 
-def test_user_selected_2026_scope_is_shared_by_producer_and_live_consumers(tmp_path):
+def test_checkpoint_validation_context_is_shared_without_expanding_2026_output(tmp_path):
     import yaml
     from stockagent.config import load_config
 
@@ -278,22 +278,22 @@ def test_user_selected_2026_scope_is_shared_by_producer_and_live_consumers(tmp_p
     source = yaml.safe_load(candidate.read_text())
     live = yaml.safe_load(factorized.read_text())
     alternative = yaml.safe_load(mgda.read_text())
-    assert source["data"]["panel_start_date"] == "2026-01-01"
+    assert source["data"]["panel_start_date"] == "2025-01-01"
     assert live["base_config"] == candidate.name
-    assert live["data"].get("panel_start_date", source["data"]["panel_start_date"]) == "2026-01-01"
-    assert alternative["data"]["panel_start_date"] == "2026-01-01"
-    assert source["walk_forward"]["expected_first_year"] == 2026
-    assert alternative["walk_forward"]["expected_first_year"] == 2026
+    assert live["data"].get("panel_start_date", source["data"]["panel_start_date"]) == "2025-01-01"
+    assert alternative["data"]["panel_start_date"] == "2025-01-01"
+    assert source["walk_forward"]["expected_first_year"] == 2025
+    assert alternative["walk_forward"]["expected_first_year"] == 2025
     assert alternative["walk_forward"]["split_start_year"] == 2026
     # Exercise the canonical validator, not just YAML literals: start-date and
     # expected-year must agree even when the runtime mode is inference.
     selected = load_config(candidate)
-    assert selected.data.panel_start_date == "2026-01-01"
-    assert selected.walk_forward.expected_first_year == 2026
+    assert selected.data.panel_start_date == "2025-01-01"
+    assert selected.walk_forward.expected_first_year == 2025
     assert selected.training.lookback == 32
     live_selected = load_config(factorized)
-    assert live_selected.data.panel_start_date == "2026-01-01"
-    assert live_selected.walk_forward.expected_first_year == 2026
+    assert live_selected.data.panel_start_date == "2025-01-01"
+    assert live_selected.walk_forward.expected_first_year == 2025
     assert live_selected.runner.mode == "infer"
     # The private restored MGDA artifact is not a test dependency. Reproduce
     # its inherited historical range and split metadata with a public config,
@@ -307,8 +307,8 @@ def test_user_selected_2026_scope_is_shared_by_producer_and_live_consumers(tmp_p
     overlay_path = tmp_path / "mgda.yaml"
     overlay_path.write_text(yaml.safe_dump(overlay))
     mgda_selected = load_config(overlay_path)
-    assert mgda_selected.data.panel_start_date == "2026-01-01"
-    assert mgda_selected.walk_forward.expected_first_year == 2026
+    assert mgda_selected.data.panel_start_date == "2025-01-01"
+    assert mgda_selected.walk_forward.expected_first_year == 2025
     assert mgda_selected.walk_forward.split_start_year == 2026
     assert mgda_selected.runner.mode == "infer"
 

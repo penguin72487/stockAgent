@@ -12,8 +12,10 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import re
 
 import numpy as np
+import polars as pl
 import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
@@ -33,7 +35,42 @@ SOURCE_SESSION_COLUMNS.update({f"{name}.parquet": ("Date", "yyyymmdd", True) for
     "taifex_large_trader_futures_oi",
 )})
 SOURCE_SESSION_COLUMNS["taifex_final_settlement_price.parquet"] = ("最後結算日", "yyyymmdd", True)
-DATED_SOURCES = frozenset(SOURCE_SESSION_COLUMNS)
+# These rows are partitioned by the exact canonical feature availability and
+# value projection, not the archive's date or the announcement's subject date.
+# Keep these columns in step with _build_attention_disposal_features. Disposal
+# uses only date and symbol, so price columns are deliberately null there.
+SEMANTIC_SOURCE_COLUMNS = {
+    "twse_notice_stock.parquet": ("Code", "ClosingPrice", "PE"),
+    "tpex_attention_stock.parquet": ("SecuritiesCompanyCode", "ClosePrice", "PriceEarningRatio"),
+    "twse_disposal_stock.parquet": ("Code", None, None),
+    "tpex_disposal_stock.parquet": ("SecuritiesCompanyCode", None, None),
+}
+TPEX_SHORTING_SOURCE = "tpex_api_tpex_margin_sbl.parquet"
+TPEX_TRANSFER_SOURCE = "tpex_api_mopsfin_t187ap12_o.parquet"
+SEMANTIC_SESSION_SOURCES = frozenset(SEMANTIC_SOURCE_COLUMNS) | {
+    TPEX_SHORTING_SOURCE, TPEX_TRANSFER_SOURCE,
+}
+DATED_SOURCES = frozenset(SOURCE_SESSION_COLUMNS) | SEMANTIC_SESSION_SOURCES
+# Audited against the complete feature-reader implementation, its local
+# semantic dependencies and Polars version below. Full raw receipts remain
+# part of the publication contract. Any code/library drift disables this
+# proof until the source-reader audit is repeated and the identity renewed.
+NON_FEATURE_SOURCES = frozenset({
+    "tpex_api_mopsfin_t187ap02_o.parquet",
+    "tpex_api_mopsfin_t187ap13_o.parquet",
+    "tpex_api_mopsfin_t187ap31_o.parquet",
+    "tpex_api_tpex_3insti_qfii.parquet",
+    "tpex_api_tpex_3insti_qfii_industry.parquet",
+    "tpex_api_tpex200_constituents.parquet",
+    "tpex_api_tpex50_constituents.parquet",
+    "tpex_api_tpex_index_consti.parquet",
+    "tpex_api_tpex_margin_trading_margin_mark.parquet",
+    "tpex_api_tpex_margin_trading_margin_used.parquet",
+    "tpex_api_tpex_margin_trading_short_sell.parquet",
+    "tpex_api_tpex_short_sell.parquet",
+    "tpex_api_tphd_constituents.parquet",
+})
+NON_FEATURE_CONSUMPTION_PROOF = "6295e7fbd322f661eb90cec90cdebccd66050c4279c1adbb9902bb0843fa8b67"
 MAX_SESSION_ROWS = 250_000
 MAX_CACHED_ROW_GROUPS = 16_384
 PHYSICAL_PREFIX_CONTRACT = "tw_public_verified_parquet_groups_v1"
@@ -46,6 +83,33 @@ def _generation(path):
 
 def implementation_sha256():
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def proven_non_feature_sources():
+    """Return audited exclusions only for the exact reader implementation."""
+    root = Path(__file__).parent
+    try:
+        code = {name: hashlib.sha256((root / name).read_bytes()).hexdigest() for name in (
+            "tw_public_features.py", "tw_delisting_rules.py", "tw_security.py",
+            "partitioned_parquet.py")}
+        code["live/market_status.py"] = hashlib.sha256(
+            (root.parent / "live" / "market_status.py").read_bytes()
+        ).hexdigest()
+        # The proof value cannot hash itself. Normalize only that one literal;
+        # edits anywhere else in this planner invalidate the audit as well.
+        planner = Path(__file__).read_text(encoding="utf-8")
+        normalized, replacements = re.subn(
+            r'^NON_FEATURE_CONSUMPTION_PROOF = "[0-9a-f]{64}"$',
+            'NON_FEATURE_CONSUMPTION_PROOF = "<proof>"', planner, flags=re.MULTILINE,
+        )
+        if replacements != 1:
+            return frozenset()
+        code["tw_public_incremental.py"] = hashlib.sha256(normalized.encode()).hexdigest()
+    except (OSError, UnicodeError):
+        return frozenset()
+    identity = hashlib.sha256(json.dumps({"code": code, "polars": pl.__version__},
+                                        sort_keys=True).encode()).hexdigest()
+    return NON_FEATURE_SOURCES if identity == NON_FEATURE_CONSUMPTION_PROOF else frozenset()
 
 
 class _HashSink(io.RawIOBase):
@@ -224,6 +288,153 @@ def table_session_fingerprints(table: pa.Table) -> dict:
     return _fingerprint_batches(table.schema.remove_metadata(), table.to_batches(max_chunksize=65_536))
 
 
+def _notice_feature_session_fingerprints(path: Path) -> dict:
+    """Certify rows consumed by the canonical attention/disposal builder.
+
+    Availability and values use the producer's own expressions, including
+    observed-clock fallback. Mapping to exchange sessions happens later and
+    only moves a date forward. Order, duplicates, nulls and float values remain
+    significant inside each available day. Unknown schemas fail closed.
+    """
+    from stockagent.data.tw_public_features import (
+        _optional_num_expr, _snapshot_date_expr, _symbol_expr,
+    )
+
+    symbol_col, close_col, pe_col = SEMANTIC_SOURCE_COLUMNS[path.name]
+    before = _generation(path)
+    frame = pl.read_parquet(path)
+    if frame.is_empty():
+        projected = pl.DataFrame(schema={
+            "date": pl.Date, "symbol": pl.String,
+            "_close": pl.Float64, "_pe": pl.Float64,
+        })
+    else:
+        columns = set(frame.columns)
+        projected = frame.select(
+            _snapshot_date_expr(columns).alias("date"),
+            _symbol_expr(symbol_col).alias("symbol"),
+            _optional_num_expr(columns, close_col).alias("_close"),
+            _optional_num_expr(columns, pe_col).alias("_pe"),
+        ).drop_nulls(["date", "symbol"]).filter(pl.col("symbol") != "")
+        projected = projected.sort("date", maintain_order=True)
+    proof = table_session_fingerprints(projected.to_arrow())
+    proof["session_clock"] = {
+        "column": "canonical_notice_availability", "format": "feature_projection_v1",
+        "ignore_null": True,
+    }
+    if before != _generation(path):
+        raise OSError("notice source changed during semantic partition proof")
+    return proof
+
+
+def _tpex_shorting_feature_session_fingerprints(path: Path, *, source_sha256: str) -> dict:
+    """Prove the exact TPEx shorting rows visible to the feature builder.
+
+    The declared day and observation clock are interpreted by the same
+    expressions as the canonical producer. Session mapping can only move
+    availability forward. Keep duplicate order and null/value semantics.
+    """
+    from stockagent.data.tw_public_features import (
+        _num_expr, _positive_log1p, _snapshot_date_expr, _snapshot_symbol_expr,
+    )
+
+    before = _generation(path)
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != source_sha256:
+        raise ValueError("TPEx shorting source does not match its captured receipt")
+    schema = pl.read_parquet_schema(path)
+    columns = set(schema)
+    required = {
+        "SaleAvailableVolumes", "SecuritiesBorrowingBalanceOfTheMarketDay",
+        "AvailableVolumesForSBLShortSale",
+    }
+    if not required <= columns:
+        raise ValueError("TPEx shorting feature columns are missing")
+    needed = {
+        "出表日期", "發言日期", "Date", "日期", "date", "_downloaded_at_utc", "_as_of_date",
+        "公司代號", "SecuritiesCompanyCode", "Code", "TWSECode",
+        "SaleAvailableVolumes", "SecuritiesBorrowingBalanceOfTheMarketDay",
+        "AvailableVolumesForSBLShortSale",
+    } & columns
+    frame = pl.read_parquet(path, columns=sorted(needed))
+    if frame.is_empty():
+        projected = pl.DataFrame(schema={
+            "date": pl.Date, "symbol": pl.String,
+            "twpub_short_sale_available_log": pl.Float64,
+            "twpub_sbl_balance_log": pl.Float64,
+            "twpub_borrow_available_log": pl.Float64,
+        })
+    else:
+        projected = frame.select(
+            _snapshot_date_expr(columns).alias("date"),
+            _snapshot_symbol_expr(columns).alias("symbol"),
+            _positive_log1p(_num_expr("SaleAvailableVolumes")).alias("twpub_short_sale_available_log"),
+            _positive_log1p(_num_expr("SecuritiesBorrowingBalanceOfTheMarketDay")).alias("twpub_sbl_balance_log"),
+            _positive_log1p(_num_expr("AvailableVolumesForSBLShortSale")).alias("twpub_borrow_available_log"),
+        ).drop_nulls(["date", "symbol"]).filter(pl.col("symbol") != "")
+        projected = projected.sort("date", maintain_order=True)
+    proof = table_session_fingerprints(projected.to_arrow())
+    proof["session_clock"] = {
+        "column": "canonical_tpex_shorting_availability", "format": "feature_projection_v1",
+        "ignore_null": True,
+    }
+    if before != _generation(path):
+        raise OSError("TPEx shorting source changed during semantic partition proof")
+    return proof
+
+
+def _tpex_transfer_feature_session_fingerprints(path: Path, *, source_sha256: str) -> dict:
+    """Certify the ordered inputs to the canonical insider-transfer aggregation.
+
+    The input rows are projected with the builder's expressions before its
+    per-date/symbol sum. Rows that cannot produce a valid feature key are
+    removed by the canonical feature finalizer. Retain original order within
+    each day, duplicate rows, nulls and all numeric values; do not infer a
+    change from the raw file's size or announcement subject date.
+    """
+    from stockagent.data.tw_public_features import (
+        _num_expr, _snapshot_date_expr, _snapshot_symbol_expr,
+    )
+
+    before = _generation(path)
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != source_sha256:
+        raise ValueError("TPEx transfer source does not match its captured receipt")
+    frame = pl.read_parquet(path)
+    shares_column = "預定轉讓方式及股數-轉讓股數"
+    if shares_column not in frame.columns:
+        raise ValueError("TPEx transfer feature column is missing")
+    columns = set(frame.columns)
+    projected = frame.select(
+        _snapshot_date_expr(columns).alias("date"),
+        _snapshot_symbol_expr(columns).alias("symbol"),
+        _num_expr(shares_column).alias("shares"),
+    ).drop_nulls(["date", "symbol"]).filter(pl.col("symbol") != "")
+    # The builder groups and sums Float64 shares. Restrict the proof to an
+    # exact-integer domain so repartitioning/group order cannot change the
+    # sum through floating-point non-associativity. Everything outside this
+    # conservative range uses the existing full-build fallback.
+    shares = projected.get_column("shares").drop_nulls()
+    if (not shares.is_finite().all() or (shares != shares.floor()).any()
+            or shares.abs().sum() >= 2**52):
+        raise ValueError("TPEx transfer shares are not bounded exact integers")
+    projected = projected.sort("date", maintain_order=True)
+    proof = table_session_fingerprints(projected.to_arrow())
+    proof["session_clock"] = {
+        "column": "canonical_tpex_transfer_availability", "format": "feature_projection_v1",
+        "ignore_null": True,
+    }
+    if before != _generation(path):
+        raise OSError("TPEx transfer source changed during semantic partition proof")
+    return proof
+
+
 def table_content_sha256(table: pa.Table) -> str:
     """Exact typed ordered values, independent of slices and physical chunks."""
     table = table.replace_schema_metadata(None).combine_chunks()
@@ -284,6 +495,9 @@ def _fingerprint_batches(schema, batches, *, date_column="date", date_format="is
 
 
 def capture_partitions(root: Path, receipts: list[dict], previous: dict | None) -> dict:
+    from stockagent.data.tw_public_features import _feature_implementation_sha256
+
+    feature_identity = _feature_implementation_sha256()
     previous = previous if isinstance(previous, dict) else {}
     compatible = (previous.get("contract") == CONTRACT
                   and previous.get("implementation_sha256") == implementation_sha256()
@@ -298,17 +512,30 @@ def capture_partitions(root: Path, receipts: list[dict], previous: dict | None) 
             continue
         old = prior.get(name, {})
         old = old if isinstance(old, dict) else {}
-        if old.get("source_sha256") == receipt["sha256"] and "sessions" in old:
+        if (old.get("source_sha256") == receipt["sha256"] and "sessions" in old
+                and (name not in SEMANTIC_SESSION_SOURCES
+                     or old.get("semantic_feature_implementation_sha256") == feature_identity)):
             sources[name] = old
             reused += 1
             continue
         try:
-            column, fmt, ignore_null = SOURCE_SESSION_COLUMNS[name]
-            proof = session_fingerprints(root / name, date_column=column,
-                                         date_format=fmt, ignore_null_dates=ignore_null,
-                                         previous=old, capture_physical=True)
-        except (OSError, ValueError, pa.ArrowException) as exc:
+            if name == TPEX_SHORTING_SOURCE:
+                proof = _tpex_shorting_feature_session_fingerprints(
+                    root / name, source_sha256=receipt["sha256"])
+            elif name == TPEX_TRANSFER_SOURCE:
+                proof = _tpex_transfer_feature_session_fingerprints(
+                    root / name, source_sha256=receipt["sha256"])
+            elif name in SEMANTIC_SESSION_SOURCES:
+                proof = _notice_feature_session_fingerprints(root / name)
+            else:
+                column, fmt, ignore_null = SOURCE_SESSION_COLUMNS[name]
+                proof = session_fingerprints(root / name, date_column=column,
+                                             date_format=fmt, ignore_null_dates=ignore_null,
+                                             previous=old, capture_physical=True)
+        except (OSError, ValueError, pa.ArrowException, pl.exceptions.PolarsError) as exc:
             proof = {"unsupported": type(exc).__name__}
+        if name in SEMANTIC_SESSION_SOURCES:
+            proof["semantic_feature_implementation_sha256"] = feature_identity
         sources[name] = {"source_sha256": receipt["sha256"], **proof}
         scanned += 1
     return {"contract": CONTRACT, "implementation_sha256": implementation_sha256(),
@@ -341,10 +568,14 @@ def affected_start(previous_summary: dict, receipts: list[dict], current: dict,
         return reject("partition_bootstrap_or_implementation_changed")
     if old_receipts.keys() != new_receipts.keys():
         return reject("source_membership_changed")
-    if not set(changed) <= DATED_SOURCES:
+    non_feature = set(changed) - DATED_SOURCES
+    if non_feature and not non_feature <= proven_non_feature_sources():
         return reject("non_dated_or_global_dependency_changed")
+    if non_feature:
+        plan["non_feature_sources"] = sorted(non_feature)
+        plan["non_feature_consumption_proof"] = NON_FEATURE_CONSUMPTION_PROOF
     affected = []
-    for name in changed:
+    for name in sorted(set(changed) & DATED_SOURCES):
         old_sources = old.get("sources", {})
         if not isinstance(old_sources, dict):
             return reject("source_partition_proof_missing_or_schema_changed")
@@ -354,6 +585,9 @@ def affected_start(previous_summary: dict, receipts: list[dict], current: dict,
         if (before.get("source_sha256") != old_receipts[name]
                 or after.get("source_sha256") != new_receipts[name]
                 or not isinstance(before.get("sessions"), dict) or not isinstance(after.get("sessions"), dict)
+                or (name in SEMANTIC_SESSION_SOURCES
+                    and before.get("semantic_feature_implementation_sha256")
+                    != after.get("semantic_feature_implementation_sha256"))
                 or before.get("session_clock") != after.get("session_clock")
                 or before.get("schema_sha256") != after.get("schema_sha256")):
             return reject("source_partition_proof_missing_or_schema_changed")
@@ -370,6 +604,15 @@ def affected_start(previous_summary: dict, receipts: list[dict], current: dict,
         return reject("previous_completed_session_missing")
     if end_date < old_end:
         return reject("requested_history_truncated")
+    if non_feature and not (set(changed) & DATED_SOURCES) and end_date == old_end:
+        return None, {**plan, "mode": "non_feature_sources_only"}
+    semantic_changed = set(changed) & SEMANTIC_SESSION_SOURCES
+    if (semantic_changed and not ((set(changed) & DATED_SOURCES) - semantic_changed)
+            and end_date == old_end and all(day > end_date for day in affected)):
+        # The canonical semantic projections have no changed rows visible by the
+        # completed end date. Session mapping can only move availability later.
+        # `all` also handles identical projected rows (empty affected list).
+        return None, {**plan, "mode": "semantic_sources_unchanged"}
     # Extending the decision calendar can expose a previously unavailable
     # next-session feature. Start at the first newly requested day, not just
     # the last release date, even when source rows themselves are unchanged.

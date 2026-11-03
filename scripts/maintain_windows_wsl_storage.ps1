@@ -1,7 +1,7 @@
 # Run from a Windows-native copy: shutting WSL stops scripts on its UNC share.
 [CmdletBinding()]
 param(
-    [ValidateSet('Plan', 'Expand', 'CompactIfStopped')]
+    [ValidateSet('Plan', 'Expand', 'Compact', 'CompactIfStopped')]
     [string]$Mode = 'Plan',
     [Parameter(Mandatory = $true)][string]$DistroName,
     [Parameter(Mandatory = $true)][string]$ExpectedVhdPath,
@@ -82,12 +82,15 @@ $receipt = [ordered]@{
     script_sha256 = (Get-FileHash -LiteralPath $PSCommandPath -Algorithm SHA256).Hash;
     errors = @(); events = @(); recovery = $null
 }
-$plannedGrowth = $TargetSizeBytes - [long]$receipt.before.virtual_bytes
+$plannedGrowth = if ($Mode -in @('Compact', 'CompactIfStopped')) { 0L } else {
+    $TargetSizeBytes - [long]$receipt.before.virtual_bytes
+}
+$maintenanceReserve = if ($Mode -eq 'Compact') { 1GB } else { 32GB }
 $receipt['capacity_plan'] = [ordered]@{
-    future_growth_bytes=$plannedGrowth; reserve_bytes=32GB;
-    required_host_free_bytes=($plannedGrowth + 32GB);
+    future_growth_bytes=$plannedGrowth; reserve_bytes=$maintenanceReserve;
+    required_host_free_bytes=($plannedGrowth + $maintenanceReserve);
     host_free_bytes=$receipt.before.host_free_bytes;
-    full_growth_covered_before_compaction=($receipt.before.host_free_bytes -ge ($plannedGrowth + 32GB));
+    full_growth_covered_before_compaction=($receipt.before.host_free_bytes -ge ($plannedGrowth + $maintenanceReserve));
     final_admission='remeasure_after_offline_read_only_compaction';
     virtual_limit_is_not_host_physical_space=$true }
 if ($Mode -eq 'Plan' -or -not $Apply) {
@@ -186,11 +189,14 @@ try {
             throw 'Refusing global WSL shutdown while another distribution is running'
         }
         if ($DistroName -notin $running) {
-            throw 'Expansion requires a running distro for a fresh filesystem identity baseline'
+            throw 'Maintenance requires a running distro for a fresh filesystem identity baseline'
         }
-        if ((Get-VHD -Path $vhdPath).Size -gt $TargetSizeBytes) { throw 'Refusing virtual-disk shrink' }
-        if ((Get-VhdObservation).host_free_bytes -lt 32GB) {
+        if ($Mode -eq 'Expand' -and (Get-VHD -Path $vhdPath).Size -gt $TargetSizeBytes) { throw 'Refusing virtual-disk shrink' }
+        if ($Mode -eq 'Expand' -and (Get-VhdObservation).host_free_bytes -lt 32GB) {
             throw 'Host lacks the unchanged 32 GiB physical reserve before maintenance'
+        }
+        if ($Mode -eq 'Compact' -and (Get-VhdObservation).host_free_bytes -lt 1GB) {
+            throw 'Host lacks 1 GiB for bounded maintenance metadata; application reserves are unchanged'
         }
         $tasks = @($taskNames | ForEach-Object {
             $task = Get-ScheduledTask -TaskName $_ -TaskPath '\'
@@ -245,24 +251,32 @@ try {
         # Compact via the existing read-only owner, then measure admission
         # for ALL future growth plus the unchanged 32 GiB physical reserve.
         if (-not (Compact-StoppedVhd)) { throw 'VHD unexpectedly restarted before capacity admission' }
-        $growth = $TargetSizeBytes - (Get-VHD -Path $vhdPath).Size
-        $capacity = Get-VhdObservation
-        $receipt['resize_admission'] = [ordered]@{
-            growth_bytes=$growth; reserve_bytes=32GB;
-            required_host_free_bytes=($growth + 32GB); host_free_bytes=$capacity.host_free_bytes;
-            admitted=($capacity.host_free_bytes -ge ($growth + 32GB)) }
-        Save-Receipt 'offline-capacity-observed'
-        if (-not $receipt.resize_admission.admitted) {
-            throw 'Host cannot cover future growth plus a 32 GiB reserve after compaction'
+        if ($Mode -eq 'Compact') {
+            $receipt['after'] = Get-VhdObservation
+            if ($receipt.after.virtual_bytes -ne $receipt.before.virtual_bytes) {
+                throw 'Compaction unexpectedly changed virtual capacity'
+            }
+            Add-Event 'offline-compaction-verified-without-resize'
+        } else {
+            $growth = $TargetSizeBytes - (Get-VHD -Path $vhdPath).Size
+            $capacity = Get-VhdObservation
+            $receipt['resize_admission'] = [ordered]@{
+                growth_bytes=$growth; reserve_bytes=32GB;
+                required_host_free_bytes=($growth + 32GB); host_free_bytes=$capacity.host_free_bytes;
+                admitted=($capacity.host_free_bytes -ge ($growth + 32GB)) }
+            Save-Receipt 'offline-capacity-observed'
+            if (-not $receipt.resize_admission.admitted) {
+                throw 'Host cannot cover future growth plus a 32 GiB reserve after compaction'
+            }
+            Add-Event 'offline-resize-started'
+            $null = Invoke-WslChecked @('--manage', $DistroName, '--resize', ($TargetSizeBytes.ToString() + 'B'))
+            if ((Get-VHD -Path $vhdPath).Size -ne $TargetSizeBytes) { throw 'VHD capacity readback mismatch' }
+            Add-Event 'offline-resize-verified'
+            # --manage uses a utility VM. Shut it down before offline compaction.
+            $null = Invoke-WslChecked @('--shutdown')
+            if (-not (Compact-StoppedVhd)) { throw 'VHD unexpectedly restarted before compaction' }
+            $receipt['after'] = Get-VhdObservation
         }
-        Add-Event 'offline-resize-started'
-        $null = Invoke-WslChecked @('--manage', $DistroName, '--resize', ($TargetSizeBytes.ToString() + 'B'))
-        if ((Get-VHD -Path $vhdPath).Size -ne $TargetSizeBytes) { throw 'VHD capacity readback mismatch' }
-        Add-Event 'offline-resize-verified'
-        # --manage uses a utility VM. Shut it down before offline compaction.
-        $null = Invoke-WslChecked @('--shutdown')
-        if (-not (Compact-StoppedVhd)) { throw 'VHD unexpectedly restarted before compaction' }
-        $receipt['after'] = Get-VhdObservation
     }
 } catch {
     $receipt.errors += $_.Exception.Message
@@ -311,7 +325,13 @@ try {
             }
         }
         $receipt['after'] = Get-VhdObservation
-        if ($exitCode) { Save-Receipt 'needs-attention' } else { Save-Receipt 'expanded-and-boot-verified' }
+        if ($exitCode) {
+            Save-Receipt 'needs-attention'
+        } elseif ($Mode -eq 'Compact') {
+            Save-Receipt 'compacted-and-boot-verified'
+        } else {
+            Save-Receipt 'expanded-and-boot-verified'
+        }
     } elseif ($exitCode) {
         Save-Receipt 'failed'
     }

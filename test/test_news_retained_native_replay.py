@@ -570,16 +570,32 @@ def test_claim_update_itself_fences_a_newer_observation_after_select(settings, t
 def test_superseded_head_is_rejected_before_writing_a_body_receipt(settings, tmp_path, monkeypatch):
     queue, _, path, _ = approved(tmp_path, settings)
     accept = queue.accept
-    def newer_refusal(records):
+    def newer_refusal(records, **kwargs):
         with queue.db:
             queue.db.execute("UPDATE articles SET state='http_403',error_code='http_403',lease_owner=NULL,lease_until=NULL WHERE url=?", (URL,))
-        accept(records)
+        return accept(records, **kwargs)
     monkeypatch.setattr(queue, 'accept', newer_refusal)
     try:
         with pytest.raises(ValueError, match='reviewed_native_head_changed_before_acceptance'):
             replay(queue, path)
         assert head(queue)['state'] == 'http_403' and head(queue)['body_sha256'] is None
         assert not list((queue.root/'receipts').glob('*.json'))
+    finally:
+        queue.close()
+
+
+def test_superseded_native_receipt_is_not_reported_as_materialized(settings, tmp_path, monkeypatch):
+    queue, _, path, _ = approved(tmp_path, settings)
+    original = queue._accept_records
+    def newer_claim(records, relative, receipt, **kwargs):
+        with queue.db:
+            queue.db.execute("UPDATE articles SET lease_token='new-token' WHERE url=?", (URL,))
+        return original(records, relative, receipt, **kwargs)
+    monkeypatch.setattr(queue, '_accept_records', newer_claim)
+    try:
+        result = replay(queue, path)
+        assert result['materialized_bodies'] == 0 and result['superseded_urls'] == [URL]
+        assert head(queue)['body_sha256'] is None
     finally:
         queue.close()
 

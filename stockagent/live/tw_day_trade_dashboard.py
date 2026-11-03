@@ -142,6 +142,10 @@ _OPENING_FAILED_ATTEMPT_FIELDS: Final[tuple[str, ...]] = (
 _OPENING_TAIL_PROJECTION_CONTRACT: Final[str] = "opening_failure_fields_v1:" + hashlib.sha256(
     json.dumps(_OPENING_FAILED_ATTEMPT_FIELDS).encode()
 ).hexdigest()
+_OPENING_DIAGNOSTIC_PROJECTION_CONTRACT: Final[str] = (
+    _OPENING_TAIL_PROJECTION_CONTRACT + ":dashboard_corrupt_line_marker_v1"
+)
+_OPENING_CORRUPT_LINE: Final[str] = "__stockagent_opening_telemetry_corrupt_line__"
 _TAIL_PROJECTION_MAX_BYTES: Final[int] = 32 * 1024**2
 _OPENING_FAILURE_DECODER = (
     _ProjectionDecoder(_projection_struct(
@@ -401,7 +405,6 @@ class _LedgerSessionIndex:
 
 
 _LEDGER_SESSION_INDEX_CACHE: dict[tuple[Path, bool], _LedgerSessionIndex] = {}
-_LEDGER_SESSION_INDEX_LOCK = threading.Lock()
 _LEDGER_SESSION_INDEX_SCHEMA_VERSION: Final[int] = 1
 _LEDGER_SESSION_INDEX_CACHE_ENV: Final[str] = "STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR"
 
@@ -945,6 +948,15 @@ def _read_signal_feature_record(summary_path: Path) -> dict[str, Any]:
             return {**cached, "drivers": list(cached["drivers"])}
     try:
         summary = _object(summary_path)
+        # Only the canonical reader can certify stable descriptor/path bytes.
+        # Manifests are intentionally absent from its parent-inode cache, so
+        # child validation cannot be bypassed by this derived feature cache.
+        with _OBJECT_CACHE_LOCK:
+            source_cache = _OBJECT_CACHE.get(summary_path.resolve())
+        stable = (
+            source_cache is not None
+            and source_cache[0] == cache_key == metadata_signature(summary_path.stat())
+        )
     except (OSError, ValueError, json.JSONDecodeError):
         return {"drivers": []}
     publication = summary.get("source_publication_contract") or {}
@@ -995,7 +1007,8 @@ def _read_signal_feature_record(summary_path: Path) -> dict[str, Any]:
         if type(publication.get(field)) is bool:
             record[field] = publication[field]
     cacheable = (
-        signature.st_size < 64 * 1024 * 1024
+        stable
+        and signature.st_size < 64 * 1024 * 1024
         and len(json.dumps(drivers, separators=(",", ":")).encode("utf-8"))
         <= _SIGNAL_FEATURE_SUMMARY_CACHE_MAX_ITEM_BYTES
     )
@@ -1448,16 +1461,21 @@ def _read_verified_jsonl_append(path, maximum_rows, signature, cached, row_proje
                                  snapshot.head["sha256"] if snapshot is not None else None)
 
 
-def _opening_tail_projection_path(path: Path, maximum_rows: int) -> Path | None:
+def _opening_tail_projection_path(
+    path: Path, maximum_rows: int, *, contract: str = _OPENING_TAIL_PROJECTION_CONTRACT,
+) -> Path | None:
     cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
     if not cache_root or not Path(cache_root).is_dir():
         return None
-    identity = [str(path.resolve()), maximum_rows, _OPENING_TAIL_PROJECTION_CONTRACT]
+    identity = [str(path.resolve()), maximum_rows, contract]
     digest = hashlib.sha256(json.dumps(identity, separators=(",", ":")).encode()).hexdigest()
     return Path(cache_root) / f"opening-tail-projection-v1-{digest}.json"
 
 
-def _load_opening_tail_projection(cache_path: Path, path: Path, maximum_rows: int):
+def _load_opening_tail_projection(
+    cache_path: Path, path: Path, maximum_rows: int, *,
+    contract: str = _OPENING_TAIL_PROJECTION_CONTRACT,
+):
     """Restore only a byte-generation-bound derived tail, never source truth.
 
     A changed raw prefix still goes through the existing complete SHA check in
@@ -1478,7 +1496,7 @@ def _load_opening_tail_projection(cache_path: Path, path: Path, maximum_rows: in
         envelope = private_json.loads(body)
         value = envelope["payload"]
         if (envelope["sha256"] != hashlib.sha256(private_json.ledger_bytes(value)).hexdigest()
-                or value["contract"] != _OPENING_TAIL_PROJECTION_CONTRACT
+                or value["contract"] != contract
                 or value["source"] != str(path.resolve()) or value["maximum_rows"] != maximum_rows):
             return None
         generation, slots = value["generation"], value["line_slots"]
@@ -1504,11 +1522,12 @@ def _load_opening_tail_projection(cache_path: Path, path: Path, maximum_rows: in
 
 
 def _store_opening_tail_projection(cache_path: Path, path: Path, maximum_rows: int,
-                                   signature: tuple[int, ...], rows: list) -> None:
+                                   signature: tuple[int, ...], rows: list, *,
+                                   contract: str = _OPENING_TAIL_PROJECTION_CONTRACT) -> None:
     if not isinstance(rows, _VerifiedTailRows) or rows.journal_head is not None:
         return
     try:
-        value = {"contract": _OPENING_TAIL_PROJECTION_CONTRACT, "source": str(path.resolve()),
+        value = {"contract": contract, "source": str(path.resolve()),
                  "maximum_rows": maximum_rows, "generation": list(signature),
                  "prefix_sha256": rows.prefix_sha256, "terminated": rows.terminated,
                  "line_slots": rows.line_slots}
@@ -1538,13 +1557,21 @@ def _tail(
         signature = _tail_file_signature(stat)
         with _TAIL_CACHE_LOCK:
             cached = _TAIL_CACHE.get(cache_key)
+        projection_contract = (
+            _OPENING_DIAGNOSTIC_PROJECTION_CONTRACT
+            if row_decoder is _decode_opening_latency_row_for_dashboard
+            else _OPENING_TAIL_PROJECTION_CONTRACT
+        )
         projection_path = (
-            _opening_tail_projection_path(path, maximum_rows)
+            _opening_tail_projection_path(path, maximum_rows, contract=projection_contract)
             if verified_append and row_projection is None
-            and row_decoder is _decode_opening_latency_row else None
+            and row_decoder in (_decode_opening_latency_row, _decode_opening_latency_row_for_dashboard)
+            else None
         )
         if cached is None and projection_path is not None:
-            cached = _load_opening_tail_projection(projection_path, path, maximum_rows)
+            cached = _load_opening_tail_projection(
+                projection_path, path, maximum_rows, contract=projection_contract,
+            )
         if cached and cached[0] == signature and _tail_file_signature(path.stat()) == signature:
             with _TAIL_CACHE_LOCK:
                 if cache_key not in _TAIL_CACHE and len(_TAIL_CACHE) >= _TAIL_CACHE_MAX_ENTRIES:
@@ -1563,7 +1590,10 @@ def _tail(
                     _TAIL_CACHE.pop(next(iter(_TAIL_CACHE)))
                 _TAIL_CACHE[cache_key] = (signature, result)
             if projection_path is not None:
-                _store_opening_tail_projection(projection_path, path, maximum_rows, signature, result)
+                _store_opening_tail_projection(
+                    projection_path, path, maximum_rows, signature, result,
+                    contract=projection_contract,
+                )
         return list(result)
 
 
@@ -1634,7 +1664,9 @@ def _ledger_session_index(
     if not source.is_file():
         return None
     cache_key = (source.resolve(), bool(recorded_at_fallback))
-    with _LEDGER_SESSION_INDEX_LOCK:
+    # One writer per exact source and index policy. Independent paper journals
+    # must not wait behind a large prefix verification for another file.
+    with _shared_query_lock(("ledger_session_index", *cache_key)):
         for _attempt in range(3):
             stat = source.stat()
             if observed_signature is not None and metadata_signature(stat) != observed_signature:
@@ -2031,8 +2063,6 @@ def _columnar_ledger_frame(
     ):
         return None
     needs_bounded_tail = total_bytes > _COLUMNAR_LEDGER_MAX_BYTES
-    if needs_bounded_tail and maximum_rows is None:
-        return None
     try:
         import polars as pl
     except ImportError:
@@ -2059,7 +2089,30 @@ def _columnar_ledger_frame(
         return frame
 
     try:
-        if needs_bounded_tail:
+        if needs_bounded_tail and maximum_rows is None:
+            # A complete session is not a recent-row query. Project bounded
+            # complete-line batches before retaining them, never the full raw
+            # multi-GiB payload or a silently truncated tail.
+            frames = []
+            pending: list[bytes] = []
+            pending_bytes = 0
+            with open_paper_journal(Path(source), "rb") as handle:
+                for start, end, _ in selected_spans:
+                    handle.seek(start)
+                    while handle.tell() < end:
+                        line = handle.readline(min(_MAX_LEDGER_LINE_BYTES + 1, end - handle.tell()))
+                        if not line.endswith(b"\n") or len(line) > _MAX_LEDGER_LINE_BYTES:
+                            raise ValueError(f"dashboard ledger span is invalid: {source}")
+                        pending.append(line)
+                        pending_bytes += len(line)
+                        if pending_bytes >= 4 << 20:
+                            frames.append(read_frame(io.BytesIO(b"".join(pending))))
+                            pending.clear()
+                            pending_bytes = 0
+            if pending:
+                frames.append(read_frame(io.BytesIO(b"".join(pending))))
+            frame = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
+        elif needs_bounded_tail:
             cache_root = str(
                 os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or ""
             ).strip()
@@ -2298,7 +2351,8 @@ def _narrow_signal_page_projection(
     *,
     index: _LedgerSessionIndex,
     selected_session_dates: list[str],
-) -> tuple[Any, dict[str, tuple[Path, tuple[int, int, int, int, int]]], Any] | None:
+    mode: str = "all",
+) -> tuple[Any, dict[str, tuple[Path, tuple[int, int, int, int, int]]], Any, int] | None:
     """Load only fields used by the full-history filter, audit and top-K."""
 
     try:
@@ -2331,6 +2385,15 @@ def _narrow_signal_page_projection(
             how="diagonal_relaxed",
         )
         full_schema = lazy.collect_schema()
+        selected_mode = str(mode or "").strip()
+        scoped = bool(selected_mode and selected_mode != "all")
+        # Keep the original row indices for exact top-K rehydration. Exclude
+        # other modes before materializing their millions of narrow rows;
+        # counts still validate the complete receipted session projection.
+        if scoped:
+            if lazy.select(pl.len()).collect().item() != expected_rows:
+                return None
+            lazy = lazy.filter(pl.col("market").fill_null("") == selected_mode)
         frame = lazy.select(
             column for column in _SIGNAL_PAGE_NARROW_COLUMNS
             if column in full_schema
@@ -2343,7 +2406,7 @@ def _narrow_signal_page_projection(
             for column in ("signal_id", "reason", "status")
             if column in frame.columns
         )
-        if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(frame.columns) or frame.height != expected_rows or not all(
+        if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(frame.columns) or (not scoped and frame.height != expected_rows) or not all(
             _projected_file_signature(path) == signature
             for path, signature in paths.values()
         ):
@@ -2353,7 +2416,7 @@ def _narrow_signal_page_projection(
             index.device, index.inode, index.observed_size, index.modified_ns
         ):
             return None
-        return frame, paths, full_schema
+        return frame, paths, full_schema, expected_rows
     except (OSError, TypeError, ValueError, pl.exceptions.PolarsError):
         return None
 
@@ -2552,7 +2615,7 @@ def _complete_session_rows(
         return rows
 
     index_key = (path.resolve(), bool(recorded_at_fallback))
-    with _LEDGER_SESSION_INDEX_LOCK:
+    with _shared_query_lock(("ledger_session_index", *index_key)):
         previous_index = _LEDGER_SESSION_INDEX_CACHE.get(index_key)
         index_signature = previous_index.facts_signature if previous_index else None
     observations = [index_signature]
@@ -2861,6 +2924,20 @@ def _decode_opening_latency_row(line: bytes) -> Any:
                 }
     payload = json.loads(text)
     return _opening_latency_row_projection(payload) if isinstance(payload, dict) else payload
+
+
+def _decode_opening_latency_row_for_dashboard(line: bytes) -> Any:
+    """Keep a damaged diagnostic line visible without failing financial reads.
+
+    The strict decoder remains the audit/benchmark contract. A physical line
+    with invalid JSON or UTF-8 is not recovered or promoted into evidence;
+    the dashboard counts it and marks all aggregate timing claims incomplete.
+    The original append-only bytes remain untouched.
+    """
+    try:
+        return _decode_opening_latency_row(line)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {_OPENING_CORRUPT_LINE: True}
 
 
 def _opening_signal_latency_summary(
@@ -4250,6 +4327,7 @@ def _load_or_rebuild_history_session_projection(
     source_fingerprints: Mapping[str, str],
     sources: Mapping[str, Any],
     available_session_dates: list[str],
+    history_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any] | None:
     started = time.perf_counter()
     head = _history_session_head(state_dir)
@@ -4304,6 +4382,7 @@ def _load_or_rebuild_history_session_projection(
             use_persistent_cache=False,
             use_session_projection=False,
             _session_projection_capture=captured,
+            _committed_history_state=history_state,
         )
         shard = captured.get(session_date)
         if not isinstance(shard, dict):
@@ -5285,6 +5364,11 @@ def _operational_issues(
         engine_status = str(mode.get("engine_status") or "")
         if engine_status.startswith(("critical", "blocked")):
             execution_details = {
+                "critical_ledger_state_divergence": (
+                    "模擬帳本提交與執行狀態不一致，該模式已暫停新訊號及行情處理；"
+                    "若仍有未平模擬持倉，停損及收盤沖銷不會自動處理。"
+                    "須先核對原始事件、委託、成交及持倉，不能直接解除隔離或視為券商成交。"
+                ),
                 "critical_day_trade_exit_unresolved": "當沖部位未能在當日沖銷；缺資料、容量不足或程式異常不得當成一般隔夜持倉。",
                 "critical_adverse_limit_exception": "不利漲跌停且退出方向無對手量，保留例外證據；下一交易時段優先沖銷，並非券商已核准融資融券。",
                 "critical_prior_inventory_liquidation": "前日殘餘部位優先沖銷，清理前不建立新的當沖曝險，不依新訊號留用舊庫存。",
@@ -5756,6 +5840,7 @@ def build_dashboard_history_snapshot(
     use_persistent_cache: bool = True,
     use_session_projection: bool = True,
     _session_projection_capture: dict[str, dict[str, Any]] | None = None,
+    _committed_history_state: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return cross-session strategy and total-return benchmark curves.
 
@@ -5794,7 +5879,8 @@ def build_dashboard_history_snapshot(
     explicit_dates = selected_start is not None or selected_end is not None
     root = Path(state_dir)
     try:
-        state = _object(root / "state.json")
+        state = (dict(_committed_history_state) if _committed_history_state is not None
+                 else _object(root / "state.json"))
     except (OSError, ValueError, json.JSONDecodeError):
         state = {}
     is_overnight = str(state.get("product") or "") == "tw_overnight"
@@ -6056,6 +6142,7 @@ def build_dashboard_history_snapshot(
             source_fingerprints=session_source_fingerprints,
             sources=session_source_context,
             available_session_dates=session_source_dates,
+            history_state={"product": product, "enabled_markets": configured_markets},
         )
         if sharded is not None:
             if persistent_projection_eligible:
@@ -6707,7 +6794,9 @@ def _preopen_progress(
     path: Path | None,
     modes: list[dict[str, Any]],
     observed: datetime,
+    session_date: str | None = None,
 ) -> dict[str, Any]:
+    session_date = session_date or observed.astimezone(TAIPEI).date().isoformat()
     payload: dict[str, Any] = {}
     if path is not None and Path(path).is_file():
         try:
@@ -6722,7 +6811,7 @@ def _preopen_progress(
             updated = _timestamp(updated_at)
             source_age_seconds = max(0.0, (observed - updated).total_seconds())
             same_trading_date = (
-                updated.astimezone(TAIPEI).date() == observed.astimezone(TAIPEI).date()
+                updated.astimezone(TAIPEI).date().isoformat() == session_date
             )
         except (TypeError, ValueError):
             pass
@@ -6731,10 +6820,10 @@ def _preopen_progress(
     if not isinstance(raw_markets, Mapping):
         raw_markets = {}
     rows: list[dict[str, Any]] = []
-    session_date = observed.astimezone(TAIPEI).date().isoformat()
     local_time = observed.astimezone(TAIPEI).time()
     final_arm_current_process_required = (
-        datetime_time(8, 55) <= local_time < datetime_time(9, 0)
+        observed.astimezone(TAIPEI).date().isoformat() == session_date
+        and datetime_time(8, 55) <= local_time < datetime_time(9, 0)
     )
     process_run_id = str(payload.get("run_id") or "")
     for mode in modes:
@@ -6987,6 +7076,7 @@ def _preopen_progress(
     )
     return {
         "status": overall_status,
+        "session_date": session_date,
         "updated_at": updated_at if same_trading_date else None,
         "source_age_seconds": (
             round(source_age_seconds, 3)
@@ -7013,14 +7103,16 @@ def _preopen_progress(
     }
 
 
-def _simulation_preopen_progress(*, path: Path, observed: datetime) -> dict[str, Any]:
+def _simulation_preopen_progress(
+    *, path: Path, observed: datetime, session_date: str | None = None,
+) -> dict[str, Any]:
     payload: dict[str, Any] = {}
     if path.is_file():
         try:
             payload = _object(path)
         except (OSError, ValueError, json.JSONDecodeError):
             payload = {}
-    session_date = observed.astimezone(TAIPEI).date().isoformat()
+    session_date = session_date or observed.astimezone(TAIPEI).date().isoformat()
     if payload.get("session_date") != session_date:
         return {
             "status": "pending",
@@ -7849,6 +7941,20 @@ def build_dashboard_snapshot(
     require_committed_revision: bool = False,
 ) -> dict[str, Any]:
     root = Path(state_dir)
+    def opening_attempts() -> list[dict[str, Any]]:
+        return _tail(
+            root / "opening_signal_latency.jsonl",
+            10_000,
+            row_decoder=_decode_opening_latency_row_for_dashboard,
+            verified_append=True,
+        )
+
+    # Discord owns this diagnostic journal independently of the paper commit.
+    # Snapshot it once before the financial consistency window: appends after
+    # this observation must not trigger another full-prefix verification while
+    # financial state is being assembled. The tail's generation-verified
+    # cache never treats inode/size growth alone as proof of append ancestry.
+    opening_attempt_rows = opening_attempts()
     # Interactive views must not stamp a committed revision onto a mixture of
     # individually atomic files. Legacy forensic/report readers may still ask
     # for the explicitly stale diagnostic view. This guard reads only compact
@@ -8392,12 +8498,13 @@ def build_dashboard_snapshot(
     benchmark_marks = list(benchmark_marks_by_id_minute.values())
     events = session_facts("events.jsonl")
     all_latency_rows = _tail(root / "latency.jsonl", 2_000)
-    opening_attempt_rows = _tail(
-        root / "opening_signal_latency.jsonl",
-        10_000,
-        row_decoder=_decode_opening_latency_row,
-        verified_append=True,
+    malformed_opening_attempt_rows = sum(
+        row == {_OPENING_CORRUPT_LINE: True} for row in opening_attempt_rows
     )
+    if malformed_opening_attempt_rows:
+        opening_attempt_rows = [
+            row for row in opening_attempt_rows if row != {_OPENING_CORRUPT_LINE: True}
+        ]
     latency_rows = selected_session_rows(
         "latency.jsonl",
         min(maximum_event_rows, 2_000),
@@ -8424,6 +8531,22 @@ def build_dashboard_snapshot(
         expected_markets=[str(row.get("market") or "") for row in modes],
         session_date=selected_session_date,
     )
+    opening_signal_latency["integrity"] = {
+        "state": "partial_corrupt" if malformed_opening_attempt_rows else "window_readable",
+        "scope": "last_physical_lines",
+        "maximum_lines": 10_000,
+        "malformed_lines": malformed_opening_attempt_rows,
+    }
+    if malformed_opening_attempt_rows:
+        # A missing record can invalidate a purported earliest/latest result,
+        # complete mode set, failure count or comparison. Retain individually
+        # decoded samples but never assert a complete or successful aggregate.
+        for aggregate in [opening_signal_latency, *opening_signal_latency.get("trend", [])]:
+            aggregate.update(complete=False, ledger_complete=False,
+                             final_ledger_ms=None,
+                             first_signal_goal_met=None, all_modes_goal_met=None,
+                             all_ledgers_goal_met=None)
+        opening_signal_latency["change_vs_previous_ms"] = None
 
     pending_session_markets = {
         str(mode.get("market"))
@@ -8696,7 +8819,7 @@ def build_dashboard_snapshot(
         )
         mode["signal_product"] = "scheduled_execution"
     measured_opening_markets = set(opening_signal_latency.get("observed_markets") or [])
-    opening_signal_latency["replay_without_live_measurement"] = [
+    opening_signal_latency["replay_without_live_measurement"] = None if malformed_opening_attempt_rows else [
         str(mode["market"]) for mode in modes
         if mode.get("counterfactual_open_replay")
         and mode["market"] not in measured_opening_markets
@@ -8716,14 +8839,20 @@ def build_dashboard_snapshot(
     # session should evaluate preopen state at that historical timestamp.
     operational_view = session_date is None or current_view
     preopen_observed = observed if operational_view else selected_observed
+    preopen_session = (
+        dashboard_session_clock(observed, rollover_local_time=session_rollover_time).get("display_session_date")
+        if operational_view else selected_session_date
+    )
     preopen = _preopen_progress(
         path=preopen_readiness_path,
         modes=modes,
         observed=preopen_observed,
+        session_date=preopen_session,
     )
     simulation_preopen = _simulation_preopen_progress(
         path=root / "preopen_readiness.json",
         observed=preopen_observed,
+        session_date=preopen_session,
     )
     preopen["simulation"] = simulation_preopen
     if operational_view and not simulation_preopen["ready"]:
@@ -8735,6 +8864,21 @@ def build_dashboard_snapshot(
         preopen=preopen,
         observed=preopen_observed,
     )
+    if malformed_opening_attempt_rows:
+        operational_issues.append({
+            "severity": "warning",
+            "scope": "opening_signal_telemetry",
+            "market": None,
+            "code": "opening_signal_telemetry_corrupt",
+            "title": "開盤測速紀錄不完整",
+            "detail": (
+                f"最近 10,000 行中有 {malformed_opening_attempt_rows} 行無法解析；"
+                "原始紀錄已保留，測速彙總不能用於完整性或達標驗收。"
+                "訊號與持倉仍依各自已提交帳本顯示。"
+            ),
+            "count": malformed_opening_attempt_rows,
+            "observed_at": observed.isoformat(timespec="seconds"),
+        })
     if operational_view:
         try:
             raw_opening_gate = _object(DEFAULT_OPENING_GATE_PATH)
@@ -9343,18 +9487,13 @@ def build_dashboard_signal_page(
         str, tuple[Path, tuple[int, int, int, int, int]]
     ] = {}
     narrow_full_schema: Any | None = None
-    if use_latest_session_fast_path and selected_session_dates == [
-        requested_single_date
-    ]:
-        rows_by_session = {
-            requested_single_date: tuple(
-                _latest_contiguous_session_rows(
-                    signal_path,
-                    requested_single_date,
-                    maximum_scan_rows,
-                )
-            )
-        }
+    narrow_source_rows: int | None = None
+    # Latest-day progressive signals can contain hundreds of full-universe
+    # revisions. Date selection is cheap above, but a capped raw-row read here
+    # both loses revisions and allocates huge Python objects for a tiny page.
+    # Latest and historical dates share the same complete session projections.
+    if not selected_session_dates:
+        rows_by_session = {}
     else:
         signal_index = _ledger_session_index(
             signal_path,
@@ -9379,9 +9518,10 @@ def build_dashboard_signal_page(
                 signal_path,
                 index=signal_index,
                 selected_session_dates=selected_session_dates,
+                mode=normalized_mode,
             )
             if narrow is not None:
-                signal_frame, narrow_projection_paths, narrow_full_schema = narrow
+                signal_frame, narrow_projection_paths, narrow_full_schema, narrow_source_rows = narrow
                 import polars as pl
 
                 polars_module = pl
@@ -9609,7 +9749,7 @@ def build_dashboard_signal_page(
                 resolved_weight.abs().alias("__absolute_weight"),
             )
         )
-        source_rows_scanned = signal_frame.height
+        source_rows_scanned = narrow_source_rows if narrow_source_rows is not None else signal_frame.height
         filtered_total = filtered_frame.height
     mark_stage("filter")
     capitals = {

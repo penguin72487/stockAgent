@@ -200,3 +200,71 @@ def test_changed_loaded_code_stops_the_process_not_other_market_retry_budgets(ow
     with pytest.raises(LoadedImplementationChanged):
         runner._populate_postclose_signal_caches([cfg.market, "next"])
     assert calls == ["cache"]
+
+
+@pytest.mark.parametrize("source_result", ["ready", "waiting", "failed"])
+def test_independent_close_caches_publish_before_cold_shared_source(
+    owner, monkeypatch, source_result,
+):
+    from scripts import discord_postclose_wakeup as wakeup
+
+    cfg, _path, _state, _status, bot, _calls, _emissions = owner
+    configs = {
+        cfg.market: cfg,
+        "mgda": SimpleNamespace(market="mgda", completed_session_command=cfg.completed_session_command),
+        "other_1": SimpleNamespace(market="other_1", completed_session_command=()),
+        "other_2": SimpleNamespace(market="other_2", completed_session_command=()),
+    }
+    events = []
+    bot._resolve_market = configs.__getitem__
+    bot._is_tw_daily_signal_market = lambda _cfg: True
+    bot._run_completed_session_signal_cache_sync = lambda current: events.append(("cache", current.market))
+    bot._log_exception = lambda *_args: None
+    monkeypatch.setattr(wakeup, "observe", lambda _root: {})
+    monkeypatch.setattr(wakeup, "acknowledge", lambda *_args: True)
+
+    def recover(current, *, allow_warming):
+        assert allow_warming
+        if runner._owns_factorized_source_updater(current):
+            assert events[:2] == [("cache", "other_2"), ("cache", "other_1")]
+            events.append(("source", current.market))
+            if source_result == "failed":
+                raise RuntimeError("source unavailable")
+            return source_result == "ready"
+        return True
+
+    monkeypatch.setattr(runner, "_recover_deferred_factorized_source", recover)
+    result = runner._populate_postclose_signal_caches(
+        [cfg.market, "other_2", "mgda", "other_1"],
+    )
+    assert result == (4, 2 if source_result == "failed" else 0,
+                      2 if source_result == "waiting" else 0)
+    assert [name for kind, name in events if kind == "source"] == [cfg.market, "mgda"]
+    assert [name for kind, name in events if kind == "cache"] == (
+        ["other_2", "other_1", cfg.market, "mgda"]
+        if source_result == "ready" else ["other_2", "other_1"]
+    )
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_successful_builds_require_coherent_readback_before_completion(owner, monkeypatch, accepted):
+    from scripts import discord_postclose_wakeup as wakeup
+
+    cfg, _path, _state, _status, bot, _calls, emissions = owner
+    cached = []
+    bot._resolve_market = lambda _market: cfg
+    bot._is_tw_daily_signal_market = lambda _cfg: True
+    bot._run_completed_session_signal_cache_sync = lambda current: cached.append(current.market)
+    monkeypatch.setattr(runner, "_recover_deferred_factorized_source", lambda *_a, **_kw: True)
+    monkeypatch.setattr(wakeup, "observe", lambda _root: {"fingerprint": "before"})
+    monkeypatch.setattr(wakeup, "acknowledge", lambda *_args: accepted)
+
+    assert runner._populate_postclose_signal_caches([cfg.market]) == (1, 0, int(not accepted))
+    assert cached == [cfg.market]  # Do not discard/re-run an already successful model.
+    readback = [event for event in emissions if event["status"] == "postclose_wakeup_readback"]
+    assert readback == [{"status": "postclose_wakeup_readback", "acknowledged": accepted,
+                         "advisory_only": True}]
+    waiting = [event for event in emissions if event["status"] == "postclose_cache_deferred"]
+    assert bool(waiting) is not accepted
+    if waiting:
+        assert waiting[0]["reason"] == "canonical_readback_not_accepted"

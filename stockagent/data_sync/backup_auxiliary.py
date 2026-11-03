@@ -112,7 +112,8 @@ def working_tree_inventory(root: Path, *, documentation: bool, configs: bool) ->
 
 def control_input(receipt_path: Path) -> tuple[dict, Path, Path]:
     receipt_path = private_file(receipt_path)
-    receipt = json.loads(receipt_path.read_bytes())
+    receipt_bytes = receipt_path.read_bytes()
+    receipt = json.loads(receipt_bytes)
     if receipt.get("state") != "backup_written" or receipt.get("same_mvcc_snapshot_as_dump") is not True:
         raise SnapshotError("control transport needs an exact exported MVCC snapshot")
     archive = private_file(Path(receipt["archive"]))
@@ -129,7 +130,7 @@ def control_input(receipt_path: Path) -> tuple[dict, Path, Path]:
         "same_mvcc_snapshot_as_dump": True, "archive": "archive.backup", "logical_state_file": "logical-state.json",
         "sha256": receipt["sha256"], "logical_state_file_sha256": receipt["logical_state_file_sha256"],
         "logical_state_identity_sha256": receipt["logical_state_identity_sha256"],
-        "source_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+        "source_receipt_sha256": hashlib.sha256(receipt_bytes).hexdigest(),
         "source_observed_at_utc": receipt["observed_at_utc"], "bytes": archive.stat().st_size,
         "control_database_restore_verified": False}
     return portable, archive, state
@@ -194,6 +195,7 @@ def export_auxiliary(root: Path, destination: Path, *, control_receipt: Path,
         "transport": verification, "content_identity_sha256": content_identity,
         "code_identity_sha256": tree["identity_sha256"], "code_files": len(tree["files"]),
         "excluded_private_paths": tree["excluded_private_paths"], "control_archive_sha256": control["sha256"],
+        "control_source_receipt_sha256": control["source_receipt_sha256"],
         "control_logical_identity_sha256": control["logical_state_identity_sha256"],
         "control_database_restore_verified": False, "durable_off_host_backup_verified": False,
         "observed_at_utc": datetime.now(timezone.utc).isoformat()}
@@ -219,13 +221,21 @@ def verified_working_tree(root: Path) -> dict:
     tree = json.loads(_regular(root / "receipt.json").read_bytes())
     if tree.get("contract") != CODE or identity_sha256({k: v for k, v in tree.items() if k != "identity_sha256"}) != tree.get("identity_sha256"):
         raise SnapshotError("working-tree receipt identity differs")
-    with zipfile.ZipFile(_regular(root / "working-tree.zip")) as archive:
-        if set(archive.namelist()) != set(tree["files"]) or len(archive.namelist()) != len(tree["files"]):
-            raise SnapshotError("working-tree archive file set differs")
-        if archive.testzip() is not None:
-            raise SnapshotError("working-tree archive CRC differs")
-        for name, digest in tree["files"].items():
-            if hashlib.sha256(archive.read(name)).hexdigest() != digest:
-                raise SnapshotError("working-tree restored file SHA differs")
+    try:
+        with zipfile.ZipFile(_regular(root / "working-tree.zip")) as archive:
+            if set(archive.namelist()) != set(tree["files"]) or len(archive.namelist()) != len(tree["files"]):
+                raise SnapshotError("working-tree archive file set differs")
+            for name, digest in tree["files"].items():
+                sha = hashlib.sha256()
+                # ZipExtFile checks the ZIP CRC on EOF. Reading each member to
+                # EOF here checks CRC and SHA over the same bytes in one pass,
+                # without allocating a whole uncompressed member in memory.
+                with archive.open(name) as source:
+                    for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                        sha.update(chunk)
+                if sha.hexdigest() != digest:
+                    raise SnapshotError("working-tree restored file SHA differs")
+    except zipfile.BadZipFile as error:
+        raise SnapshotError("working-tree archive CRC or structure differs") from error
     return {"state": "frozen_working_tree_files_verified", "identity_sha256": tree["identity_sha256"],
         "files_verified": len(tree["files"]), "loaded_service_revision_verified": False}

@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import polars as pl
+import pytest
 import stockagent.data.panel as panel_module
 
 from stockagent.data.panel import (
@@ -13,6 +14,76 @@ from stockagent.data.panel import (
     _load_external_feature_arrays,
     build_panel,
 )
+
+
+@pytest.mark.parametrize("duplicates", ["none", "some", "all", "empty"])
+@pytest.mark.parametrize("columns", [[], ["twpub_f32", "twpub_f64", "_twpub_rule"]])
+def test_external_aggregation_preserves_every_group_value_and_dtype(duplicates, columns):
+    frame = pl.DataFrame({
+        "date": [date(2020, 1, 3), date(2020, 1, 2), date(2020, 1, 2)],
+        "symbol": ["2330", "__MARKET__", "2330"],
+        "twpub_f32": pl.Series([float("nan"), -0., 1.25], dtype=pl.Float32),
+        "twpub_f64": [1.000000000123, float("inf"), None],
+        "_twpub_rule": [None, 123.456789123456, -0.],
+    }).with_columns(pl.col("date").cast(pl.Datetime("ns")))
+    if duplicates in {"some", "all"}:
+        repeated = frame.tail(1) if duplicates == "some" else frame
+        correction = repeated.with_columns(
+            pl.lit(None, dtype=pl.Float32).alias("twpub_f32"),
+            pl.lit(2.000000000123).alias("twpub_f64"),
+            pl.lit(None, dtype=pl.Float64).alias("_twpub_rule"))
+        frame = pl.concat([frame, correction])
+    elif duplicates == "empty":
+        frame = frame.head(0)
+    expected = frame.group_by(["date", "symbol"]).agg(
+        [pl.col(name).drop_nulls().last().alias(name) for name in columns]
+    ).sort(["symbol", "date"])
+    actual = panel_module._aggregate_external_feature_rows(frame, columns)
+    assert actual.schema == expected.schema
+    assert actual.select(["date", "symbol"]).equals(expected.select(["date", "symbol"]))
+    for name in columns:
+        assert actual[name].is_null().equals(expected[name].is_null())
+        assert actual[name].to_numpy().tobytes() == expected[name].to_numpy().tobytes()
+
+
+def test_external_duplicates_are_normalized_before_last_non_null_resolution(tmp_path):
+    path = tmp_path / "normalized-duplicates.parquet"
+    pq.write_table(pa.table({
+        "date": ["2020-01-02", "2020-01-02", "2020-01-03", None, "2020-01-02"],
+        "symbol": [" abc ", "ABC", "__market__", "abc", " "],
+        "twpub_first": [1., None, -0., 90., 80.],
+        "twpub_second": [None, 2., 3., 90., 80.],
+        "_twpub_price_limit_upper": [123.456789123456, None, 5., 90., 80.],
+    }), path)
+    actual = _load_external_feature_arrays(path)
+    assert set(actual.by_symbol) == {"ABC"}
+    dates, values = actual.by_symbol["ABC"]
+    np.testing.assert_array_equal(dates, np.array(["2020-01-02"], dtype="datetime64[ns]"))
+    np.testing.assert_array_equal(values, np.array([[1., 2.]], dtype=np.float32))
+    assert actual.by_symbol_rules["ABC"][1][0, 0] == 123.456789123456
+    assert np.signbit(actual.market_values[0, 0])
+
+
+@pytest.mark.parametrize("dtype", [np.float32, np.float64])
+@pytest.mark.parametrize("layout", ["c", "fortran", "strided", "empty"])
+def test_single_mask_sanitizer_preserves_all_finite_bits_and_layout(dtype, layout):
+    limits = np.finfo(dtype)
+    smallest = np.nextafter(dtype(0), dtype(1))
+    values = np.array([np.nan, np.inf, -np.inf, -0., 0., smallest,
+                       -smallest, limits.max, -limits.max, 1., -1., 7.5], dtype=dtype).reshape(2, 2, 3)
+    if layout == "fortran":
+        values = np.asfortranarray(values)
+    elif layout == "strided":
+        values = np.repeat(values, 2, axis=1)[:, ::2]
+    elif layout == "empty":
+        values = values[:0]
+    before = values.copy()
+    expected = np.nan_to_num(before, nan=0., posinf=0., neginf=0.)
+    pointer, strides = values.ctypes.data, values.strides
+    actual = panel_module._zero_nonfinite_features_inplace(values)
+    assert actual is values and actual.ctypes.data == pointer and actual.strides == strides
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape
+    assert actual.tobytes() == expected.tobytes()
 
 
 def _write_symbol(path, dates: list[date]) -> None:

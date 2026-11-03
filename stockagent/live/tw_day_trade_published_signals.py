@@ -7,7 +7,7 @@ execution payload so a changing ledger cannot delay the first signal view.
 
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import datetime
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -17,6 +17,7 @@ from zoneinfo import ZoneInfo
 from stockagent.live.market_config import load_market_configs, resolved_live_output_dir
 from stockagent.live.public_dashboards import public_paper_signal_key
 from stockagent.live.signal_artifacts import read_execution_weight_rows
+from stockagent.live.tw_day_trade_dashboard import dashboard_session_clock
 
 
 _TAIPEI = ZoneInfo("Asia/Taipei")
@@ -115,23 +116,28 @@ def _read_market(
         raise ValueError("signal pointer changed during read")
     return ({"status": "published", "signal_ready_at": ready_at,
              "artifact_published_at": artifact_at, "revision_index": revision_index,
+             "completed_session_calculation": summary.get("price_source") == "panel_close",
              "target_count": len(rows), "public_signal_key": public_key}, tuple(rows))
 
 
 def build_published_signal_snapshot(*, repo_root: Path, observed_at: datetime | None = None) -> dict[str, Any]:
-    """Return per-mode current-day published targets with no fill assertions."""
+    """Return targets for the dashboard's verified session, not calendar midnight."""
     repo = Path(repo_root).resolve(strict=True)
     now = observed_at or datetime.now(_TAIPEI)
     if now.tzinfo is None:
         raise ValueError("observation time must be timezone-aware")
-    session = now.astimezone(_TAIPEI).date().isoformat()
-    date.fromisoformat(session)
+    clock = dashboard_session_clock(now)
+    session = clock.get("display_session_date")
     configs = load_market_configs(repo / "services/discord_bot/markets")
     modes, rows = [], []
     for market, config in sorted(configs.items()):
         if not config.enabled or not config.day_trade_simulation_enabled:
             continue
         mode: dict[str, Any] = {"market": market, "label": config.label}
+        if session is None:
+            mode.update(status="calendar_unverified")
+            modes.append(mode)
+            continue
         configured_root = resolved_live_output_dir(config)
         root = (configured_root if configured_root.is_absolute() else repo / configured_root).resolve()
         try:

@@ -43,8 +43,31 @@ def _attach_configured_stock_context_futures_panel(panel, config):
     clock_path = Path(config.trading.tw_futures_portfolio_entry_clock_path)
     clock = json.loads(clock_path.with_name("manifest.json").read_text())
     clock_contract_from_manifest(clock, config.trading.tw_futures_portfolio_decision_time)
-    panel = slice_panel_start(panel, clock["start_date"])
     panel = slice_panel_end(panel, clock["end_date"])
+    source_panel = panel
+    panel = slice_panel_start(panel, clock["start_date"])
+    feature_contract = getattr(config.trading, "tw_futures_feature_history_contract", None)
+    if feature_contract is not None:
+        from dataclasses import replace
+        from stockagent.data.futures_feature_history import CONTRACT, bind_futures_feature_history
+        from stockagent.training.dataset import execution_feature_lag
+
+        if feature_contract != CONTRACT:
+            raise ValueError("unsupported futures feature history contract")
+        history = bind_futures_feature_history(
+            source_panel, panel, lookback=config.training.lookback,
+            feature_lag=execution_feature_lag(config.trading.execution_mode),
+        )
+        panel = replace(panel, feature_history=history)
+        first_end = history.prefix_rows - execution_feature_lag(config.trading.execution_mode)
+        first_start = first_end - int(config.training.lookback) + 1
+        print(
+            f"[futures-feature-history] prefix_sessions={history.prefix_rows}; "
+            f"first_decision={panel.dates[0]}; "
+            f"first_window={history.dates[first_start]}..{history.dates[first_end]}; "
+            f"decision_sessions={len(panel.dates)}",
+            flush=True,
+        )
     return attach_configured_futures_account_calendar(panel, config)
 
 
@@ -1736,6 +1759,54 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def _build_requested_walk_forward_folds(dates, config, *, checkpoint=None, requested_fold=None):
+    """Restore inference identity before attempting to construct training folds.
+
+    A deployment can retain validation/test context without retaining its old
+    training rows.  The checkpoint owns that fold's years and fitted state;
+    insufficient rows to *train* another fold must not reject valid inference.
+    All other calendar/config errors, including missing validation, still fail.
+    """
+    from stockagent.data.walkforward import (
+        build_checkpoint_inference_fold,
+        build_expanding_year_folds,
+        year_boundary_offset_sessions,
+    )
+
+    offset = year_boundary_offset_sessions(config)
+    restored = None
+    if checkpoint is not None:
+        restored = build_checkpoint_inference_fold(
+            dates, checkpoint, year_boundary_offset_sessions=offset,
+        )
+        if requested_fold is None or restored.fold_id != int(requested_fold):
+            raise ValueError(
+                "requested inference fold does not match checkpoint metadata: "
+                f"requested={requested_fold} saved={restored.fold_id}"
+            )
+    try:
+        folds = build_expanding_year_folds(
+            dates=dates,
+            min_train_years=config.walk_forward.min_train_years,
+            val_years=config.walk_forward.val_years,
+            require_future_test_year=config.walk_forward.require_future_test_year,
+            split_start_year=config.walk_forward.split_start_year,
+            year_boundary_offset_sessions=offset,
+        )
+    except ValueError as exc:
+        # This is the canonical builder's sole empty-result error.  Do not
+        # convert malformed calendars or split settings to an inference pass.
+        if restored is None or str(exc) != "No valid walk-forward folds could be constructed":
+            raise
+        folds = []
+    if restored is not None:
+        folds = sorted(
+            [fold for fold in folds if fold.fold_id != restored.fold_id] + [restored],
+            key=lambda fold: fold.fold_id,
+        )
+    return folds
+
+
 def main() -> None:
     global _ACTIVE_OUTPUT_DIR
     startup_timing = _StartupTimingRecorder()
@@ -1862,8 +1933,6 @@ def main() -> None:
 
     from stockagent.data.panel import build_panel
     from stockagent.data.walkforward import (
-        build_checkpoint_inference_fold,
-        build_expanding_year_folds,
         validate_walk_forward_year_contract,
         year_boundary_offset_sessions, year_period_contract,
     )
@@ -2274,6 +2343,9 @@ def main() -> None:
                         terminal_liquidation_unlimited_capacity=(
                             config.trading.tw_day_trade_terminal_liquidation_unlimited_capacity
                         ),
+                        short_limit_up_penalty_rate=(
+                            config.trading.tw_day_trade_short_limit_up_penalty_rate
+                        ),
                         sparse_event_slots=(
                             config.training.day_trade_sparse_event_slots
                             if config.training.day_trade_sparse_events
@@ -2550,13 +2622,13 @@ def main() -> None:
         expected_first_year=config.walk_forward.expected_first_year,
         require_contiguous_years=config.walk_forward.require_contiguous_years,
     )
-    all_folds = build_expanding_year_folds(
-        dates=panel.dates,
-        min_train_years=config.walk_forward.min_train_years,
-        val_years=config.walk_forward.val_years,
-        require_future_test_year=config.walk_forward.require_future_test_year,
-        split_start_year=config.walk_forward.split_start_year,
-        year_boundary_offset_sessions=year_boundary_offset_sessions(config),
+    checkpoint = None
+    if mode == "infer" and start_fold is not None:
+        checkpoint_path = Path(output_dir) / f"fold_{int(start_fold):02d}" / "checkpoint_best.pt"
+        if checkpoint_path.exists():
+            checkpoint = _load_checkpoint(checkpoint_path)
+    all_folds = _build_requested_walk_forward_folds(
+        panel.dates, config, checkpoint=checkpoint, requested_fold=start_fold,
     )
     if year_boundary_offset_sessions(config) and _distributed_rank() == 0:
         from downloader.artifact_io import atomic_write_json
@@ -2568,40 +2640,15 @@ def main() -> None:
                       f"train={panel.dates[boundary_fold.train_indices[0]]}..{panel.dates[boundary_fold.train_indices[-1]]} "
                       f"val={panel.dates[boundary_fold.val_indices[0]]}..{panel.dates[boundary_fold.val_indices[-1]]} "
                       f"test={panel.dates[boundary_fold.test_indices[0]]}..{panel.dates[boundary_fold.test_indices[-1]]}", flush=True)
-    if mode == "infer" and start_fold is not None:
-        checkpoint_path = (
-            Path(output_dir)
-            / f"fold_{int(start_fold):02d}"
-            / "checkpoint_best.pt"
+    if checkpoint is not None:
+        checkpoint_fold = next(fold for fold in all_folds if fold.fold_id == int(start_fold))
+        print(
+            "[runner] restored checkpoint-defined inference fold "
+            f"fold={checkpoint_fold.fold_id} "
+            f"train={checkpoint_fold.train_years[0]}-{checkpoint_fold.train_years[-1]} "
+            f"val={checkpoint_fold.val_years} test={checkpoint_fold.test_years}",
+            flush=True,
         )
-        if checkpoint_path.exists():
-            checkpoint = _load_checkpoint(checkpoint_path)
-            checkpoint_fold = build_checkpoint_inference_fold(
-                panel.dates,
-                checkpoint,
-                year_boundary_offset_sessions=year_boundary_offset_sessions(config),
-            )
-            if checkpoint_fold.fold_id != int(start_fold):
-                raise ValueError(
-                    "requested inference fold does not match checkpoint metadata: "
-                    f"requested={int(start_fold)} saved={checkpoint_fold.fold_id}"
-                )
-            all_folds = sorted(
-                [
-                    fold
-                    for fold in all_folds
-                    if int(fold.fold_id) != int(start_fold)
-                ]
-                + [checkpoint_fold],
-                key=lambda fold: int(fold.fold_id),
-            )
-            print(
-                "[runner] restored checkpoint-defined inference fold "
-                f"fold={checkpoint_fold.fold_id} "
-                f"train={checkpoint_fold.train_years[0]}-{checkpoint_fold.train_years[-1]} "
-                f"val={checkpoint_fold.val_years} test={checkpoint_fold.test_years}",
-                flush=True,
-            )
     startup_timing.checkpoint(
         "walk_forward_validation_and_fold_build",
         folds=int(len(all_folds)),
@@ -2859,5 +2906,23 @@ def main() -> None:
         torch.distributed.destroy_process_group()
 
 
+def _run_entrypoint() -> None:
+    from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    try:
+        main()
+    except (TWPublicSourceUpdatePending, CapacityDeferred) as exc:
+        # A pinned service may still be running the preceding source guard.
+        # Its ordinary traceback remains valid until both sides are admitted.
+        try:
+            from stockagent.live.tw_public_source_guard import report_maintenance_pending_to_parent
+        except ImportError:
+            pass
+        else:
+            report_maintenance_pending_to_parent(exc)
+        raise
+
+
 if __name__ == "__main__":
-    main()
+    _run_entrypoint()

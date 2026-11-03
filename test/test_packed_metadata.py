@@ -405,6 +405,65 @@ def test_interrupted_iterator_can_close_after_index_without_unraisable_errors():
     iterator.close()
 
 
+def test_bulk_insert_duplicate_keeps_exact_successful_prefix_and_count():
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        with pytest.raises(sqlite3.IntegrityError):
+            rows.extend(record(name) for name in ('a', 'b', 'c', 'b', 'unseen'))
+        assert len(rows) == 3
+        assert [row['path'] for row in rows] == ['a', 'b', 'c']
+        rows.append(record('d'))
+        assert len(rows) == 4
+
+
+def test_bulk_insert_generator_failure_preserves_incremental_visibility():
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        rows.extend([record('a'), record('b')])
+        def values():
+            for name, count in [('c', 2), ('d', 3), ('e', 4)]:
+                assert len(rows) == count
+                yield record(name)
+            assert len(rows) == 5
+            raise ValueError('interrupted inventory')
+        with pytest.raises(ValueError, match='interrupted inventory'):
+            rows.extend(values())
+        assert len(rows) == 5
+        assert [row['path'] for row in rows] == list('abcde')
+
+
+def test_memory_pressure_spills_admitted_index_without_losing_any_rows():
+    decisions = iter([True, False])
+    with MetadataRows(dict, dict, memory_rows=20000, memory_guard=lambda: next(decisions)) as rows:
+        rows.extend(record(f'{number:05}') for number in range(8200))
+        assert rows.spilled and len(rows) == 8200
+        assert [row['path'] for row in rows] == [f'{number:05}' for number in range(8200)]
+
+
+def test_adaptive_inventory_has_identical_full_recovery_and_visible_loading_progress(tmp_path, monkeypatch):
+    from stockagent import remote_build
+    original = source(tmp_path / 'source')
+    cold = tmp_path / 'cold'
+    release = packed.publish_packed_snapshot(cold, 'test', original, node_id='test', pack_buckets=1)
+    monkeypatch.setattr(packed, 'METADATA_MEMORY_ROWS', 1)
+    monkeypatch.setattr(remote_build, 'observe_node', lambda *_: {'limits': {'memory_headroom_bytes': 1024**4}})
+    events = []
+    with packed._open_inventory(cold, release.manifest, adaptive_memory=True, progress=events.append) as rows:
+        assert not rows.spilled
+        assert events[0]['stage'] == 'load-packed-inventory'
+        assert events[0]['completed_items'] == 0
+        assert events[-1]['completed_items'] == len(rows) == events[-1]['total_items']
+        assert all(event['acceptance'] is False for event in events)
+    memory = packed.verify_packed_snapshot(cold, release, reconstruct_all=True,
+                                          adaptive_inventory_memory=True, progress=events.append)
+    monkeypatch.setattr(remote_build, 'observe_node', lambda *_: {'limits': {'memory_headroom_bytes': 0}})
+    with packed._open_inventory(cold, release.manifest, adaptive_memory=True) as rows:
+        assert rows.spilled
+    spilled = packed.verify_packed_snapshot(cold, release, reconstruct_all=True,
+                                           adaptive_inventory_memory=True)
+    assert memory == spilled
+    assert memory['independently_reconstructed_files'] == 15
+    assert any(event['stage'] == 'validate-packed-inventory' for event in events)
+
+
 def test_bootstrap_benchmark_uses_the_real_reader_with_equal_metadata_and_no_public_write():
     from scripts.benchmark_packed_metadata import bootstrap_trial
     retained = bootstrap_trial(20, 'retained', 2)
