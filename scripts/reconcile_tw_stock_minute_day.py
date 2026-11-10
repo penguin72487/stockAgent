@@ -184,6 +184,20 @@ def _day_summary(day: pl.DataFrame, trade_date: date,
 def reconcile(input_root: Path, output_root: Path, trade_date: date,
               *, stock_root: Path = Path("data_tw_public/stocks"),
               repair: bool = False) -> dict[str, Any]:
+    if repair:
+        # A repair replaces both a partition and its manifest. Hold the same
+        # root owner as the full builder and publisher for the whole check,
+        # rather than only serializing the final rename with other repairs.
+        from stockagent.data_sync.workspace_source_handoff import guarded_source_writer
+        with guarded_source_writer(output_root):
+            return _reconcile_with_owner(input_root, output_root, trade_date,
+                                         stock_root=stock_root, repair=True)
+    return _reconcile_with_owner(input_root, output_root, trade_date,
+                                 stock_root=stock_root, repair=False)
+
+
+def _reconcile_with_owner(input_root: Path, output_root: Path, trade_date: date,
+                          *, stock_root: Path, repair: bool) -> dict[str, Any]:
     if trade_date >= datetime.now(ZoneInfo("Asia/Taipei")).date():
         raise ValueError("only completed trading sessions can be reconciled")
     if input_root.is_symlink() or output_root.is_symlink():

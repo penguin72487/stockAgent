@@ -10,6 +10,7 @@ from hashlib import sha256
 from http.client import HTTPException
 from io import BytesIO, StringIO
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -34,6 +35,15 @@ except ImportError:  # pragma: no cover - direct execution from downloader/
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(REPO_ROOT))
+
+from dataset_lock import (  # noqa: E402
+    DEFAULT_LOCK_TIMEOUT_SECONDS,
+    exclusive_dataset_lock,
+    parse_lock_timeout_seconds,
+)
 
 from common import (  # noqa: E402
     PersistentProgress,
@@ -925,6 +935,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-download-bytes", type=int, default=0)
     parser.add_argument("--retries", type=int, default=5)
     parser.add_argument(
+        "--lock-timeout-seconds", type=parse_lock_timeout_seconds,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+    )
+    parser.add_argument(
         "--preflight-only",
         action="store_true",
         help="Persist the O(1) local capacity gate without listing remote archives.",
@@ -934,7 +948,24 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    root = args.output_root.resolve()
+    root = Path(os.path.abspath(args.output_root))
+    from stockagent.data_sync.workspace_source_handoff import guard_path
+
+    # Guard before creating even the lock: an unavailable E mount must never
+    # silently recreate a C-side source tree. Direct CLI and timer share the
+    # same root lock, which the source handoff also holds through exchange.
+    guard_path(root)
+    guard_path(root.resolve(strict=False))
+    with exclusive_dataset_lock(
+        root / ".download.lock", provider="binance_public_archive",
+        timeout_seconds=args.lock_timeout_seconds,
+    ):
+        guard_path(root)
+        guard_path(root.resolve(strict=False))
+        return _run_locked(args, root)
+
+
+def _run_locked(args: argparse.Namespace, root: Path) -> int:
     root.mkdir(parents=True, exist_ok=True)
     preflight = _capacity_receipt(
         root,

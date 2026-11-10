@@ -1,5 +1,31 @@
 # Penguin → lab203：來源證據與背壓交接（2026-10-29）
 
+## 2026-11-05 18:32 接續：確認 repository lock 與刷新原 readiness
+
+這是來源端交接要求，不是 NAS ACK、鎖已失效或接收端已採用的證明。
+Penguin 仍讀到 11/2 12:49:56（台北）的原 `readiness.json`，已超過原
+900 秒有效期間；新鮮的 capacity／runtime／owner schedule 不延長它。
+11/4 19:27:36 的固定 `stockagent.lab203_readiness_and_batch_progress_non_ack.v1`
+診斷回報原 repository config preflight exit 11、`unable to create lock`／
+`repository is already locked exclusively`，且明確保留其他 repository
+clients 可能存在。這是當時診斷，不斷言今天仍為同一持有者。
+
+請 lab203 的原 owner：
+
+1. 核對目前 repository 身分、所有已知 clients、鎖持有者與對應備份／
+   restore／prune 活動。保留原鎖與證據；不依本機 PID 不存在就強制 unlock。
+2. 在原安全流程取得准入後，重新執行原 readiness 檢查並產生真正新觀測；
+   沿既有反向回執通道回傳，不改寫舊時鐘或單純延長 lease。
+3. 接續既有封閉 dispatch 的 NAS 獨立讀回與配對 ACK。Penguin 的 lifecycle
+   snapshot 1061 尚在等 delivery
+   `bd73586c2a4cfaed9b1b6674bf4b731f5334abb7cc6095eac1df820681d8e856`。
+   請分開回報該 delivery 與私有備份 cohort 的進度、剩餘工作量、實際讀回
+   吞吐量、下一次檢查／開始／預計完成；不可由送達或容量推定驗收。
+
+Penguin 已保留服務、原 source journals 和 NAS 未 ACK 的副本；網站每分鐘
+觀測，原候選 worker 仍待安全邊界載入 E metadata scratch 改善。無需為
+刷新網頁另起 backup writer、重新封裝已驗收包或更改現有 reserve。
+
 ## 2026-10-30 00:55 更新：三個固定控制包已取得 NAS 檔案還原 ACK
 
 以下更新取代本文件較早時間點「等待三包 NAS 驗收」的狀態。Penguin

@@ -1347,6 +1347,12 @@ def _input_receipts(
 
 def main() -> None:
     args = parse_args()
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard
+    with writer_guard(args.bybit_daily_dir, args.output_path):
+        _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args) -> None:
     started = datetime.now(timezone.utc)
     started_monotonic = time.perf_counter()
     stage_seconds: dict[str, float] = {}

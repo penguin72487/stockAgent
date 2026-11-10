@@ -1108,6 +1108,10 @@ def main() -> None:
         },
     )
     output_dir = Path(args.output_dir)
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+    guard_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_handle = (output_dir / ".download.lock").open("a+")
     try:
@@ -1118,6 +1122,11 @@ def main() -> None:
             "skip duplicate run"
         )
         return
+    try:
+        guard_locked_path(output_dir, lock_handle)
+    except BaseException:
+        lock_handle.close()
+        raise
     client = HttpClient(max_retries=args.max_retries, retry_base=args.retry_base)
     started = datetime.now(UTC)
     progress_path = output_dir / "progress.json"

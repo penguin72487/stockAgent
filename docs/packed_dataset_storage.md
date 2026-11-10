@@ -1,5 +1,49 @@
 # 大檔資料發布與 Syncthing 同步設計
 
+## 資料集相鄰封裝：E 候選，不等於 D 格式已遷移
+
+`publish_packed_snapshot` 與資料目錄發布器支援選用
+`pack_layout: source-dataset-v1`：以一個原來源資料集為單位，新檔按原
+相對路徑排列，即使位於不同子目錄也可放在同一個新 ZIP。單次發布的
+變更在容量與成員上限內形成一個增量包；較大的變更分成多個有界包，單一
+來源檔在一個成員內保持完整。`source-directory-v1` 則可按第一層目錄
+細分，適用已知經常只取用某個子目錄的來源。二者均不混合不同資料集；
+原始名稱及位元組仍依 inventory 還原。`pack_target_bytes` 是原始邏輯
+位元組目標，單一大成員、ZIP 標頭及壓縮結果可能超過目標。資料集整包的
+候選預設值 4 GiB 是待量測的起點，不是實際 HDD 效能保證。
+若希望小於目標大小的完整檔案一起進包，登錄該資料集時也須將
+`loose_threshold_bytes` 明確設成適合的大小，例如等於封包目標；否則
+超過原門檻的檔案仍會是獨立 blob 或 chunks，而不會自動變成同一個包。
+
+`large_file_layout: whole-file-v1` 可讓新的大檔保留為完整 blob；預設仍
+沿用既有 v2 chunks。兩者使用既有 ZIP／blob 與 v2 讀取契約，不替換或刪除
+舊分塊。調高 `loose_threshold_bytes` 時，小於此門檻的完整檔案可直接存入
+目錄分組 ZIP；大於門檻的檔案按選定的大檔策略處理。頻繁修改的大檔可能
+因整檔重寫而顯著增加增量用量，應按資料集實測，不一律選整檔。
+
+manifest 的 `new_pack_layout`、`new_pack_target_bytes` 和
+`new_large_file_layout` 說明**後續新物件的寫入政策**；原樣重用的舊物件
+可能仍是路徑雜湊包或分塊，不能僅憑這些欄位宣稱既有資料已完成重封裝。
+政策切換會建立新 manifest，保留既有版本、完整還原、引用及 NAS 閘門。
+舊工具可能忽略政策欄位，正式對任何資料集啟用前須先核對所有實際 writer
+與 reader 的版本，並依資料集容量與使用限制由原 owner 登錄。
+
+增量包服務當前資料；研究實際採用的版本需要固定原始 release、研究
+設定、程式、runtime 和成果的可驗證關聯。既有研究配方的持久 `build`
+在原 publication／retention 鎖下，將所用 release 的標準 pin、精確配方與
+設定摘要登記至 retention 狀態目錄；建置收據再記錄關聯與 runtime。
+此 pin 保護冷版本，不會因此永久固定 C 的已還原工作集，後者仍按租約
+及活躍程序引用管理。試跑 `trial` 不建立研究 pin。失敗或中斷的持久建置
+保留 pin 和失敗收據，待確認研究產物後再處理。這只涵蓋此配方持久建置
+路徑，並未證明所有其他研究或歷史執行都已登記；不得把「未找到研究
+使用」當作舊版本的刪除證明。版本保留策略也不能刪掉資料集內本身需要
+的歷史記錄、公告時間或來源修正紀錄。
+
+2026-11-06 固定 CFTC 歷史版本已在 E 建立、獨立還原和逐檔比對候選；未
+更新 D 正式 head、未取得該候選的 NAS 配對驗收，也沒有授權回收舊版。
+實測結果、原始版本及限制見
+[來源目錄封裝與遷移進度](source_local_packing_migration_2026-11-06.md)。
+
 ## 結論
 
 目前部署以 penguin 為唯一資料權威；檔案格式中的多產生者 head 是來源與版本資訊，
@@ -17,7 +61,7 @@
 查詢對齊的 canonical 資料（每日、每 symbol 或每 endpoint Parquet）
         │ packed publish
         ▼
-Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
+Syncthing 發布庫（依選用政策的 ZIP／blob + manifest/head）
         │ 原子發布後通知掃描（penguin D:）／watcher（其他節點）+ cold verify
         ▼
 各節點預設 COLD_ONLY（不自動 fetch/use/materialize）
@@ -39,14 +83,15 @@ Syncthing 發布庫（固定 hash 分桶 ZIP + 大檔 blob + manifest/head）
 
 - 單一巨檔只改一筆也要重傳整檔，且損毀半徑最大。
 - 每個小檔直接同步會消耗 Syncthing 掃描、資料庫與 inode。
-- 第一版以固定路徑雜湊分桶建立 base packs。後續 manifest 逐檔比較 SHA；
-  未變檔案沿用既有 pack member，只有新增或變更檔案寫入 delta packs。
+- 舊預設以固定路徑雜湊分桶建立 base packs；新資料集政策依來源資料集
+  聚合。後續 manifest 逐檔比較 SHA；未變檔案沿用既有 pack member，
+  只有新增或變更檔案寫入 delta packs。
 - 每個增量 manifest 都直接列出完整可重建物件集合，不需要依序重播整條 delta chain；
   被部分沿用的舊 pack 會標記為 subset reference，fetch 只解出目前 inventory 成員。
 - 大於門檻的 Parquet/NPY 直接成為 SHA-256 blob，不做無效二次壓縮。
 - 接收端仍可 materialize 舊目錄契約，既有訓練 reader 不必同時重寫。
 
-預設門檻是 8 MiB；文字類小檔用 Deflate，Parquet、NPY、ZIP、Zstd 等已壓縮
+舊預設門檻是 8 MiB；文字類小檔用 Deflate，Parquet、NPY、ZIP、Zstd 等已壓縮
 格式用 Stored。每個來源檔、pack、blob、inventory 與 manifest 都有 SHA-256。
 
 這裡的 `snapshot_id` 是向後相容的 release ID 名稱；它不代表每次發布都完整複製一棵

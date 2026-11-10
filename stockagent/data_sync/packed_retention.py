@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import time
@@ -33,6 +34,8 @@ from stockagent.data_sync.packed_snapshots import (
 )
 
 PLAN_SCHEMA = 1
+RESEARCH_PIN_MARKER = "research-pins-enabled.json"
+RESEARCH_PIN_CONTRACT = "stockagent.research_pins.v1"
 
 
 def _utc_now() -> str:
@@ -88,11 +91,26 @@ def _manifest_identity(sync_root: Path, path: Path, manifest: Mapping[str, Any])
 
 
 def _local_protected_snapshot_ids(
-    materialized_root: Path, known: set[str]
+    materialized_root: Path, known: set[str], *, research_pin_root: Path | None = None,
+    research_pin_marker: Path | None = None,
 ) -> tuple[set[str], list[str], list[str]]:
     protected: set[str] = set()
     evidence: list[str] = []
     errors: list[str] = []
+    if research_pin_root is not None:
+        # Rescue plans can name a source that is missing today. Keep that
+        # exact identity enrolled without treating its absence as a reason to
+        # block retirement of an unrelated snapshot. A damaged enrolled
+        # registry is different: it must never become an empty protection set.
+        try:
+            from stockagent.data_sync import rescue_source_references
+            for binding in rescue_source_references.load(research_pin_root.parent):
+                snapshot_id = binding['snapshot_id']
+                if snapshot_id in known:
+                    protected.add(snapshot_id)
+                    evidence.append(f'{snapshot_id}:rescue-source-reference')
+        except (OSError, ValueError, TypeError, SnapshotError) as error:
+            errors.append(f'cannot enumerate rescue source references: {error}')
     candidates = [
         path
         for path in materialized_root.rglob("*.pin.json")
@@ -100,6 +118,37 @@ def _local_protected_snapshot_ids(
     ]
     candidates += list((materialized_root / ".cache-state/leases").glob("*/*.json"))
     candidates += list(materialized_root.glob("*/*.READY.json"))
+    if research_pin_root is not None:
+        try:
+            if research_pin_marker is not None:
+                marker_exists = research_pin_marker.exists() or research_pin_marker.is_symlink()
+                root_exists = research_pin_root.exists() or research_pin_root.is_symlink()
+                if marker_exists:
+                    if (research_pin_marker.is_symlink() or not research_pin_marker.is_file()
+                            or not 0 < research_pin_marker.stat().st_size <= 4096
+                            or json.loads(research_pin_marker.read_text()) != {
+                                "contract": RESEARCH_PIN_CONTRACT, "schema_version": 1}
+                            or not root_exists):
+                        raise OSError("missing or invalid research protection marker/root")
+                elif root_exists:
+                    raise OSError("research protection root lacks its marker")
+            if research_pin_root.is_symlink():
+                raise OSError("redirected research protection root")
+            if research_pin_root.exists():
+                if not research_pin_root.is_dir() or research_pin_root.resolve(strict=True) != research_pin_root:
+                    raise OSError("invalid research protection root")
+                with os.scandir(research_pin_root) as studies:
+                    for study in studies:
+                        if not study.is_dir(follow_symlinks=False):
+                            raise OSError("invalid research protection entry")
+                        with os.scandir(study.path) as members:
+                            for member in members:
+                                if member.is_symlink() or not member.is_file(follow_symlinks=False):
+                                    raise OSError("invalid research protection member")
+                                if member.name.endswith(".pin.json"):
+                                    candidates.append(Path(member.path))
+        except (OSError, ValueError, TypeError) as error:
+            return protected, evidence, [f"cannot enumerate research protection: {error}"]
     for path in candidates:
         try:
             value = json.loads(path.read_text())
@@ -224,7 +273,8 @@ def build_plan(config: RetentionConfig, *, now_ns: int | None = None) -> dict[st
             blockers.append(f"incomplete current head: {head_path}: {exc}")
 
     local_ids, local_evidence, local_errors = _local_protected_snapshot_ids(
-        config.materialized_root, set(manifests)
+        config.materialized_root, set(manifests), research_pin_root=config.state_dir / "research-pins",
+        research_pin_marker=config.state_dir / RESEARCH_PIN_MARKER,
     )
     if local_errors:
         blockers.append("local retention protection metadata requires audit")

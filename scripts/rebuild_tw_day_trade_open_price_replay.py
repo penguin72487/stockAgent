@@ -36,7 +36,7 @@ from pathlib import Path
 import re
 import sys
 import time as time_module
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Iterable, Mapping
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -46,7 +46,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.run_tw_day_trade_simulation import _mode_specs, _rule_data_dir  # noqa: E402
+from scripts.run_tw_day_trade_simulation import (  # noqa: E402
+    _mode_specs, _rule_data_dir, _research_terminal_contexts_from_loaded,
+)
 from stockagent.live.paper_journal import open_paper_journal
 from downloader.download_tw_public_data import (  # noqa: E402
     DEFAULT_DATASETS,
@@ -66,6 +68,8 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
     MARGIN_CARRY_CONTRACT,
     EXECUTION_REALISM_CONTRACT,
     ENTRY_PRICE_GUARD_CONTRACT,
+    HISTORICAL_BRACKET_FULL_CROSS_CONTRACT,
+    HISTORICAL_OPEN_FALLBACK_CONTRACT,
     TERMINAL_CLOSE_UNLIMITED_CONTRACT,
     TwDayTradeSimulationEngine,
     load_live_eligibility,
@@ -90,6 +94,11 @@ from stockagent.live.minute_source_paths import (  # noqa: E402
     DEFAULT_LOCAL_MINUTE_ROOTS as DEFAULT_MINUTE_DATA_ROOTS,
 )
 from stockagent.live.signal_artifacts import read_execution_weight_rows  # noqa: E402
+from stockagent.live.tw_day_trade_nontrade import (  # noqa: E402
+    CONTRACT as NONTRADE_CONTRACT,
+    apply_nontrade_observation,
+    select_pinned_last_minute_observations,
+)
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -1073,6 +1082,7 @@ def _entry_quotes(
     historical_books: Mapping[str, Mapping[str, Any]] | None = None,
     official_no_trade_symbols: set[str] | None = None,
     observed_no_trade_through_0901_symbols: set[str] | None = None,
+    official_open_fallback_evidence: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> tuple[dict[str, dict[str, Any]], dict[str, Any]]:
     if spec.entry_fill_policy == ENTRY_FILL_POLICY_CAUSAL_BOOK:
         raise RuntimeError(
@@ -1088,6 +1098,7 @@ def _entry_quotes(
     exact_best_quote_symbols: list[str] = []
     adverse_tick_fallback_symbols: list[str] = []
     observed_0901_price_symbols: list[str] = []
+    open_fallback_symbols: list[str] = []
     observed_0901_price_method_counts: dict[str, int] = {}
     missing_official_open_symbols: list[str] = []
     official_open_mismatches: list[dict[str, Any]] = []
@@ -1171,6 +1182,26 @@ def _entry_quotes(
             math.isfinite(execution_price_0901)
             and execution_price_0901 > 0.0
         )
+        observed_lots = observed_0901_minute_volume_lots(book, lot_size=spec.lot_size)
+        raw_volume = book.get("tick_volume_units_0901")
+        # A reported zero/invalid source volume is not an absent observation.
+        # Do not use the fallback to overturn known no-trade or malformed data.
+        invalid_or_zero_volume = raw_volume is not None and _finite(raw_volume) is None
+        fallback_evidence = (official_open_fallback_evidence or {}).get(symbol)
+        use_open_fallback = bool(
+            spec.historical_open_price_fallback and is_0901_vwap_policy
+            and (not has_0901_price or observed_lots <= 0)
+            and not invalid_or_zero_volume
+            and symbol not in (official_no_trade_symbols or set())
+            and symbol not in (observed_no_trade_through_0901_symbols or set())
+            and isinstance(fallback_evidence, Mapping)
+            and serialized_open is not None
+            and fallback_evidence.get("session_date") == quote_at.date().isoformat()
+            and fallback_evidence.get("symbol") == symbol
+            and _finite(fallback_evidence.get("price")) == serialized_open
+        )
+        if use_open_fallback:
+            open_fallback_symbols.append(symbol)
         use_adverse_tick_fallback = bool(
             potentially_executable
             and spec.entry_fill_policy
@@ -1199,6 +1230,8 @@ def _entry_quotes(
             )
         source_quote_at = book.get(source_quote_at_key) or book.get("quote_at")
         entry_price_source = (
+            "official_daily_session_open_assumed_for_0901"
+            if use_open_fallback else
             str(book.get("source") or "observed_right_labelled_09_01_minute_price")
             if is_0901_vwap_policy and has_0901_price
             else "missing_observed_09_01_minute_price"
@@ -1223,7 +1256,7 @@ def _entry_quotes(
             "bid_volume": (book.get("bid_volume") if has_required_best_quote else None),
             "ask_volume": (book.get("ask_volume") if has_required_best_quote else None),
             "minute_volume_lots": (
-                observed_0901_minute_volume_lots(book, lot_size=spec.lot_size)
+                observed_lots
                 if is_0901_vwap_policy else book.get("minute_volume_lots")
             ),
             "execution_price_0901": (
@@ -1232,8 +1265,10 @@ def _entry_quotes(
             "historical_minute_valuation": is_0901_vwap_policy,
             "valuation_price_0901": book.get("valuation_price_0901"),
             "execution_price_0901_method": (
-                execution_price_0901_method if has_0901_price else None
+                "official_open_fallback_assumption" if use_open_fallback
+                else execution_price_0901_method if has_0901_price else None
             ),
+            "historical_open_fallback_evidence": dict(fallback_evidence) if use_open_fallback else None,
             "upper_limit": evidence.get("upper_limit_price"),
             "lower_limit": evidence.get("lower_limit_price"),
             "reference_price": evidence.get("reference_price"),
@@ -1244,9 +1279,11 @@ def _entry_quotes(
                 observed_no_trade_through_0901_symbols
                 and symbol in observed_no_trade_through_0901_symbols
             ),
-            "quote_at": quote_at.isoformat(timespec="seconds"),
+            # The 09:01 ledger clock is a simulation convention, not evidence
+            # that a quote or trade was actually observed at that time.
+            "quote_at": None if use_open_fallback else quote_at.isoformat(timespec="seconds"),
             "historical_source_quote_at": (
-                book.get("source_window_end")
+                None if use_open_fallback else book.get("source_window_end")
                 if is_0901_vwap_policy
                 else source_quote_at
             ),
@@ -1284,6 +1321,7 @@ def _entry_quotes(
         "adverse_tick_fallback_symbols": sorted(set(adverse_tick_fallback_symbols)),
         "observed_0901_price_rows": len(observed_0901_price_symbols),
         "observed_0901_price_symbols": sorted(observed_0901_price_symbol_set),
+        "official_open_fallback_symbols": sorted(set(open_fallback_symbols)),
         "observed_0901_price_method_counts": observed_0901_price_method_counts,
         "missing_0901_price_symbols": sorted(
             nonzero_target_symbols - observed_0901_price_symbol_set
@@ -1592,6 +1630,27 @@ def _official_aggregate_daily_rows(
 ) -> dict[str, dict[str, Any]]:
     """Load one official session from the venue aggregates as a lag fallback."""
 
+    return _official_aggregate_daily_rows_batch(twse_path, tpex_path, (trading_date,))[trading_date]
+
+
+def _official_aggregate_daily_rows_batch(
+    twse_path: Path,
+    tpex_path: Path,
+    trading_dates: Iterable[date],
+) -> dict[date, dict[str, dict[str, Any]]]:
+    """Read a bounded set of exact sessions without rescanning per session.
+
+    Missing sessions, null prices and zero-volume rows keep their original
+    meaning; this reader does not synthesize either an open or an execution.
+    """
+
+    dates_by_text = {day.isoformat(): day for day in trading_dates}
+    rows_by_date: dict[date, dict[str, dict[str, Any]]] = {
+        day: {} for day in dates_by_text.values()
+    }
+    if not dates_by_text:
+        return rows_by_date
+
     def _price(column: str, alias: str) -> pl.Expr:
         return (
             pl.col(column)
@@ -1626,8 +1685,9 @@ def _official_aggregate_daily_rows(
                        else pl.lit(None, dtype=pl.Float64).alias("volume_shares"))
         frame = (
             lazy
-            .filter(pl.col("date").cast(pl.String) == trading_date.isoformat())
+            .filter(pl.col("date").cast(pl.String).is_in(list(dates_by_text)))
             .select(
+                pl.col("date").cast(pl.String).alias("_official_date"),
                 pl.col(symbol_column).cast(pl.String).str.strip_chars().alias("symbol"),
                 *(
                     _price(source_column, target_column)
@@ -1641,10 +1701,11 @@ def _official_aggregate_daily_rows(
         if not frame.is_empty():
             frames.append(frame)
     if not frames:
-        return {}
+        return rows_by_date
 
-    rows: dict[str, dict[str, Any]] = {}
     for row in pl.concat(frames, how="vertical").iter_rows(named=True):
+        trading_date = dates_by_text[row["_official_date"]]
+        rows = rows_by_date[trading_date]
         symbol = str(row.get("symbol") or "")
         if not symbol:
             continue
@@ -1661,7 +1722,7 @@ def _official_aggregate_daily_rows(
             "volume_shares": row.get("volume_shares"),
             "_official_source": row.get("_official_source"),
         }
-    return rows
+    return rows_by_date
 
 
 @lru_cache(maxsize=None)
@@ -1707,6 +1768,41 @@ def _official_zero_volume_no_ohlc(daily: Mapping[str, Any]) -> bool:
         return False
     return (math.isfinite(number) and number == 0.0
             and all(daily.get(name) is None for name in ("open", "max", "min", "close")))
+
+
+def _verified_official_open_fallbacks(
+    *, raw_root: Path, trading_date: date, canonical_opens: Mapping[str, float],
+    symbols: set[str],
+) -> tuple[dict[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Pin daily source bytes; do not infer when that session's first trade was."""
+    from scripts.settle_tw_day_trade_official_close import official_closes
+
+    daily, sources = official_closes(raw_root, trading_date, pin_sources=True)
+    proof_created_at = datetime.now(TAIPEI).isoformat(timespec="microseconds")
+    proofs: dict[str, dict[str, Any]] = {}
+    for symbol in symbols:
+        row = daily.get(symbol) or {}
+        values = row.get("official_row") or {}
+        opening = _finite(str(values.get("開盤價", values.get("開盤"))).replace(",", ""))
+        try:
+            volume = float(str(values.get("成交股數", values.get("成交量"))).replace(",", ""))
+        except (TypeError, ValueError):
+            continue
+        canonical = _finite(canonical_opens.get(symbol))
+        if not (opening is not None and canonical is not None
+                and math.isclose(opening, canonical, rel_tol=0, abs_tol=1e-8)
+                and math.isfinite(volume) and volume > 0 and volume.is_integer()):
+            continue
+        proofs[symbol] = {
+            "contract": HISTORICAL_OPEN_FALLBACK_CONTRACT,
+            "session_date": trading_date.isoformat(), "symbol": symbol, "price": opening,
+            "source_path": row["source_path"], "source_sha256": row["source_sha256"],
+            "source": row["source"], "opening_time_known": False,
+            "proof_created_at": proof_created_at, "proof_clock_basis": "host_wall_clock",
+            "full_quantity_assumed": True, "simulation_only": True,
+            "broker_fill": False, "exchange_fill": False,
+        }
+    return proofs, sources
 
 
 def _official_open_map(
@@ -2260,9 +2356,9 @@ def _close_quotes(
                 if not math.isclose(close_price, proof["price"], rel_tol=0, abs_tol=1e-9):
                     raise ValueError(f"official terminal close sources disagree: {trading_date}/{symbol}")
                 quotes[symbol]["session_close_evidence"] = {
-                    "session_date": proof["official_date"], "price": proof["price"],
+                    "session_date": proof["official_date"], "symbol": symbol, "price": proof["price"],
                     "source": proof["source"], "source_sha256": proof["source_sha256"],
-                    "price_basis": proof["price_basis"],
+                    "source_path": proof["source_path"], "price_basis": proof["price_basis"],
                 }
     if missing:
         raise ValueError(
@@ -2307,6 +2403,8 @@ def _position_stats(mode: Mapping[str, Any]) -> dict[str, Any]:
         "execution_evidence_complete": mode.get("execution_evidence_complete"),
         "terminal_flatten_count": int(mode.get("terminal_flatten_count") or 0),
         "terminal_close_contract": mode.get("terminal_close_contract"),
+        **({"research_short_limit_up_close_penalty_rate": mode["research_short_limit_up_close_penalty_rate"]}
+           if mode.get("research_short_limit_up_close_penalty_rate") else {}),
         "entry_fill_policy": mode.get("entry_fill_policy"),
         "entry_fill_contract": mode.get("entry_fill_contract"),
         "entry_price_guard_contract": mode.get("entry_price_guard_contract"),
@@ -2365,8 +2463,14 @@ def _minute_bar_rows(
     *,
     trading_date: date,
     symbols: set[str],
+    requested_minutes: frozenset[time] | None = None,
 ) -> tuple[dict[str, dict[str, dict[str, float]]], dict[str, Any]]:
-    """Load retained right-labelled minute OHLCV without fabricating books."""
+    """Load retained right-labelled OHLCV; optionally materialize only given minutes.
+
+    Source ownership is selected using all valid rows, even when only a subset
+    of minutes is returned.  An absent requested minute must not silently select
+    a different source for the same symbol/session.
+    """
 
     unresolved = set(symbols)
     output: dict[str, dict[str, dict[str, float]]] = {}
@@ -2461,8 +2565,6 @@ def _minute_bar_rows(
                 # refresh inventory marks nor trigger a resting stop/limit.
                 zero_volume_rows += 1
                 continue
-            amount = _finite(row.get("Amount"))
-            vwap = amount / volume if amount is not None and volume > 0.0 else close
             raw_source = str(row.get("_source_path") or source_text)
             row_source = resolved_sources.get(raw_source)
             if row_source is None:
@@ -2473,6 +2575,12 @@ def _minute_bar_rows(
                 # have one deterministic source so an independent verifier can
                 # reproduce both prints and explicit no-print minutes.
                 continue
+            accepted_symbols.add(symbol)
+            accepted_sources.setdefault(symbol, row_source)
+            if requested_minutes is not None and stamp.time() not in requested_minutes:
+                continue
+            amount = _finite(row.get("Amount"))
+            vwap = amount / volume if amount is not None and volume > 0.0 else close
             output.setdefault(symbol, {})[stamp.isoformat(timespec="minutes")] = {
                 "open": float(_finite(row.get("Open")) or close),
                 "high": float(_finite(row.get("High")) or close),
@@ -2481,8 +2589,6 @@ def _minute_bar_rows(
                 "vwap": float(vwap),
                 "volume_shares": volume,
             }
-            accepted_symbols.add(symbol)
-            accepted_sources.setdefault(symbol, row_source)
         if any(Path(raw).resolve() != path for raw, path in resolved_sources.items()):
             raise ValueError("minute source path redirected during frame read")
         if accepted_symbols:
@@ -2580,7 +2686,9 @@ def _minute_bar_rows(
         "ignored_zero_volume_rows": zero_volume_rows,
         "ignored_unverified_volume_rows": unverified_volume_rows,
         "resolved_symbols": len(output),
-        "missing_symbols": sorted(unresolved),
+        "missing_symbols": sorted(
+            set(symbols) - set(output) if requested_minutes is not None else unresolved
+        ),
         "source_counts": dict(sorted(source_counts.items())),
         "source_files": source_files,
     }
@@ -2673,6 +2781,7 @@ def _apply_historical_kbar_brackets(
     bars: Mapping[str, Mapping[str, Mapping[str, float]]],
     observed: datetime,
     append_mark: bool = True,
+    allow_take_profit: bool = True,
 ) -> dict[str, dict[str, Any]]:
     """Replay brackets conservatively from a completed one-minute range.
 
@@ -2701,18 +2810,26 @@ def _apply_historical_kbar_brackets(
         stop_hit = stop_waiting or (
             side == "long" and float(bar["low"]) <= stop
         ) or (side == "short" and float(bar["high"]) >= stop)
-        take_profit_hit = (
+        take_profit_hit = allow_take_profit and ((
             side == "long" and float(bar["high"]) > take_profit
-        ) or (side == "short" and float(bar["low"]) < take_profit)
+        ) or (side == "short" and float(bar["low"]) < take_profit))
+        stop_crossed = ((side == "long" and float(bar["low"]) < stop)
+                        or (side == "short" and float(bar["high"]) > stop))
+        user_cross = bool(
+            mode.get("historical_bracket_cross_assumption") == HISTORICAL_BRACKET_FULL_CROSS_CONTRACT
+            and float(bar.get("volume_shares") or 0) > 0
+            and ((stop_hit and stop_crossed) or (not stop_hit and take_profit_hit))
+        )
         capacity = (
             abs(int(position.get("signed_shares") or 0))
-            if full_target and float(bar.get("volume_shares") or 0) > 0
+            if (full_target or user_cross) and float(bar.get("volume_shares") or 0) > 0
             else _capacity_from_bar(position, bar)
         )
         if stop_hit:
             position["stop_order_status"] = "triggered_waiting_liquidity"
             if capacity > 0:
-                execution = float(bar["vwap"])
+                execution = (float(bar["low"] if side == "long" else bar["high"])
+                             if user_cross else float(bar["vwap"]))
                 quote = _bar_quote(
                     position,
                     bar,
@@ -2722,6 +2839,12 @@ def _apply_historical_kbar_brackets(
                     last=stop,
                     full_target=full_target,
                 )
+                if user_cross:
+                    quote.update(fill_contract=HISTORICAL_BRACKET_FULL_CROSS_CONTRACT,
+                        depth_assumption="full_position_assumed_after_observed_strict_cross_no_exchange_fill_claim",
+                        bracket_cross_evidence={"contract": HISTORICAL_BRACKET_FULL_CROSS_CONTRACT,
+                            "symbol": symbol, "side": side, "bracket": "stop_loss", "trigger_price": stop,
+                            "simulation_only": True, "broker_fill": False, "exchange_fill": False})
                 engine._close_position(  # noqa: SLF001 - canonical ledger writer
                     position,
                     mode,
@@ -2748,6 +2871,12 @@ def _apply_historical_kbar_brackets(
                 ask=execution if side == "short" else None,
                 full_target=full_target,
             )
+            if user_cross:
+                quote.update(fill_contract=HISTORICAL_BRACKET_FULL_CROSS_CONTRACT,
+                    depth_assumption="full_position_assumed_after_observed_strict_cross_no_exchange_fill_claim",
+                    bracket_cross_evidence={"contract": HISTORICAL_BRACKET_FULL_CROSS_CONTRACT,
+                        "symbol": symbol, "side": side, "bracket": "take_profit", "trigger_price": take_profit,
+                        "simulation_only": True, "broker_fill": False, "exchange_fill": False})
             engine._close_position(  # noqa: SLF001 - canonical ledger writer
                 position,
                 mode,
@@ -2915,6 +3044,131 @@ def _eod_kbar_quotes(
     return quotes
 
 
+def _require_provisional_research_nav(mode: Mapping[str, Any], observed: datetime) -> None:
+    """Do not propagate a trajectory through unimplemented absorbing default.
+
+    A stale or missing mark cannot prove insolvency. Either way, this private
+    replay stops before a later decision could reset or revive the account.
+    """
+    if not mode.get("provisional_minute_source_coverage"):
+        return
+    try:
+        equity = float(mode["total_equity_twd"])
+    except (KeyError, TypeError, ValueError):
+        raise RuntimeError(f"provisional_research_nav_unavailable at {observed.isoformat()}") from None
+    if not math.isfinite(equity) or equity <= 0:
+        raise RuntimeError(f"provisional_research_nonpositive_nav_requires_reconciliation at {observed.isoformat()}")
+
+
+def _observed_terminal_quotes_only(quotes: Mapping[str, Mapping[str, Any]],
+                                   bars: Mapping[str, Mapping[str, Mapping[str, float]]],
+                                   *, trading_date: date) -> dict[str, Mapping[str, Any]]:
+    """Do not turn a daily close or an unknown auction into a trade print."""
+    key = datetime.combine(trading_date, time(13, 30), tzinfo=TAIPEI).isoformat(timespec="minutes")
+    accepted = {}
+    for symbol, quote in quotes.items():
+        bar = (bars.get(symbol) or {}).get(key) or {}
+        proof = quote.get("session_close_evidence") or {}
+        observed = _finite(bar.get("close"))
+        official = _finite(proof.get("price")) if isinstance(proof, Mapping) else None
+        if (_finite(bar.get("volume_shares")) is not None and observed is not None
+                and official is not None and math.isclose(observed, official, rel_tol=0, abs_tol=1e-8)):
+            accepted[symbol] = quote
+    return accepted
+
+
+def _settle_provisional_unobserved_terminal(
+    engine: TwDayTradeSimulationEngine, *, markets: list[str], trading_date: date,
+    official_quotes: Mapping[str, Mapping[str, Any]], accepted_quotes: Mapping[str, Mapping[str, Any]],
+    bars: dict, coverage: dict, limit_path: Path, limit_sha: str,
+    allow_official_close_reference: bool = False,
+) -> dict[str, Any]:
+    """Explicitly authorized research-only book assumptions; never fill journals."""
+    pending = []
+    for market in markets:
+        mode = engine.state["modes"][market]
+        if not mode.get("provisional_minute_source_coverage"):
+            raise ValueError("nontrade settlement requires isolated provisional replay")
+        for position in (mode.get("positions") or {}).values():
+            symbol = str(position.get("symbol") or "")
+            if int(position.get("signed_shares") or 0) and symbol not in accepted_quotes:
+                proof = (official_quotes.get(symbol) or {}).get("session_close_evidence")
+                if not isinstance(proof, Mapping):
+                    raise ValueError(f"nontrade settlement needs official close: {trading_date}/{symbol}")
+                pending.append((mode, position, dict(proof)))
+    if not pending:
+        return {"contract": NONTRADE_CONTRACT, "position_count": 0, "settled_shares": 0,
+                "simulation_only": True, "simulated_fill": False, "broker_fill": False,
+                "exchange_fill": False, "source_completeness_verified": False}
+    symbols = {str(position["symbol"]) for _mode, position, _proof in pending}
+    with_minutes, without_minutes = set(), set()
+    for symbol in symbols:
+        has_minute = False
+        for key, bar in (bars.get(symbol) or {}).items():
+            stamp = datetime.fromisoformat(str(key))
+            if (stamp.utcoffset() == timedelta(hours=8) and stamp.date() == trading_date
+                    and time(9, 1) <= stamp.time() <= time(13, 30)
+                    and _finite(bar.get("close")) is not None
+                    and _finite(bar.get("volume_shares")) is not None):
+                has_minute = True
+                break
+        (with_minutes if has_minute else without_minutes).add(symbol)
+    if without_minutes and not allow_official_close_reference:
+        raise ValueError(f"no verified positive-volume minute observation: {trading_date}/{sorted(without_minutes)[0]}")
+    references, pins = (select_pinned_last_minute_observations(day=trading_date, symbols=with_minutes,
+                        bars=bars, coverage=coverage) if with_minutes else ({}, []))
+    if without_minutes:
+        # The caller already verified positive daily volume and the official
+        # close against pinned raw bytes.  Its precise trade time, including
+        # whether it followed the assumed entry, is unknown.
+        for _mode, position, proof in pending:
+            symbol = str(position["symbol"])
+            if symbol not in without_minutes:
+                continue
+            references[symbol] = {"symbol": symbol, "reference_price": proof["price"],
+                "reference_observed_at": None, "reference_session_date": trading_date.isoformat(),
+                "exact_trade_time_known": False,
+                "source_clock_basis": "official_daily_close_last_trade_time_unknown",
+                "source": proof["source"], "source_path": proof["source_path"],
+                "source_sha256": proof["source_sha256"], "provider_object_complete": False}
+            pins.append({"path": proof["source_path"], "sha256": proof["source_sha256"]})
+    close_at = datetime.combine(trading_date, time(13, 30), tzinfo=TAIPEI)
+    staged = []
+    for mode, position, proof in pending:
+        symbol = str(position["symbol"])
+        price = _finite(proof.get("price"))
+        if price is None:
+            raise ValueError(f"nontrade official close is invalid: {trading_date}/{symbol}")
+        expense = None
+        if int(position["signed_shares"]) < 0 and mode.get("research_short_limit_up_close_penalty_rate"):
+            upper = _finite(position.get("upper_limit"))
+            if upper is None:
+                raise ValueError(f"nontrade research cost limit missing: {trading_date}/{symbol}")
+            # A missing or inconsistent auction cannot establish source
+            # capacity at the upper limit. Do not guess the 7% research cost.
+            if math.isclose(price, upper, rel_tol=0.0, abs_tol=1e-8):
+                raise ValueError(f"nontrade limit-up research cost capacity unknown: {trading_date}/{symbol}")
+            targets = {symbol: {"price": price, "upper_limit": upper,
+                                "official_close_evidence": proof}}
+            context = _research_terminal_contexts_from_loaded(observed=close_at, targets=targets,
+                limit_path=limit_path, limit_sha=limit_sha, bars=bars, coverage=coverage)[symbol]
+            expense = engine._research_terminal_expense(mode, position, price=price, proof=proof,
+                quote=context, effective_at=close_at)
+        staged.append((mode, position, proof, references[symbol], expense))
+    # Validate every source and research expense before any financial mutation.
+    shares = 0
+    for mode, position, proof, reference, expense in staged:
+        quantity = abs(int(position["signed_shares"]))
+        apply_nontrade_observation(engine, mode, position, day=trading_date, reference=reference,
+                                   official_evidence=proof, research_close_expense=expense)
+        shares += quantity
+    return {"contract": NONTRADE_CONTRACT, "position_count": len(staged), "settled_shares": shares,
+            "symbols": sorted(symbols), "source_pins": pins, "simulation_only": True,
+            "official_daily_close_time_unknown_symbols": sorted(without_minutes),
+            "simulated_fill": False, "broker_fill": False, "exchange_fill": False,
+            "source_completeness_verified": False}
+
+
 def _replay_historical_intraday(
     engine: TwDayTradeSimulationEngine,
     *,
@@ -2924,6 +3178,7 @@ def _replay_historical_intraday(
     end_at: time = time(13, 30),
     terminal_close_quote_provider: Callable[[], Mapping[str, Mapping[str, Any]]] | None = None,
     before_completed_minute: Callable[[datetime], None] | None = None,
+    research_source_context: Mapping[str, Any] | None = None,
 ) -> None:
     # 09:01 was already emitted atomically with the entry registration.  Every
     # following point is an exact right-labelled completed minute.
@@ -2969,10 +3224,20 @@ def _replay_historical_intraday(
                     ),
                     append_history=True,
                 )
+                _require_provisional_research_nav(mode, observed)
             continue
         if observed.time() < time(13, 25):
             for market in markets:
                 mode = engine.state["modes"][market]
+                # Entry expiry is a clock event, not a quote/inventory event.
+                # Even an empty exit quote batch must cancel its remainder.
+                engine._retry_historical_minute_entry_orders(mode, {}, observed)
+                if mode.get("historical_bracket_cross_assumption") == HISTORICAL_BRACKET_FULL_CROSS_CONTRACT:
+                    # Keep already-armed stops active through the pre-auction
+                    # exit window; ordinary 13:20/13:24 logic handles any
+                    # remaining position after the bracket decision.
+                    _apply_historical_kbar_brackets(engine, market=market, bars=bars,
+                        observed=observed, append_mark=False, allow_take_profit=False)
                 quotes = _eod_kbar_quotes(mode, bars, observed=observed)
                 if observed.time() == time(13, 24) and mode.get("execution_realism_contract") == EXECUTION_REALISM_CONTRACT:
                     # The right-labelled 13:24 bar precedes the 13:24 market
@@ -2985,6 +3250,7 @@ def _replay_historical_intraday(
                         if int(position.get("signed_shares") or 0):
                             position["eod_limit_order_status"] = "cancelled_at_13_24"
                     engine._mark_mode(market, observed, quotes)
+                    _require_provisional_research_nav(mode, observed)
                     continue
                 engine.process_quotes(
                     quotes=quotes,
@@ -2992,6 +3258,7 @@ def _replay_historical_intraday(
                     markets=[market],
                     persist=False,
                 )
+                _require_provisional_research_nav(mode, observed)
             continue
         # Attach the opted-in source close before the final mark, not after
         # margin conversion or a second 13:30 mark. Earlier minutes keep their
@@ -3007,6 +3274,26 @@ def _replay_historical_intraday(
                 if "session_close_evidence" in terminal_quote:
                     quotes.setdefault(symbol, {}).update({
                         "session_close_evidence": terminal_quote["session_close_evidence"]})
+            if observed.time() == time(13, 30) and research_source_context and mode.get("research_short_limit_up_close_penalty_rate"):
+                targets = {}
+                for position in (mode.get("positions") or {}).values():
+                    if int(position.get("signed_shares") or 0) >= 0:
+                        continue
+                    symbol = str(position.get("symbol") or "")
+                    proof = (quotes.get(symbol) or {}).get("session_close_evidence") or {}
+                    upper = _finite(position.get("upper_limit"))
+                    price = _finite(proof.get("price"))
+                    if symbol and upper is not None and price is not None and proof.get("source_path") and proof.get("source_sha256"):
+                        targets[symbol] = {"price": price, "upper_limit": upper,
+                                           "official_close_evidence": dict(proof)}
+                contexts = _research_terminal_contexts_from_loaded(observed=observed, targets=targets,
+                    limit_path=research_source_context["price_limit_path"],
+                    limit_sha=research_source_context["price_limit_sha256"], bars=bars,
+                    coverage=research_source_context["intraday_replay"])
+                for symbol, context in contexts.items():
+                    quotes.setdefault(symbol, {}).update({
+                        "research_terminal_source_context": context["research_terminal_source_context"],
+                        "research_closing_minute_evidence": context["research_closing_minute_evidence"]})
             if observed.time() == time(13, 25) and mode.get("execution_realism_contract") == EXECUTION_REALISM_CONTRACT:
                 # Counterfactual completed 13:24–13:25 continuous interval,
                 # distinct from a live market order submitted during auction.
@@ -3015,6 +3302,7 @@ def _replay_historical_intraday(
                 quotes=quotes,
                 now=observed, markets=[market], persist=False,
             )
+            _require_provisional_research_nav(mode, observed)
 
 
 def _retained_prior_paper_fills(
@@ -3095,6 +3383,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--preflight-only", action="store_true",
                         help="Validate all selected signal artifacts without building a paper ledger.")
+    parser.add_argument("--inspect-disabled-research-accounting", action="store_true",
+                        help="Read-only source preflight for one disabled research-cost mode; never permits replay or live execution.")
+    parser.add_argument("--provisional-disabled-research-replay", action="store_true",
+                        help="User-authorized isolated current-year replay; unknown bars cannot create trades and output remains provisional.")
+    parser.add_argument("--provisional-nontrade-accounting", action="store_true",
+                        help="Separately authorized non-execution book settlement using pinned last observed minute; never creates an order or fill.")
+    parser.add_argument("--provisional-bracket-full-on-cross", action="store_true",
+                        help="Assume a complete paper stop/profit exit only after a positive-volume minute strictly crosses its trigger; never claims exchange depth or fills.")
+    parser.add_argument("--provisional-official-open-fallback", action="store_true",
+                        help="For missing 09:01 price/volume only, assume a full paper entry at the pinned daily open; actual first-trade time and liquidity remain unknown.")
+    parser.add_argument("--provisional-official-close-reference", action="store_true",
+                        help="For a remaining position without any verified minute, permit pinned positive-volume daily close as a nontrade book assumption with unknown trade time.")
+    parser.add_argument("--preflight-market-config", type=Path,
+                        help="Exact candidate config for read-only research inspection; selector remains in its original location.")
     parser.add_argument("--preflight-output", type=Path,
                         help="Optional durable source-only preflight receipt, outside the live ledger.")
     parser.add_argument("--terminal-close-unlimited", action="store_true",
@@ -3320,6 +3622,39 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("--start-date must not be after --end-date")
+    if args.inspect_disabled_research_accounting and not (
+            args.preflight_only and args.local_only and args.include_disabled
+            and len(args.only_market) == 1 and args.preflight_market_config is not None):
+        raise ValueError("research accounting inspection requires --preflight-only, --local-only, --include-disabled and one --only-market")
+    if args.inspect_disabled_research_accounting and args.provisional_disabled_research_replay:
+        raise ValueError("research preflight and provisional replay are distinct")
+    if args.provisional_nontrade_accounting and not args.provisional_disabled_research_replay:
+        raise ValueError("nontrade accounting requires the isolated provisional research replay")
+    if args.provisional_bracket_full_on_cross and not args.provisional_disabled_research_replay:
+        raise ValueError("full-on-cross brackets require the isolated provisional research replay")
+    if args.provisional_official_open_fallback and not args.provisional_disabled_research_replay:
+        raise ValueError("official-open fallback requires the isolated provisional research replay")
+    if args.provisional_official_close_reference and not (
+            args.provisional_disabled_research_replay and args.provisional_nontrade_accounting):
+        raise ValueError("official-close reference requires isolated nontrade accounting")
+    if args.provisional_disabled_research_replay and not (
+            not args.preflight_only and args.local_only and args.include_disabled
+            and args.replay_intraday_kbars and len(args.only_market) == 1
+            and args.preflight_market_config is not None and args.single_market_signal_dir is not None
+            and not args.include_current_open_session and not args.historical_full_fill_0901
+            and not args.paper_market_at_best and not args.allow_adverse_tick_fallback
+            and not args.assume_margin_conversion and not args.assume_odd_lot_board_price
+            and args.source_ledger_dir is None):
+        raise ValueError("provisional research replay requires one disabled candidate, local minute evidence and an isolated completed-session ledger")
+    if args.provisional_disabled_research_replay:
+        from stockagent.live.tw_day_trade_research_candidates import research_session_is_completed
+        current = datetime.now(TAIPEI)
+        if (start.year != current.year or end.year != start.year
+                or not research_session_is_completed(end, current)):
+            raise ValueError("provisional research replay is limited to completed dates in the current Taipei year")
+    if args.preflight_market_config is not None and not (
+            args.inspect_disabled_research_accounting or args.provisional_disabled_research_replay):
+        raise ValueError("--preflight-market-config is limited to disabled research accounting inspection")
     if args.missing_signal_root is not None and (
             args.source_ledger_dir is None or args.signal_root is not None
             or args.single_market_signal_dir is not None):
@@ -3330,6 +3665,12 @@ def main() -> None:
     if args.historical_full_fill_0901 and not args.replay_intraday_kbars:
         raise ValueError("--historical-full-fill-0901 requires --replay-intraday-kbars")
     state_dir = args.state_dir.resolve()
+    if args.inspect_disabled_research_accounting or args.provisional_disabled_research_replay:
+        live_root = (REPO_ROOT / "artifacts/live/tw_day_trade_simulation").resolve()
+        if (state_dir == live_root or live_root in state_dir.parents or state_dir in live_root.parents):
+            raise ValueError("research source inspection must be outside the live ledger")
+        if args.preflight_output and not args.preflight_output.resolve().is_relative_to(state_dir):
+            raise ValueError("research source inspection receipt must stay in its isolated state directory")
     if state_dir.exists() and any(state_dir.iterdir()):
         raise RuntimeError(f"refusing non-empty rebuild target: {state_dir}")
     minute_data_roots = tuple(
@@ -3340,6 +3681,9 @@ def main() -> None:
     specs, live_configs, errors = _mode_specs(
         args.markets_dir,
         include_disabled=bool(args.include_disabled),
+        research_accounting_preflight_only=bool(args.inspect_disabled_research_accounting),
+        isolated_provisional_research_replay=bool(args.provisional_disabled_research_replay),
+        preflight_market_config=args.preflight_market_config,
     )
     if args.only_market:
         requested_markets = set(args.only_market)
@@ -3408,6 +3752,11 @@ def main() -> None:
                 entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
                 entry_price_offset_ticks=0,
                 historical_full_fill_at_0901=bool(args.historical_full_fill_0901),
+                signal_update_policy=("opening_once_v1" if args.provisional_disabled_research_replay
+                                      else spec.signal_update_policy),
+                historical_counterfactual_provisional=bool(args.provisional_disabled_research_replay),
+                historical_bracket_full_on_cross=bool(args.provisional_bracket_full_on_cross),
+                historical_open_price_fallback=bool(args.provisional_official_open_fallback),
             )
             for spec in specs
         ]
@@ -3621,8 +3970,19 @@ def main() -> None:
         "schema_version": 3,
         "created_at": current.isoformat(timespec="seconds"),
         "producer_code_sha256": _sha256(Path(__file__).resolve()),
+        "simulation_engine_code_sha256": _sha256(Path(sys.modules[TwDayTradeSimulationEngine.__module__].__file__).resolve()),
         "simulation_only": True,
         "production_order_possible": False,
+        **({"provisional_minute_source_coverage": True,
+            "historical_decision_policy": "single_counterfactual_open_not_published_revision_replay_v1",
+            "publication_authorized": False} if args.provisional_disabled_research_replay else {}),
+        **({"historical_bracket_cross_assumption": HISTORICAL_BRACKET_FULL_CROSS_CONTRACT}
+           if args.provisional_bracket_full_on_cross else {}),
+        **({"historical_open_fallback_assumption": HISTORICAL_OPEN_FALLBACK_CONTRACT,
+            "historical_open_fallback_disclosure": "official daily open may be first traded after 09:01; timestamp and full quantity are paper assumptions, not observed fills"}
+           if args.provisional_official_open_fallback else {}),
+        **({"official_daily_close_reference_when_minute_missing": True}
+           if args.provisional_official_close_reference else {}),
         "prior_paper_fill_provenance": prior_paper_fill_provenance,
         "replay_contract": {
             "order_price_contract_version": TW_ORDER_PRICE_CONTRACT_VERSION,
@@ -3632,6 +3992,9 @@ def main() -> None:
             "residual": MARGIN_CARRY_CONTRACT if all(s.residual_margin_conversion for s in specs) else "unresolved_delivery_obligation",
             "odd_lot_execution_policy": specs[0].odd_lot_execution_policy,
             "entry_price": (
+                "observed 09:01 price and volume when available; otherwise a pinned official daily open is assumed at 09:01 with no evidence of the first trade time or executable liquidity"
+                if args.provisional_official_open_fallback
+                else
                 "existing local paper entry fills retain their original price and "
                 "time, with the full legal NAV-funded target attributed to that "
                 "counterfactual; symbols without a prior paper fill use the "
@@ -3653,6 +4016,9 @@ def main() -> None:
                 "side uses official session open moved one adverse legal tick"
             ),
             "entry_liquidity": (
+                "observed minute volume cap when available; otherwise full NAV-funded whole-lot paper quantity is assumed without depth or fill evidence"
+                if args.provisional_official_open_fallback
+                else
                 "full legal NAV-funded target at prior paper fill or 09:01 price; "
                 "no observed-liquidity, exchange-fill, or broker-deal claim"
                 if args.historical_full_fill_0901
@@ -3698,6 +4064,10 @@ def main() -> None:
                 TERMINAL_CLOSE_UNLIMITED_CONTRACT
                 if all(s.terminal_liquidation_unlimited_capacity for s in specs) else None
             ),
+            **({"research_close_penalty_by_market_v1": {
+                s.market: float(s.research_short_limit_up_close_penalty_rate)
+                for s in specs if s.research_short_limit_up_close_penalty_rate}}
+                if any(s.research_short_limit_up_close_penalty_rate for s in specs) else {}),
             "intraday_path": (
                 "retained right-labelled 1m OHLCV; stop-before-profit; full target "
                 "only on positive-trade bars; no executable Bid/Ask or liquidity claim"
@@ -3822,6 +4192,15 @@ def main() -> None:
                 "official_no_trade_print_count": len(official_no_trade_symbols),
                 "official_no_trade_print_symbols": sorted(official_no_trade_symbols),
             }
+            official_open_fallback_evidence = {}
+            if args.provisional_official_open_fallback:
+                requested = {str(row.get("symbol") or "") for value in selected.values()
+                             for row in value[4] if abs(float(row.get("target_weight") or 0)) > 0}
+                official_open_fallback_evidence, fallback_sources = _verified_official_open_fallbacks(
+                    raw_root=args.tw_public_dir.resolve() / "raw", trading_date=day,
+                    canonical_opens=canonical_open_by_symbol, symbols=requested)
+                session_receipt["canonical_open"]["official_open_fallback_sources"] = fallback_sources
+                session_receipt["canonical_open"]["verified_fallback_symbol_count"] = len(official_open_fallback_evidence)
         else:
             if day != current.date() or not (
                 bool(args.fetch_current_open)
@@ -4338,6 +4717,17 @@ def main() -> None:
                     {"market": spec.market, **override}
                 )
             replay_summary = dict(summary)
+            if args.provisional_disabled_research_replay:
+                replay_summary.update({
+                    "source_day_trade_signal_update_policy": summary.get("day_trade_signal_update_policy"),
+                    "source_opening_signal_revision": summary.get("opening_signal_revision"),
+                    "day_trade_signal_update_policy": "opening_once_v1",
+                    "opening_signal_revision": None,
+                    "provisional_minute_source_coverage": True,
+                    "historical_bracket_cross_assumption": (
+                        HISTORICAL_BRACKET_FULL_CROSS_CONTRACT
+                        if args.provisional_bracket_full_on_cross else None),
+                })
             replay_summary.update(
                 {
                     # register_signal validates its event-time session through
@@ -4352,6 +4742,8 @@ def main() -> None:
                     "simulation_replay": True,
                     "historical_minute_valuation": bool(args.replay_intraday_kbars),
                     "replay_basis": (
+                        "observed_0901_else_official_daily_open_assumed_0901_to_intraday_kbar_schedule"
+                        if args.provisional_official_open_fallback else
                         "retained_prior_paper_fill_else_source_backed_09_01_full_target_to_intraday_kbar_schedule"
                         if args.historical_full_fill_0901 and should_close and args.replay_intraday_kbars
                         else "retained_prior_paper_fill_else_source_backed_09_01_full_target_to_official_close"
@@ -4374,6 +4766,8 @@ def main() -> None:
                         else "historical_best_quote_else_adverse_open_tick_to_live_quotes"
                     ),
                     "replay_source": (
+                        "pinned_official_daily_open_assumption_and_retained_0901_minutes_when_available"
+                        if args.provisional_official_open_fallback else
                         "pinned_signal_retained_local_paper_fill_else_source_backed_09_01_minute_price"
                         if args.historical_full_fill_0901
                         else
@@ -4385,6 +4779,8 @@ def main() -> None:
                     ),
                     "entry_fill_contract": replay_entry_contract,
                     "entry_liquidity_assumption": (
+                        "observed_minute_volume_cap_else_full_quantity_official_open_assumption_no_exchange_fill_claim"
+                        if args.provisional_official_open_fallback else
                         "historical_prior_paper_fill_else_09_01_full_target_no_liquidity_or_broker_fill_claim"
                         if args.historical_full_fill_0901
                         else
@@ -4435,6 +4831,8 @@ def main() -> None:
                     )
                     or ()
                 ),
+                official_open_fallback_evidence=(official_open_fallback_evidence
+                                                if args.provisional_official_open_fallback else None),
             )
             if args.historical_full_fill_0901:
                 for symbol, quote in entry_quotes.items():
@@ -4458,6 +4856,8 @@ def main() -> None:
                 counterfactual_open_replay=True,
             )
             mode = engine.state["modes"][spec.market]
+            if args.provisional_disabled_research_replay:
+                _require_provisional_research_nav(mode, observed)
             session_receipt["modes"].append(
                 {
                     "market": spec.market,
@@ -4530,7 +4930,7 @@ def main() -> None:
                 held_symbols=held_symbols, official_no_trade_carries=no_trade_carries)
             minute_coverage.update(missing_paths)
             minute_coverage["official_no_trade_carried_symbols"] = sorted(no_trade_carries)
-            if missing_paths["missing_held_symbols"]:
+            if missing_paths["missing_held_symbols"] and not args.provisional_disabled_research_replay:
                 session_receipt["intraday_replay"] = minute_coverage
                 session_receipt["close"] = {"status": "blocked_missing_held_minute_path"}
                 receipt["failure"] = {"session_date": day.isoformat(),
@@ -4543,6 +4943,13 @@ def main() -> None:
                 )
             session_receipt["intraday_replay"] = {
                 **minute_coverage,
+                **({"provisional_minute_source_coverage": True,
+                    "missing_minutes_are_not_zero_trade_evidence": True}
+                   if args.provisional_disabled_research_replay else {}),
+                **({"historical_bracket_cross_assumption": HISTORICAL_BRACKET_FULL_CROSS_CONTRACT,
+                    "full_bracket_fill_is_assumed_not_broker_or_exchange_fill": True,
+                    "stop_fill_price": "adverse_observed_minute_extreme"}
+                   if args.provisional_bracket_full_on_cross else {}),
                 "contract": (
                     HISTORICAL_FULL_KBAR_FILL_CONTRACT
                     if args.historical_full_fill_0901 else HISTORICAL_KBAR_FILL_CONTRACT
@@ -4565,6 +4972,18 @@ def main() -> None:
                     tpex_daily_ohlcv_path=tpex_daily_ohlcv_path,
                     official_raw_root=args.tw_public_dir.resolve() / "raw")
                 terminal_close_quality.update(quality)
+                if args.provisional_disabled_research_replay:
+                    # An official close does not prove a 13:30 observed trade.
+                    # Unknown minutes remain unresolved, never synthetic fills.
+                    accepted = _observed_terminal_quotes_only(quotes, minute_bars, trading_date=day)
+                    if args.provisional_nontrade_accounting:
+                        settlement = _settle_provisional_unobserved_terminal(engine,
+                            markets=list(specs_by_market), trading_date=day, official_quotes=quotes,
+                            accepted_quotes=accepted, bars=minute_bars, coverage=minute_coverage,
+                            limit_path=limit_path, limit_sha=session_receipt["price_limit_sha256"],
+                            allow_official_close_reference=bool(args.provisional_official_close_reference))
+                        terminal_close_quality["nontrade_settlement"] = settlement
+                    quotes = accepted
                 return quotes
 
             _replay_historical_intraday(
@@ -4574,6 +4993,9 @@ def main() -> None:
                 trading_date=day,
                 terminal_close_quote_provider=(terminal_close_quotes
                     if any(s.terminal_liquidation_unlimited_capacity for s in specs) else None),
+                research_source_context={"price_limit_path": str(limit_path),
+                    "price_limit_sha256": session_receipt["price_limit_sha256"],
+                    "intraday_replay": minute_coverage},
             )
         elif not should_close and args.replay_intraday_kbars:
             current_symbols = {
@@ -4660,6 +5082,13 @@ def main() -> None:
                 # Commit all append-only ledgers before advancing state.json.
                 # The live process still fsyncs each call; only this isolated
                 # completed-session replay batches writes at the day boundary.
+                for mode in engine.state["modes"].values():
+                    if (mode.get("historical_bracket_full_cross_count") or mode.get("nontrade_settlement_count")
+                            or mode.get("historical_open_fallback_fill_count")):
+                        # A later ordinary terminal routine may report flat;
+                        # it cannot turn a full-cross assumption into evidence
+                        # of an actual market or broker execution.
+                        mode["execution_evidence_complete"] = False
                 engine.flush_deferred_ledger_writes()
                 engine._persist(close_at)  # noqa: SLF001 - session transaction
             session_receipt["close"] = {
@@ -4670,6 +5099,10 @@ def main() -> None:
                     else
                     "unresolved_delivery_obligation_at_close"
                     if any(int(engine.state["modes"][m].get("open_position_count") or 0) for m in specs_by_market)
+                    else "session_flat_with_nontrade_book_assumptions"
+                    if (terminal_close_quality.get("nontrade_settlement") or {}).get("position_count")
+                    else "session_flat_no_broker_fill_claim"
+                    if args.provisional_disabled_research_replay
                     else "settled_official_close"
                 ),
                 **close_quality,

@@ -1,0 +1,16 @@
+{
+  "contract": "explicit-local-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "User authorized deletion of old performance-validation data; preserve the associated summary and failure receipts.",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round14/pinned_six_mode_sensitivity_v2.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round19/full_cpu_baseline.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/reconstruction_graph_candidate_v41.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/reconstruction_graph_control_v41.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round29/progressive_today_window_native_v2.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round29/progressive_today_window_native_v4_retry.json", "kind": "file", "reason": "benchmark"}
+  ],
+  "identity_sha256": "5a259a23ad96d6bcf3fec6d31969fed1b230e861df915efbc3b3488fa5a87ba7"
+}

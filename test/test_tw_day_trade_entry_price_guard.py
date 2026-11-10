@@ -66,6 +66,30 @@ def test_guard_never_rounds_an_outside_float_into_the_interval():
     ) is None
 
 
+@pytest.mark.parametrize("weight", [.3, -.3])
+@pytest.mark.parametrize("missing", ["upper_limit", "lower_limit", "both"])
+def test_unavailable_or_inapplicable_price_band_keeps_signal_without_paper_fill(tmp_path, weight, missing):
+    spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    quote = {**_quote(), "simtrade": False}
+    for field in ("upper_limit", "lower_limit"):
+        if missing in {field, "both"}:
+            quote[field] = None
+    assert engine.register_signal(
+        spec=spec, summary=_summary(), signal_rows=[_row(weight)],
+        quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7),
+    ) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert not mode["positions"] and not _rows(engine.fills_path)
+    signal = _rows(engine.signals_path)[0]
+    assert signal["target_weight"] == weight and signal["requested_shares"] == 3000
+    assert signal["reason"] == "price_limit_unavailable" and signal["filled_shares"] == 0
+    displayed = build_dashboard_signal_page(state_dir=engine.state_dir, session_date="2026-08-13",
+        mode=spec.market, symbol="2330")["rows"][0]
+    assert displayed["target_weight"] == weight
+    assert displayed["reason"] == "price_limit_unavailable" and displayed["filled_shares"] == 0
+
+
 @pytest.mark.parametrize("policy", [ENTRY_FILL_POLICY_CAUSAL_BOOK, ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET])
 @pytest.mark.parametrize("weight", [.3, -.3])
 @pytest.mark.parametrize("price", [900., 901., 1095., 1100.])

@@ -9,6 +9,7 @@ import time
 import pytest
 
 from stockagent.data_sync import cold_tiers as tiers
+from scripts import maintain_cold_tiers as maintenance
 
 
 @pytest.mark.parametrize('identity_exit', [0, 78])
@@ -38,9 +39,77 @@ run_fintech_python() {{
     assert (tmp_path / 'initialization-order').read_text().splitlines() == expected
     if identity_exit == 0:
         assert (tmp_path / 'dispatch.argv').read_text().splitlines() == [
-            'scripts/maintain_cold_tiers.py', '--apply', '--seed-existing']
+            'scripts/maintain_cold_tiers.py', '--apply', '--seed-existing', '--yield-to-migration']
     else:
         assert not (tmp_path / 'dispatch.argv').exists()
+
+
+def test_automatic_tier_work_defers_to_pressure_without_erasing_last_work(tmp_path, monkeypatch, capsys):
+    policy = json.loads((Path(__file__).parents[1] / 'configs/data_sync/cold_tiers.json').read_text())
+    output = tmp_path/'status.json'
+    previous = {'contract': tiers.CONTRACT, 'last_work_cycle': {'contract': tiers.CONTRACT,
+                'apply': True, 'objects_completed': 2, 'allocation_bytes_saved': 123}}
+    output.write_text(json.dumps(previous))
+    monkeypatch.setattr(maintenance, 'load_policy', lambda _: policy)
+    monkeypatch.setattr(maintenance, 'migration_priority_active', lambda: True)
+    monkeypatch.setattr(maintenance, 'is_work_window', lambda *_a: True)
+    monkeypatch.setattr(maintenance, 'cycle', lambda *_a, **_kw: pytest.fail('must yield to retirement'))
+    monkeypatch.setattr(maintenance.sys, 'argv', ['maintain', '--apply', '--seed-existing',
+                        '--yield-to-migration', '--output', str(output)])
+    assert maintenance.main() == 0
+    status = json.loads(output.read_text())
+    assert status['state'] == 'waiting_migration_priority' and status['original_objects_deleted'] == 0
+    assert status['last_work_cycle']['allocation_bytes_saved'] == 123
+    assert json.loads(capsys.readouterr().out)['state'] == 'waiting_migration_priority'
+
+
+def test_manual_tier_work_does_not_implicitly_opt_into_deferral(tmp_path, monkeypatch, capsys):
+    policy = json.loads((Path(__file__).parents[1] / 'configs/data_sync/cold_tiers.json').read_text())
+    monkeypatch.setattr(maintenance, 'load_policy', lambda _: policy)
+    monkeypatch.setattr(maintenance, 'migration_priority_active', lambda: pytest.fail('manual work is explicit'))
+    monkeypatch.setattr(maintenance, 'cycle', lambda *_a, **_kw: {'state': 'bounded_cycle_complete',
+                        'apply': True, 'original_objects_deleted': 0})
+    monkeypatch.setattr(maintenance.sys, 'argv', ['maintain', '--apply', '--output', str(tmp_path/'status.json')])
+    assert maintenance.main() == 0
+    assert json.loads(capsys.readouterr().out)['state'] == 'bounded_cycle_complete'
+
+
+@pytest.mark.parametrize(('free_gib', 'pending', 'expected'), [(100, True, True),
+                          (128, True, False), (100, False, False)])
+def test_migration_priority_requires_capacity_pressure_and_actionable_queue(tmp_path, monkeypatch, free_gib, pending, expected):
+    from types import SimpleNamespace
+    from scripts import run_source_local_retirement_queue as retirement
+    from stockagent.data_sync import cold_primary, workspace_volume
+    monkeypatch.setattr(workspace_volume, 'configuration', lambda: {'mount_point': str(tmp_path), 'cold_root': str(tmp_path)})
+    monkeypatch.setattr(workspace_volume, 'check', lambda **_kw: None)
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda _path: None)
+    monkeypatch.setattr(retirement, '_retirement_work_pending', lambda _path: pending)
+    monkeypatch.setattr(maintenance, 'migration_owner_active', lambda: False)
+    monkeypatch.setattr(maintenance.os, 'statvfs', lambda _path: SimpleNamespace(f_bavail=free_gib, f_frsize=1024**3))
+    assert maintenance.migration_priority_active() is expected
+
+
+def test_active_migration_owner_defers_tier_even_if_queue_observation_is_stale(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from scripts import run_source_local_retirement_queue as retirement
+    from stockagent.data_sync import cold_primary, workspace_volume
+    monkeypatch.setattr(workspace_volume, 'configuration', lambda: {'mount_point': str(tmp_path), 'cold_root': str(tmp_path)})
+    monkeypatch.setattr(workspace_volume, 'check', lambda **_kw: None)
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda _path: None)
+    monkeypatch.setattr(retirement, '_retirement_work_pending', lambda _path: False)
+    monkeypatch.setattr(maintenance, 'migration_owner_active', lambda: True)
+    monkeypatch.setattr(maintenance.os, 'statvfs', lambda _path: SimpleNamespace(f_bavail=100, f_frsize=1024**3))
+    assert maintenance.migration_priority_active()
+
+
+def test_migration_owner_probe_handles_active_and_unavailable_systemd(monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setattr(maintenance.subprocess, 'run', lambda *_a, **_kw:
+                        SimpleNamespace(returncode=0, stdout='inactive\nactivating\ninactive\n'))
+    assert maintenance.migration_owner_active()
+    monkeypatch.setattr(maintenance.subprocess, 'run', lambda *_a, **_kw:
+                        (_ for _ in ()).throw(TimeoutError('offline')))
+    assert not maintenance.migration_owner_active()
 
 
 def test_outside_window_poll_preserves_last_actual_work_counts():
@@ -53,6 +122,9 @@ def test_outside_window_poll_preserves_last_actual_work_counts():
     assert later["objects_completed"] == 0
     assert later["last_work_cycle"] == work
     assert later["schedule"]["daily_window_start_hour"] == 3
+    assert later["schedule"]["reserve_bytes"] == policy["reserve_bytes"]
+    from stockagent.data_sync.storage_monitor import public_cold_tiers
+    assert public_cold_tiers(later, now=later["observed_at_epoch"])["schedule"]["reserve_bytes"] == policy["reserve_bytes"]
     dry = tiers.status_record({**work, "apply": False, "objects_completed": 9}, policy, later)
     assert dry["last_work_cycle"] == work
 from stockagent.data_sync import cold_primary

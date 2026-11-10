@@ -8,6 +8,73 @@ from stockagent.data_sync import workspace_volume as volume
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
+def test_workspace_mount_enqueues_original_lifecycle_without_forcing_restart():
+    repo = Path(__file__).resolve().parents[1]
+    unit = (repo/'deploy/systemd/stockagent-e-workspace-mount.service.in').read_text()
+    lifecycle = (repo/'deploy/systemd/stockagent-storage-lifecycle.service.in').read_text()
+    assert 'Wants=stockagent-storage-lifecycle.service' in unit
+    assert 'Before=stockagent-storage-lifecycle.service stockagent-backup-transport-mount.service' in unit
+    assert 'Upholds=' not in unit and 'OnSuccess=' not in unit
+    assert 'Requires=stockagent-d-cold-mount.service stockagent-backup-transport-mount.service' in lifecycle
+    assert 'Restart=on-failure' in lifecycle
+
+
+@pytest.mark.parametrize('initial,expected_calls', [
+    ('rw,relatime,discard', 1),
+    ('rw,relatime', 0),
+])
+def test_workspace_mount_disables_online_discard_once(monkeypatch, initial, expected_calls):
+    from scripts import manage_workspace_volume as manager
+    from types import SimpleNamespace
+    state = {'options': initial, 'mounts': []}
+
+    def run(args, **kwargs):
+        if args[0] == 'findmnt':
+            assert args[-2:] == ['--mountpoint', '/enrolled-e']
+            return SimpleNamespace(stdout=state['options'] + '\n')
+        assert args == ['mount', '-o', 'remount,nodiscard', '/enrolled-e']
+        state['mounts'].append(args)
+        state['options'] = 'rw,relatime'
+        return SimpleNamespace(stdout='')
+
+    monkeypatch.setattr(manager.subprocess, 'run', run)
+    manager.disable_workspace_online_discard(Path('/enrolled-e'))
+    assert len(state['mounts']) == expected_calls
+
+
+@pytest.mark.parametrize('observed', ['', 'rw,discard\nrw', 'rw,discard'])
+def test_workspace_discard_policy_rejects_unknown_or_unchanged_mount(monkeypatch, observed):
+    from scripts import manage_workspace_volume as manager
+    from types import SimpleNamespace
+    monkeypatch.setattr(manager.subprocess, 'run',
+                        lambda *args, **kwargs: SimpleNamespace(stdout=observed))
+    with pytest.raises(ValueError, match='options|discard'):
+        manager.disable_workspace_online_discard(Path('/enrolled-e'))
+
+
+def test_workspace_mount_checks_e_identity_before_changing_discard(tmp_path, monkeypatch):
+    from scripts import manage_workspace_volume as manager
+    shared, target = tmp_path/'shared', tmp_path/'target'
+    shared.mkdir()
+    target.mkdir()
+    enrollment = tmp_path/'enrollment.json'
+    enrollment.write_text('{}')
+    c = {'shared_root': str(shared), 'mount_point': str(target), 'distribution': 'StockAgentData'}
+    (shared/volume.MARKER).write_text(json.dumps({'fixed': True}))
+    events = []
+    monkeypatch.setattr(manager, 'ENROLLMENT', enrollment)
+    monkeypatch.setattr(manager, 'native_identity', lambda _: {'registration': True})
+    monkeypatch.setattr(manager, 'wsl_command', lambda *args, **kwargs: None)
+    monkeypatch.setattr(manager, '_mount_info', lambda _: {'fstype': 'ext4'})
+    monkeypatch.setattr(manager, 'marker', lambda _: {'fixed': True})
+    monkeypatch.setattr(Path, 'is_mount', lambda path: path in (shared, target))
+    monkeypatch.setattr(manager, 'check', lambda **kwargs: events.append('verified') or {'state': 'mounted'})
+    monkeypatch.setattr(manager, 'disable_workspace_online_discard',
+                        lambda path: events.append(('nodiscard', path)))
+    assert manager.mount(c) == {'state': 'mounted'}
+    assert events == ['verified', ('nodiscard', shared)]
+
+
 def test_work_volume_does_not_relocate_cold_authority(tmp_path):
     c = volume.configuration()
     assert c["physical_volume"] == "E:"
@@ -73,7 +140,9 @@ def test_finlab_futures_workspace_must_be_the_enrolled_mounted_alias(tmp_path, m
     with pytest.raises(SnapshotError, match='absent or redirected'):
         volume.check_finlab_futures(c=c)
     original_mount, original_samefile = Path.is_mount, Path.samefile
-    monkeypatch.setattr(Path, 'is_mount', lambda p: True if p == target else original_mount(p))
+    # Same-filesystem binds are real mounts even though Path.is_mount is false.
+    monkeypatch.setattr(Path, 'is_mount', lambda p: False if p == target else original_mount(p))
+    monkeypatch.setattr(volume, '_mount_info', lambda p: {'target': str(target)})
     monkeypatch.setattr(Path, 'samefile', lambda p, other: True if (p, other) == (target, source)
                         else original_samefile(p, other))
     assert volume.check_finlab_futures(c=c)['target'] == str(target)

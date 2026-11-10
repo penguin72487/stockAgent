@@ -1,0 +1,15 @@
+[Unit]
+Description=Keep online discard disabled on the StockAgent WSL root
+ConditionVirtualization=wsl
+DefaultDependencies=no
+After=local-fs.target
+Before=basic.target shutdown.target
+Conflicts=shutdown.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /root/stockAgent/scripts/ensure_wsl_no_online_discard.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=basic.target

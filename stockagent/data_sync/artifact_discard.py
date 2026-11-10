@@ -27,7 +27,7 @@ from stockagent.data_sync.training_return import shared_inode_references
 
 from stockagent.data_sync.testing_disposition import (
     CONTRACT, DEFAULT_POLICY, load_policy, artifact_roots, discarded_root, manifest_discarded,
-    target_path, LOCAL_TESTING_CONTRACT,
+    target_path, LOCAL_TESTING_CONTRACT, LOCAL_COPY_CONTRACTS, D_WORKFLOW_TESTING_CONTRACT,
 )
 
 
@@ -48,7 +48,7 @@ def cold_discard_plan(cold_root: Path, policy: dict, *, materialized_root: Path)
     Restricted publications and historical manifests count as references too.
     Current use/pins override the user's discard decision.
     """
-    if policy.get('contract') == LOCAL_TESTING_CONTRACT:
+    if policy.get('contract') in LOCAL_COPY_CONTRACTS:
         raise SnapshotError('local performance-copy disposal cannot discard cold objects')
     from stockagent.data_sync.packed_snapshots import _validate_manifest
     from stockagent.data_sync.packed_backup import object_descriptor
@@ -196,6 +196,7 @@ def restore_unchanged_discard_quarantine(policy: dict, target: dict, *, state_ro
     """Resume only this owner's unchanged, exact journal; preserve unknown data."""
     if target not in policy["targets"]:
         raise SnapshotError("quarantine resume is outside the user disposition")
+    retained_evidence = _guard_d_workflow_copy(policy, cold_root, target)
     state_root = real(state_root)
     key = identity(target)
     journal = real(state_root / (key + ".json"))
@@ -204,19 +205,69 @@ def restore_unchanged_discard_quarantine(policy: dict, target: dict, *, state_ro
     with real(state_root / (key + ".lock")).open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         value = json.loads(journal.read_bytes())
-        if value.get("state") not in {"prepared", "quarantined"}:
+        if value.get("state") not in {"prepared", "quarantined", "unlink_started", "unlink_finished"}:
             return False
         plan = value["plan"]
+        if policy.get('contract') == D_WORKFLOW_TESTING_CONTRACT and plan.get('retained_evidence') != retained_evidence:
+            raise SnapshotError('D benchmark comparison evidence changed; quarantine retained')
         source = target_path(policy, target, repo_root=repo_root, engineering_root=engineering_root)
         q = real(Path(value["quarantine"]))
         old_location = q.parent.parent == state_root and q.parent.name.startswith('quarantine-')
-        local_location = (policy['contract'] == LOCAL_TESTING_CONTRACT
+        local_location = (policy['contract'] in LOCAL_COPY_CONTRACTS
                           and q.parent.parent == source.parent
                           and q.parent.name.startswith('.stockagent-testing-quarantine-'))
         if (plan["policy_identity_sha256"] != policy["identity_sha256"] or plan["target"] != target
                 or plan["source"] != str(source) or not (old_location or local_location)
                 or q.name != source.name):
             raise SnapshotError("testing quarantine/source identity changed")
+        if value['state'] == 'unlink_started' and not os.path.lexists(source) and not os.path.lexists(q):
+            # The process may have died immediately after its one exact unlink
+            # and before the result receipt.  A durable pre-unlink intent binds
+            # this name; do not invent an allocated-byte reclamation amount.
+            if (policy['contract'] not in LOCAL_COPY_CONTRACTS or target['kind'] != 'file'
+                    or plan.get('identity_sha256') != identity({k: v for k, v in plan.items()
+                                                                if k != 'identity_sha256'})):
+                raise SnapshotError('interrupted testing file intent differs')
+            if q.parent.exists():
+                info = q.parent.lstat()
+                if (not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid()
+                        or stat.S_IMODE(info.st_mode) != 0o700 or any(q.parent.iterdir())
+                        or process_references(q.parent)):
+                    raise SnapshotError('interrupted testing file quarantine is not empty or is active')
+                q.parent.rmdir()
+            result = {'state': 'discarded-without-preservation', 'deleted': True, 'target': target,
+                'policy_identity_sha256': policy['identity_sha256'], 'files': 1,
+                'logical_bytes': plan['observed']['logical_bytes'], 'reclaimed_allocated_bytes': 0,
+                'reclaimed_allocation_unknown': True, 'reconciled_absent_after_unlink_intent': True,
+                'recovery_claimed': False, 'external_shared_names_deleted': False, 'at_epoch': time.time()}
+            write_discard_receipt(journal, {'state': 'discarded', 'plan': plan, 'result': result})
+            return True
+        if value['state'] == 'unlink_finished':
+            result = value.get('result')
+            if (policy['contract'] != D_WORKFLOW_TESTING_CONTRACT or target['kind'] != 'directory'
+                    or plan.get('identity_sha256') != identity({k:v for k,v in plan.items() if k != 'identity_sha256'})
+                    or not isinstance(result, dict) or result.get('target') != target
+                    or result.get('policy_identity_sha256') != policy['identity_sha256']
+                    or result.get('deleted') is not True or type(result.get('reclaimed_allocated_bytes')) is not int
+                    or result['reclaimed_allocated_bytes'] < 0 or source.exists() or source.is_symlink()):
+                raise SnapshotError('completed D benchmark quarantine identity changed')
+            if q.exists():
+                if (not q.is_dir() or any(q.iterdir())
+                        or signature(q.lstat())[:2] != plan['observed']['root_signature'][:2]):
+                    raise SnapshotError('completed D benchmark quarantine is not empty')
+                empty = _observed(q, target['kind'])
+                if (process_references(q)
+                        or _gates(source, empty, repo_root, materialized_root, cold_root, allow_opaque_symlinks=True)
+                        or _gates(q, empty, repo_root, materialized_root, cold_root, allow_opaque_symlinks=True)):
+                    raise SnapshotError('completed D benchmark quarantine is in use')
+                q.rmdir()
+            if q.parent.exists():
+                if not q.parent.is_dir() or any(q.parent.iterdir()):
+                    raise SnapshotError('completed D benchmark quarantine parent is not empty')
+                q.parent.rmdir()
+            result = {**result, 'resumed_partial': True}
+            write_discard_receipt(journal, {'state': 'discarded', 'plan': plan, 'result': result})
+            return True
         if value['state'] == 'prepared' and source.exists() and not q.exists():
             # EXDEV/pre-rename interruption left the source untouched. Only
             # this exact unchanged generation and empty owned directory may
@@ -234,15 +285,88 @@ def restore_unchanged_discard_quarantine(policy: dict, target: dict, *, state_ro
             raise SnapshotError('testing quarantine/source identity changed')
         current = _observed(q, target["kind"])
         old = plan["observed"]
-        if (current["rows"] != old["rows"] or not _same_root_before_after_rename(
+        if (policy['contract'] == D_WORKFLOW_TESTING_CONTRACT and target['kind'] == 'directory'
+                and current['rows'] != old['rows']):
+            return _resume_partial_d_workflow_discard(policy, target, value, current, q, source, journal,
+                repo_root, materialized_root, cold_root)
+        rows_changed = current['rows'] != old['rows']
+        if target['kind'] == 'file' and len(current['rows']) == len(old['rows']) == 1:
+            before, after = old['rows'][0], current['rows'][0]
+            rows_changed = (before['path'] != after['path'] or before['kind'] != after['kind']
+                or before['signature'][:4] != after['signature'][:4]
+                or before['signature'][5:] != after['signature'][5:])
+        if (rows_changed or not _same_root_before_after_rename(
                 old["root_signature"], current["root_signature"], target["kind"])
                 or process_references(q) or _gates(source, current, repo_root, materialized_root, cold_root,
-                    **({'allow_opaque_symlinks': True} if policy['contract'] == LOCAL_TESTING_CONTRACT else {}))):
+                    **({'allow_opaque_symlinks': True} if policy['contract'] in LOCAL_COPY_CONTRACTS else {}))):
             raise SnapshotError("interrupted testing quarantine changed or became active")
         q.rename(source)
         q.parent.rmdir()
         write_discard_receipt(journal, {**value, "state": "rolled-back-for-fresh-discard", "resumed_at_epoch": time.time()})
         return True
+
+
+def _resume_partial_d_workflow_discard(policy, target, journal_value, current, quarantine, source, journal,
+                                       repo_root, materialized_root, cold_root):
+    """Finish a reviewed disposable trial after an interrupted partial unlink.
+
+    A partial deletion cannot be rolled back. Continue only if every remaining
+    name/inode came from the fixed plan, and no current consumer or pin applies.
+    Earlier freed blocks are unknowable here and are never counted a second time.
+    """
+    plan = journal_value['plan']
+    if plan.get('identity_sha256') != identity({k: v for k, v in plan.items() if k != 'identity_sha256'}):
+        raise SnapshotError('partial D benchmark journal identity changed')
+    original = plan['observed']
+    before_root, after_root = original['root_signature'], current['root_signature']
+    if before_root[:2] != after_root[:2] or before_root[5] != after_root[5]:
+        raise SnapshotError('partial D benchmark quarantine root changed')
+    planned = {row['path']: row for row in original['rows']}
+    remaining = {row['path']: row for row in current['rows']}
+    if len(planned) != len(original['rows']) or len(remaining) != len(current['rows']) or not remaining.keys() <= planned.keys():
+        raise SnapshotError('partial D benchmark has unplanned names')
+    removed_links = {}
+    for name, row in planned.items():
+        if name not in remaining and row['kind'] == 'file':
+            key = tuple(row['signature'][:2])
+            removed_links[key] = removed_links.get(key, 0) + 1
+    for name, row in remaining.items():
+        prior = planned[name]
+        old, new = prior['signature'], row['signature']
+        if (row['kind'] != prior['kind'] or row['cross_filesystem'] or prior['cross_filesystem']
+                or old[:2] != new[:2] or old[5] != new[5]):
+            raise SnapshotError('partial D benchmark member identity changed')
+        if row['kind'] == 'file':
+            removed = removed_links.get(tuple(old[:2]), 0)
+            if (old[2:4] != new[2:4] or new[6] != old[6] - removed
+                    or (not removed and old != new)):
+                raise SnapshotError('partial D benchmark file changed')
+        elif row['kind'] == 'unsupported' and old != new:
+            raise SnapshotError('partial D benchmark opaque name changed')
+    options = {'allow_opaque_symlinks': True}
+    if (process_references(quarantine) or _gates(source, current, repo_root, materialized_root, cold_root, **options)
+            or _gates(quarantine, current, repo_root, materialized_root, cold_root, **options)
+            or _observed(quarantine, target['kind']) != current
+            or _guard_d_workflow_copy(policy, cold_root, target) != plan.get('retained_evidence')):
+        raise SnapshotError('partial D benchmark is active or changed; quarantine retained')
+    write_discard_receipt(journal, {**journal_value, 'partial_resume': {
+        'prior_names_absent': len(planned) - len(remaining), 'at_epoch': time.time()}})
+    reclaimed = unlink_preserved_file_names(quarantine, current['rows'])
+    reclaimed += _unlink_opaque_links(quarantine, current['rows'])
+    for row in sorted(current['rows'], key=lambda r: len(PurePosixPath(r['path']).parts), reverse=True):
+        if row['kind'] == 'directory':
+            (quarantine / row['path']).rmdir()
+    result = {'state': 'discarded-without-preservation', 'deleted': True, 'target': target,
+              'policy_identity_sha256': policy['identity_sha256'], 'files': current['files'],
+              'logical_bytes': current['logical_bytes'], 'reclaimed_allocated_bytes': reclaimed,
+              'prior_reclaimed_allocated_bytes_unknown': True, 'resumed_partial': True,
+              'recovery_claimed': False, 'external_shared_names_deleted': False, 'at_epoch': time.time()}
+    write_discard_receipt(journal, {'state': 'unlink_finished', 'plan': plan,
+                                    'quarantine': str(quarantine), 'result': result})
+    quarantine.rmdir()
+    quarantine.parent.rmdir()
+    write_discard_receipt(journal, {'state': 'discarded', 'plan': plan, 'result': result})
+    return True
 
 
 def _gates(source: Path, observed: dict, repo_root: Path, materialized_root: Path, cold_root: Path,
@@ -357,11 +481,36 @@ def _unlink_opaque_links(root: Path, rows: list[dict]) -> int:
     return reclaimed
 
 
+def _guard_d_workflow_copy(policy: dict, cold_root: Path, target: dict):
+    if policy.get('contract') == D_WORKFLOW_TESTING_CONTRACT:
+        from stockagent.data_sync.cold_primary import _check_d_primary_mount
+        from stockagent.data_sync import testing_disposition
+        _check_d_primary_mount(cold_root)
+        if target['kind'] == 'directory':
+            round_name = PurePosixPath(target['relative']).parts[1]
+            name = 'comparison_result.json' if round_name in {'round25', 'round27'} else 'comparison.json'
+            path = real(testing_disposition.D_WORKFLOW_TESTING_ROOT / 'benchmarks' / round_name / name)
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC)
+            with os.fdopen(fd, 'rb') as handle:
+                before = signature(os.fstat(handle.fileno()))
+                if not stat.S_ISREG(os.fstat(handle.fileno()).st_mode) or before[2] > 1024**2:
+                    raise SnapshotError('D benchmark comparison evidence is not a bounded regular file')
+                raw = handle.read(1024**2 + 1)
+                if len(raw) != before[2] or signature(os.fstat(handle.fileno())) != before or signature(path.lstat()) != before:
+                    raise SnapshotError('D benchmark comparison evidence changed during read')
+            summary = json.loads(raw)
+            if not isinstance(summary, dict) or not summary:
+                raise SnapshotError('D benchmark comparison evidence is empty')
+            return {'sha256': hashlib.sha256(raw).hexdigest(), 'signature': before, 'name': name}
+    return None
+
+
 def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_root: Path,
                    state_root: Path, materialized_root: Path, cold_root: Path,
                    apply: bool = False, expected_plan_identity: str | None = None) -> dict:
     if target not in policy["targets"] or type(apply) is not bool:
         raise SnapshotError("testing deletion requires one exact approved target")
+    retained_evidence = _guard_d_workflow_copy(policy, cold_root, target)
     source = target_path(policy, target, repo_root=repo_root, engineering_root=engineering_root)
     state_root = real(state_root)
     state_root.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -372,16 +521,18 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
         fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
         journal = state_root / (key + ".json")
         prior = json.loads(real(journal).read_bytes()) if journal.exists() else {}
-        if prior.get("state") in {"prepared", "quarantined"}:
+        if prior.get("state") in {"prepared", "quarantined", "unlink_started", "unlink_finished"}:
             raise SnapshotError("interrupted discard quarantine needs exact recovery")
         if not source.exists():
             return {"state": "already-absent", "target": target, "deleted": False,
                     "reclaimed_allocated_bytes": 0}
         observed = _observed(source, target["kind"])
-        gate_options = {'allow_opaque_symlinks': True} if policy['contract'] == LOCAL_TESTING_CONTRACT else {}
+        gate_options = {'allow_opaque_symlinks': True} if policy['contract'] in LOCAL_COPY_CONTRACTS else {}
         blockers = _gates(source, observed, repo_root, materialized_root, cold_root, **gate_options)
         plan = {"contract": policy["contract"], "policy_identity_sha256": policy["identity_sha256"],
                 "target": target, "source": str(source), "observed": observed, "blockers": blockers}
+        if policy['contract'] == D_WORKFLOW_TESTING_CONTRACT:
+            plan['retained_evidence'] = retained_evidence
         plan["identity_sha256"] = identity(plan)
         if not apply:
             return {**plan, "state": "discard-dry-run", "deleted": False}
@@ -390,11 +541,13 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
                                 + json.dumps({"blockers": blockers, "generation_changed": plan["identity_sha256"] != expected_plan_identity}))
         if _observed(source, target["kind"]) != observed or _gates(source, observed, repo_root, materialized_root, cold_root, **gate_options):
             raise SnapshotError("testing discard changed before quarantine")
+        if _guard_d_workflow_copy(policy, cold_root, target) != retained_evidence:
+            raise SnapshotError('D benchmark comparison evidence changed before quarantine')
         # Equal st_dev does not imply rename works across distinct bind
         # mounts. A local work copy uses a private sibling on its own mount;
         # its durable journal remains under the canonical service state.
         quarantine_parent = (source.parent / ('.stockagent-testing-quarantine-' + uuid.uuid4().hex)
-                             if policy['contract'] == LOCAL_TESTING_CONTRACT else
+                             if policy['contract'] in LOCAL_COPY_CONTRACTS else
                              state_root / ("quarantine-" + uuid.uuid4().hex))
         quarantine_parent.mkdir(mode=0o700)
         if quarantine_parent.stat().st_dev != source.stat().st_dev:
@@ -416,18 +569,25 @@ def discard_target(policy: dict, target: dict, *, repo_root: Path, engineering_r
             if old[:4] != new[:4] or old[5:] != new[5:]:
                 raise SnapshotError("testing file changed during quarantine")
         unlink_root = quarantine if target["kind"] == "directory" else quarantine_parent
+        if policy['contract'] in LOCAL_COPY_CONTRACTS and target['kind'] == 'file':
+            write_discard_receipt(journal, {"state": "unlink_started", "plan": plan,
+                                            "quarantine": str(quarantine)})
         reclaimed = unlink_preserved_file_names(unlink_root, current["rows"])
-        if policy['contract'] == LOCAL_TESTING_CONTRACT:
+        if policy['contract'] in LOCAL_COPY_CONTRACTS:
             reclaimed += _unlink_opaque_links(unlink_root, current['rows'])
         if target["kind"] == "directory":
             for r in sorted(current["rows"], key=lambda r: len(PurePosixPath(r["path"]).parts), reverse=True):
                 if r["kind"] == "directory":
                     (quarantine / r["path"]).rmdir()
-            quarantine.rmdir()
-        quarantine_parent.rmdir()
         result = {"state": "discarded-without-preservation", "deleted": True, "target": target,
                   "policy_identity_sha256": policy["identity_sha256"], "files": current["files"],
                   "logical_bytes": current["logical_bytes"], "reclaimed_allocated_bytes": reclaimed,
                   "recovery_claimed": False, "external_shared_names_deleted": False, "at_epoch": time.time()}
+        if policy['contract'] == D_WORKFLOW_TESTING_CONTRACT and target['kind'] == 'directory':
+            write_discard_receipt(journal, {"state": "unlink_finished", "plan": plan,
+                                            "quarantine": str(quarantine), "result": result})
+        if target["kind"] == "directory":
+            quarantine.rmdir()
+        quarantine_parent.rmdir()
         write_discard_receipt(journal, {"state": "discarded", "plan": plan, "result": result})
         return result

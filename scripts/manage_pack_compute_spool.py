@@ -15,9 +15,11 @@ from datetime import datetime, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 import re
+import shlex
 import stat
 import sys
 import subprocess
@@ -38,39 +40,90 @@ ENROLLED_SOURCES = {
 }
 
 
+class RemoteCapacityWait(Exception):
+    """A disposable remote cache miss cannot be staged below its reserve."""
+
+
+def remote_spool_available(options, remote):
+    """One read-only observation per scope; the remote writer remains authority."""
+    profile, repo = options.get('ssh_profile'), getattr(remote, 'repo', None)
+    if not options.get('remote_spool') or not isinstance(profile, str) or not repo:
+        return None
+    program = 'import os,sys;s=os.statvfs(sys.argv[1]);print(s.f_bavail*s.f_frsize)'
+    cache_root = PurePosixPath(str(repo)) / 'service_data/pack_compute_cache'
+    command = 'python3 -c ' + shlex.quote(program) + ' ' + shlex.quote(str(cache_root))
+    try:
+        result = subprocess.run(['ssh', '-T', '-F', profile, 'stockagent-vast', command],
+            capture_output=True, text=True, check=True, timeout=10)
+        value = result.stdout.strip()
+        return int(value) if value.isascii() and value.isdigit() and len(value) <= 20 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None  # Original remote physical admission still applies.
+
+
 def now():
     return datetime.now(timezone.utc).isoformat()
 
 
 class NativeUpload:
     """One lazy native reader; upload overlaps other lanes' remote decoding."""
-    def __init__(self, path, size, lock):
+    def __init__(self, path, size, lock, remote_available=None, remote_reserve=None):
         self.path, self.size, self.lock = path, size, lock
+        self.remote_available, self.remote_reserve = remote_available, remote_reserve
         self.stack = None
         self.started = self.finished = None
+        self.bytes_read, self.eof = 0, False
 
     def seek(self, offset):
         if offset != 0 or self.stack is not None:
             raise ValueError('native upload supports exactly one full forward read')
+        if (type(self.remote_available) is int and type(self.remote_reserve) is int
+                and self.remote_available < self.remote_reserve + self.size):
+            raise RemoteCapacityWait('remote disposable cache reserve is unavailable')
         from stockagent.data_sync.windows_cold_io import binary_reader
         self.lock.acquire()
         self.started = time.monotonic()
         self.stack = ExitStack()
         try:
-            self.stream = self.stack.enter_context(binary_reader(self.path, expected_bytes=self.size))
+            # The remote RPC deadline cannot interrupt source.seek/read. Bound
+            # native pipe inactivity too, including a stalled WSL launch that
+            # produces neither bytes nor EOF. Only this read-only child aborts.
+            self.stream = self.stack.enter_context(binary_reader(
+                self.path, expected_bytes=self.size, read_idle_timeout=120))
         except BaseException:
-            self.close(); raise
+            self.abort(); raise
 
     def read(self, count):
-        return self.stream.read(count)
+        block = self.stream.read(count)
+        self.bytes_read += len(block)
+        self.eof = not block
+        return block
 
-    def close(self):
+    def _finish(self, *, aborted):
         if self.stack is not None:
             stack, self.stack = self.stack, None
-            try: stack.close()  # exact EOF, child exit, mount and generation
+            try:
+                if aborted:
+                    # Inject cancellation into the native reader's context so
+                    # it terminates an unread producer instead of waiting for
+                    # a child blocked on a full, no-longer-consumed pipe.
+                    stack.__exit__(RuntimeError, RuntimeError('native upload cancelled'), None)
+                else:
+                    stack.close()  # exact EOF, child exit, mount and generation
             finally:
                 self.finished = time.monotonic()
                 self.lock.release()
+
+    def abort(self):
+        self._finish(aborted=True)
+
+    def close(self):
+        if self.stack is None:
+            return
+        if not self.eof or self.bytes_read != self.size:
+            self.abort()
+            raise ValueError('native upload did not consume exact source and EOF')
+        self._finish(aborted=False)
 
 
 def candidates(cold, since):
@@ -130,6 +183,7 @@ ConvertTo-Json -InputObject @($rows.ToArray()) -Compress
 
 def enrolled_sources(cfg):
     if (cfg.get('contract') != CONTRACT or cfg.get('enabled') is not True
+            or type(cfg.get('pressure_recovery_enabled', False)) is not bool
             or type(cfg.get('maximum_jobs_per_cycle')) is not int
             or not 1 <= cfg['maximum_jobs_per_cycle'] <= 256):
         raise ValueError('invalid explicitly enrolled private compute scope')
@@ -185,28 +239,110 @@ def run_scope(scope, cfg, *, progress):
                  if (key in current and value.get('source_generation') == list(signature(current[key]))
                      and value.get('worker_sha256') == VERIFIER_SHA
                      and value.get('cache_worker_sha256') == CACHE_SHA)}
-    pending_jobs = [(path, info) for path, info in jobs if path.stem not in completed]
+    previous_retries = previous.get('retry_failures')
+    previous_retries = previous_retries if isinstance(previous_retries, dict) else {}
+    retries = {key: value for key, value in previous_retries.items()
+               if (key in current and key not in completed and isinstance(value, dict)
+                   and value.get('source_generation') == list(signature(current[key]))
+                   and type(value.get('retry_after_epoch')) in (int, float)
+                   and math.isfinite(value['retry_after_epoch'])
+                   and value['retry_after_epoch'] <= time.time() + 1020
+                   and type(value.get('attempts')) is int and 0 < value['attempts'] <= 1000)}
+    pending = [(path, info) for path, info in jobs if path.stem not in completed]
+    pending_jobs = [(path, info) for path, info in pending
+                    if path.stem not in retries or retries[path.stem]['retry_after_epoch'] <= time.time()]
+    need_capacity = bool(pending) or previous.get('pressure_sync_state') == 'failed'
+    available = remote_spool_available(options, remote) if need_capacity else None
+    reserve = options.get('remote_spool_reserve_bytes', 32*1024**3)
     report = {'contract': CONTRACT, 'context_sha256': context, 'dataset': scope['dataset'], 'remote_boot_id': remote.boot_id,
               'objects': completed, 'source_retirement': False, 'nas_acceptance': False,
               'total_items': len(jobs), 'total_bytes': sum(info.st_size for _, info in jobs),
               'workers': options['remote_workers'], 'source_readers': 1, 'active_jobs': 0,
               'computed_this_turn': 0,
-              'failures': {}, 'state': 'running'}
+              'failures': {}, 'retry_failures': retries, 'state': 'running',
+              'remote_spool_available_bytes': available, 'remote_spool_reserve_bytes': reserve,
+              'capacity_wait': False}
+    for metric in ('bytes', 'items'):
+        prior = previous.get('pressure_reclaimed_total_' + metric,
+                             previous.get('pressure_reclaimed_' + metric, 0))
+        report['pressure_reclaimed_total_' + metric] = prior if type(prior) is int and prior >= 0 else 0
+    if previous.get('pressure_sync_state') in {'requested', 'not_required', 'failed'}:
+        report['pressure_sync_state'] = previous['pressure_sync_state']
     report['discovery_seconds'] = time.monotonic()-discovery_started
     report['inventory_observed_at_utc'] = now()
     def save():
         report.update(observed_at_utc=now(), completed_items=len(completed),
                       completed_bytes=sum(v['object_bytes'] for v in completed.values()))
         atomic_write_json(state_path, report, durable=True)
-        progress({**{k:v for k,v in report.items() if k not in {'objects', 'failures', 'cleanup'}},
-                  'failed_items': len(report['failures'])})
+        progress({**{k:v for k,v in report.items() if k not in {'objects', 'failures', 'retry_failures', 'cleanup'}},
+                  'failed_items': len(report['failures']),
+                  'retry_deferred_items': sum(item['retry_after_epoch'] > time.time() for item in retries.values())})
+    # Recover only disposable Vast compute-cache pairs whose original D bytes
+    # are freshly checked against an independently reconstructed fixed release.
+    # Keep this on the original spool owner; unknown remote outcomes block any
+    # further automatic reclamation rather than pretending an unlink succeeded.
+    scan_attempted = False
+    if (cfg.get('pressure_recovery_enabled') is True and type(available) is int
+            and available < reserve and pending and completed):
+        from stockagent.data_sync.pack_compute_pressure_control import relieve
+        from stockagent.data_sync.pack_compute_pressure import SOURCE_SHA256 as PRESSURE_SHA
+        retry_at = previous.get('pressure_retry_after_epoch')
+        deferred = (type(retry_at) in (int, float) and math.isfinite(retry_at)
+                    and time.time() < retry_at <= time.time() + 300
+                    and previous.get('pressure_retry_worker_sha256') == PRESSURE_SHA)
+        def pressure_progress(value):
+            report['pressure_state'] = value['phase']
+            report['pressure_done_bytes'] = value['done_bytes']
+            report['pressure_total_bytes'] = value['total_bytes']
+            report['pressure_plan'] = value.get('plan')
+            save()
+        if deferred:
+            report['pressure_state'] = previous.get('pressure_state', 'waiting_retry')
+            report['pressure_retry_after_epoch'] = retry_at
+            report['pressure_retry_worker_sha256'] = PRESSURE_SHA
+            report['capacity_wait'] = True
+        else:
+            try:
+                result = relieve(scope, current, completed, options, remote, STATE,
+                                 available=available, progress=pressure_progress)
+                report['pressure_state'] = result['state']
+                removed = result.get('removed', [])
+                for row in removed:
+                    completed[row['object_sha256']]['payload_cache_retired'] = True
+                report['pressure_reclaimed_bytes'] = sum(row['released_allocated_bytes'] for row in removed)
+                report['pressure_reclaimed_items'] = len(removed)
+                report['pressure_reclaimed_total_bytes'] += report['pressure_reclaimed_bytes']
+                report['pressure_reclaimed_total_items'] += report['pressure_reclaimed_items']
+                available = remote_spool_available(options, remote)
+                report['remote_spool_available_bytes'] = available
+                report['capacity_wait'] = type(available) is int and available < reserve
+                if removed and type(available) is int and available >= 16 * 1024**3:
+                    from stockagent.data_sync.pack_compute_pressure_control import retry_vast_syncthing_scan
+                    report['pressure_sync_state'] = retry_vast_syncthing_scan(options)
+                    scan_attempted = True
+                if not removed and report['capacity_wait'] and result['state'] != 'waiting_for_tw_opening':
+                    report['pressure_retry_after_epoch'] = time.time() + 300
+                    report['pressure_retry_worker_sha256'] = PRESSURE_SHA
+            except Exception as error:
+                report['pressure_state'] = 'blocked_error'
+                report['pressure_error_type'] = type(error).__name__
+                report['capacity_wait'] = True
+                report['pressure_retry_after_epoch'] = time.time() + 300
+                report['pressure_retry_worker_sha256'] = PRESSURE_SHA
+        save()
+    if (cfg.get('pressure_recovery_enabled') is True and not scan_attempted
+            and report.get('pressure_sync_state') == 'failed'
+            and type(available) is int and available >= 16 * 1024**3):
+        from stockagent.data_sync.pack_compute_pressure_control import retry_vast_syncthing_scan
+        report['pressure_sync_state'] = retry_vast_syncthing_scan(options)
+        save()
     io_lock = threading.Lock()
     def compute(path, before):
         item = {'kind': 'pack', 'sha256': path.stem, 'bytes': before.st_size}
-        source = NativeUpload(path, before.st_size, io_lock)
+        source = NativeUpload(path, before.st_size, io_lock, available, reserve)
         began = time.monotonic()
         try: result = remote.stage(source, item, on_payload_sent=source.close)
-        finally: source.close()
+        finally: source.abort()
         if signature(path.lstat()) != signature(before):
             raise ValueError('closed D pack generation changed during staging')
         finished = time.monotonic()
@@ -220,7 +356,10 @@ def run_scope(scope, cfg, *, progress):
         with ThreadPoolExecutor(max_workers=options['remote_workers'], thread_name_prefix='stage-closed-pack') as pool:
             iterator = iter(pending_jobs[:cfg['maximum_jobs_per_cycle']])
             active = {}
+            circuit_open = False
             def dispatch():
+                if circuit_open:
+                    return
                 for path, before in iterator:
                     active[pool.submit(compute, path, before)] = path.stem
                     return
@@ -233,12 +372,26 @@ def run_scope(scope, cfg, *, progress):
                     digest = active.pop(future)
                     try:
                         completed[digest] = future.result()
+                        retries.pop(digest, None)
                         report['computed_this_turn'] += 1
-                    except Exception as exc: report['failures'][digest] = type(exc).__name__
+                    except Exception as exc:
+                        report['failures'][digest] = type(exc).__name__
+                        report['capacity_wait'] = report['capacity_wait'] or isinstance(exc, RemoteCapacityWait)
+                        prior = retries.get(digest, {})
+                        attempts = min(1000, int(prior.get('attempts', 0)) + 1)
+                        retries[digest] = {'source_generation': list(signature(current[digest])),
+                            'attempts': attempts, 'error_type': type(exc).__name__,
+                            'retry_after_epoch': time.time() + min(900, 60 * 2**min(attempts - 1, 4))}
+                        # RemotePacks returns aborted sessions to its shared
+                        # queue to unblock waiters. They cannot service later
+                        # jobs in this turn; keep the original checkpoint and
+                        # let the next timer create fresh sessions instead.
+                        if any(getattr(session, 'closed', False) for session in getattr(remote, 'sessions', ())):
+                            circuit_open = True
                     dispatch()
                 save()
         report['active_jobs'] = 0
-        report['state'] = ('blocked' if report['failures'] else 'queued'
+        report['state'] = ('blocked' if report['failures'] or (retries and not pending_jobs) else 'queued'
                            if len(completed) < len(jobs) else 'waiting_for_new_sealed_packs')
     finally:
         report['cleanup'] = remote.close()

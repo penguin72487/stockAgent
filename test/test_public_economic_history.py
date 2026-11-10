@@ -1,5 +1,6 @@
 import io
 import json
+import fcntl
 import zipfile
 
 import pyarrow as pa
@@ -8,6 +9,50 @@ import pytest
 from downloader import download_public_economic_history as worker
 from downloader import public_economic_sources as source
 from downloader.download_keyed_public_catalogs import CatalogError, RequestBudget, SafeCatalogTransport
+from stockagent.data_sync.desync_snapshots import SnapshotError
+
+
+def test_economic_provider_holds_its_original_lock_and_other_providers_can_run(tmp_path, monkeypatch):
+    original_guard = worker.guard_locked_path
+    observed = []
+    def guard(root, handle, *, lock_name):
+        original_guard(root, handle, lock_name=lock_name)
+        with (root / lock_name).open('a+') as same:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(same, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with (root / '.census.lock').open('a+') as independent:
+            fcntl.flock(independent, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        observed.append(lock_name)
+    monkeypatch.setattr(worker, 'guard_locked_path', guard)
+    monkeypatch.setattr(worker, 'core_jobs', lambda: [])
+    result = worker.run_provider('bea', tmp_path, {}, max_requests=0, max_bytes=1024, min_free_bytes=0)
+    assert result['state'] == 'requested_scope_current' and observed == ['.bea.lock']
+
+
+def test_economic_provider_rejects_alias_change_before_any_data_write(tmp_path, monkeypatch):
+    def bad_guard(*_args, **_kwargs):
+        raise SnapshotError('source lock changed')
+    monkeypatch.setattr(worker, 'guard_locked_path', bad_guard)
+    monkeypatch.setattr(worker, 'core_jobs', lambda: pytest.fail('producer must not run'))
+    with pytest.raises(SnapshotError, match='source lock changed'):
+        worker.run_provider('bea', tmp_path, {}, max_requests=0, max_bytes=1024, min_free_bytes=0)
+    assert not (tmp_path / 'status').exists()
+
+
+def test_economic_summary_uses_brief_root_lock_without_serializing_provider_jobs(tmp_path, monkeypatch):
+    monkeypatch.setattr(worker, 'load_env_file', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(worker, 'run_provider', lambda provider, *_args, **_kwargs:
+                        {'provider': provider, 'state': 'current', 'requests': 0})
+    monkeypatch.setattr(worker, 'read_json', lambda _path: {})
+    seen = []
+    def write(path, _value):
+        with (tmp_path / '.download.lock').open('a+') as lock:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        seen.append(path.name)
+    monkeypatch.setattr(worker, 'atomic_write_json', write)
+    assert worker.main(['--execute', '--providers', 'bea', '--output-root', str(tmp_path)]) == 0
+    assert seen == ['download_summary.json']
 
 
 def census_body(value="123.4567890123456789"):

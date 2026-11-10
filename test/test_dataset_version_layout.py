@@ -48,7 +48,7 @@ def test_every_existing_data_root_registered_with_its_existing_publication_owner
     assert result["legacy_deletions"] == 0
 
 
-def test_all_source_catalog_entries_share_v2_policy_without_enabling_private_publication(layout_repo):
+def test_source_catalog_has_only_explicit_v3_opt_in_without_enabling_private_publication(layout_repo):
     entries = _load_catalog(layout_repo / "configs/data_sync/packed_datasets.json", True)
     policy = version_policy(layout_repo)
     roots = set()
@@ -58,10 +58,13 @@ def test_all_source_catalog_entries_share_v2_policy_without_enabling_private_pub
         names = dataset_roots(layout_repo, source, policy)
         roots.update(names)
         options = publication_version_options(layout_repo, entry, reader_contract="packed-v2-chunks")
-        assert options == ({"file_chunk_bytes": 8 * 1024**2}
-                           if names or "file_chunk_bytes" in entry else {})
-        assert publication_version_options(layout_repo, entry, reader_contract="packed-v1") == (
-            {"file_chunk_bytes": entry["file_chunk_bytes"]} if "file_chunk_bytes" in entry else {})
+        expected = ({"file_chunk_bytes": 8 * 1024**2} if names or "file_chunk_bytes" in entry else {})
+        legacy = ({"file_chunk_bytes": entry["file_chunk_bytes"]} if "file_chunk_bytes" in entry else {})
+        if entry.get('reader_contract') == 'packed-v3-content-alias':
+            assert entry['dataset'] == 'tw-index-futures' and 'file_chunk_bytes' in entry
+            expected['allow_content_alias_v3'] = legacy['allow_content_alias_v3'] = True
+        assert options == expected
+        assert publication_version_options(layout_repo, entry, reader_contract="packed-v1") == legacy
     assert roots == set(policy["roots"])
     private = {entry["dataset"]: entry["publish"] for entry in entries}
     assert all(private[name] is False for name in (
@@ -72,8 +75,11 @@ def test_actual_source_entries_are_enrolled_without_enrolling_artifact_families(
     entries = _load_catalog(layout_repo / "configs/data_sync/packed_datasets.json", True)
     for entry in entries:
         options = publication_version_options(layout_repo, entry, reader_contract=None)
-        assert options == ({"file_chunk_bytes": 8 * 1024**2}
-                           if "publication_family" not in entry else {})
+        expected = ({"file_chunk_bytes": 8 * 1024**2} if "publication_family" not in entry else {})
+        if entry.get('reader_contract') == 'packed-v3-content-alias':
+            assert entry['dataset'] == 'tw-index-futures'
+            expected['allow_content_alias_v3'] = True
+        assert options == expected
 
 
 @pytest.mark.parametrize('shared', [False, True])
@@ -332,6 +338,34 @@ def test_per_entry_chunk_format_requires_explicit_reader_enrollment(tmp_path):
     entry["reader_contract"] = "packed-v2-chunks"
     path.write_text(json.dumps({"schema_version": 1, "datasets": [entry]}))
     assert _load_catalog(path)[0]["file_chunk_bytes"] == 8 * 1024**2
+    entry["reader_contract"] = "packed-v3-content-alias"
+    path.write_text(json.dumps({"schema_version": 1, "datasets": [entry]}))
+    loaded = _load_catalog(path)[0]
+    assert publication_version_options(tmp_path, loaded, reader_contract=None) == {
+        "file_chunk_bytes": 8 * 1024**2, "allow_content_alias_v3": True}
+
+
+def test_layout_reports_v3_head_without_claiming_v2_or_payload_verification(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    import stockagent.data_sync.dataset_version_layout as layout
+    policy = json.loads((REPO/'configs/columnar_storage.json').read_text())
+    policy['source_versioning']['roots'] = {
+        'data_one': {'native_layout': 'source_shards', 'target_grain': 'date'}}
+    (tmp_path/'configs').mkdir()
+    (tmp_path/'configs/columnar_storage.json').write_text(json.dumps(policy))
+    (tmp_path/'data_one').mkdir()
+    cold = tmp_path/'cold'
+    (cold/'heads/one').mkdir(parents=True)
+    monkeypatch.setattr(layout, 'resolve_latest_packed', lambda *_a, **_kw: SimpleNamespace(
+        manifest={'snapshot_id': 'v3', 'schema_version': 3, 'archive': {'file_chunk_bytes': 8*1024**2}},
+        manifest_sha256='a'*64))
+    entry = {'dataset': 'one', 'source': 'data_one', 'role': 'source', 'publish': True,
+             'reader_contract': 'packed-v3-content-alias', 'file_chunk_bytes': 8*1024**2}
+    result = inventory_version_layout(tmp_path, [entry], sync_root=cold)
+    row = result['roots'][0]
+    assert row['rollout_state'] == 'shared_v3_head_observed' and row['current_v3_head_observed']
+    assert not row['current_v2_head_observed'] and row['configured_v3_publication_branches'] == ['one']
+    assert row['publication_bindings'][0]['head']['objects_verified'] is False
 
 
 def test_source_rollout_filter_keeps_private_gates_and_excludes_artifact_families(layout_repo):

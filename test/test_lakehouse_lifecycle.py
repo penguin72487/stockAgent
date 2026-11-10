@@ -18,6 +18,54 @@ from stockagent.data_sync.immutable_replication import ACK, digest, seal
 from stockagent.runtime_identity import identity_sha256
 
 
+def test_drained_handoff_refuses_inflight_recovery_or_started_activity():
+    from scripts import rollout_lakehouse_source_policy as rollout
+    rollout.require_drained_activities({'inflight_attempts': {}}, [])
+    with pytest.raises(rollout.PublicationOwnerBusy):
+        rollout.require_drained_activities({'inflight_attempts': {'futures': {'state': 'recovery'}}}, [])
+    with pytest.raises(rollout.PublicationOwnerBusy):
+        rollout.require_drained_activities(None, [('workflow', 'export_version', '27')])
+
+
+@pytest.mark.parametrize('state,expected', [(1, []), (2, [('one', 'recovery', '7')]),
+                                             (3, [('one', 'recovery', '7')])])
+def test_started_activity_observation_keeps_cancellation_as_active(monkeypatch, state, expected):
+    import asyncio
+    from scripts import rollout_lakehouse_source_policy as rollout
+    from temporalio.client import Client
+    activity = SimpleNamespace(state=state, activity_id='7', activity_type=SimpleNamespace(name='recovery'))
+    description = SimpleNamespace(status=SimpleNamespace(name='RUNNING'),
+                                  raw_description=SimpleNamespace(pending_activities=[activity]))
+    class Handle:
+        async def describe(self, **kwargs): return description
+    class FakeClient:
+        def get_workflow_handle(self, name): return Handle()
+    async def connect(*args, **kwargs): return FakeClient()
+    monkeypatch.setattr(Client, 'connect', connect)
+    monkeypatch.setattr(rollout, 'IDS', ('one',))
+    monkeypatch.setattr(rollout, 'OPTIONAL_IDS', ())
+    assert asyncio.run(rollout.started_activities({'temporal_endpoint': 'x', 'temporal_namespace': 'y'})) == expected
+
+
+def test_started_activity_observation_rejects_unknown_state(monkeypatch):
+    import asyncio
+    from scripts import rollout_lakehouse_source_policy as rollout
+    from temporalio.client import Client
+    activity = SimpleNamespace(state=0, activity_id='7', activity_type=SimpleNamespace(name='recovery'))
+    description = SimpleNamespace(status=SimpleNamespace(name='RUNNING'),
+                                  raw_description=SimpleNamespace(pending_activities=[activity]))
+    class Handle:
+        async def describe(self, **kwargs): return description
+    class FakeClient:
+        def get_workflow_handle(self, name): return Handle()
+    async def connect(*args, **kwargs): return FakeClient()
+    monkeypatch.setattr(Client, 'connect', connect)
+    monkeypatch.setattr(rollout, 'IDS', ('one',))
+    monkeypatch.setattr(rollout, 'OPTIONAL_IDS', ())
+    with pytest.raises(ValueError, match='state is unknown'):
+        asyncio.run(rollout.started_activities({'temporal_endpoint': 'x', 'temporal_namespace': 'y'}))
+
+
 def test_closed_transport_summary_reuses_only_an_unchanged_exact_generation(tmp_path, monkeypatch):
     path = tmp_path / 'cache-retirement-fixed.json'
     value = dict(state='retired', reclaimed_bytes=7, primary_source_files_deleted=False,
@@ -116,10 +164,23 @@ def test_worker_identity_includes_loaded_packed_reader_and_manifest_contract(mon
     monkeypatch.setattr(worker, "digest", source_digest)
     baseline = worker.worker_code_identity()
     for relative in ("stockagent/data_sync/packed_snapshots.py",
+                     "stockagent/data_sync/packed_alias_v3.py",
+                     "stockagent/data_sync/dedup_candidate_reader.py",
                      "stockagent/data_sync/work_progress.py",
                      "stockagent/data_sync/syncthing_scan.py",
                      "stockagent/data_sync/packed_metadata.py",
                      "stockagent/data_sync/packing_checkpoint.py",
+                     "stockagent/data_sync/packed_member_stream.py",
+                     "stockagent/data_sync/stream_repack.py",
+                     "stockagent/data_sync/private_subset_reuse.py",
+                     "stockagent/data_sync/latest_repack_successor.py",
+                     "stockagent/data_sync/latest_promotion_evidence.py",
+                     "stockagent/data_sync/repack_retirement.py",
+                     "stockagent/data_sync/semantic_link_promotion.py",
+                     "stockagent/data_sync/semantic_link_retirement.py",
+                     "scripts/retire_staged_cold_objects.py",
+                     "scripts/stage_d_cold_relocation.py",
+                     "configs/data_sync/fast_latest_generation_migration.json",
                      "stockagent/data_sync/packed_backup.py",
                      "stockagent/data_sync/desync_snapshots.py",
                      "stockagent/data_sync/closed_source.py",
@@ -372,6 +433,34 @@ def source_wave(tmp_path):
     source.parent.mkdir(parents=True);source.write_bytes(data)
     c = {'cold_root': str(cold), 'state_root': str(state), 'producer_device_id': 'penguin', 'receiver_device_id': 'lab203'}
     return c, [(relative, sha, len(data))], physical, state / 'ledger.json', {'deliveries': {}}, source
+
+
+def test_source_wave_user_migration_pause_retains_state_and_does_no_replication(source_wave, monkeypatch):
+    c, _chosen, _physical, _ledger_path, _ledger, source = source_wave
+    state = Path(c['state_root'])
+    marker = state/'source-replication-migration-pause.json'
+    marker.write_text(json.dumps({'contract': 'stockagent.source_replication_migration_pause.v1',
+                                  'paused': True}))
+    marker.chmod(0o600)
+    atomic_write_json(state/'source-replication-status.json', {'retained_transport_bytes': 42})
+    monkeypatch.setattr(lakehouse, 'guard', lambda *_: pytest.fail('paused wave touched storage'))
+    result = lakehouse.stage_source_wave(c)
+    assert result['state'] == 'paused_for_user_migration' and result['retained_transport_bytes'] == 42
+    assert source.exists() and not (state/'source-replication-owner.lock').exists()
+    marker.unlink()
+    monkeypatch.setattr(lakehouse, 'guard', lambda *_: (_ for _ in ()).throw(RuntimeError('resumed')))
+    with pytest.raises(RuntimeError, match='resumed'):
+        lakehouse.stage_source_wave(c)
+
+
+def test_source_wave_rejects_untrusted_migration_pause(source_wave):
+    c = source_wave[0]
+    marker = Path(c['state_root'])/'source-replication-migration-pause.json'
+    marker.write_text(json.dumps({'contract': 'stockagent.source_replication_migration_pause.v1',
+                                  'paused': True}))
+    marker.chmod(0o644)
+    with pytest.raises(ValueError, match='private local file'):
+        lakehouse.stage_source_wave(c)
 
 
 def test_interrupted_partial_source_wave_reuses_intent_without_losing_original(source_wave, monkeypatch):

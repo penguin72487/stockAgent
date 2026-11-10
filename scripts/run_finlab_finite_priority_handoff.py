@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bounded handoff of explicit futures requests to the existing FinLab owner.
+"""Bounded handoff of explicit minute requests to the existing FinLab owner.
 
 The predecessor is allowed to finish first.  This coordinator never creates
 an SDK session or changes requests: it calls the canonical finite drain, which
@@ -9,9 +9,10 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 import json
 from pathlib import Path
+import re
 import sys
 import time
 
@@ -29,8 +30,10 @@ OWNER_FILES = tuple(ROOT / path for path in (
     'scripts/run_finlab_finite_priority_drain.py', 'scripts/download_finlab_market_intraday.py',
     'scripts/download_finlab_intraday.py', 'scripts/check_acquisition_capacity.py',
     'scripts/finlab_futures_sdk_bridge.py', 'downloader/provider_priority.py',
+    'downloader/dataset_lock.py', 'downloader/paused_provider_owners.py',
     'stockagent/data/finlab_futures_sdk.py',
     'stockagent/data_sync/cache_capacity.py',
+    'stockagent/data_sync/provider_workspace.py',
 ))
 WORKSPACE_FILES = tuple(ROOT / path for path in (
     'stockagent/data_sync/workspace_volume.py', 'configs/data_sync/workspace_volume.json',
@@ -53,7 +56,10 @@ def process_start_ticks(pid: int, *, proc_root: Path = Path('/proc')) -> int | N
     return int(fields[19])
 
 
-def request_summary(request_ids: list[str], now: datetime, *, reader=inspect) -> dict:
+def request_summary(request_ids: list[str], now: datetime, *, reader=inspect,
+                    family: str = 'futures') -> dict:
+    if family not in {'futures', 'stock'}:
+        raise ValueError('unknown minute handoff family')
     counts: Counter[str] = Counter()
     expiries = []
     active_expiries = []
@@ -72,10 +78,19 @@ def request_summary(request_ids: list[str], now: datetime, *, reader=inspect) ->
         expiries.append(expiry)
         for row in status['items']:
             key = json.loads(row['key'])
+            prefix = 'tw_futures_minute:' if family == 'futures' else 'tw_minute:'
             if (not isinstance(key, list) or len(key) != 2
-                    or not isinstance(key[0], str) or not key[0].startswith('tw_futures_minute:')
+                    or not isinstance(key[0], str) or not key[0].startswith(prefix)
                     or not isinstance(key[1], str)):
-                raise ValueError('handoff is limited to explicit futures minute partitions')
+                raise ValueError(f'handoff is limited to explicit {family} minute partitions')
+            if family == 'stock':
+                symbol = key[0][len(prefix):]
+                try:
+                    valid_date = date.fromisoformat(key[1]).isoformat() == key[1]
+                except ValueError:
+                    valid_date = False
+                if not re.fullmatch(r'[A-Za-z0-9]{1,16}', symbol) or not valid_date:
+                    raise ValueError('invalid explicit stock minute partition')
             state = row.get('state')
             if state not in WAITING | TERMINAL:
                 raise ValueError(f'priority receipt needs review: {state}')
@@ -113,14 +128,22 @@ def retry_delay(code: int, result: dict, now: datetime) -> int | None:
 def run(request_ids: list[str], predecessor_pid: int, predecessor_ticks: int, progress: Path,
         *, now=lambda: datetime.now(UTC), monotonic=time.monotonic, sleep=time.sleep,
         reader=inspect, process=process_start_ticks, digest=sha256_file, drain_owner=drain,
-        headroom=wait_for_headroom, futures_workspace_only: bool = False) -> int:
+        headroom=wait_for_headroom, futures_workspace_only: bool = False,
+        preferred_futures_request_ids: tuple[str, ...] = (), family: str = 'futures') -> int:
     if not request_ids or len(request_ids) != len(set(request_ids)) or predecessor_pid <= 0 or predecessor_ticks <= 0:
         raise ValueError('unique requests and a specific predecessor are required')
-    start = now()
-    initial = request_summary(request_ids, start, reader=reader)
-    deadline = min(initial['latest_expiry'], start + timedelta(days=7))
     if type(futures_workspace_only) is not bool:
         raise ValueError('invalid futures workspace mode')
+    if family not in {'futures', 'stock'} or (family != 'futures' and futures_workspace_only):
+        raise ValueError('invalid minute family or futures workspace combination')
+    if (not isinstance(preferred_futures_request_ids, tuple)
+            or len(set(preferred_futures_request_ids)) != len(preferred_futures_request_ids)
+            or any(request_id not in request_ids for request_id in preferred_futures_request_ids)
+            or preferred_futures_request_ids and not futures_workspace_only):
+        raise ValueError('preferred requests must be unique registered futures requests')
+    start = now()
+    initial = request_summary(request_ids, start, reader=reader, family=family)
+    deadline = min(initial['latest_expiry'], start + timedelta(days=7))
     pins = {str(path): digest(path) for path in
             OWNER_FILES + (WORKSPACE_FILES if futures_workspace_only else ())}
 
@@ -133,14 +156,16 @@ def run(request_ids: list[str], predecessor_pid: int, predecessor_ticks: int, pr
             'request_ids': request_ids, 'states': summary['counts'],
             'active_waiting': summary['active_waiting'], 'predecessor_pid': predecessor_pid,
             'predecessor_start_ticks': predecessor_ticks, 'source_sha256': pins,
+            'family': family,
             'futures_workspace_only': futures_workspace_only,
+            'preferred_futures_request_ids': preferred_futures_request_ids,
             'data_completeness_claim': False, **extra})
 
     while True:
         if not pins_match():
             report('owner_changed_review_required', initial)
             return 75
-        summary = request_summary(request_ids, now(), reader=reader)
+        summary = request_summary(request_ids, now(), reader=reader, family=family)
         if now() >= deadline or not summary['active_waiting']:
             report('requests_expired_or_no_longer_waiting', summary)
             return 0
@@ -153,7 +178,7 @@ def run(request_ids: list[str], predecessor_pid: int, predecessor_ticks: int, pr
         def capacity_wait() -> bool:
             if not pins_match():
                 return False
-            current = request_summary(request_ids, now(), reader=reader)
+            current = request_summary(request_ids, now(), reader=reader, family=family)
             active_expiry = current['latest_active_expiry']
             if active_expiry is None:
                 return False
@@ -171,13 +196,15 @@ def run(request_ids: list[str], predecessor_pid: int, predecessor_ticks: int, pr
                                 still_valid=pins_match, **kwargs)
             if not admitted or not pins_match() or now() >= deadline:
                 return False
-            current = request_summary(request_ids, now(), reader=reader)
+            current = request_summary(request_ids, now(), reader=reader, family=family)
             return bool(current['active_waiting'] and current['latest_active_expiry']
                         and now() < min(deadline, current['latest_active_expiry']))
 
         kwargs = {'futures_workspace_only': True} if futures_workspace_only else {}
+        if preferred_futures_request_ids:
+            kwargs['preferred_futures_request_ids'] = preferred_futures_request_ids
         code, result = drain_owner(32, kind='tw_minute', capacity_wait=capacity_wait, **kwargs)
-        after = request_summary(request_ids, now(), reader=reader)
+        after = request_summary(request_ids, now(), reader=reader, family=family)
         report('canonical_owner_returned', after, owner_exit_code=code, owner_result=result)
         if now() >= deadline or not after['active_waiting']:
             continue
@@ -195,13 +222,17 @@ def main() -> int:
     parser.add_argument('--predecessor-pid', type=int, required=True)
     parser.add_argument('--predecessor-start-ticks', type=int, required=True)
     parser.add_argument('--progress', type=Path, required=True)
+    parser.add_argument('--family', choices=('futures', 'stock'), default='futures',
+                        help='explicit registered minute family; default preserves existing futures behavior')
     parser.add_argument('--futures-workspace-only', action='store_true')
+    parser.add_argument('--preferred-futures-request-id', action='append', default=[])
     args = parser.parse_args()
     progress = args.progress.resolve()
     if not progress.is_relative_to((ROOT / 'artifacts/operations').resolve()):
         parser.error('progress must be within artifacts/operations')
     return run(args.request_id, args.predecessor_pid, args.predecessor_start_ticks, progress,
-               futures_workspace_only=args.futures_workspace_only)
+               futures_workspace_only=args.futures_workspace_only,
+               preferred_futures_request_ids=tuple(args.preferred_futures_request_id), family=args.family)
 
 
 if __name__ == '__main__':

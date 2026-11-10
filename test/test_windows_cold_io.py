@@ -13,6 +13,44 @@ from stockagent.data_sync import windows_cold_io as native
 from stockagent.data_sync.desync_snapshots import SnapshotError
 
 
+@pytest.mark.parametrize('initial,denied,expanded', [(65536, False, True),
+                                                   (1048576, False, False),
+                                                   (2097152, False, False),
+                                                   (65536, True, True)])
+def test_native_stdout_pipe_expansion_is_best_effort_and_never_shrinks(monkeypatch, initial, denied, expanded):
+    calls = []
+    def control(fd, operation, *args):
+        calls.append((fd, operation, args))
+        if operation == native.fcntl.F_GETPIPE_SZ:
+            return initial
+        if denied:
+            raise PermissionError('pipe size not available')
+        return args[0]
+    monkeypatch.setattr(native.fcntl, 'fcntl', control)
+    native._expand_native_stdout_pipe(SimpleNamespace(fileno=lambda: 12))
+    assert calls[0][1] == native.fcntl.F_GETPIPE_SZ
+    assert (len(calls) == 2) is expanded
+    if expanded:
+        assert calls[1] == (12, native.fcntl.F_SETPIPE_SZ, (1024*1024,))
+    native._expand_native_stdout_pipe(None)
+
+
+def test_native_launch_pipe_hint_preserves_all_stream_bytes(monkeypatch):
+    import os
+    popen = subprocess.Popen
+    monkeypatch.setattr(native, '_native_command', lambda *_args, **_kwargs: 'synthetic')
+    monkeypatch.setattr(native, '_windows_process_environment', lambda: dict(os.environ))
+    monkeypatch.setattr(native.subprocess, 'Popen', lambda _args, **kwargs: popen(
+        [sys.executable, '-c', 'import sys;sys.stdout.buffer.write(sys.stdin.buffer.read())'], **kwargs))
+    process, errors = native._launch([{}])
+    try:
+        payload = bytes(range(256))*128
+        result, _ = process.communicate(payload, timeout=10)
+        assert process.returncode == 0 and result == payload
+    finally:
+        errors.close()
+
+
 @pytest.mark.parametrize('linux_free,physical_free,required,accepted', [
     (293 * 1024**3, 30 * 1024**3, 32 * 1024**3, False),
     (293 * 1024**3, 32 * 1024**3, 32 * 1024**3, True),
@@ -53,6 +91,22 @@ def test_non_d_read_and_hash_use_exact_regular_bytes(tmp_path):
     assert native.hash_file(path) == hashlib.sha256(value).hexdigest()
 
 
+def test_immutable_lake_hash_uses_native_hash_without_opening_stream(tmp_path, monkeypatch):
+    path = tmp_path/'member.parquet'
+    path.write_bytes(b'fixture')
+    expected = hashlib.sha256(b'fixture').hexdigest()
+    monkeypatch.setattr(native, 'windows_path',
+                        lambda selected: 'D:\\stockagent-immutable-lake\\member.parquet')
+    monkeypatch.setattr(native, 'binary_reader', lambda *_a, **_k: pytest.fail('forbidden read mode'))
+    calls = []
+    def hash_many(paths, **_kwargs):
+        calls.append(paths)
+        return {path: expected}
+    monkeypatch.setattr(native, 'hash_many', hash_many)
+    assert native.hash_file(path) == expected
+    assert calls == [[path]]
+
+
 @pytest.mark.parametrize('failure',['startup-once','startup-exhausted','nonempty-failure','other-error','empty-file'])
 def test_read_retry_only_accepts_empty_known_interop_startup_and_preserves_first_byte(monkeypatch,failure):
     value=b'\x00\xffevery byte matters'
@@ -81,6 +135,50 @@ def test_read_retry_only_accepts_empty_known_interop_startup_and_preserves_first
             assert stream.read()==(b'' if failure=='empty-file' else value)
         assert len(launched)==(2 if failure=='startup-once' else 1)
     assert all(p.stdout.closed for p in launched)
+
+
+@pytest.mark.parametrize('failure', ['startup', 'midstream', 'none'])
+def test_opted_in_native_read_bounds_idle_and_preserves_every_byte(monkeypatch, failure):
+    import os
+    payload = b'\x00\xffevery byte matters'
+    read_fd, write_fd = os.pipe()
+    writer = os.fdopen(write_fd, 'wb', buffering=0)
+    class Process:
+        def __init__(self):
+            self.stdin = io.BytesIO()
+            self.stdout = os.fdopen(read_fd, 'rb')
+            self.code = 0 if failure == 'none' else None
+            self.terminated = False
+        def wait(self, **kwargs): return self.code
+        def poll(self): return self.code
+        def terminate(self):
+            self.terminated, self.code = True, -15
+            writer.close()
+    process = Process()
+    launches = []
+    def launch(*args, **kwargs):
+        launches.append(True)
+        return process, io.BytesIO()
+    monkeypatch.setattr(native, 'windows_path', lambda p: 'D:\\stockagent-cold-primary\\fixed')
+    monkeypatch.setattr(native, '_process', launch)
+    if failure != 'startup': writer.write(payload)
+    if failure == 'none': writer.close()
+    try:
+        if failure == 'none':
+            with native.binary_reader(Path('/fixed'), read_idle_timeout=0.02) as stream:
+                assert stream.read() == payload
+        else:
+            with pytest.raises(SnapshotError, match='inactivity timeout'):
+                with native.binary_reader(Path('/fixed'), read_idle_timeout=0.02) as stream:
+                    assert failure == 'midstream'
+                    assert stream.read(1) + stream.read(65536) == payload
+                    stream.read(1)
+        assert len(launches) == 1  # Unknown idle failures are never silently retried.
+        assert process.terminated == (failure != 'none')
+        assert process.stdout.closed
+    finally:
+        writer.close()
+        process.stdout.close()
 
 
 def test_d_mapping_cannot_silently_normalize_parent_traversal(monkeypatch):
@@ -131,6 +229,7 @@ def test_writer_retry_requires_empty_startup_no_input_and_absent_fresh_destinati
                 b'<3>WSL ERROR: UtilAcceptVsock:273: accept4 failed 110')
         return p,io.BytesIO(stderr if fail else b'')
     monkeypatch.setattr(native,'_process',launch)
+    monkeypatch.setattr(native, '_writer_readiness_line', lambda process, **_: process.stdout.readline(4096))
     monkeypatch.setattr(native.time,'sleep',lambda *a:None)
     if failure=='startup-once':
         writer=native.BinaryWriter(path);assert len(launched)==2 and writer.appended==0
@@ -143,6 +242,70 @@ def test_writer_retry_requires_empty_startup_no_input_and_absent_fresh_destinati
     assert all(p.stdout.closed for p in launched)
     if failure in ('existing','append'):assert path.read_bytes()==b'fixed-prefix'
     if failure=='created-partial':assert path.read_bytes()==b'partial to retain'
+
+
+@pytest.mark.parametrize('silent', [False, True])
+def test_native_writer_finish_bounds_silent_process_and_preserves_partial(tmp_path, monkeypatch, silent):
+    import tempfile
+    target = tmp_path/'incoming.partial'
+    payload = b'original observed bytes\x00\xff'
+    script = '''
+import hashlib, json, pathlib, sys, time
+print(json.dumps({'state':'native_writer_ready','offset':0}), flush=True)
+data = sys.stdin.buffer.read()
+pathlib.Path(sys.argv[1]).write_bytes(data)
+if sys.argv[2] == 'silent':
+    time.sleep(60)
+print(json.dumps({'flushed':True,'bytes':len(data),'sha256':hashlib.sha256(data).hexdigest()}), flush=True)
+'''
+    launched = []
+    def launch(*_a, **_kw):
+        errors = tempfile.TemporaryFile()
+        process = subprocess.Popen([sys.executable, '-u', '-c', script, str(target),
+                                    'silent' if silent else 'complete'],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors)
+        launched.append(process)
+        return process, errors
+    monkeypatch.setattr(native, '_process', launch)
+    writer = native.BinaryWriter(target)
+    try:
+        writer.write(payload)
+        if silent:
+            with pytest.raises(SnapshotError, match='finish timeout'):
+                writer.finish(timeout=0.1)
+            with pytest.raises(SnapshotError, match='already failed'):
+                writer.finish(timeout=0.1)
+        else:
+            result = writer.finish(timeout=5)
+            assert result['sha256'] == hashlib.sha256(payload).hexdigest()
+            assert writer.finish() == result
+    finally:
+        writer.close()
+    assert len(launched) == 1 and launched[0].poll() is not None
+    assert target.read_bytes() == payload
+
+
+@pytest.mark.parametrize('prefix', [b'', b'partial startup output'])
+def test_native_writer_silent_startup_has_deadline_and_never_sends_input(tmp_path, monkeypatch, prefix):
+    import tempfile
+    processes = []
+    errors = []
+    def launch(*_a, **_kw):
+        stderr = tempfile.TemporaryFile()
+        script = ('import sys,time; sys.stdout.buffer.write('+repr(prefix)+'); sys.stdout.flush(); '
+                  'sys.stderr.write("<3>WSL ERROR: UtilAcceptVsock:273: accept4 failed 110"); '
+                  'sys.stderr.flush(); time.sleep(60)')
+        process = subprocess.Popen([sys.executable, '-c', script],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr)
+        processes.append(process)
+        errors.append(stderr)
+        return process, stderr
+    monkeypatch.setattr(native, '_process', launch)
+    with pytest.raises(SnapshotError, match='writer not ready'):
+        native.BinaryWriter(tmp_path/'untouched.partial', startup_timeout=0.1)
+    assert len(processes) == 1 and processes[0].poll() is not None
+    assert processes[0].stdin.closed and processes[0].stdout.closed and errors[0].closed
+    assert not (tmp_path/'untouched.partial').exists()
 
 
 def test_native_io_uses_binary_filestream_not_9p_copy():
@@ -201,6 +364,51 @@ def test_enrolled_lake_allows_only_native_hash_on_its_actual_d_volume(monkeypatc
     else:
         with pytest.raises(SnapshotError,match='read-only'):
             native._configuration(path,mode='write' if damage=='write' else 'hash',expected_bytes=9*1024**2)
+
+
+@pytest.mark.parametrize('mode,namespace,allowed', [
+    ('hash', 'stockagent-immutable-lake', True),
+    ('read', 'stockagent-immutable-lake', False),
+    ('write', 'stockagent-immutable-lake', False),
+    ('copy', 'stockagent-immutable-lake', False),
+    ('hash-chunks', 'stockagent-immutable-lake', False),
+    ('hash', 'stockagent-immutable-lake-unrelated', False),
+])
+def test_windows_script_enforces_lake_read_only_scope(mode, namespace, allowed):
+    """Exercise the actual native guard, not just Python's path admission."""
+    import os
+    if not Path(native.POWERSHELL).is_file():
+        pytest.skip('Windows native bridge is unavailable')
+    try:
+        native._windows_process_environment()
+    except SnapshotError:
+        pytest.skip('No verified Windows interop bridge')
+    # The parent is deliberately absent, so even a broken guard cannot write
+    # to an existing production file. A permitted hash reaches the normal
+    # FileStream error; a rejected mode never reaches file I/O.
+    path = f'D:\\{namespace}\\__stockagent_scope_test_{os.urandom(16).hex()}__\\member'
+    config = {'mode': mode, 'path': path, 'expected_bytes': 0}
+    token = os.urandom(16).hex()
+    process, errors = native._launch([config], batched=True, startup_token=token)
+    try:
+        native._await_batch_ready(process, token)
+        output, _ = process.communicate(json.dumps([config]).encode() + b'\n', timeout=60)
+        errors.seek(0)
+        failure = errors.read(4096)
+        assert process.returncode != 0 and not output
+        if allowed:
+            assert b'STOCKAGENT_WINDOWS_BINARY_IO_FAILED' in failure
+            assert b'Fixed D cold namespace required' not in failure
+        else:
+            assert b'Fixed D cold namespace required' in failure
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=15)
+        if process.stdin is not None:
+            process.stdin.close()
+        process.stdout.close()
+        errors.close()
 
 
 @pytest.mark.parametrize('namespace', ['stockagent-completed-benchmark-scratch', 'stockagent-completed-offline-scratch'])

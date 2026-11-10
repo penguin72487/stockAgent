@@ -725,6 +725,51 @@ def test_reference_negative_checks_preserve_sibling_boundary_and_inode_only_mode
     assert materialized_cache_module.process_references_many([], inode_keys={(99, 100)}) == []
 
 
+def test_component_reference_lookup_matches_the_original_prefix_semantics():
+    root_sets = [
+        set(), {'/'}, {'/data/a', '/data/a b', '/data/ab'},
+        {'/data/a', '/data/a/child', '/other/with space'},
+    ]
+    values = ['/data/a', '/data/a/child', '/data/ab/file', '/data/a b/file',
+              '/data/a b (deleted)', '/data/a-other/file', '/other/with space/x',
+              '/', '/ordinary', '//double-root', 'socket:[123]']
+    for roots in root_sets:
+        for value in values:
+            cleaned = value.removesuffix(' (deleted)')
+            expected = any(cleaned == root or cleaned.startswith(root + os.sep) for root in roots)
+            assert materialized_cache_module._reference_path_matches(value, roots) == expected
+
+
+def test_maps_common_filter_never_discards_an_original_match():
+    target_sets = [[], ['/'], ['/x'], ['/x/a', '/x/space name'], ['/x/a', '/else/b']]
+    maps_values = ['', '000-fff r--p 0 00:00 0 /x/a',
+                   'arbitrary legacy text /x/space name/child extra',
+                   '000-fff r--p 0 00:00 0 /x/a-other',
+                   '000-fff r--p 0 00:00 0 /else/b (deleted)',
+                   'legacy //child', 'plain text /']
+    for targets in target_sets:
+        common = os.path.commonpath(targets) if targets else None
+        for maps in maps_values:
+            lines = maps.splitlines()
+            original_match = any(f' {target}/' in maps or any(
+                line.endswith(f' {target}') for line in lines) for target in targets)
+            if original_match:
+                assert materialized_cache_module._maps_could_reference(maps, lines, common)
+
+
+def test_many_disjoint_targets_keep_exact_map_evidence_in_original_order(tmp_path, monkeypatch):
+    base = tmp_path / 'preparation'
+    targets = [base / f'group-{i:03}' / f'item {i:03}' for i in range(400)]
+    chosen = [targets[2], targets[87], targets[399]]
+    maps = '\n'.join((f'000-fff r--p 0 00:00 0 {chosen[0]}',
+                      f'legacy text {chosen[1]}/nested extra',
+                      f'000-fff r--p 0 00:00 0 {chosen[2]}',
+                      f'000-fff r--p 0 00:00 0 {base}/unrelated/file'))
+    _reference_process(tmp_path, monkeypatch, maps_text=maps)
+    expected = [f'pid=123:maps:{target}' for target in sorted(chosen)]
+    assert materialized_cache_module.process_references_many(targets, limit=1000) == expected
+
+
 def test_inode_only_reference_checks_cwd_through_a_different_mount_name(tmp_path, monkeypatch):
     source = tmp_path / 'original-directory'
     source.mkdir()

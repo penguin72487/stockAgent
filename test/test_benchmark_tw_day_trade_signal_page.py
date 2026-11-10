@@ -33,11 +33,12 @@ def test_signal_benchmark_requires_gateway_projection_directory(tmp_path, monkey
 
 
 def test_signal_benchmark_records_complete_exact_page(tmp_path, monkeypatch, capsys):
-    args = _args(tmp_path) + ["--hide-zero-targets", "--mode", "mode_fixture"]
+    args = _args(tmp_path) + ["--hide-zero-targets", "--mode", "mode_fixture", "--offset", "1001"]
 
     def build(**kwargs):
         assert kwargs["hide_zero_targets"] is True
         assert kwargs["mode"] == "mode_fixture"
+        assert kwargs["offset"] == 1001
         kwargs["timing_ms"]["source_projection"] = 1.5
         return {
             "total": 2, "returned": 1, "scan_limit_reached": False,
@@ -58,6 +59,7 @@ def test_signal_benchmark_records_complete_exact_page(tmp_path, monkeypatch, cap
     assert result["record_count"] == 12
     assert result["hide_zero_targets"] is True
     assert result["mode"] == "mode_fixture"
+    assert result["offset"] == 1001
     assert result["stages_ms"]["source_projection"] == 1.5
     assert len(result["result_sha256"]) == 64
 

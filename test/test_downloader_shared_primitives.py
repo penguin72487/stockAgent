@@ -3,7 +3,9 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
 from io import BytesIO
 import json
+import os
 from pathlib import Path
+import shutil
 import shlex
 import subprocess
 import traceback
@@ -25,6 +27,67 @@ from downloader.http_transport import (
     ResilientHttpTransport,
 )
 from scripts.write_downloader_step_receipt import write_receipt
+
+
+def test_crypto_background_wait_passes_the_same_bound_to_each_source(tmp_path: Path) -> None:
+    # Exercise the real shell command construction with stubbed steps; no API
+    # or production source lock is touched.
+    command = r'''
+source downloader/run_daily_all_markets.sh
+BYBIT_SOURCE_LOCK_FILE="$1/bybit.lock"
+run_step() { printf 'STEP:%s\n' "$*"; }
+RUN_CEX_PERP=1 RUN_BINANCE_PERP=1 RUN_CRYPTO_DAILY_MATERIALIZE=0
+run_okx_perp_incremental
+run_bybit_perp_incremental
+run_binance_perp_incremental
+'''
+    result = subprocess.run(
+        ['bash', '-c', command, 'test', str(tmp_path)], cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, 'CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS': '4321'},
+        text=True, capture_output=True, check=True,
+    )
+    steps = [line for line in result.stdout.splitlines() if line.startswith('STEP:')]
+    assert len(steps) == 3
+    assert all('--lock-timeout-seconds 4321' in line for line in steps)
+    wrapper = Path('scripts/run_registered_data_refresh.sh').read_text()
+    assert wrapper.count('CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS="${CRYPTO_BACKGROUND_LOCK_WAIT_SECONDS:-21600}"') == 2
+
+
+def test_crypto_source_lock_wait_rejects_invalid_bounds() -> None:
+    result = subprocess.run(
+        ['bash', '-c', 'source downloader/run_daily_all_markets.sh; validate_settings'],
+        cwd=Path(__file__).resolve().parents[1],
+        env={**os.environ, 'CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS': '-1'},
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert 'CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS' in result.stderr
+
+
+def test_crypto_only_backfill_reuses_runner_without_yahoo(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    (tmp_path / 'scripts').mkdir()
+    (tmp_path / 'downloader').mkdir()
+    shutil.copy(root / 'scripts/run_registered_data_refresh.sh', tmp_path / 'scripts')
+    (tmp_path / 'scripts/runtime_env.sh').write_text(
+        'ensure_enrolled_wsl_identity() { return 0; }\n'
+        'run_fintech_python() { return 0; }\n'
+    )
+    runner = tmp_path / 'downloader/run_daily_all_markets.sh'
+    runner.write_text(
+        '#!/bin/bash\n'
+        'printf "%s\\n" "$RUN_YAHOO|$CRYPTO_TAIL_ONLY|$CRYPTO_HISTORICAL_FEATURES|$CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS|$LOCK_FILE|$RUN_ID"\n'
+    )
+    runner.chmod(0o755)
+    result = subprocess.run(
+        ['bash', str(tmp_path / 'scripts/run_registered_data_refresh.sh'), 'backfill'],
+        env={**os.environ, 'BACKFILL_CRYPTO_ONLY': '1'},
+        text=True, capture_output=True, check=True,
+    )
+    fields = result.stdout.strip().split('|')
+    assert fields[:4] == ['0', '0', '1', '21600']
+    assert fields[4].endswith('/registered_backfill_crypto_repair.lock')
+    assert fields[5].startswith('registered-backfill-crypto-repair-')
 
 
 class _Limiter:

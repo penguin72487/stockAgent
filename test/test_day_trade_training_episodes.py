@@ -28,9 +28,9 @@ def annual_fixture():
                           day_trade_carry_source=replace(runtime.day_trade_carry_source, sessions=sessions, session_days=())), loss_fn
 
 
-def independent_year_reference(split, runtime, loss_fn, model):
+def independent_year_reference(split, runtime, loss_fn, model, *, spans=None):
     total = 0
-    for start, end in [(0, 2), (2, 5)]:
+    for start, end in ([(0, 2), (2, 5)] if spans is None else spans):
         batch = split.batch_by_rows(start, end, torch.device("cpu"), False)
         bound = bind_physical_carry_loss(loss_fn, source=runtime.day_trade_carry_source,
             split=split, start=start, end=end, device=torch.device("cpu"), previous=None)

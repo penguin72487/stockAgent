@@ -68,6 +68,20 @@ def test_acknowledged_projection_is_sanitized_and_preserves_complete_open_positi
     assert "secret" not in json.dumps(owner)
 
 
+def test_live_mode_retains_nontrade_disclosure_from_same_commit(committed, monkeypatch):
+    original = live._read_once
+    def read(root):
+        receipt, files = original(root)
+        files["status.json"]["modes"]["m"].update(nontrade_settlement_count=2,
+            nontrade_settlement_shares=2000, cumulative_nontrade_settlement_net_pnl_twd=-100.)
+        return receipt, files
+    monkeypatch.setattr(live, "_read_once", read)
+    mode = live.build_live_paper_snapshot(state_dir=committed)["modes"][0]
+    assert mode["nontrade_settlement_count"] == 2
+    assert mode["nontrade_settlement_shares"] == 2000
+    assert mode["cumulative_nontrade_settlement_net_pnl_twd"] == -100.
+
+
 @pytest.mark.parametrize("damage", ["missing_ack", "wrong_ack", "ahead", "missing_generation", "unsafe_receipt"])
 def test_unacknowledged_or_ahead_files_are_never_published(committed, monkeypatch, damage):
     monkeypatch.setattr(live.time, "sleep", lambda _: None)

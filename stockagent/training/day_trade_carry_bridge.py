@@ -1029,7 +1029,7 @@ class PreparedDayTradeCarrySource:
             ) as pool:
                 sessions = tuple(pool.map(row_loader, rows))
         else:
-            if event_compression and identity:
+            if identity and (event_compression or packed_transport):
                 sessions = tuple(row_loader(row) for row in rows)
             else:
                 sessions = self.rows(rows, indices, torch.device("cpu"))

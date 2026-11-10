@@ -23,6 +23,27 @@ class Transport:
         return HttpResponse(200, PAYLOAD, {}, 1)
 
 
+def test_missing_workspace_refuses_to_create_collector_or_publisher_lock(tmp_path, monkeypatch):
+    from scripts.publish_data_releases import _source_coordination_lock
+    from stockagent.data_sync import workspace_source_handoff
+
+    source = tmp_path / 'source'
+    def refuse(path):
+        assert Path(path) == source
+        raise SnapshotError('source E mount is missing')
+    monkeypatch.setattr(workspace_source_handoff, 'guard_path', refuse)
+    with pytest.raises(SnapshotError, match='mount is missing'):
+        with retained.collector_owner(source, 'fred-crypto-macro'):
+            pytest.fail('collector should not start')
+    entry = {'dataset': 'fred-crypto-macro', 'source': str(source),
+             'source_coordination_lock_scope': 'source_parent',
+             'source_coordination_lock': f'{source.name}/{retained.LOCK}'}
+    with pytest.raises(SnapshotError, match='mount is missing'):
+        with _source_coordination_lock(entry):
+            pytest.fail('publisher should not start')
+    assert not source.exists()
+
+
 def fixture(tmp_path, *, private=False):
     source, cold, pins = tmp_path / 'source', tmp_path / 'cold', tmp_path / 'pin-owner'
     if private:

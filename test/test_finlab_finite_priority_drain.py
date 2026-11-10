@@ -193,6 +193,30 @@ def test_drain_retries_a_measured_prelock_capacity_race():
     assert result['state'] == 'no_more_actionable_in_pass'
 
 
+def test_drain_rechecks_a_transient_unconfirmed_priority_backing_probe():
+    waits, sleeps = [], []
+    response = {'contract': 'acquisition_dispatch_capacity_v1', 'state': 'deferred',
+                'reason': 'physical_backing_headroom_unconfirmed', 'retryable': True,
+                'allocation_admitted': False, 'error_type': 'SnapshotError'}
+    responses = iter([(75, response), (0, _pass(0))])
+    code, result = drain(1, run_batch=lambda: next(responses), owner_digest=lambda: 'stable',
+                         capacity_wait=lambda: waits.append('wait') or True, busy_sleep=sleeps.append)
+    assert code == 0 and result['state'] == 'no_more_actionable_in_pass'
+    assert result['passes'] == 1 and result['attempted'] == 0
+    assert result['admission_waits'] == 1
+    assert waits == ['wait', 'wait'] and sleeps == [finite_drain.ADMISSION_RETRY_SECONDS]
+
+
+@pytest.mark.parametrize('overrides', [{'retryable': False}, {'allocation_admitted': True}])
+def test_drain_does_not_retry_malformed_or_nonretryable_backing_probe(overrides):
+    response = {'contract': 'acquisition_dispatch_capacity_v1', 'state': 'deferred',
+                'reason': 'physical_backing_headroom_unconfirmed', 'retryable': True,
+                'allocation_admitted': False} | overrides
+    code, result = drain(1, run_batch=lambda: (75, response), owner_digest=lambda: 'stable',
+                         capacity_wait=lambda: True, busy_sleep=lambda _: pytest.fail('must stop'))
+    assert code == 75 and result['state'] == 'child_deferred'
+
+
 def test_drain_does_not_retry_unknown_prelock_deferrals():
     response = {'contract': 'acquisition_dispatch_capacity_v1', 'state': 'deferred',
                 'reason': 'priority_backing_unverified'}

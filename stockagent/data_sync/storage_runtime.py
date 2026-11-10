@@ -46,11 +46,31 @@ try:
   raw=r.read(65537)
  if len(raw)>65536: raise ValueError('metrics_too_large')
  m=json.loads(raw); metrics=runtime['metrics']
- for section,key,target in [('cpu','percent','cpu_percent'),('cpu','count','cpu_count'),('ram','used','memory_used_bytes'),('ram','total','memory_total_bytes'),('gpu','count','gpu_count'),('gpu','avg_load_percent','gpu_percent')]:
+ for section,key,target in [('cpu','percent','cpu_percent'),('cpu','count','cpu_count'),('gpu','count','gpu_count'),('gpu','avg_load_percent','gpu_percent')]:
   metrics[target]=m.get(section,{}).get(key)
  if m.get('gpu',{}).get('memory_unit')=='MB':
   metrics['gpu_memory_used_mb']=m['gpu'].get('memory_used'); metrics['gpu_memory_total_mb']=m['gpu'].get('memory_total')
 except (OSError,ValueError,TypeError,KeyError):
+ pass
+# Portal RAM can combine a container limit with usage from a different scope.
+# Sample current and max from the same cgroup; usage includes reclaimable file
+# cache. An unlimited cgroup falls back to clearly labeled host MemAvailable.
+try:
+ with open('/sys/fs/cgroup/memory.max',encoding='ascii') as f: limit=f.read(128).strip()
+ if limit!='max':
+  total=int(limit)
+  with open('/sys/fs/cgroup/memory.current',encoding='ascii') as f: used=int(f.read(128).strip())
+  if 0<=used<=total and total>0:
+   runtime['metrics'].update(memory_total_bytes=total,memory_used_bytes=used)
+   runtime['memory_scope']='cgroup_v2_including_cache'
+ else:
+  with open('/proc/meminfo',encoding='ascii') as f: lines=f.read(65536).splitlines()
+  values={line.split(':',1)[0]:int(line.split(':',1)[1].split()[0])*1024 for line in lines if line.startswith(('MemTotal:','MemAvailable:'))}
+  total,available=values['MemTotal'],values['MemAvailable']
+  if 0<=available<=total and total>0:
+   runtime['metrics'].update(memory_total_bytes=total,memory_used_bytes=total-available)
+   runtime['memory_scope']='host_memavailable'
+except (OSError,ValueError,TypeError,KeyError,IndexError):
  pass
 try:
  p=subprocess.run(['supervisorctl','status'],capture_output=True,text=True,timeout=2)
@@ -183,6 +203,12 @@ def public_status(value, *, now=None) -> dict:
             metrics["gpu_memory_used_mb"] = None
         services = raw.get("services") if isinstance(raw.get("services"), list) else []
         indexed = {r.get("id"): r for r in services if isinstance(r, dict) and isinstance(r.get("id"), str)}
+        remote_memory_scope = raw.get('memory_scope')
+        vast_scope = ("Vast RAM 為容器 cgroup 使用量（含可回收檔案快取）；"
+                      if remote_memory_scope == 'cgroup_v2_including_cache' else
+                      "Vast RAM 為主機 MemAvailable 口徑，可能包含其他工作；"
+                      if remote_memory_scope == 'host_memavailable' else
+                      "Vast RAM 口徑尚未確認；")
         nodes.append({"id": name, "label": label, "state": state,
             "observed_at_utc": iso(observed) if valid_clock else None,
             "age_seconds": round(age) if age is not None else None,
@@ -195,6 +221,6 @@ def public_status(value, *, now=None) -> dict:
                       "lab203": ("CPU／RAM 由接收端配對回執取樣；備份驗收與工作量仍須看各自收據。"
                                  if raw.get("source") == "paired_host_runtime" else
                                  "沿既有配對回執確認在線；接收端尚未提供 CPU／RAM 與逐階段工作量。"),
-                      "vastai1T": "Vast 本機監控快取與 Supervisor StockAgent 程序；可能與其他工作共享硬體。"}[name]})
+                      "vastai1T": vast_scope + "CPU／GPU 與 Supervisor StockAgent 程序可能與其他工作共享硬體。"}[name]})
     return {"contract": CONTRACT, "read_only": True, "interval_seconds": 60, "nodes": nodes,
             "acceptance": "在線、GPU 使用率與程序數均不代表資料或訓練已驗收。"}

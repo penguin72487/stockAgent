@@ -34,10 +34,13 @@ def official_jobs(catalog: list[dict], selected=DEFAULT_PROVIDERS) -> list[Econo
 
 
 def run_official_history(root: Path, *, max_requests: int = 16) -> dict:
+    from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+    guard_path(root)
     root.mkdir(parents=True, exist_ok=True)
     budget = RequestBudget(max_requests)
     with (root / ".download.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard_locked_path(root, lock)
         path = root / "catalog.json"
         cached = read_json(path)
         if is_due(cached, now(), 86400):

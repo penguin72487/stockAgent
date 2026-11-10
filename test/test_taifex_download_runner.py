@@ -29,6 +29,9 @@ run_fintech_python() {
 def test_independent_sources_continue_after_positioning_failure(tmp_path):
     result = subprocess.run(['bash', str(runner(tmp_path))], capture_output=True, text=True)
     calls = (tmp_path / 'calls.txt').read_text().splitlines()
+    assert any(call.startswith('-c ') and 'guard_path(' in call for call in calls)
+    assert any(call.startswith('-c ') and 'guard_locked_path(' in call for call in calls)
+    calls = [call for call in calls if not call.startswith('-c ')]
     assert result.returncode == 1  # wrapper must NOT publish a successful release
     assert len(calls) == 5
     assert '--phase put-call' in calls[0]
@@ -43,9 +46,45 @@ def test_targeted_phase_does_not_redownload_unrelated_sources(tmp_path):
     result = subprocess.run(['bash', str(runner(tmp_path)), '--phase', 'large-trader-range',
                              '--large-trader-start', '2026-07-01'], capture_output=True, text=True)
     calls = (tmp_path / 'calls.txt').read_text().splitlines()
+    assert any(call.startswith('-c ') and 'guard_path(' in call for call in calls)
+    assert any(call.startswith('-c ') and 'guard_locked_path(' in call for call in calls)
+    calls = [call for call in calls if not call.startswith('-c ')]
     assert result.returncode == 0
     assert len(calls) == 1
     assert '--large-trader-start 2026-07-01' in calls[0]
+
+
+@pytest.mark.parametrize(('membership_rc', 'portfolio_rc', 'expected'), [
+    (0, 75, 75), (7, 0, 7), (0, 0, 0),
+])
+def test_futures_sources_and_panel_fail_independently(
+    tmp_path, membership_rc, portfolio_rc, expected,
+):
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    executable = scripts / 'run_taifex_all_futures_daily.sh'
+    shutil.copyfile(ROOT / 'scripts/run_taifex_all_futures_daily.sh', executable)
+    (scripts / 'runtime_env.sh').write_text('''
+run_fintech_python() {
+  printf '%s\\n' "$*" >> calls.txt
+  case "$*" in
+    *--stock-futures-only*) return "${MEMBERSHIP_RC}";;
+    *build_taifex_futures_portfolio_daily.py*) return "${PORTFOLIO_RC}";;
+  esac
+  return 0
+}
+''')
+    import os
+    env = {**os.environ, 'MEMBERSHIP_RC': str(membership_rc),
+           'PORTFOLIO_RC': str(portfolio_rc),
+           'TAIFEX_FUTURES_TARGET_SESSION': '2026-11-09'}
+    result = subprocess.run(['bash', str(executable)], env=env, capture_output=True, text=True)
+    calls = (tmp_path / 'calls.txt').read_text().splitlines()
+    assert result.returncode == expected
+    membership = next(i for i, call in enumerate(calls) if '--stock-futures-only' in call)
+    portfolio = next(i for i, call in enumerate(calls) if 'build_taifex_futures_portfolio_daily.py' in call)
+    assert membership < portfolio
+    assert any('download_taifex_futures_final_settlement_history.py' in call for call in calls)
 
 
 def test_unverified_rule_archive_is_excluded_from_cold_publication():

@@ -13,6 +13,9 @@ from torch.nn import functional as F
 from stockagent.data.factorized_sparse_rows import FactorizedSparseRowStore
 
 
+FORWARD_CONTRACT = "full_schema_csr_fixed_row_fp32_date_view_forward_v4"
+
+
 def sparse_adjoint_contract():
     backend = os.environ.get('STOCKAGENT_SPARSE_ADJOINT_BACKEND', 'native')
     if backend == 'native':

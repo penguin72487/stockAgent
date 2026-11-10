@@ -1,5 +1,10 @@
 # 恢復與回收判準
 
+2026-11-06 使用者要求遷移優先、暫停備份與解壓驗證；D 上目前不被任何
+release 引用的物件可依 `docs/agents/storage.md` 的限定例外逐批移至 E，
+來源寫入時算 SHA，完成後在原鎖與引用檢查下回收精確 D 名稱。E 是中介
+資料而非另一次備份或獨立讀回；這不涵蓋仍被引用的物件與其他清理工作。
+
 先讀本次 checkout 的 `docs/agents/storage.md` 中 exact recovery、consumer、
 lease／pin、transport 和 quarantine 契約；此檔教如何找證據，不能替代工具的 gate。
 

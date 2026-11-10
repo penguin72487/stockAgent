@@ -6,7 +6,7 @@ cd "$finlab_repo_root"
 source "$finlab_repo_root/scripts/runtime_env.sh"
 # Keep the existing control/ledger reserve before SDK startup, credentials or
 # source requests. Exit 75 defers this timer pass without changing quota policy.
-run_fintech_python "$finlab_repo_root/scripts/check_acquisition_capacity.py" --path "$finlab_repo_root"
+run_fintech_python "$finlab_repo_root/scripts/check_acquisition_capacity.py" --path "$finlab_repo_root/data_finlab"
 finlab_python_bin="$(resolve_fintech_python)"
 "$finlab_python_bin" -c '
 from importlib.metadata import version
@@ -59,18 +59,30 @@ if [[ "$finlab_finite_general_only" == "1" ]]; then
 fi
 
 # The quota resets at 08:00 Taipei time, but live Taiwan opening has a
-# protected 08:20–09:10 resource window.  The first sweep only starts keys
-# whose full configured timeout plus termination grace fits before 08:18.
+# protected 08:20–09:10 resource window.  The service itself can run for four
+# hours, so a pass started as early as 04:00 can otherwise carry heavy work
+# across the opening.  Any such session-day pass only starts keys whose full
+# configured timeout plus termination grace fits before 08:18.  Earlier timer
+# passes hit the service's four-hour deadline before this boundary.
 finlab_preopen=0
 finlab_preopen_deadline=0
-finlab_reset_launch=0
+finlab_reset_confirmed=0
 finlab_local_clock="$(TZ=Asia/Taipei date +%H%M%S)"
-if [[ "$finlab_local_clock" > "075959" && "$finlab_local_clock" < "082000" ]]; then
-  finlab_reset_launch=1
-  if "$finlab_python_bin" "$finlab_repo_root/scripts/check_outside_tw_opening_resource_window.py" \
-      --official-calendar-root "$finlab_repo_root/data_tw_public" --session-status >/dev/null; then
+if [[ "$finlab_local_clock" > "035959" && "$finlab_local_clock" < "082000" ]]; then
+  if finlab_calendar_result="$("$finlab_python_bin" "$finlab_repo_root/scripts/check_outside_tw_opening_resource_window.py" \
+      --official-calendar-root "$finlab_repo_root/data_tw_public" --session-status)"; then
     finlab_preopen=1
     finlab_preopen_deadline="$(TZ=Asia/Taipei date -d "$(TZ=Asia/Taipei date +%F) 08:18:00" +%s)"
+  else
+    finlab_calendar_exit=$?
+    # Exit 1 can also be an interpreter failure. Only an explicit structured
+    # no-session result permits skipping the session-day runway.
+    if [[ "$finlab_calendar_exit" != "1" ]] || ! "$finlab_python_bin" -c \
+        'import json,sys; sys.exit(0 if json.load(sys.stdin).get("stock_session") is False else 1)' \
+        <<< "$finlab_calendar_result"; then
+      echo "[finlab] session calendar check failed; deferring rather than risking the opening" >&2
+      exit 75
+    fi
   fi
 fi
 
@@ -86,13 +98,34 @@ if (( finlab_preopen )) && (( $(date +%s) >= finlab_preopen_deadline )); then
   exit 0
 fi
 
-if (( finlab_reset_launch )); then
-  if ! timeout --signal=TERM --kill-after=10s 140s \
-    "$finlab_python_bin" "$finlab_repo_root/scripts/snapshot_finlab_quota.py" \
-      --confirm-daily-reset --wait-seconds 120; then
-    echo "[finlab] 08:00 reset not yet confirmed by account quota; 09:10 resume remains scheduled"
-    exit 0
+finlab_has_key_runway() {
+  if (( ! finlab_preopen )); then
+    return 0
   fi
+  local runway_seconds=$((finlab_preopen_deadline - $(date +%s)))
+  (( runway_seconds > finlab_key_timeout_seconds + 30 ))
+}
+
+finlab_confirm_daily_reset_if_due() {
+  local current_clock
+  current_clock="$(TZ=Asia/Taipei date +%H%M%S)"
+  if (( ! finlab_reset_confirmed )) && [[ "$current_clock" > "075959" && "$current_clock" < "082000" ]]; then
+    if ! timeout --signal=TERM --kill-after=10s 140s \
+      "$finlab_python_bin" "$finlab_repo_root/scripts/snapshot_finlab_quota.py" \
+        --confirm-daily-reset --wait-seconds 120; then
+      echo "[finlab] 08:00 reset not yet confirmed by account quota; 09:10 resume remains scheduled"
+      return 1
+    fi
+    finlab_reset_confirmed=1
+  fi
+}
+
+if ! finlab_has_key_runway; then
+  echo "[finlab] pre-open runway ended; next sweep begins at 09:10 Asia/Taipei"
+  exit 0
+fi
+if ! finlab_confirm_daily_reset_if_due; then
+  exit 0
 fi
 
 if (( finlab_preopen )) && (( $(date +%s) >= finlab_preopen_deadline )); then
@@ -124,12 +157,18 @@ if (( finlab_preopen )); then
 fi
 finlab_group_timeout_seconds=$((finlab_key_timeout_seconds * finlab_general_batch_size))
 for ((finlab_batch = 1; finlab_batch <= finlab_max_batches; finlab_batch++)); do
-  if (( finlab_preopen )); then
-    finlab_runway_seconds=$((finlab_preopen_deadline - $(date +%s)))
-    if (( finlab_runway_seconds <= finlab_key_timeout_seconds + 30 )); then
-      echo "[finlab] pre-open runway ended; next sweep begins at 09:10 Asia/Taipei"
-      break
-    fi
+  if ! finlab_has_key_runway; then
+    echo "[finlab] pre-open runway ended; next sweep begins at 09:10 Asia/Taipei"
+    break
+  fi
+  # A pass started before 08:00 must not bypass the same reset confirmation
+  # that a newly started pass would perform after crossing 08:00.
+  if ! finlab_confirm_daily_reset_if_due; then
+    break
+  fi
+  if ! finlab_has_key_runway; then
+    echo "[finlab] reset check consumed the pre-open runway; next sweep begins at 09:10 Asia/Taipei"
+    break
   fi
   finlab_attempt_id="${BASHPID}-$(date +%s%N)"
   if timeout --signal=TERM --kill-after=30s "${finlab_group_timeout_seconds}s" \

@@ -535,6 +535,12 @@ def _write_symbol(
 
 def main() -> None:
     args = parse_args()
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(args.symbols_root, args.summary_path, args.report_path):
+        _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args: argparse.Namespace) -> None:
     input_dir = Path(args.input_dir)
     root = Path(args.symbols_root)
     normalized_archives = 0

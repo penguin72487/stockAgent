@@ -35,6 +35,11 @@ def decision(path: str, size: int = 0, *, large_bytes: int = 5 * 1024**2) -> dic
     if not parts or p.is_absolute() or ".." in parts:
         raise ValueError("expected a repository-relative path")
     first = parts[0]
+    retained_provider_copy = (len(parts) > 1 and first.startswith(".data_")
+                              and ".pre-e-" in first)
+    node_runtime = (len(parts) > 1
+                    and (first in {"service_data", ".stversions", ".codex_remote_perf"}
+                         or first.startswith("stockagent-rate-limits-")))
     private = (name.startswith(".env") and not name.endswith((".example", ".sample", ".template"))
                or p.suffix.lower() in PRIVATE_SUFFIXES
                or name in {"id_rsa", "id_ed25519"} or ".ssh" in parts)
@@ -42,7 +47,8 @@ def decision(path: str, size: int = 0, *, large_bytes: int = 5 * 1024**2) -> dic
         category, reason = "exclude", "private credentials or machine environment"
     elif set(parts) & CACHE_PARTS:
         category, reason = "exclude", "rebuildable cache or duplicate skill backup"
-    elif (first in {"data", "artifacts", "reports", ".codex", "codex", "build", ".build", "dist"}
+    elif (retained_provider_copy or node_runtime
+          or first in {"data", "artifacts", "reports", ".codex", "codex", "build", ".build", "dist"}
           or (first.startswith(("data_", "artifacts_"))
               and (len(parts) > 1 or not p.suffix))):
         category, reason = "exclude", "node-local data, generated output or tool state"

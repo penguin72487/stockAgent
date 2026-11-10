@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+from contextlib import contextmanager
 from datetime import date, datetime, time
+import fcntl
 import hashlib
 import json
 import os
@@ -423,7 +425,21 @@ def _atomic_json(path: Path, payload: dict[str, Any]) -> None:
     os.replace(temporary, path)
 
 
-def build_date(
+@contextmanager
+def _output_owner(root: Path):
+    """Fence the reviewed output alias before any builder can change it."""
+    from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+    root = Path(root)
+    guard_path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(root/'.download.lock', os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_CLOEXEC, 0o600)
+    with os.fdopen(fd, 'r+b') as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard_locked_path(root, handle)
+        yield
+
+
+def _build_date_unlocked(
     *,
     capture_root: Path,
     universe_path: Path,
@@ -535,6 +551,15 @@ def build_date(
     return summary
 
 
+def build_date(*, capture_root: Path, universe_path: Path, output_root: Path, trade_date: date,
+               session_start: str, session_end: str, max_book_age_ms: float,
+               horizons: tuple[int, ...]) -> dict[str, Any]:
+    with _output_owner(output_root):
+        return _build_date_unlocked(capture_root=capture_root, universe_path=universe_path,
+            output_root=output_root, trade_date=trade_date, session_start=session_start,
+            session_end=session_end, max_book_age_ms=max_book_age_ms, horizons=horizons)
+
+
 def _discover_dates(capture_root: Path) -> list[date]:
     dates: list[date] = []
     for path in sorted((capture_root / "book_1s").glob("trade_date=*")):
@@ -543,8 +568,7 @@ def _discover_dates(capture_root: Path) -> list[date]:
     return dates
 
 
-def main() -> None:
-    args = parse_args()
+def _run_locked(args: argparse.Namespace) -> None:
     horizons = _parse_horizons(args.horizons)
     dates = (
         [date.fromisoformat(value) for value in args.trade_dates]
@@ -555,7 +579,7 @@ def main() -> None:
         raise RuntimeError("no captured trade dates found")
     summaries = []
     for trade_date in dates:
-        summary = build_date(
+        summary = _build_date_unlocked(
             capture_root=args.capture_root,
             universe_path=args.universe,
             output_root=args.output_root,
@@ -581,6 +605,12 @@ def main() -> None:
             "partitions": summaries,
         },
     )
+
+
+def main() -> None:
+    args = parse_args()
+    with _output_owner(args.output_root):
+        _run_locked(args)
 
 
 if __name__ == "__main__":

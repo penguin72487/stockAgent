@@ -1,0 +1,12 @@
+[Unit]
+Description=Observe the enrolled Vast reader and retry a missing fixed release
+
+[Timer]
+OnBootSec=30s
+OnCalendar=*:0/1
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-edge-reader-recovery.service
+
+[Install]
+WantedBy=timers.target

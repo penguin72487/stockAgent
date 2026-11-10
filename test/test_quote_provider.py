@@ -1841,6 +1841,17 @@ def test_load_prices_csv_preserves_explicit_open_snapshot(tmp_path) -> None:
     assert snapshot.timestamps_ms is None
 
 
+def test_load_prices_csv_preserves_numeric_identifiers_and_rejects_duplicates(tmp_path) -> None:
+    path = tmp_path / "numeric_symbols.csv"
+    path.write_text("Symbol,price,open_price\n0050,10,10\n2330,100,100\n", encoding="utf-8")
+    snapshot = load_prices_csv(path, ["0050", "50", "2330"], np.ones(3))
+    assert snapshot.available_mask.tolist() == [True, False, True]
+    np.testing.assert_allclose(snapshot.prices, [10., 1., 100.])
+    path.write_text("Symbol,price\n0050,10\n0050,11\n", encoding="utf-8")
+    with pytest.raises(ValueError, match="duplicate prices CSV symbol: 0050"):
+        load_prices_csv(path, ["0050"], np.ones(1))
+
+
 def test_load_prices_csv_uses_only_explicit_observation_timestamps(tmp_path) -> None:
     path = tmp_path / 'history.csv'
     path.write_text(

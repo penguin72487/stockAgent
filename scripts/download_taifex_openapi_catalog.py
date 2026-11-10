@@ -269,7 +269,7 @@ def _persist(
     return receipt
 
 
-def main() -> int:
+def _main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="data_taifex_public_history")
     parser.add_argument("--capture-date", type=date.fromisoformat, default=date.today())
@@ -364,6 +364,12 @@ def main() -> int:
     # Partial endpoint availability is visible in the manifest and retried on
     # the next run.  A total failure remains a service failure.
     return 0 if completed else 1
+
+
+def main() -> int:
+    from stockagent.data_sync.taifex_workspace_guard import cli_writer_guard
+    with cli_writer_guard(default_output='data_taifex_public_history'):
+        return _main()
 
 
 if __name__ == "__main__":

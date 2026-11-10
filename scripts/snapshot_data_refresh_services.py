@@ -633,6 +633,8 @@ def main() -> int:
         observed=datetime.now(UTC), audit_seconds=getattr(args, "bar_audit_seconds", 2.),
         record_inventory=record_inventory, inventory_snapshot=inventory_snapshot)
     public_status_timing_ms["bar_inventory"] = round((time.perf_counter() - bar_started) * 1_000, 3)
+    from stockagent.live.taifex_snapshot_cache import prime as prime_taifex_snapshots
+    prime_taifex_snapshots(REPO_ROOT)
     public_status = build_data_monitor_public_status(
         REPO_ROOT,
         now=observed,

@@ -9,6 +9,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import re
 import sqlite3
 import stat
 import tarfile
@@ -20,6 +21,7 @@ from stockagent.data_sync import transport_relocation_delta as delta
 from stockagent.data_sync.workspace_relocation import destination_metadata_matches, digest, signature, walk
 
 CONTRACT = 'stockagent.transport_relocation_retirement.v1'
+ARCHIVED_FALLBACK_CONTRACT = 'stockagent.transport_relocation_archived_controls_retirement.v1'
 
 
 def _name_absent(path):
@@ -63,16 +65,16 @@ def _current_e_proof(root, relative, expected_sha, source_signature):
         return None
 
 
-def _delta_manifest(evidence, comparison):
+def _delta_manifest(evidence, comparison, *, verify_archive_sha=True):
     receipt = json.loads((evidence/'delta-receipt.json').read_bytes())
     archive = Path(receipt['archive'])
     if (receipt.get('contract') != delta.CONTRACT or receipt.get('state') != 'verified'
             or receipt.get('comparison_identity_sha256') != comparison['identity_sha256']
             or receipt.get('source_names_deleted') != 0 or receipt.get('retirement_authorized') is not False
             or archive.is_symlink() or archive.resolve() != archive
-            or signature(archive) != receipt.get('archive_signature')
-            or digest(archive) != receipt.get('archive_sha256')
-            or signature(archive) != receipt.get('archive_signature')):
+            or not delta.same_E_generation(archive, receipt.get('archive_signature'))
+            or (verify_archive_sha and digest(archive) != receipt.get('archive_sha256'))
+            or not delta.same_E_generation(archive, receipt.get('archive_signature'))):
         raise ValueError('verified E delta archive or its generation differs')
     with tarfile.open(archive, 'r:') as tar:
         member = tar.getmember('manifest.json')
@@ -94,6 +96,47 @@ def _delta_manifest(evidence, comparison):
     return archive, receipt['archive_signature'], by_path
 
 
+def _validate_archived_controls_policy(value):
+    members = value.get('members') if isinstance(value, dict) else None
+    if (not isinstance(value, dict) or value.get('contract') != ARCHIVED_FALLBACK_CONTRACT
+            or not isinstance(value.get('comparison_identity_sha256'), str)
+            or re.fullmatch('[a-f0-9]{64}', value['comparison_identity_sha256']) is None
+            or not isinstance(value.get('archive_sha256'), str)
+            or re.fullmatch('[a-f0-9]{64}', value['archive_sha256']) is None
+            or not isinstance(members, list) or not 1 <= len(members) <= 16
+            or any(not isinstance(item, str) or not item or PurePosixPath(item).is_absolute()
+                   or '..' in PurePosixPath(item).parts or str(PurePosixPath(item)) != item for item in members)
+            or len(set(members)) != len(members)):
+        raise ValueError('archived-controls policy differs from its fixed archive')
+
+
+def load_archived_controls_policy(path: Path, comparison: dict, evidence: Path):
+    """Only the exact user-enrolled fixed controls may use the old E archive."""
+    if not os.path.lexists(path):
+        return None
+    if path.is_symlink() or not path.is_file() or path.stat().st_size > 65536:
+        raise ValueError('archived-controls policy is redirected or oversized')
+    value = json.loads(path.read_bytes())
+    _validate_archived_controls_policy(value)
+    if value['comparison_identity_sha256'] != comparison.get('identity_sha256'):
+        return None  # This fixed policy never applies to another operation.
+    receipt = json.loads((evidence/'delta-receipt.json').read_bytes())
+    if value['archive_sha256'] != receipt.get('archive_sha256'):
+        raise ValueError('archived-controls policy differs from its fixed archive')
+    return value
+
+
+def _current_control_signature(root, relative):
+    """Require an existing, ordinary current E control even if its bytes differ."""
+    path = root.joinpath(*PurePosixPath(relative).parts)
+    try:
+        if path.is_symlink() or path.resolve() != path or not stat.S_ISREG(path.lstat().st_mode):
+            return None
+        return signature(path)
+    except OSError:
+        return None
+
+
 def rehearse_delta_restore(evidence: Path, workspace: Path, *, admit):
     """Rebuild each archived member into an anonymous E file and read it back.
 
@@ -109,7 +152,7 @@ def rehearse_delta_restore(evidence: Path, workspace: Path, *, admit):
                 and previous.get('comparison_identity_sha256') == comparison.get('identity_sha256')
                 and previous.get('archive_sha256') == delta_receipt.get('archive_sha256')
                 and previous.get('archive_signature') == delta_receipt.get('archive_signature')
-                and signature(Path(delta_receipt['archive'])) == previous.get('archive_signature')
+                and delta.same_E_generation(Path(delta_receipt['archive']), previous.get('archive_signature'))
                 and previous.get('files') == delta_receipt.get('files')
                 and previous.get('logical_bytes') == delta_receipt.get('logical_bytes')
                 and previous.get('member_bytes_and_portable_metadata_verified') is True):
@@ -169,7 +212,7 @@ def rehearse_delta_restore(evidence: Path, workspace: Path, *, admit):
                     'logical_bytes_completed': processed, 'logical_bytes_total': delta_receipt['logical_bytes'],
                     'observed_at_epoch': time.time()})
     if (done != delta_receipt['files'] or processed != delta_receipt['logical_bytes']
-            or signature(archive) != archive_signature):
+            or not delta.same_E_generation(archive, archive_signature)):
         raise ValueError('delta archive changed during restore rehearsal')
     result = {'contract': CONTRACT + '.delta_restore', 'state': 'member_restore_verified',
               'comparison_identity_sha256': comparison['identity_sha256'],
@@ -213,7 +256,7 @@ def _check_references(source, rows):
         raise BlockingIOError('old transport has an active process reference')
 
 
-def _waiting_held_copy(evidence, destination, comparison, intent, workers):
+def _waiting_held_copy(evidence, destination, comparison, intent, workers, archived_fallback=None):
     """Avoid repeating a D census when no held E target can yet be retired.
 
     This is a no-action observation, not fresh recovery/absence acceptance.
@@ -247,6 +290,11 @@ def _waiting_held_copy(evidence, destination, comparison, intent, workers):
     held = [row for row in rows if states[row[0]] == 'held']
     if not held:
         return None
+    if archived_fallback and any(row[0] in archived_fallback['members']
+                                 and _current_control_signature(destination, row[0]) is not None for row in held):
+        # This is only an eligibility hint; deletion still needs the original
+        # sender locks, exact archive/member identities and live-reference checks.
+        return None
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='held-e-check') as pool:
         available = list(pool.map(lambda row: _current_e_proof(destination, row[0], row[2], json.loads(row[1])), held))
     if any(proof is not None for proof in available):
@@ -260,9 +308,8 @@ def _waiting_held_copy(evidence, destination, comparison, intent, workers):
     return status
 
 
-def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, workers=4, batch_size=512):
-    if type(workers) is not int or not 1 <= workers <= 16 or not 1 <= batch_size <= 512:
-        raise ValueError('invalid bounded retirement parallelism')
+def _fixed_retirement_scope(evidence: Path, source: Path):
+    """Read and validate the same enrolled fixed copy before any fast path."""
     intent = json.loads((evidence/'intent.json').read_bytes())
     comparison = json.loads((evidence/'comparison-status.json').read_bytes())
     if (comparison.get('contract') != 'stockagent.transport_relocation_comparison.v1'
@@ -271,10 +318,47 @@ def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, worker
         raise ValueError('original copy comparison is incomplete')
     delta._validate_native_source(source, intent)
     _check_unreachable_namespaces()
-    waiting = _waiting_held_copy(evidence, destination, comparison, intent, workers)
+    return intent, comparison
+
+
+def observe_unchanged_held_copy(evidence: Path, source: Path, destination: Path, *, workers=4,
+                                archived_fallback=None):
+    """Observe a provably idle held queue without taking publisher locks.
+
+    A result only means no held same-name E member matched during this read.
+    It never permits unlink, refreshes recovery, or confirms D source absence.
+    If any member becomes eligible, return None so the caller acquires every
+    original sender lock and repeats all destructive-path checks.
+    """
+    if type(workers) is not int or not 1 <= workers <= 16:
+        raise ValueError('invalid bounded retirement parallelism')
+    intent, comparison = _fixed_retirement_scope(evidence, source)
+    if archived_fallback:
+        return _waiting_held_copy(evidence, destination, comparison, intent, workers, archived_fallback)
+    return _waiting_held_copy(evidence, destination, comparison, intent, workers)
+
+
+def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, workers=4, batch_size=512,
+                      archived_fallback=None):
+    if type(workers) is not int or not 1 <= workers <= 16 or not 1 <= batch_size <= 512:
+        raise ValueError('invalid bounded retirement parallelism')
+    intent, comparison = _fixed_retirement_scope(evidence, source)
+    if archived_fallback:
+        _validate_archived_controls_policy(archived_fallback)
+        receipt = json.loads((evidence/'delta-receipt.json').read_bytes())
+        if (archived_fallback.get('contract') != ARCHIVED_FALLBACK_CONTRACT
+                or archived_fallback.get('comparison_identity_sha256') != comparison['identity_sha256']
+                or archived_fallback.get('archive_sha256') != receipt.get('archive_sha256')):
+            raise ValueError('archived-controls policy identity changed')
+        waiting = _waiting_held_copy(evidence, destination, comparison, intent, workers, archived_fallback)
+    else:
+        waiting = _waiting_held_copy(evidence, destination, comparison, intent, workers)
     if waiting is not None:
         return waiting
-    archive, archive_signature, preserved = _delta_manifest(evidence, comparison)
+    # The fast-migration policy uses the already verified immutable E archive
+    # generation; it does not reread its full payload during this retirement.
+    archive, archive_signature, preserved = _delta_manifest(
+        evidence, comparison, verify_archive_sha=not bool(archived_fallback))
     restored = json.loads((evidence/'delta-restore-receipt.json').read_bytes())
     delta_receipt = json.loads((evidence/'delta-receipt.json').read_bytes())
     if (restored.get('contract') != CONTRACT + '.delta_restore'
@@ -309,6 +393,8 @@ def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, worker
         journal.execute('PRAGMA journal_mode=WAL')
         journal.execute('CREATE TABLE IF NOT EXISTS metadata (identity TEXT NOT NULL)')
         journal.execute('CREATE TABLE IF NOT EXISTS members (path TEXT PRIMARY KEY, state TEXT NOT NULL)')
+        journal.execute('CREATE TABLE IF NOT EXISTS archived_controls '
+                        '(path TEXT PRIMARY KEY, archive_sha256 TEXT NOT NULL, member_sha256 TEXT NOT NULL)')
         existing = journal.execute('SELECT identity FROM metadata').fetchone()
         if existing and existing[0] != comparison['identity_sha256']:
             raise ValueError('retirement journal bound to another inventory')
@@ -338,16 +424,17 @@ def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, worker
         progress('verifying_and_retiring')
         with ThreadPoolExecutor(max_workers=workers, thread_name_prefix='retire-e-check') as pool:
             for offset in range(0, len(rows), batch_size):
-                if signature(archive) != archive_signature:
+                if not delta.same_E_generation(archive, archive_signature):
                     raise ValueError('E delta archive changed during retirement')
                 batch = rows[offset:offset+batch_size]
                 if all(states.get(row[0]) == 'retired' for row in batch):
                     # Retried waves must still detect recreated names, but do
                     # not rehash, rescan every process or rewrite a journal
                     # for a batch with no remaining work.
-                    absent = pool.map(lambda row: _name_absent(source.joinpath(*PurePosixPath(row[0]).parts)), batch)
-                    if not all(absent):
-                        raise ValueError('retired source name reappeared')
+                    if not archived_fallback:
+                        absent = pool.map(lambda row: _name_absent(source.joinpath(*PurePosixPath(row[0]).parts)), batch)
+                        if not all(absent):
+                            raise ValueError('retired source name reappeared')
                     continue
                 proofs = list(pool.map(lambda row: None if states.get(row[0]) == 'retired' else
                                       _current_e_proof(destination, row[0], row[2], json.loads(row[1])), batch))
@@ -367,7 +454,10 @@ def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, worker
                     # existing sender or downstream reader can find that
                     # version at its original path. Keep differing/missing E
                     # names until the live path itself is independently proven.
-                    safe_copy = proof is not None
+                    archived = (proof is None and archived_fallback is not None
+                                and relative in archived_fallback['members'] and relative in preserved)
+                    current_control = _current_control_signature(destination, relative) if archived else None
+                    safe_copy = proof is not None or archived and current_control is not None
                     if not safe_copy or origin.is_symlink() or origin.resolve(strict=False) != origin:
                         journal.execute("INSERT OR REPLACE INTO members VALUES (?, 'held')", (relative,))
                         states[relative] = 'held'
@@ -387,14 +477,17 @@ def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, worker
                         states[relative] = 'held'
                         continue
                     journal.execute("INSERT OR REPLACE INTO members VALUES (?, 'prepared')", (relative,))
+                    if archived:
+                        journal.execute('INSERT OR REPLACE INTO archived_controls VALUES (?,?,?)',
+                                        (relative, archived_fallback['archive_sha256'], sha))
                     states[relative] = 'prepared'
-                    prepared.append((origin, relative, current, proof))
+                    prepared.append((origin, relative, current, current_control if archived else proof))
                 journal.commit()  # recovery evidence precedes every unlink
 
                 def unlink_prepared(member):
                     origin, relative, original_signature, proof = member
                     target = destination.joinpath(*PurePosixPath(relative).parts)
-                    if (signature(origin) != original_signature or signature(archive) != archive_signature
+                    if (signature(origin) != original_signature or not delta.same_E_generation(archive, archive_signature)
                             or proof is not None and signature(target) != proof):
                         return relative, 'held'
                     origin.unlink()
@@ -418,6 +511,10 @@ def retire_fixed_copy(evidence: Path, source: Path, destination: Path, *, worker
         receipt.update(logical_bytes=intent['logical_bytes'], old_root_and_empty_directories_retained=True,
                        D_available_change_during_retirement_bytes=(
                            os.statvfs(source).f_bavail * os.statvfs(source).f_frsize - before_free))
+        if archived_fallback:
+            receipt['archived_controls_retired'] = journal.execute('SELECT count(*) FROM archived_controls').fetchone()[0]
+            receipt['archived_controls_archive_sha256'] = archived_fallback['archive_sha256']
+            receipt['archived_controls_full_payload_reread'] = False
         atomic_write_json(evidence/'retirement-receipt.json', receipt)
         return receipt
     finally:

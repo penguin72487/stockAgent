@@ -6,9 +6,9 @@
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#071019">
   <title>台股多模式當沖模擬</title>
-  <link rel="stylesheet" href="styles.css?v=27">
+  <link rel="stylesheet" href="styles.css?v=32">
   <link rel="stylesheet" href="../dashboard-core.css?v=7">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=11">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=12">
   <link rel="stylesheet" href="../vendor/uplot/uPlot.min.css?v=1.6.32">
 </head>
 <body>
@@ -129,11 +129,11 @@
       <div class="controls-title"><strong>明細篩選</strong><span>模式、股票與狀態</span></div>
       <label>起始日<input id="detail-start-date" type="date"></label>
       <label>終止日<input id="detail-end-date" type="date"></label>
-      <button id="performance-range" class="secondary" type="button" aria-pressed="false">2026 年至今</button>
+      <button id="performance-range" class="secondary" type="button" aria-pressed="false">今年至今</button>
       <button id="follow-latest-session" class="secondary" type="button" aria-pressed="true">跟隨最新交易日</button>
       <label>模式<select id="mode-filter"><option value="all">全部模式</option></select></label>
       <label>股票<input id="symbol-filter" type="search" placeholder="輸入代號或名稱" autocomplete="off"></label>
-      <label>狀態<select id="status-filter"><option value="all">全部狀態</option><option value="open">持倉中</option><option value="closed">已平倉</option><option value="blocked">未執行</option></select></label>
+      <label>狀態<select id="status-filter"><option value="all">全部狀態</option><option value="open">持倉中</option><option value="closed">已出場／帳面結算</option><option value="blocked">未執行</option></select></label>
       <button id="reset-filters" class="secondary" type="button">清除篩選</button>
       <div class="clock"><span>系統時間</span><strong id="clock">—</strong></div>
     </section>
@@ -171,10 +171,10 @@
     </section>
 
     <section class="panel table-panel">
-	      <div class="panel-head"><div><h2>所有訊號與模擬成交明細</h2><p>依 |持倉目標 %| 由大到小；隱藏目標為 0 的訊號，非零目標但 0 股未成交的股票仍保留。期貨標記依最新期交所名單（日期列於各股票下方），不是訊號當日資格或目前可成交保證。</p></div><div class="table-actions"><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
+	      <div class="panel-head"><div><h2>所有訊號與模擬成交明細</h2><p>預設列出各交易日、各模式最新完整訊號；可切換完整修訂。依 |持倉目標 %| 由大到小，隱藏目標為 0 的訊號，非零目標但 0 股未成交的股票仍保留。期貨標記依最新期交所名單，不是訊號當日資格或可成交保證。</p></div><div class="table-actions"><label>訊號版本 <select id="signal-revision-filter"><option value="latest">最新版本</option><option value="all">完整修訂紀錄</option></select></label><span id="signal-count" class="count"></span><button id="load-more-signals" class="secondary hidden" type="button">載入更多</button></div></div>
 	      <div id="signal-direction-summary" class="direction-summary"></div>
 	      <div class="scroll-hint" aria-hidden="true">窄螢幕可左右滑動查看訊號細節 →</div>
-	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／持倉 %</th><th>開盤計價／市價成交</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
+	      <div class="table-scroll" tabindex="0" role="region" aria-label="所有訊號"><table class="compact-table signal-table"><thead><tr><th>時間／模式</th><th>股票／方向／結果</th><th>分數／持倉 %</th><th>開盤計價／紙上進場</th><th>現在市價／該檔盈虧</th><th>損益／模式總權益</th></tr></thead><tbody id="signal-body"></tbody></table></div>
     </section>
 
     <section class="panel table-panel">
@@ -228,13 +228,13 @@
       </div>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=19" defer></script>
-  <script src="published-signals.js?v=23814c03f6cc" defer></script>
+  <script src="../dashboard-core.js?v=20" defer></script>
+  <script src="published-signals.js?v=343de29e2934" defer></script>
   <script src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32" defer></script>
-  <script src="presentation.js?v=4" defer></script>
-  <script src="detail-components.js?v=60d3cc74926e" defer></script>
-  <script src="chart-renderer.js?v=6" defer></script>
-  <script src="app.js?v=af774f5edcfe" defer></script>
-  <script src="live-snapshot.js?v=0a6e9e7d1f72" defer></script>
+  <script src="presentation.js?v=6" defer></script>
+  <script src="detail-components.js?v=7d01a690bb4c" defer></script>
+  <script src="chart-renderer.js?v=8" defer></script>
+  <script src="app.js?v=e0eeeff1b520" defer></script>
+  <script src="live-snapshot.js?v=c807d6ed348d" defer></script>
 </body>
 </html>

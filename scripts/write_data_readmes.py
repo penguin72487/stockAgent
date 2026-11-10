@@ -320,6 +320,12 @@ def validate_markdown(path: Path, content: str) -> list[str]:
 
 
 def atomic_text(path: Path, content: str) -> None:
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard
+    with writer_guard(path):
+        _atomic_text_with_workspace_guard(path, content)
+
+
+def _atomic_text_with_workspace_guard(path: Path, content: str) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:

@@ -1,0 +1,5 @@
+{
+  "contract": "tw_current_year_formal_history_v1",
+  "enabled": true,
+  "calendar_year": "current"
+}

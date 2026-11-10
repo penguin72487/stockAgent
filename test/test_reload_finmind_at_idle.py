@@ -201,6 +201,7 @@ def test_preparation_guard_rechecks_frozen_claims_and_always_thaws(tmp_path, mon
     with sqlite3.connect(root / 'queue.sqlite3') as conn:
         conn.execute('CREATE TABLE finmind_object_prefetch_claims(id)')
         conn.execute('CREATE TABLE complement_year_batch_claims(id)')
+        conn.execute('CREATE TABLE tasks(state)')
     calls = []
     monkeypatch.setattr(reload, '_preparation_pid', lambda: 123)
     monkeypatch.setattr(reload, '_stacks', lambda _: preparation_threads())
@@ -214,6 +215,13 @@ def test_preparation_guard_rechecks_frozen_claims_and_always_thaws(tmp_path, mon
     assert [args[1] for args in calls] == ['freeze', 'thaw']
     with sqlite3.connect(root / 'queue.sqlite3') as conn:
         conn.execute('INSERT INTO finmind_object_prefetch_claims VALUES (1)')
+    calls.clear()
+    with reload.preparation_boundary(root, {'InvocationID': 'one'}) as proof:
+        assert proof is None
+        assert [args[1] for args in calls] == ['freeze', 'thaw']
+    with sqlite3.connect(root / 'queue.sqlite3') as conn:
+        conn.execute('DELETE FROM finmind_object_prefetch_claims')
+        conn.execute("INSERT INTO tasks VALUES ('inflight')")
     calls.clear()
     with reload.preparation_boundary(root, {'InvocationID': 'one'}) as proof:
         assert proof is None
@@ -343,6 +351,58 @@ def test_idle_reload_requires_nonreactive_window_deadline_and_empty_claims(tmp_p
     assert reload.idle_proof(other, now) is None
 
 
+def test_idle_disk_guard_requires_explicit_complement_scope_and_no_claims(tmp_path):
+    now = datetime(2026, 10, 14, tzinfo=UTC)
+    root = tmp_path / 'owner'
+    setup_idle(root, now, reason='disk_guard', seconds=60)
+    assert reload.idle_proof(root, now) is None
+    assert reload.idle_proof(root, now, allow_disk_guard=True)['reason'] == 'disk_guard'
+    with worker._db(root / 'queue.sqlite3') as connection:
+        connection.execute("INSERT INTO tasks(dataset,data_id,partition,kind,priority,state) "
+                           "VALUES ('GoldPrice','','2026','year',1,'inflight')")
+        connection.commit()
+    assert reload.idle_proof(root, now, allow_disk_guard=True) is None
+
+
+def test_capacity_resume_adoption_checks_semantic_cases_and_source_scope(tmp_path):
+    import xml.etree.ElementTree as ET
+    names = [
+        'test_capacity_wait_rechecks_each_minute_and_reuses_sampler',
+        'test_capacity_wait_resumes_promptly_after_the_inflight_probe',
+        'test_background_startup_keeps_summary_clock_and_does_not_scan',
+        'test_background_capacity_wait_never_overrides_a_real_reserve',
+        'test_wait_for_refresh_reuses_inflight_probe_and_returns_only_new_result',
+        'test_pending_and_expired_samples_fail_closed_with_only_one_probe',
+        'test_probe_failure_and_invalid_result_are_not_admission',
+        'test_idle_disk_guard_requires_explicit_complement_scope_and_no_claims',
+    ]
+    suite = ET.Element('testsuite')
+    for name in names:
+        ET.SubElement(suite, 'testcase', name=name)
+    path = tmp_path / 'semantic.xml'
+    ET.ElementTree(suite).write(path)
+    proof = {'measurement_contract': reload.CAPACITY_RESUME_ACCEPTANCE,
+             'state': 'capacity_resume_semantics_accepted',
+             'source_only_no_training_injection': True, 'source_state_preserved': True,
+             'provider_calls': 0, 'production_queue_mutations': 0, 'source_writes': 0,
+             'semantic_junit_path': str(path), 'semantic_junit_sha256': reload.file_sha(path)}
+    assert reload.accepted_local_measurement(proof)
+    assert not reload.accepted_local_measurement({**proof, 'source_state_preserved': False})
+    assert not reload.accepted_local_measurement({**proof, 'provider_calls': 1})
+    assert not reload.accepted_local_measurement({**proof, 'semantic_junit_sha256': '0' * 64})
+    ET.SubElement(suite[0], 'failure')
+    ET.ElementTree(suite).write(path)
+    proof['semantic_junit_sha256'] = reload.file_sha(path)
+    assert not reload.accepted_local_measurement(proof)
+
+
+def test_capacity_adoption_readback_allows_bounded_queue_preparation_time():
+    assert reload._owner_readback_timeout({'measurement_contract': reload.CAPACITY_RESUME_ACCEPTANCE}) == 300
+    assert reload._owner_readback_timeout({'measurement_contract': 'unrelated'}) == 90
+    for contract in reload.ETA_MEASUREMENTS:
+        assert reload._owner_readback_timeout({'measurement_contract': contract}) == 300
+
+
 def test_idle_without_claim_table_entry_still_rejects_an_inflight_task(tmp_path):
     now = datetime.now(UTC)
     root = tmp_path / 'sponsor'
@@ -453,6 +513,34 @@ def test_reload_rechecks_the_actual_idle_cycle_after_preservation_readback(tmp_p
     observed = json.loads(output.read_bytes())
     assert observed["state"] == "deferred_generation_or_deadline_changed"
     assert not observed["restart_requested"]
+
+
+def test_refused_frozen_signal_is_reported_without_claiming_a_restart(tmp_path, monkeypatch):
+    from contextlib import contextmanager
+    now = datetime.now(UTC)
+    root = tmp_path / 'owner'
+    setup_idle(root, now, reason='current_queue', seconds=60)
+    monkeypatch.setattr(reload, 'ROOT', root)
+    monkeypatch.setattr(reload, 'code_matches', lambda _: True)
+    monkeypatch.setattr(reload, 'identity', lambda _: {'ActiveState': 'active', 'InvocationID': 'same', 'MainPID': '123'})
+    monkeypatch.setattr(reload, 'idle_proof', lambda *_a, **_kw: None)
+    monkeypatch.setattr(reload, 'prior_files', lambda *_: [])
+    @contextmanager
+    def boundary(*_args):
+        yield {'mode': 'frozen_drained_preparation', 'claims': {'inflight': 0}, 'last_task': None}
+    monkeypatch.setattr(reload, 'preparation_boundary', boundary)
+    monkeypatch.setattr(reload, 'terminate_frozen_preparation',
+                        lambda _: (_ for _ in ()).throw(ValueError('preparation_owner_has_nondefault_sigterm')))
+    monkeypatch.setattr(reload.subprocess, 'run', lambda *_a, **_kw: pytest.fail('systemd restart must not run'))
+    acceptance = tmp_path / 'acceptance.json'
+    acceptance.write_text(json.dumps({'exact_output_parity': True, 'code_stable': True,
+                                      'status_wall_improvement_observed': True, 'source_queue': str(root/'queue.sqlite3')}))
+    output = tmp_path / 'observed.json'
+    assert reload.main(['--acceptance', str(acceptance), '--output', str(output), '--apply',
+                        '--wait-seconds', '0', '--allow-preparation-boundary']) == 0
+    result = json.loads(output.read_bytes())
+    assert result['state'] == 'deferred_frozen_owner_not_safe_to_stop'
+    assert result['restart_requested'] is False and 'restart_at_utc' not in result
 
 
 def test_observation_default_never_restarts_a_service(tmp_path, monkeypatch):

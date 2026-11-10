@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the fixed D workflow benchmark cleanup after interruption
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=15min
+AccuracySec=30s
+Unit=stockagent-d-benchmark-discard.service
+
+[Install]
+WantedBy=timers.target

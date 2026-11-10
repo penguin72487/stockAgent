@@ -58,6 +58,127 @@ def test_missing_session_append_cannot_replace_current_or_bypass_inventory(chang
         repair._require_missing_session_target({**_flat(), **change}, date(2026, 10, 8))
 
 
+def _settled_terminal_orders():
+    signal_id = "prior-signal"
+    identity = {"market": "m", "symbol": "2330", "session_date": "2026-10-07",
+                "signal_id": signal_id, "signal_at": "2026-10-07T13:19:00+08:00", "requested_shares": 0}
+    mode = {**_flat(), "market": "m", "engine_status": "waiting_signal", "signal_id": signal_id,
+            "signal_at": "2026-10-07T13:19:00+08:00", "processed_signal_ids": [signal_id],
+            "execution_evidence_complete": True, "closing_auction_settled_at": "2026-10-07T13:30:01+08:00",
+            "pending_entry_shares": 0, "pending_entry_source_count": 0, "pending_reduction_shares": 0,
+            "closing_auction_pending_count": 0, "unresolved_exit_count": 0,
+            "pending_entry_orders": {
+                "2330": {"status": "cancelled_exit_priority", "remaining_shares": 0,
+                         "sizing_pending": True, "position": identity},
+                "2317": {"status": "inventory_target_retained", "remaining_shares": 0,
+                         "sizing_pending": False, "position": {**identity, "symbol": "2317"}},
+            },
+            "pending_reduction_orders": {
+                "0050": {"status": "cancelled_exit_priority", "remaining_shares": 1000,
+                         "requested_shares": 1000, "signal_at": "2026-10-07T13:19:00+08:00"},
+            }}
+    event = {"event": "signal_revision_exit_priority", "market": "m", "signal_id": signal_id,
+             "recorded_at": "2026-10-07T13:20:00+08:00", "cancelled": [
+                 {"kind": "entry", "symbol": "2330", "shares": 0},
+                 {"kind": "reduction", "shares": 1000}]}
+    return mode, event
+
+
+@pytest.mark.parametrize("status", ["waiting_signal", "waiting_09_00_signal",
+                                    "session_flat_after_exit", "session_complete"])
+def test_missing_session_accepts_only_evidenced_prior_terminal_orders_without_erasing_them(tmp_path, status):
+    mode, event = _settled_terminal_orders()
+    mode["engine_status"] = status
+    before = deepcopy(mode)
+    events = tmp_path / "events.jsonl"
+    events.write_text(json.dumps(event) + "\n")
+    repair._require_missing_session_target(mode, date(2026, 10, 8), events_path=events)
+    assert mode == before
+
+
+def test_missing_session_accepts_cancellation_for_consumed_intraday_signal_after_close_update(tmp_path):
+    mode, event = _settled_terminal_orders()
+    # An after-close publication can become the latest mode signal without
+    # changing which intraday signal actually owned the cancelled orders.
+    mode["signal_id"] = "after-close-signal"
+    mode["processed_signal_ids"].append("after-close-signal")
+    mode["pending_reduction_orders"] = {}
+    before = deepcopy(mode)
+    events = tmp_path / "events.jsonl"
+    events.write_text(json.dumps(event) + "\n")
+    repair._require_missing_session_target(mode, date(2026, 10, 8), events_path=events)
+    assert mode == before
+
+
+@pytest.mark.parametrize("damage", ["unconsumed_old_signal", "wrong_cancel_signal", "wrong_quantity", "early_cancel",
+                                    "future_old_signal", "missing_old_signal_clock"])
+def test_missing_session_does_not_accept_unproved_old_signal_cancellation(tmp_path, damage):
+    mode, event = _settled_terminal_orders()
+    mode["signal_id"] = "after-close-signal"
+    mode["processed_signal_ids"].append("after-close-signal")
+    mode["pending_reduction_orders"] = {}
+    if damage == "unconsumed_old_signal":
+        mode["processed_signal_ids"].remove("prior-signal")
+    elif damage == "wrong_cancel_signal":
+        event["signal_id"] = "after-close-signal"
+    elif damage == "wrong_quantity":
+        event["cancelled"][0]["shares"] = 1000
+    elif damage == "early_cancel":
+        event["recorded_at"] = "2026-10-07T13:19:59+08:00"
+    elif damage == "future_old_signal":
+        mode["pending_entry_orders"]["2330"]["position"]["signal_at"] = "2026-10-07T17:00:00+08:00"
+    else:
+        mode["pending_entry_orders"]["2330"]["position"].pop("signal_at")
+    events = tmp_path / "events.jsonl"
+    events.write_text(json.dumps(event) + "\n")
+    with pytest.raises(RuntimeError):
+        repair._require_missing_session_target(mode, date(2026, 10, 8), events_path=events)
+
+
+@pytest.mark.parametrize("status", ["waiting_signal", "session_complete"])
+@pytest.mark.parametrize("change", ["missing_event", "wrong_event_signal", "wrong_event_quantity",
+    "early_event", "working", "unknown_order", "unsettled", "early_settlement", "unknown_evidence",
+    "pending_entry", "pending_reduction", "unresolved_exit", "unknown_position", "open_position",
+    "wrong_market", "wrong_symbol", "wrong_signal", "wrong_session", "unknown_sizing",
+    "unsized_nonzero", "negative_reduction", "bad_reduction_clock", "unconsumed_signal",
+    "retained_nonzero", "interrupted_commit", "malformed_orders"])
+def test_missing_session_rejects_unproven_terminal_orders(tmp_path, change, status):
+    mode, event = _settled_terminal_orders()
+    mode["engine_status"] = status
+    entry = mode["pending_entry_orders"]["2330"]
+    reduction = mode["pending_reduction_orders"]["0050"]
+    if change == "wrong_event_signal": event["signal_id"] = "other"
+    elif change == "wrong_event_quantity": event["cancelled"][1]["shares"] = 2000
+    elif change == "early_event": event["recorded_at"] = "2026-10-07T13:19:59+08:00"
+    elif change == "working": entry["status"] = "working"
+    elif change == "unknown_order": entry["status"] = "unexpected"
+    elif change == "unsettled": mode.pop("closing_auction_settled_at")
+    elif change == "early_settlement": mode["closing_auction_settled_at"] = "2026-10-07T13:29:59+08:00"
+    elif change == "unknown_evidence": mode["execution_evidence_complete"] = False
+    elif change == "pending_entry": mode["pending_entry_shares"] = 1000
+    elif change == "pending_reduction": mode["pending_reduction_shares"] = 1000
+    elif change == "unresolved_exit": mode["unresolved_exit_count"] = 1
+    elif change == "unknown_position": mode["positions"] = {"p": {}}
+    elif change == "open_position": mode["positions"] = {"p": {"signed_shares": 1000}}
+    elif change == "wrong_market": entry["position"]["market"] = "other"
+    elif change == "wrong_symbol": entry["position"]["symbol"] = "0050"
+    elif change == "wrong_signal": entry["position"]["signal_id"] = "other"
+    elif change == "wrong_session": entry["position"]["session_date"] = "2026-10-06"
+    elif change == "unknown_sizing": entry["sizing_pending"] = None
+    elif change == "unsized_nonzero": entry["remaining_shares"] = 1000
+    elif change == "negative_reduction": reduction["remaining_shares"] = -1
+    elif change == "bad_reduction_clock": reduction["signal_at"] = "2026-10-06T13:19:00+08:00"
+    elif change == "unconsumed_signal": mode["processed_signal_ids"] = []
+    elif change == "retained_nonzero": mode["pending_entry_orders"]["2317"]["remaining_shares"] = 1000
+    elif change == "interrupted_commit": mode["entry_retry_pending_commit"] = "pending"
+    elif change == "malformed_orders": mode["pending_entry_orders"] = []
+    events = tmp_path / "events.jsonl"
+    events.write_text(json.dumps(event) + "\n")
+    with pytest.raises(RuntimeError):
+        repair._require_missing_session_target(mode, date(2026, 10, 8),
+                                               events_path=None if change == "missing_event" else events)
+
+
 def test_outcome_keeps_economics_but_not_new_audit_identity():
     first = _flat()
     first["positions"] = {"p": {"symbol": "2330", "side": "short", "signed_shares": -1000,
@@ -67,6 +188,65 @@ def test_outcome_keeps_economics_but_not_new_audit_identity():
     assert repair._outcome(first) == repair._outcome(second)
     second["positions"]["p"]["entry_fee_twd"] += 1
     assert repair._outcome(first) != repair._outcome(second)
+
+
+def test_replay_rejects_known_1333_close_only_for_open_position():
+    day = date(2026, 11, 4)
+    key = "2026-11-04T13:33+08:00"
+    bars = {"6516": {key: {"close": 50.4, "volume_shares": 1000}}}
+    mode = {"positions": {"p": {"symbol": "6516", "signed_shares": 1000}}}
+    with pytest.raises(RuntimeError, match="13:33 delayed closing trade"):
+        repair._require_no_known_delayed_closing_trade(mode, bars, day)
+    mode["positions"]["p"]["signed_shares"] = 0
+    repair._require_no_known_delayed_closing_trade(mode, bars, day)
+    mode["positions"]["p"]["signed_shares"] = 1000
+    repair._require_no_known_delayed_closing_trade(mode, {}, day)
+
+
+def test_delayed_auction_quote_is_split_only_with_exact_source_and_close(tmp_path):
+    import hashlib
+    import polars as pl
+
+    day = date(2026, 11, 4)
+    path = tmp_path / "bars.parquet"
+    pl.DataFrame({"symbol": ["6516"], "ts": [datetime(2026, 11, 4, 13, 33)],
+                  "Close": [50.4], "volume_shares": [1000.]}).write_parquet(path)
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    sources = [{"path": str(path), "sha256": digest, "symbols": ["6516"]}]
+    mode = {"positions": {"p": {"symbol": "6516", "signed_shares": -1000}}}
+    bars = {"6516": {"2026-11-04T13:33+08:00": {"close": 50.4, "volume_shares": 1000.}}}
+    quotes = {"6516": {"session_close_evidence": {"price": 50.4}}}
+    delayed = repair._separate_delayed_auction_quotes(mode, bars, sources, day, quotes)
+    assert not quotes
+    assert delayed["6516"]["delayed_paper_auction"]["source_minute_at"] == "2026-11-04T13:33:00+08:00"
+    for bad_quotes in ({}, {"6516": {"session_close_evidence": {"price": 50.3}}}):
+        with pytest.raises(RuntimeError, match="official closing price"):
+            repair._separate_delayed_auction_quotes(mode, bars, sources, day, bad_quotes)
+    with pytest.raises(RuntimeError, match="source ownership"):
+        repair._separate_delayed_auction_quotes(mode, bars, [], day, {"6516": {}})
+    conflicting = {"6516": {**bars["6516"], "2026-11-04T13:30+08:00": {"close": 50.4}}}
+    with pytest.raises(RuntimeError, match="ambiguous 13:30"):
+        repair._separate_delayed_auction_quotes(mode, conflicting, sources, day, {"6516": {}})
+
+
+def test_selected_finmind_limits_must_match_session_and_actual_directory(tmp_path, monkeypatch):
+    from scripts import prepare_finmind_tw_day_trade_price_limits as limits
+
+    marker = tmp_path / limits.MANIFEST
+    marker.write_text("private source")
+    output = tmp_path / "2026-11-04.parquet"
+    output.write_bytes(b"source-bound")
+    proof = {"session_date": "2026-11-04", "contract": limits.CONTRACT,
+             "output": {"path": str(output), "sha256": "a" * 64},
+             "source_pins": [{"path": "/source", "sha256": "b" * 64}], "summary": {}}
+    monkeypatch.setattr(limits, "verify", lambda _root: proof)
+    lineage, pins = repair._verified_finmind_price_limits(str(tmp_path), date(2026, 11, 4), tmp_path)
+    assert lineage["contract"] == limits.CONTRACT
+    assert len(pins) == 3
+    with pytest.raises(RuntimeError, match="directory"):
+        repair._verified_finmind_price_limits(str(tmp_path), date(2026, 11, 4), tmp_path.parent)
+    with pytest.raises(RuntimeError, match="another session"):
+        repair._verified_finmind_price_limits(str(tmp_path), date(2026, 11, 5), tmp_path)
 
 
 def _published_fixture(tmp_path):
@@ -113,6 +293,47 @@ def test_published_revision_plan_keeps_restarts_and_superseded_decisions(tmp_pat
     assert plan["versions"][2]["effective_entry_at"].endswith("09:04:00+08:00")
     assert plan["versions"][3]["effective_entry_at"] is None
     assert [repair._sha256(path) for path in paths] == [row["summary_sha256"] for row in plan["versions"]]
+
+
+def test_late_first_plan_discloses_0901_counterfactual_and_keeps_later_clocks(tmp_path):
+    spec, paths = _published_fixture(tmp_path)
+    clocks = ("10:02:00", "10:02:20", "10:03:10", "13:19:10")
+    for path, clock in zip(paths, clocks, strict=True):
+        summary = json.loads(path.read_text())
+        stamp = f"2026-10-29T{clock}+08:00"
+        for key in ("signal_started_at", "generated_at", "artifact_published_at", "execution_pointer_written_at"):
+            summary[key] = stamp
+        path.write_text(json.dumps(summary))
+    plan = repair._published_revision_inventory(spec, date(2026, 10, 29))
+    versions = plan["versions"]
+    assert plan["first_entry_assumption"] == "explicit_counterfactual_09_01_not_intraminute_fill_evidence"
+    assert versions[0]["publication_upper_bound"].endswith("10:02:00+08:00")
+    assert versions[0]["effective_entry_at"].endswith("09:01:00+08:00")
+    assert versions[1]["effective_entry_at"].endswith("10:04:00+08:00")
+    assert versions[2]["effective_entry_at"].endswith("10:05:00+08:00")
+    assert versions[3]["effective_entry_at"] is None
+
+
+def test_published_replay_proof_versions_only_the_late_first_assumption():
+    first = {"signal_id": "original", "publication_upper_bound": "2026-10-29T10:02:00+08:00",
+             "opening_signal_revision": {"index": 0, "root_signal_id": "original"}}
+    later = {"signal_id": "later", "publication_upper_bound": "2026-10-29T10:03:00+08:00",
+             "opening_signal_revision": {"index": 1, "root_signal_id": "original"}}
+    plan = {"plan_sha256": "a" * 64, "versions": [first, later]}
+    opening = datetime(2026, 10, 29, 9, 1, tzinfo=repair.TAIPEI)
+    proof = repair._published_replay_proof(plan, later, opening_entry_at=opening)
+    assert proof["contract"] == repair.PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT
+    assert proof["publication_upper_bound"] == later["publication_upper_bound"]
+    assert proof["first_publication_upper_bound"] == first["publication_upper_bound"]
+    assert proof["first_source_signal_id"] == "original" and proof["first_entry_is_counterfactual"] is True
+    early = {**first, "publication_upper_bound": "2026-10-29T09:00:59+08:00"}
+    legacy = repair._published_replay_proof({**plan, "versions": [early, later]}, later,
+                                            opening_entry_at=opening)
+    assert legacy["contract"] == repair.PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT
+    assert "first_entry_is_counterfactual" not in legacy
+    with pytest.raises(ValueError, match="timezone-aware"):
+        repair._published_replay_proof({**plan, "versions": [{**first, "publication_upper_bound":
+                                        "2026-10-29T10:02:00"}]}, later, opening_entry_at=opening)
 
 
 def test_published_revision_plan_rejects_missing_original_parent(tmp_path):
@@ -323,6 +544,41 @@ def test_chart_keeps_replay_provenance_first_seen_after_inference_prefix(tmp_pat
     assert result["historical_minute_valuation_contracts"] == ["source-close-replay"]
     series = next(row for row in result["minute_series"] if row["series_id"] == "m")
     assert int(series["points"][0][3]) & 2 == 2
+
+
+@pytest.mark.parametrize("session_projection", [False, True])
+def test_chart_keeps_only_explicit_delayed_auction_event_after_regular_close(tmp_path, monkeypatch, session_projection):
+    if session_projection:
+        cache = tmp_path / "cache"
+        cache.mkdir()
+        monkeypatch.setenv(dashboard._LEDGER_SESSION_INDEX_CACHE_ENV, str(cache))
+    else:
+        monkeypatch.delenv(dashboard._LEDGER_SESSION_INDEX_CACHE_ENV, raising=False)
+    repair._atomic_json(tmp_path / "state.json", {"schema_version": repair.SIMULATION_SCHEMA_VERSION,
+        "enabled_markets": ["m"], "modes": {"m": {"market": "m", "initial_capital_twd": 10000000}}})
+    start = datetime.fromisoformat("2026-10-06T09:01:00+08:00")
+    marks = [{"session_date": "2026-10-06", "market": "m", "minute": (start + timedelta(minutes=i)).isoformat(),
+              "initial_capital_twd": 10000000, "total_equity_twd": 10000000,
+              "historical_minute_replay": True, "valuation_stale": False} for i in range(270)]
+    marks.extend([
+        {**marks[-1], "minute": "2026-10-06T13:31:00+08:00", "total_equity_twd": 10000001},
+        {**marks[-1], "minute": "2026-10-06T13:33:00+08:00", "total_equity_twd": 10000002},
+        {**marks[-1], "minute": "2026-10-06T13:33:00+08:00", "total_equity_twd": 10000003,
+         "valuation_source": "source_pinned_delayed_auction_event_v1"},
+    ])
+    (tmp_path / "marks.jsonl").write_text("\n".join(json.dumps(row) for row in marks) + "\n")
+    result = dashboard.build_dashboard_history_snapshot(state_dir=tmp_path, range_key="all", resolution="1m",
+        start_date="2026-10-06", end_date="2026-10-06", use_memory_cache=False,
+        use_persistent_cache=False, use_session_projection=session_projection)
+    points = next(row for row in result["minute_series"] if row["series_id"] == "m")["points"]
+    assert len(points) == 271
+    assert points[-1][0] - points[0][0] == 272
+    assert points[-1][0] == int(datetime.fromisoformat("2026-10-06T13:33:00+08:00").timestamp() // 60)
+    assert result["historical_minute_replay_points"] == 270
+    assert result["historical_delayed_auction_event_points"] == 1
+    summary = next(row for row in result["range_summary"] if row["series_id"] == "m")
+    assert summary["minute_coverage_ratio"] == 1.0
+    assert summary["delayed_auction_event_points"] == 1
 
 
 @pytest.mark.parametrize("weight", [0.025, 0.0001])

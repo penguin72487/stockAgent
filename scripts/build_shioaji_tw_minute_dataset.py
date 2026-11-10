@@ -590,6 +590,12 @@ def _feature_statistics(day_frame: pl.DataFrame) -> dict[str, Any]:
 
 def main() -> None:
     args = parse_args()
+    from stockagent.data_sync.workspace_source_handoff import guarded_source_writer
+    with guarded_source_writer(args.output_root):
+        _build_with_owner(args)
+
+
+def _build_with_owner(args: argparse.Namespace) -> None:
     requested = {
         item.strip().upper() for item in str(args.symbols).split(",") if item.strip()
     }

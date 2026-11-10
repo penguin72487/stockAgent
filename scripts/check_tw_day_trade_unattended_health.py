@@ -320,20 +320,29 @@ def _signal_observation(
 
 
 def _systemctl_show(unit: str) -> dict[str, str]:
-    completed = subprocess.run(
-        [
-            "systemctl",
-            "show",
-            unit,
-            "--property="
-            "LoadState,ActiveState,SubState,UnitFileState,Result,NRestarts,"
-            "MemoryCurrent,MemoryHigh,MemoryMax,TasksCurrent,TasksMax",
-        ],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=5,
-    )
+    try:
+        completed = subprocess.run(
+            [
+                "systemctl",
+                "show",
+                unit,
+                "--property="
+                "LoadState,ActiveState,SubState,UnitFileState,Result,NRestarts,"
+                "MemoryCurrent,MemoryHigh,MemoryMax,TasksCurrent,TasksMax",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # An unknown systemd state is neither ready nor permission to start a
+        # potentially running owner. Keep the rest of the receipt observable.
+        return {"ActiveState": "unknown", "show_returncode": "-1",
+                "show_error_type": type(exc).__name__}
+    if completed.returncode != 0:
+        return {"ActiveState": "unknown", "show_returncode": str(completed.returncode),
+                "show_error_type": "SystemctlShowFailed"}
     rows: dict[str, str] = {}
     for line in completed.stdout.splitlines():
         key, separator, value = line.partition("=")
@@ -392,19 +401,35 @@ def _unit_resource_pressure(row: dict[str, str]) -> dict[str, Any]:
 
 
 def _run_systemctl(*arguments: str) -> dict[str, Any]:
-    completed = subprocess.run(
-        ["systemctl", *arguments],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=10,
-    )
+    command = ["systemctl", *arguments]
+    try:
+        completed = subprocess.run(
+            command,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        # A timeout does not establish whether systemd accepted the request.
+        # Report unknown, record cooldown, and re-observe on the next pass.
+        return {"command": command, "returncode": None, "stdout": "", "stderr": "",
+                "error_type": type(exc).__name__, "outcome": "unverified"}
     return {
-        "command": ["systemctl", *arguments],
+        "command": command,
         "returncode": int(completed.returncode),
         "stdout": completed.stdout[-1000:],
         "stderr": completed.stderr[-1000:],
     }
+
+
+def _required_unit_repair_needed(row: dict[str, str], *, timer: bool) -> bool:
+    """Only a known stopped/failed unit, or a disabled active timer, is rearmed."""
+    if row.get("show_returncode") not in {None, "0"} or row.get("LoadState") not in {None, "loaded"}:
+        return False
+    state = row.get("ActiveState")
+    return (state in {"inactive", "failed"}
+            or (timer and state == "active" and row.get("UnitFileState") == "disabled"))
 
 
 def _cooldown_ready(
@@ -459,12 +484,11 @@ def _repair_unit(
     reset = _run_systemctl("reset-failed", unit)
     reset["action_key"] = key
     actions.append(reset)
-    start_args = ("enable", "--now", unit) if timer else (
-        "enable",
-        "--now",
-        unit,
-    )
-    started = _run_systemctl(*start_args)
+    # A systemd start can legitimately take longer than this guardian's
+    # ten-second command bound. Queue it, then independently observe readiness
+    # on a later pass; acceptance of the request is not an active service.
+    started = _run_systemctl("enable", "--now", "--no-block", unit)
+    started["readiness"] = "unverified_until_next_observation"
     started["action_key"] = key
     actions.append(started)
     _record_action(key, started, action_state=action_state, observed=observed)
@@ -905,7 +929,8 @@ def main() -> int:
             row = _systemctl_show(unit)
             services[unit] = row
             if row.get("ActiveState") != "active":
-                failures.append(f"required service is inactive: {unit}")
+                failures.append(f"required service is not active: {unit} (state={row.get('ActiveState') or 'unknown'})")
+            if _required_unit_repair_needed(row, timer=False):
                 actions.extend(
                     _repair_unit(
                         unit,
@@ -952,6 +977,7 @@ def main() -> int:
                 "static",
             }:
                 failures.append(f"required weekly timer is not armed: {unit}")
+            if _required_unit_repair_needed(row, timer=True):
                 actions.extend(
                     _repair_unit(
                         unit,

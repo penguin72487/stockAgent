@@ -369,6 +369,108 @@ def test_workspace_priority_selects_futures_and_rechecks_both_volumes(tmp_path, 
     assert guards and result['state'] == ('finite_priority_pass_complete' if guard_result == 0 else 'capacity_deferred')
 
 
+@pytest.mark.parametrize('pause_results,quota,expected,state', [
+    ([True, True], 2500, 2, 'finite_priority_pass_complete'),
+    ([False], 2500, 0, 'waiting_required_general_data'),
+    ([True, False], 2500, 1, 'waiting_required_general_data'),
+    ([True], 1999, 0, 'quota_margin_reached'),
+])
+def test_registered_workspace_futures_yield_only_verified_paused_general_owner(
+        tmp_path, monkeypatch, pause_results, quota, expected, state):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from downloader import paused_provider_owners
+    from scripts import download_finlab_market_intraday as module
+    from stockagent.data import finlab_futures_sdk as adapter
+
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    key = 'tw_futures_minute:I5F_201611'
+    days = [date(2016, 11, 8), date(2016, 11, 9)]
+    register(root, {'contract': CONTRACT, 'provider': 'finlab', 'reason': 'paused owner fixture',
+        'created_at_utc': (now-timedelta(seconds=1)).isoformat(),
+        'expires_at_utc': (now+timedelta(hours=1)).isoformat(),
+        'items': [{'dataset': key, 'partition': day.isoformat()} for day in days]}, now=now)
+    calls, checks = [], []
+    observations = iter(pause_results)
+
+    def fetch(output, dataset, partition, *, overlay, futures_workspace):
+        assert futures_workspace and dataset == key
+        calls.append(partition)
+        receipt = {'dataset': dataset, 'trade_date': partition.isoformat(),
+                   'status': 'verified_no_trade', 'rows': 0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+        {'state': 'general_work_pending', 'minute_residual_allowed': False,
+         'supplemental_allowed': False, 'actionable_pending': 9, 'scheduled_reserve_mb': 500})
+    monkeypatch.setattr(module, 'acquisition_dispatch_status', lambda _: {'state': 'admitted'})
+    monkeypatch.setattr(paused_provider_owners, 'explicitly_paused',
+                        lambda _: frozenset({'finlab'}) if next(observations) else frozenset())
+    monkeypatch.setattr(module, 'check_futures_workspace_dispatch', lambda *a, **kw: checks.append(True) or 0)
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (quota, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed': True})
+    monkeypatch.setattr(adapter, 'validated_overlay', lambda _: tmp_path / 'overlay')
+    monkeypatch.setattr(adapter, 'fetch_with_owner_session', fetch)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=4, reserve_mb=0, minimum_free_gb=0, now=now, kind='tw_minute',
+        finite_priority_only=True, capacity_deferred_priority=True, futures_workspace_only=True)
+    assert len(calls) == expected and result['state'] == state
+    assert result['general_acquisition_admission']['actionable_pending'] == 9
+    assert checks
+    if expected or state == 'quota_margin_reached':
+        assert result['quota_policy']['effective_reserve_mb'] >= 2000
+
+
+def test_workspace_owner_executes_the_preferred_registered_request_first(tmp_path, monkeypatch):
+    from downloader.artifact_io import atomic_write_json
+    from downloader.provider_priority import CONTRACT, register
+    from scripts import download_finlab_market_intraday as module
+    from stockagent.data import finlab_futures_sdk as adapter
+    public = tmp_path / 'public'
+    public.mkdir()
+    _fixture(public)
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    module._open_index(db).close()
+    now = datetime.now(UTC)
+    items = [{'dataset':'tw_futures_minute:AAA_201611', 'partition':'2016-11-08'},
+             {'dataset':'tw_futures_minute:ZZZ_201611', 'partition':'2016-11-09'}]
+    requests = [register(root, {'contract':CONTRACT, 'provider':'finlab', 'reason':'order fixture',
+        'created_at_utc':(now-timedelta(seconds=2-index)).isoformat(),
+        'expires_at_utc':(now+timedelta(hours=1)).isoformat(), 'items':[item]}, now=now)
+        for index, item in enumerate(items)]
+    calls = []
+    def fetch(output, dataset, partition, *, overlay, futures_workspace):
+        calls.append(dataset)
+        receipt = {'dataset':dataset, 'trade_date':partition.isoformat(), 'status':'verified_no_trade', 'rows':0}
+        atomic_write_json(_partition_paths(output, dataset, partition)[0], receipt)
+        return receipt
+    monkeypatch.setattr(module, 'credential_available', lambda: True)
+    monkeypatch.setattr(module, '_general_work_admission', lambda *a, **kw:
+                        {'state':'ready', 'minute_residual_allowed':True, 'supplemental_allowed':True})
+    monkeypatch.setattr(module, 'acquisition_dispatch_status', lambda _: {'state':'admitted'})
+    monkeypatch.setattr(module, 'check_futures_workspace_dispatch', lambda *a, **kw: 0)
+    monkeypatch.setattr(module, 'quota_room_mb', lambda: (2500, 5000))
+    monkeypatch.setattr(module, 'opening_admission', lambda *a, **kw: {'allowed':True})
+    monkeypatch.setattr(adapter, 'validated_overlay', lambda _: tmp_path/'overlay')
+    monkeypatch.setattr(adapter, 'fetch_with_owner_session', fetch)
+    result = module.sync_market(root, public, start=date(2026, 8, 19), end=date(2026, 9, 24),
+        limit=1, reserve_mb=0, minimum_free_gb=0, now=now, kind='tw_minute',
+        finite_priority_only=True, capacity_deferred_priority=True, futures_workspace_only=True,
+        preferred_futures_request_ids=(requests[1]['request_id'],))
+    assert result['futures_priority_attempts'] == 1 and calls == [items[1]['dataset']]
+
+
 def test_capacity_deferred_exception_rechecks_due_dispatch_before_each_partition(tmp_path, monkeypatch):
     from downloader.artifact_io import atomic_write_json
     from downloader.provider_priority import CONTRACT, register

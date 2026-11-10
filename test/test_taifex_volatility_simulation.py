@@ -1841,22 +1841,22 @@ def test_expired_cycle_uses_official_settlement_and_finishes_flat(
         _book("TXV-20260814-45000-P", bid=139, ask=141, receive_ns=receive_ns)
     )
     engine.step(now=datetime(2026, 8, 12, 8, 46, tzinfo=TAIPEI))
-    engine.state["active_cycle"]["expiry_date"] = "2026-08-12"
+    engine.state["active_cycle"]["expiry_date"] = "2026-08-14"
     engine.state["active_cycle"]["status"] = "waiting_official_final_settlement"
     engine._persist_state()
     pl.DataFrame(
         {
-            "settlement_date": [date(2026, 8, 12)],
-            "option_series": ["202608W2"],
+            "settlement_date": [date(2026, 8, 14)],
+            "option_series": ["202608F2"],
             "final_settlement_price": [45_100.0],
             "source_file": ["official.html"],
             "source_sha256": ["a" * 64],
         }
     ).write_parquet(tmp_path / "settlements.parquet")
     engine.latest_books.clear()
-    engine.step(now=datetime(2026, 8, 13, 8, 46, tzinfo=TAIPEI))
+    engine.step(now=datetime(2026, 8, 17, 8, 46, tzinfo=TAIPEI))
     assert engine.state["active_cycle"] is None
-    assert engine.state["last_settled_expiry"] == "2026-08-12"
+    assert engine.state["last_settled_expiry"] == "2026-08-14"
     assert engine.state["engine_status"] in {
         "flat_ready_for_next_cycle",
         "waiting_for_fresh_open_books",
@@ -1864,6 +1864,35 @@ def test_expired_cycle_uses_official_settlement_and_finishes_flat(
     for strategy_id in STRATEGY_IDS:
         assert engine.state["strategies"][strategy_id]["futures_position"] == 0
     engine.close()
+
+
+def test_official_settlement_uses_contract_series_and_actual_delayed_date(tmp_path: Path) -> None:
+    engine = TaifexVolatilitySimulation.__new__(TaifexVolatilitySimulation)
+    engine.final_settlement_path = tmp_path / "settlements.parquet"
+    pl.DataFrame({
+        "settlement_date": [date(2026, 10, 27), date(2026, 10, 28)],
+        "option_series": ["202610F4", "202610W4"],
+        "final_settlement_price": [46115.0, 46961.0],
+        "source_file": ["official.html", "official.html"],
+        "source_sha256": ["a" * 64, "a" * 64],
+    }).write_parquet(engine.final_settlement_path)
+    result = engine._official_settlement(date(2026, 10, 23), "TXY:202610:2026-10-23", date(2026, 11, 4))
+    assert result == (46115.0, "official.html", "a" * 64, date(2026, 10, 27))
+    assert engine._official_settlement(date(2026, 10, 23), "TXY:202610:2026-10-23", date(2026, 10, 27)) is None
+    assert engine._official_settlement(date(2026, 10, 23), "UNKNOWN:202610:2026-10-23", date(2026, 11, 4)) is None
+
+
+def test_reporting_recovery_skips_mark_scan_only_when_all_marks_exist(monkeypatch: pytest.MonkeyPatch) -> None:
+    engine = TaifexVolatilitySimulation.__new__(TaifexVolatilitySimulation)
+    engine.strategy_ids = ("one",)
+    calls = []
+    monkeypatch.setattr(engine, "_latest_complete_mark_cache", lambda: calls.append(True) or {})
+    payload = {"strategies": {"one": {"initial_capital_twd": 100, "last_complete_open_liquidation_value_twd": 10}}}
+    engine._ensure_strategy_reporting_state(payload)
+    assert calls == []
+    payload["strategies"]["one"]["last_complete_open_liquidation_value_twd"] = None
+    engine._ensure_strategy_reporting_state(payload)
+    assert calls == [True]
 
 
 def test_startup_settlement_bootstrap_migrates_v7_then_rolls_to_nearest_weekly(
@@ -2011,7 +2040,7 @@ def _expired_hedged_fixture(tmp_path: Path, quantity: int = 2) -> None:
     initial = _engine(tmp_path, bootstrap_after=date(2026, 8, 10))
     initial.state["active_cycle"] = {
         "cycle_id": "expired_hedged", "expiry_date": "2026-08-12",
-        "series": "TXV:202608:2026-08-12",
+        "series": "TX2:202608:2026-08-12",
     }
     ts = int(datetime(2026, 8, 12, 9, 0, tzinfo=TAIPEI).timestamp() * 1e9)
     initial._record_ideal_trade(
@@ -2023,11 +2052,12 @@ def _expired_hedged_fixture(tmp_path: Path, quantity: int = 2) -> None:
         strategy_id=CLASSIC_VARIANT_ID, instrument_type="option", product="TXO",
         code="TXV-EXPIRED-C", delta_contracts=1, price_points=100,
         decision_ns=ts, receive_ns=ts - 1, reason="fixture_option",
-        series="TXV:202608:2026-08-12", strike=45_000, option_right="C",
+        series="TX2:202608:2026-08-12", strike=45_000, option_right="C",
     )
     initial.close()
     pl.DataFrame({
         "settlement_date": [date(2026, 8, 12)],
+        "option_series": ["202608W2"],
         "final_settlement_price": [45_100.0],
         "source_file": ["official.html"], "source_sha256": ["c" * 64],
     }).write_parquet(tmp_path / "settlements.parquet")

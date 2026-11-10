@@ -112,6 +112,40 @@ STORAGE_RETIRED_SCAN_NAME = "storage-retired-scan-20261029-v1"
 STORAGE_RETIRED_SCAN_FILES = (
     "artifacts/operations/storage-single-authority-20261025/source-retired-unscanned-20261029.private.json",
 )
+STORAGE_OPERATIONS_NAME = "storage-operations-20261103-v1"
+STORAGE_OPERATIONS_FILES = (
+    "docs/lab203_runtime_observer_handoff_2026-11-03.md",
+    "docs/storage_c_e_d_layout_2026-11-02.md",
+)
+STORAGE_OPERATIONS_V2_NAME = "storage-operations-20261103-v2"
+STORAGE_OPERATIONS_V2_FILES = (*STORAGE_OPERATIONS_FILES,
+    "stockagent/control/lakehouse.py", "stockagent/remote_build.py",
+    "scripts/benchmark_lakehouse_row_digest.py", "test/test_lakehouse_row_digest.py")
+STORAGE_CONTENT_ALIAS_NAME = "storage-content-alias-reader-20261107-v1"
+STORAGE_CONTENT_ALIAS_FILES = (
+    "docs/lab203_packed_content_alias_v3_handoff_2026-11-07.md",
+    "scripts/__init__.py", "scripts/retire_staged_cold_objects.py",
+    "scripts/stage_d_cold_relocation.py", "scripts/verify_backup_delivery.py",
+    "scripts/backup_delivery_receipt.py",
+    "stockagent/__init__.py", "stockagent/service_layout.py", "stockagent/storage_layout.py",
+    "stockagent/runtime_identity.py",
+    "stockagent/data_sync/__init__.py",
+    "stockagent/data_sync/packed_snapshots.py", "stockagent/data_sync/packed_alias_v3.py",
+    "stockagent/data_sync/packed_metadata.py", "stockagent/data_sync/desync_snapshots.py",
+    "stockagent/data_sync/dedup_candidate_reader.py", "stockagent/data_sync/dedup_stream_candidate.py",
+    "stockagent/data_sync/dedup_native_chunks.py", "stockagent/data_sync/dedup_native_packs.py",
+    "stockagent/data_sync/packed_dedup_plan.py", "stockagent/data_sync/stream_repack.py",
+    "stockagent/data_sync/workspace_volume.py", "stockagent/data_sync/windows_cold_io.py",
+    "stockagent/data_sync/immutable_cache_files.py", "stockagent/data_sync/materialized_cache.py",
+    "stockagent/data_sync/cache_capacity.py", "stockagent/data_sync/completed_forward_capacity.py",
+    "stockagent/data_sync/packed_verification.py", "stockagent/data_sync/packed_backup.py",
+    "stockagent/data_sync/retained_source.py", "stockagent/data_sync/closed_source.py",
+    "stockagent/data_sync/temporary_e_authority.py", "stockagent/data_sync/staged_head_capacity_relief.py",
+    "stockagent/data_sync/repack_retirement.py", "stockagent/data_sync/packed_retention.py",
+    "stockagent/data_sync/backup_stream.py", "stockagent/data_sync/offhost_backup.py",
+    "stockagent/data_sync/transport_capacity.py",
+    "downloader/__init__.py", "downloader/artifact_io.py", "test/test_packed_alias_v3.py",
+)
 NEWS_PRIVATE_NAME = "news-private-backup-20261028-v1"
 NEWS_PRIVATE_FILES = (
     "scripts/__init__.py", "scripts/verify_backup_delivery.py", "scripts/backup_delivery_receipt.py",
@@ -125,7 +159,7 @@ MAX_CONTROL_HANDOFF_BYTES = 2 * 1024**2
 def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
                     wait_for_owner: bool = False, publish_recovery_tasks: bool = False,
                     physical_transport_alias: Path | None = None) -> dict:
-    if name not in {NEWS_PRIVATE_NAME, STORAGE_RETIRED_SCAN_NAME, STORAGE_CAPSULE_BINDING_NAME, STORAGE_SOURCE_EVIDENCE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2", "continuous-backup-20261004-v3",
+    if name not in {STORAGE_CONTENT_ALIAS_NAME, STORAGE_OPERATIONS_NAME, STORAGE_OPERATIONS_V2_NAME, NEWS_PRIVATE_NAME, STORAGE_RETIRED_SCAN_NAME, STORAGE_CAPSULE_BINDING_NAME, STORAGE_SOURCE_EVIDENCE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2", "continuous-backup-20261004-v3",
                     "continuous-backup-20261004-v4", "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
                     "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9",
                     "continuous-backup-20261004-v10"}:
@@ -155,7 +189,10 @@ def publish_handoff(queue: BackupStream, name: str, *, source_root: Path = ROOT,
     with (queue.state / lock_name).open("a") as owner:
         fcntl.flock(owner, fcntl.LOCK_EX | (0 if wait_for_owner else fcntl.LOCK_NB))
         queue.storage_guard()
-        files = (NEWS_PRIVATE_FILES if name == NEWS_PRIVATE_NAME else
+        files = (STORAGE_CONTENT_ALIAS_FILES if name == STORAGE_CONTENT_ALIAS_NAME else
+                 STORAGE_OPERATIONS_FILES if name == STORAGE_OPERATIONS_NAME else
+                 STORAGE_OPERATIONS_V2_FILES if name == STORAGE_OPERATIONS_V2_NAME else
+                 NEWS_PRIVATE_FILES if name == NEWS_PRIVATE_NAME else
                  STORAGE_RETIRED_SCAN_FILES if name == STORAGE_RETIRED_SCAN_NAME else
                  STORAGE_CAPSULE_BINDING_FILES if name == STORAGE_CAPSULE_BINDING_NAME else
                  STORAGE_SOURCE_EVIDENCE_FILES if name == STORAGE_SOURCE_EVIDENCE_NAME else
@@ -256,7 +293,7 @@ def main() -> None:
     parser.add_argument("--publish-recovery-requests", action="store_true")
     parser.add_argument("--physical-transport-alias",type=Path,
         help="Publish only a bounded immutable control package independently of the long data owner")
-    parser.add_argument("--name", choices=(NEWS_PRIVATE_NAME, STORAGE_RETIRED_SCAN_NAME, STORAGE_CAPSULE_BINDING_NAME, STORAGE_SOURCE_EVIDENCE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2",
+    parser.add_argument("--name", choices=(STORAGE_CONTENT_ALIAS_NAME, STORAGE_OPERATIONS_NAME, STORAGE_OPERATIONS_V2_NAME, NEWS_PRIVATE_NAME, STORAGE_RETIRED_SCAN_NAME, STORAGE_CAPSULE_BINDING_NAME, STORAGE_SOURCE_EVIDENCE_NAME, STORAGE_OBSERVER_NAME, STORAGE_RELAY_NAME, STORAGE_RESCUE_NAME, STORAGE_OFFLINE_NAME, STORAGE_REVISED_NAME, STORAGE_BOOTSTRAP_NAME, STORAGE_INCREMENTAL_NAME, STORAGE_CANONICAL_NAME, STORAGE_RUNTIME_NAME, "continuous-backup-20261004-v1", "continuous-backup-20261004-v2",
                                          "continuous-backup-20261004-v3", "continuous-backup-20261004-v4",
                                          "continuous-backup-20261004-v5", "continuous-backup-20261004-v6",
                                          "continuous-backup-20261004-v7", "continuous-backup-20261004-v8", "continuous-backup-20261004-v9", "continuous-backup-20261004-v10"),

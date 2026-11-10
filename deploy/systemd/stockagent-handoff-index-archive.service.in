@@ -1,0 +1,16 @@
+[Unit]
+Description=Seal fixed C source generations into dataset-local E archives
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 120 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_authority_storage_operation.sh scripts/run_handoff_index_archive_queue.py
+# The queue supervises the archive child with a source-bound inactivity
+# deadline. A fixed wall-time limit would kill a child that is still advancing.
+TimeoutStartSec=infinity
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

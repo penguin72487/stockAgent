@@ -1,0 +1,21 @@
+# Read-only research previews, not authorization to enable a paper account.
+schema_version: 1
+candidates:
+  - market_config: configs/deployments/candidates/tw_day_trade_unit_mgda_2m_20261103.yaml
+    expected_market: tw_day_trade_unit_mgda_2m_20261103
+    expected_initial_capital_twd: 2000000
+    counterfactual_signal:
+      path: artifacts/operations/public_research/unit-mgda-2m-counterfactual-signal-2026-11-09-v2.json
+      sha256: 92d5c3dda8b9099cf30a4ee6c23e2398c3099028c8f93f077454638156003af8
+    provisional_replay:
+      path: artifacts/operations/public_research/unit-mgda-2m-2026-20261109-v1.json
+      sha256: a48fdf3c938d76113e877805ed879aa684aa381cb336568ec7f0733c51f2702c
+    provisional_minutes:
+      path: artifacts/operations/public_research/unit-mgda-2m-minute-2026-20261109-v1.json.gz
+      sha256: b8ca9f974ef62c0572d6dbbb9345c00e6a67dfa2615a6e123e63c7d45cc4efbd
+    artifact_sha256:
+      checkpoint_best.pt: ef6f83f8112e6f382a744990c1cfdeec37b6e06e9eb3ede49df252cc54878fbd
+      daily_portfolio_returns.parquet: 0d0bc9fe943a1d97e72d634304148ab35d0470a91b1d22e0e572e68638802b35
+      metrics.json: b4603f4bdb34566e64dcfcfce82a5721fe842618662273bdce05b3d8b0bd2298
+      fold_complete.json: f958c1fe9b752526170376040d7bb58f36dfbe258226ec43f736e4eb4d6355f6
+      mode_artifact_contract.json: f9a5d5fa247c1572d97e5f487f692a1a449c09015ad395481d47ec141f2b23bc

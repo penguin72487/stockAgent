@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry fixed same-root private pack sharing
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Unit=stockagent-private-subset-reuse.service
+
+[Install]
+WantedBy=timers.target

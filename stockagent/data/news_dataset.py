@@ -683,8 +683,9 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
     source, output = source.resolve(), output.resolve()
     if source == output or output.is_relative_to(source) or source.is_relative_to(output):
         raise ValueError("news dataset output must be separate from its source")
+    from stockagent.data_sync.workspace_source_handoff import guard_path, guard_locked_path
+    guard_path(output)
     output.mkdir(parents=True, exist_ok=True, mode=0o700)
-    os.chmod(output, 0o700)
     notify_callback = notify
     started = time.monotonic()
     guard = _NewsDatasetDiskGuard(output)
@@ -697,6 +698,8 @@ def build_news_dataset(source: Path, output: Path, *, workers: int = 4, batch_ro
             notify_callback(payload)
     with (output / ".build.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard_locked_path(output, lock, lock_name='.build.lock')
+        os.chmod(output, 0o700)
         guard.check()
         if (output / "manifest.json").is_file() and not refresh:
             return verify_news_dataset(output, verification_memory_mb=verification_memory_mb, _guard=guard)
@@ -842,6 +845,8 @@ def finish_pending_news_dataset(output: Path, *, verification_memory_mb: int = 2
     if verification_memory_mb < 128:
         raise ValueError("news verification memory limit must be at least 128 MB")
     output = output.resolve()
+    from stockagent.data_sync.workspace_source_handoff import guard_path, guard_locked_path
+    guard_path(output)
     started = time.monotonic()
     guard = _NewsDatasetDiskGuard(output)
     def progress(stage, completed, total):
@@ -853,6 +858,7 @@ def finish_pending_news_dataset(output: Path, *, verification_memory_mb: int = 2
             notify(payload)
     with (output / ".build.lock").open("a+") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard_locked_path(output, lock, lock_name='.build.lock')
         guard.check()
         active_path = output / ".active-build.json"
         if not active_path.exists():

@@ -1,0 +1,12 @@
+[Unit]
+Description=Resume the fixed Vast rescue package E handoff
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-vast-sealed-e-handoff.service
+
+[Install]
+WantedBy=timers.target

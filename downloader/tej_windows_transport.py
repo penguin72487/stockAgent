@@ -99,6 +99,13 @@ def run_guarded_windows(command: str, *, request: Path, windows_path, timeout: f
     environments = [None]
     if interop_socket is not None:
         environments = [{**os.environ, 'WSL_INTEROP': interop_socket}]
+        # A socket and its Linux owner may remain alive even when that WSL
+        # relay no longer launches Windows processes. Only try the instance
+        # relay if the owned relay never received a permit. The wrapper checks
+        # the exact interactive Windows session *before* its readiness ACK;
+        # a Session-0 (or any other) fallback therefore cannot reach the UI.
+        if stable.is_socket() and str(stable) != interop_socket:
+            environments.append({**os.environ, 'WSL_INTEROP': str(stable)})
     elif stable.is_socket() and os.environ.get('WSL_INTEROP') != str(stable):
         # GUI startup must prefer its logged-in scheduled task's own relay.
         # The stable boot relay may belong to a noninteractive Session 0.

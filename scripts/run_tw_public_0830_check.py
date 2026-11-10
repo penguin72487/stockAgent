@@ -320,6 +320,7 @@ def _audit_command(
         "--output-dir",
         str(output_dir),
         "--build-panel",
+        "--allow-uncached-panel-on-capacity",
         "--strict",
         "--require-live-selected-features",
     ]
@@ -653,6 +654,31 @@ def _derived_data_commands(
             ]
         )
     return commands
+
+
+def _run_derived_command(command: list[str], *, step_name: str, steps: list[dict[str, Any]]):
+    """Optional parser-cache admission must not veto the canonical parser.
+
+    The symbol builder reserves cache growth before writing it and reports
+    CapacityDeferred as 75. Retry once with its existing full-parser option,
+    not a smaller dataset or a lower reserve. Any required output reservation
+    still applies and can defer this second attempt as well.
+    """
+    started = time.perf_counter()
+    completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+    if (completed.returncode != 75 or len(command) < 2
+            or command[1] != str(REPO_ROOT / "scripts/build_tw_official_symbol_parquets.py")
+            or "--no-source-cache" in command):
+        return completed
+    uncached = [argument for argument in command if argument != "--incremental-merge-cache"]
+    uncached.append("--no-source-cache")
+    steps.append({"step": "optional_symbol_source_cache_fallback",
+        "owner_step": step_name, "status": "retry_without_optional_cache_write",
+        "original_return_code": completed.returncode,
+        "elapsed_seconds": round(time.perf_counter() - started, 3),
+        "policy": "one_full_canonical_parser_retry_no_reserve_override_v1"})
+    print("[tw-public-0830] symbol cache admission deferred; retry full canonical parser without cache writes", flush=True)
+    return subprocess.run(uncached, cwd=REPO_ROOT, check=False)
 
 
 def _derived_data_dates(live_root: Path) -> dict[str, str | None]:
@@ -1262,7 +1288,7 @@ def main() -> int:
                     if not current_status["errors"][status_label]:
                         continue
                 derived_started = time.perf_counter()
-                completed = subprocess.run(command, cwd=REPO_ROOT, check=False)
+                completed = _run_derived_command(command, step_name=step_name, steps=steps)
                 steps.append(
                     {
                         "step": step_name,

@@ -1,0 +1,17 @@
+[Unit]
+Description=Restore an interrupted Vast rescue package E path binding
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+Before=multi-user.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/run_vast_sealed_e_handoff.py --recover-mount-only'
+RemainAfterExit=yes
+Restart=on-failure
+RestartSec=10s
+
+[Install]
+WantedBy=multi-user.target

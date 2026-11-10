@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume enrolled StockAgent source handoffs on E
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=5min
+AccuracySec=1s
+Unit=stockagent-workspace-source-handoff.service
+
+[Install]
+WantedBy=timers.target

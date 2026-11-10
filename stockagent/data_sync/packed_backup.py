@@ -155,6 +155,7 @@ class PinnedObjectSignatures:
         self._condition = threading.Condition(self._lock)
         self._parallel_signatures = parallel_signatures
         self._inflight_signatures = 0
+        self._placed_readers = {}
         self._flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         root_fd = os.open(root, self._flags)
         try:
@@ -173,6 +174,28 @@ class PinnedObjectSignatures:
         object_descriptor(relative)
         return self.regular_file_signature(relative)
 
+    def directory_names(self, relative: str) -> list[str]:
+        """List names through the same no-follow directory pins, without stat.
+
+        This proves neither a leaf's type nor its contents. Callers retain
+        regular-file observations and the final ancestor identity recheck.
+        Listing names avoids os.walk's repeated per-leaf type probes on DrvFs.
+        """
+        with self._lock:
+            try:
+                _, descriptor = self._parent(relative + '/.directory-enumeration')
+            except NotADirectoryError as error:
+                # Linux may report ENOTDIR, rather than ELOOP, for an
+                # O_DIRECTORY|O_NOFOLLOW symlink. Never confuse that case
+                # with an ordinary file in a noncanonical directory layout.
+                candidate = self.root
+                for part in Path(relative).parts:
+                    candidate /= part
+                    if candidate.is_symlink():
+                        raise SnapshotError('backup object directory is redirected') from error
+                raise
+            return os.listdir(descriptor)
+
     def regular_file_signature(self, relative: str) -> tuple[int, ...]:
         """Observe a regular member under the same bounded directory pins.
 
@@ -181,6 +204,17 @@ class PinnedObjectSignatures:
         before trusting the pass. The CAS signature entrypoint keeps its stricter
         object_descriptor admission.
         """
+        if relative.startswith('objects/'):
+            from stockagent.data_sync.packed_object_placement import resolve_read, WORKSPACE
+            physical = resolve_read(self.root, relative)
+            if physical != self.root/relative:
+                with self._lock:
+                    child = self._placed_readers.get(WORKSPACE)
+                    if child is None:
+                        child = PinnedObjectSignatures(WORKSPACE, max_open_directories=self._limit,
+                                                      parallel_signatures=self._parallel_signatures)
+                        self._placed_readers[WORKSPACE] = child
+                return child.regular_file_signature(physical.relative_to(WORKSPACE).as_posix())
         # A cached descriptor may be evicted by another worker.  In the
         # explicitly parallel mode duplicate it while holding the cache lock,
         # then allow slow filesystem metadata calls to overlap.  Recheck and
@@ -310,12 +344,17 @@ class PinnedObjectSignatures:
                 info = os.stat(path, follow_symlinks=False)
                 if not stat.S_ISDIR(info.st_mode) or self._identity(info) != identity:
                     raise SnapshotError(f"backup object directory changed during scan: {path}")
+            for child in self._placed_readers.values():
+                child.recheck()
 
     def close(self) -> None:
         with self._condition:
             while self._inflight_signatures:
                 self._condition.wait()
             error = None
+            for child in self._placed_readers.values():
+                child.close()
+            self._placed_readers.clear()
             while self._directories:
                 _, (fd, _identity) = self._directories.popitem()
                 try:

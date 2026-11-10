@@ -33,7 +33,7 @@ from stockagent.backtest.tw_index_derivatives_tick import (
     sweep_five_level_depth_scalar,
     txo_short_initial_margin_per_contract_scalar,
 )
-from stockagent.data.tw_index_derivatives_tick import TAIPEI
+from stockagent.data.tw_index_derivatives_tick import TAIPEI, taifex_option_expiry
 from stockagent.data.tw_index_futures import (
     TAIFEX_INDEX_FUTURES_FEE_PER_SIDE_TWD,
     TAIFEX_INDEX_FUTURES_MULTIPLIERS,
@@ -95,7 +95,7 @@ from stockagent.research.taifex_volatility_metadata import (
 
 
 SCHEMA_VERSION: Final[int] = 1
-EXECUTION_CONTRACT_VERSION: Final[int] = 13
+EXECUTION_CONTRACT_VERSION: Final[int] = 14
 OPTION_MULTIPLIER: Final[float] = 50.0
 OPTION_FEE_PER_SIDE_TWD: Final[float] = 22.0
 DEFAULT_OPTION_RISK_MARGIN_A_TWD: Final[float] = TXO_RISK_MARGIN_TWD_2026_08_13["A"]
@@ -872,6 +872,9 @@ class TaifexVolatilitySimulation:
             elif execution_version == 12:
                 payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
                 migration_reasons.append("explicit_expired_cycle_reduce_only_recovery")
+            elif execution_version == 13:
+                payload["execution_contract_version"] = EXECUTION_CONTRACT_VERSION
+                migration_reasons.append("official_contract_series_settlement_date")
             elif execution_version != EXECUTION_CONTRACT_VERSION:
                 raise RuntimeError("strategy execution contract mismatch")
 
@@ -1462,7 +1465,15 @@ class TaifexVolatilitySimulation:
         return latest
 
     def _ensure_strategy_reporting_state(self, payload: dict[str, Any]) -> None:
-        recovered = self._latest_complete_mark_cache()
+        # The journal is only a migration fallback for missing cached marks.
+        # Scanning multiple GB on every restart cannot change populated values.
+        needs_recovery = any(
+            payload["strategies"][strategy_id].get(
+                "last_complete_open_liquidation_value_twd"
+            ) is None
+            for strategy_id in self.strategy_ids
+        )
+        recovered = self._latest_complete_mark_cache() if needs_recovery else {}
         for strategy_id in self.strategy_ids:
             ledger = payload["strategies"][strategy_id]
             defaults = _new_strategy_ledger()
@@ -3933,15 +3944,40 @@ class TaifexVolatilitySimulation:
             self.state["engine_status"] = "hedge_contract_flat_for_monthly_roll"
             self._persist_state()
 
-    def _official_settlement(self, expiry: date) -> tuple[float, str, str] | None:
+    def _official_settlement(
+        self, expiry: date, series: str, trading_date: date
+    ) -> tuple[float, str, str, date] | None:
         if not self.final_settlement_path.is_file():
             return None
+        parts = str(series).split(":")
+        if len(parts) != 3 or not parts[1].isdigit() or len(parts[1]) != 6:
+            return None
+        root, month, _ = parts
+        try:
+            if date.fromisoformat(parts[2]) != expiry:
+                return None
+        except ValueError:
+            return None
+        suffix = {
+            "TXO": "", "TX1": "W1", "TX2": "W2", "TX4": "W4", "TX5": "W5",
+            "TXU": "F1", "TXV": "F2", "TXX": "F3", "TXY": "F4", "TXZ": "F5",
+        }.get(root)
+        if suffix is None:
+            return None
+        official_series = month + suffix
+        try:
+            nominal = taifex_option_expiry(official_series)
+        except ValueError:
+            return None
         frame = pl.read_parquet(self.final_settlement_path).filter(
-            pl.col("settlement_date") == expiry
+            pl.col("option_series") == official_series
         )
         if frame.height != 1:
             return None
         row = frame.row(0, named=True)
+        actual_date = row["settlement_date"]
+        if actual_date < nominal or actual_date < expiry or actual_date >= trading_date:
+            return None
         price = float(row["final_settlement_price"])
         if not math.isfinite(price) or price <= 0.0:
             return None
@@ -3949,6 +3985,7 @@ class TaifexVolatilitySimulation:
             price,
             str(row.get("source_file", "")),
             str(row.get("source_sha256", "")),
+            actual_date,
         )
 
     def _settle_expired_positions_for_subscription_bootstrap(
@@ -4027,12 +4064,14 @@ class TaifexVolatilitySimulation:
             raise RuntimeError(
                 "cannot cash-settle cycle while a shadow futures hedge remains open"
             )
-        settlement = self._official_settlement(expiry)
+        settlement = self._official_settlement(
+            expiry, str(cycle.get("series") or ""), taifex_trading_date(now)
+        )
         if settlement is None:
             self.state["engine_status"] = "blocked_missing_official_final_settlement"
             self.state["blocked_reason"] = f"missing_official_final_settlement:{expiry}"
             return
-        settlement_price, source_file, source_sha = settlement
+        settlement_price, source_file, source_sha, actual_settlement_date = settlement
         if has_futures:
             recovery = cycle.get("futures_recovery")
             if not isinstance(recovery, dict):
@@ -4072,7 +4111,12 @@ class TaifexVolatilitySimulation:
                     continue
                 leg = (ledger.get("option_position_metadata") or {}).get(code) or {}
                 strike = float(leg.get("strike") or 0.0)
-                if leg.get("option_right") not in {"C", "P"} or not math.isfinite(strike) or strike <= 0:
+                if (
+                    leg.get("option_right") not in {"C", "P"}
+                    or not math.isfinite(strike)
+                    or strike <= 0
+                    or leg.get("series") != cycle.get("series")
+                ):
                     raise RuntimeError(f"invalid held option settlement metadata: {code}")
         for strategy_id in self.strategy_ids:
             if strategy_id == PUT_CALL_PARITY_TX_STRATEGY_ID:
@@ -4099,7 +4143,7 @@ class TaifexVolatilitySimulation:
                     abs(position)
                     * option_cash_settlement_transaction_tax_twd(
                         settlement_price,
-                        settlement_date=expiry,
+                        settlement_date=actual_settlement_date,
                         multiplier_twd_per_point=OPTION_MULTIPLIER,
                     )
                     if price > 0.0
@@ -4165,6 +4209,7 @@ class TaifexVolatilitySimulation:
                 "at_utc": _now_iso(),
                 "cycle_id": cycle["cycle_id"],
                 "expiry_date": expiry.isoformat(),
+                "actual_settlement_date": actual_settlement_date.isoformat(),
                 "official_final_settlement": settlement_price,
                 "source_file": source_file,
                 "source_sha256": source_sha,
@@ -4199,7 +4244,9 @@ class TaifexVolatilitySimulation:
         expiry = date.fromisoformat(str(open_position["expiry_date"]))
         if expiry >= taifex_trading_date(now):
             return
-        settlement = self._official_settlement(expiry)
+        settlement = self._official_settlement(
+            expiry, str(open_position.get("series") or ""), taifex_trading_date(now)
+        )
         if settlement is None:
             parity_state["monitor"] = {
                 **(parity_state.get("monitor") or {}),
@@ -4210,7 +4257,7 @@ class TaifexVolatilitySimulation:
                 f"missing_put_call_parity_tx_official_final_settlement:{expiry}"
             )
             return
-        settlement_price, source_file, source_sha = settlement
+        settlement_price, source_file, source_sha, actual_settlement_date = settlement
         ledger = self.state["strategies"][PUT_CALL_PARITY_TX_STRATEGY_ID]
         metadata = ledger.get("option_position_metadata") or {}
         for code, raw_position in dict(ledger.get("option_positions") or {}).items():
@@ -4230,7 +4277,7 @@ class TaifexVolatilitySimulation:
                 abs(position)
                 * option_cash_settlement_transaction_tax_twd(
                     settlement_price,
-                    settlement_date=expiry,
+                    settlement_date=actual_settlement_date,
                     multiplier_twd_per_point=OPTION_MULTIPLIER,
                 )
                 if price > 0.0
@@ -4259,7 +4306,7 @@ class TaifexVolatilitySimulation:
         future_tax = abs(future_position) * taifex_tax_per_contract_twd(
             settlement_price,
             multiplier_twd_per_point=self.underlying_multiplier,
-            tax_rate=stock_index_futures_tax_rate(expiry),
+            tax_rate=stock_index_futures_tax_rate(actual_settlement_date),
         )
         self._record_ideal_trade(
             strategy_id=PUT_CALL_PARITY_TX_STRATEGY_ID,
@@ -4304,6 +4351,7 @@ class TaifexVolatilitySimulation:
                 "at_utc": _now_iso(),
                 "position_id": open_position.get("position_id"),
                 "expiry_date": expiry.isoformat(),
+                "actual_settlement_date": actual_settlement_date.isoformat(),
                 "official_final_settlement": settlement_price,
                 "source_file": source_file,
                 "source_sha256": source_sha,

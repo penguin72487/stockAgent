@@ -25,6 +25,8 @@ _DAY_FILE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.jsonl$")
 _PROCESS_KEY = re.compile(r"^[a-f0-9]{16}$")
 _PHASES = frozenset({"cache_wait", "build", "write", "other"})
 _HISTOGRAM_BUCKETS = 18
+_MAX_HISTORY_LINE_CHARS = 1_000_000
+_MAX_HISTORY_LINE_UTF8_BYTES = 4 * _MAX_HISTORY_LINE_CHARS
 _COUNT_FIELDS = (
     "requests",
     "response_body_bytes",
@@ -153,6 +155,7 @@ class PublicPerformanceHistoryStore:
         queue_size: int = 2_048,
         allowed_routes: Collection[str] = (),
         allowed_cache_outcomes: Collection[str] = (),
+        background_restore: bool = False,
     ) -> None:
         self.root = Path(root)
         self.retention_days = min(366, max(1, int(retention_days)))
@@ -174,20 +177,47 @@ class PublicPerformanceHistoryStore:
         self._dropped_rows = 0
         self._write_errors = 0
         self._last_error: str | None = None
+        self._restore_in_progress = False
+        self._restore_delta: list[dict[str, Any]] | None = None
+        self._restore_delta_overflow = False
+        self._restore_stop = threading.Event()
+        self._restore_thread: threading.Thread | None = None
         self._writer = threading.Thread(
             target=self._writer_loop,
             name="public-performance-history-writer",
             daemon=True,
         )
+        sources = None
         try:
             self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
             os.chmod(self.root, 0o700)
-            self._load_existing()
-            self._prune_expired_files()
+            if background_restore:
+                # Fence existing byte ranges before any new minute can be
+                # enqueued; later appends are merged from the in-memory delta.
+                sources = self._capture_restore_sources()
+                self._restore_delta = []
+                self._restore_in_progress = True
+            else:
+                self._load_existing()
+                self._prune_expired_files()
             self._enabled = True
         except OSError as error:
             self._last_error = type(error).__name__
         self._writer.start()
+        if sources is not None:
+            self._restore_thread = threading.Thread(
+                target=self._restore_in_background, args=(sources,),
+                name="public-performance-history-restore", daemon=True,
+            )
+            try:
+                self._restore_thread.start()
+            except RuntimeError as error:
+                # Keep the gateway and the independent writer available; the
+                # missing historical restoration remains explicitly degraded.
+                self._last_error = type(error).__name__
+                self._restore_delta = None
+                self._restore_in_progress = False
+                self._restore_thread = None
 
     def _validated_row(self, value: object) -> dict[str, Any] | None:
         if not isinstance(value, Mapping):
@@ -240,12 +270,18 @@ class PublicPerformanceHistoryStore:
             "cache": cache,
         }
 
-    def _index_row(self, row: dict[str, Any], *, now_epoch: int) -> None:
+    def _index_row(
+        self, row: dict[str, Any], *, now_epoch: int,
+        row_buffer: deque[dict[str, Any]] | None = None,
+        hour_buckets: dict[int, dict[str, Any]] | None = None,
+    ) -> None:
+        row_buffer = self._rows if row_buffer is None else row_buffer
+        hour_buckets = self._hour_rows if hour_buckets is None else hour_buckets
         minute = int(row["minute_epoch"])
         if minute >= now_epoch - self._recent_seconds:
-            self._rows.append(row)
+            row_buffer.append(row)
         hour = minute - minute % 3_600
-        rollup = self._hour_rows.get(hour)
+        rollup = hour_buckets.get(hour)
         if rollup is None:
             rollup = {
                 "schema_version": self.schema_version,
@@ -259,7 +295,7 @@ class PublicPerformanceHistoryStore:
                 "routes": deepcopy(row["routes"]),
                 "cache": dict(row["cache"]),
             }
-            self._hour_rows[hour] = rollup
+            hour_buckets[hour] = rollup
             return
         rollup["process_keys"].add(row["process_key"])
         rollup["observed_minute_mask"] |= 1 << ((minute - hour) // 60)
@@ -293,7 +329,7 @@ class PublicPerformanceHistoryStore:
                     continue
                 with path.open("r", encoding="utf-8") as handle:
                     for line in handle:
-                        if len(line) > 1_000_000:
+                        if len(line) > _MAX_HISTORY_LINE_CHARS:
                             self._invalid_rows += 1
                             continue
                         try:
@@ -312,6 +348,101 @@ class PublicPerformanceHistoryStore:
             except OSError as error:
                 self._last_error = type(error).__name__
         self._prune_resident(now_epoch=now_epoch)
+
+    def _capture_restore_sources(self) -> list[tuple[Path, int, int, int, int]]:
+        cutoff = datetime.now(UTC).date() - timedelta(days=self.retention_days - 1)
+        sources = []
+        for path in sorted(self.root.glob("*.jsonl")):
+            match = _DAY_FILE.fullmatch(path.name)
+            if match is None:
+                continue
+            try:
+                if date.fromisoformat(match.group(1)) < cutoff:
+                    continue
+            except ValueError:
+                self._invalid_rows += 1
+                continue
+            info = path.stat()
+            sources.append((path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+        return sources
+
+    def _restore_in_background(self, sources: list[tuple[Path, int, int, int, int]]) -> None:
+        """Restore a fenced prefix while new minute aggregates remain writable."""
+        now_epoch = int(datetime.now(UTC).timestamp())
+        rows: deque[dict[str, Any]] = deque(maxlen=self.maximum_rows)
+        hours: dict[int, dict[str, Any]] = {}
+        loaded = invalid = 0
+        failure: str | None = None
+        try:
+            for path, device, inode, size, modified_ns in sources:
+                if self._restore_stop.is_set():
+                    return
+                try:
+                    with path.open("rb") as handle:
+                        opened = os.fstat(handle.fileno())
+                        if (opened.st_dev, opened.st_ino) != (device, inode) or opened.st_size < size:
+                            raise OSError("performance history source changed")
+                        remaining = size
+                        while remaining:
+                            if self._restore_stop.is_set():
+                                return
+                            line = handle.readline(min(remaining, _MAX_HISTORY_LINE_UTF8_BYTES + 1))
+                            if not line:
+                                raise OSError("performance history source truncated")
+                            remaining -= len(line)
+                            if len(line) > _MAX_HISTORY_LINE_UTF8_BYTES:
+                                invalid += 1
+                                while remaining and not line.endswith(b"\n"):
+                                    line = handle.readline(min(remaining, _MAX_HISTORY_LINE_UTF8_BYTES + 1))
+                                    if not line:
+                                        raise OSError("performance history source truncated")
+                                    remaining -= len(line)
+                                continue
+                            try:
+                                text = line.decode("utf-8")
+                                if len(text) > _MAX_HISTORY_LINE_CHARS:
+                                    invalid += 1
+                                    continue
+                                decoded = json.loads(text)
+                            except (ValueError, UnicodeError):
+                                invalid += 1
+                                continue
+                            row = self._validated_row(decoded)
+                            if row is None:
+                                invalid += 1
+                                continue
+                            self._index_row(row, now_epoch=now_epoch, row_buffer=rows, hour_buckets=hours)
+                            loaded += 1
+                        final = os.fstat(handle.fileno())
+                        current = path.stat()
+                        if ((current.st_dev, current.st_ino) != (device, inode)
+                                or (final.st_dev, final.st_ino) != (device, inode)
+                                or final.st_size < size or current.st_size < size
+                                or (current.st_size == size and current.st_mtime_ns != modified_ns)):
+                            raise OSError("performance history source changed during restore")
+                except (OSError, ValueError, OverflowError) as error:
+                    failure = type(error).__name__
+            with self._lock:
+                if self._restore_stop.is_set():
+                    return
+                if self._restore_delta_overflow:
+                    failure = "RestoreDeltaOverflow"
+                for row in self._restore_delta or ():
+                    self._index_row(row, now_epoch=now_epoch, row_buffer=rows, hour_buckets=hours)
+                self._rows, self._hour_rows = rows, hours
+                self._loaded_rows += loaded
+                self._invalid_rows += invalid
+                if failure:
+                    self._last_error = failure
+                self._restore_delta = None
+                self._restore_in_progress = False
+                self._prune_resident(now_epoch=int(datetime.now(UTC).timestamp()))
+            self._prune_expired_files()
+        except Exception as error:
+            with self._lock:
+                self._last_error = type(error).__name__
+                self._restore_delta = None
+                self._restore_in_progress = False
 
     def _prune_expired_files(self) -> None:
         cutoff = datetime.now(UTC).date() - timedelta(days=self.retention_days - 1)
@@ -335,6 +466,11 @@ class PublicPerformanceHistoryStore:
         with self._lock:
             self._index_row(validated, now_epoch=int(datetime.now(UTC).timestamp()))
             self._prune_resident(now_epoch=int(datetime.now(UTC).timestamp()))
+            if self._restore_delta is not None:
+                if len(self._restore_delta) >= self.maximum_rows:
+                    self._restore_delta_overflow = True
+                else:
+                    self._restore_delta.append(validated)
         if not self._enabled:
             with self._lock:
                 self._dropped_rows += 1
@@ -391,7 +527,7 @@ class PublicPerformanceHistoryStore:
             try:
                 with path.open("r", encoding="utf-8") as handle:
                     for line in handle:
-                        if len(line) > 1_000_000:
+                        if len(line) > _MAX_HISTORY_LINE_CHARS:
                             continue
                         try:
                             row = self._validated_row(json.loads(line))
@@ -488,11 +624,14 @@ class PublicPerformanceHistoryStore:
                 if not self._enabled
                 else "degraded"
                 if self._dropped_rows or self._write_errors or self._last_error
+                else "warming"
+                if self._restore_in_progress
                 else "ready"
             )
             return {
                 "health": health,
                 "enabled": self._enabled,
+                "history_restore_in_progress": self._restore_in_progress,
                 "retention_days": self.retention_days,
                 "resident_rows": len(self._rows),
                 "resident_hour_rollups": len(self._hour_rows),
@@ -509,6 +648,7 @@ class PublicPerformanceHistoryStore:
             }
 
     def close(self) -> None:
+        self._restore_stop.set()
         try:
             self._queue.put(None, timeout=1.0)
         except queue.Full:
@@ -516,3 +656,5 @@ class PublicPerformanceHistoryStore:
                 self._dropped_rows += 1
             return
         self._writer.join(timeout=5.0)
+        if self._restore_thread is not None:
+            self._restore_thread.join(timeout=2.0)

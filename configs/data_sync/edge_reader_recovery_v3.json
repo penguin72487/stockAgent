@@ -1,0 +1,10 @@
+{
+  "contract": "stockagent.edge_reader_recovery_policy.v1",
+  "enabled": true,
+  "source_identity_sha256": "5b785591c4f703d704d3eaa57ed5c41dcc5bf4651b1e66598fdc00bb3cfd39f0",
+  "reader_manifest_sha256": "cd1a491edfe6cedba4b3650401fd6cda0452cb4b08c19c62a6e773b19274e941",
+  "wrapper_sha256": "0b11c8dcb1fcb342699e5498cc3c0da6aac9e56a28fcad0542ac774890d6b89d",
+  "installer_sha256": "f2e0728e066f14ff10e82475b0a6138e3eacaad11dcfe470b4fa0f41f7d77f4c",
+  "baseline_wrapper_sha256": "96c4bc4da1d0c0c5cc6b12cbb941bd7c47ff12ebc190124bf186d47118094227",
+  "dataset": "tw-index-futures"
+}

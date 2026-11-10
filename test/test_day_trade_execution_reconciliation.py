@@ -57,8 +57,8 @@ def _rules(root: Path, venue: str, symbol: str):
 
 def test_historical_exact_rule_rows_are_not_replaced_by_latest(tmp_path):
     spec = _spec(tmp_path)
-    for venue in ("twse", "tpex"):
-        _rules(tmp_path, venue, "2330")
+    for venue, symbol in (("twse", "2330"), ("tpex", "9999")):
+        _rules(tmp_path, venue, symbol)
     kwargs = dict(rule_data_dir=tmp_path, parquet_root=spec.parquet_root,
                   symbols=["2330"], trading_date=date(2026, 8, 13))
     rules, _ = load_live_eligibility(**kwargs, require_latest=False)
@@ -68,13 +68,83 @@ def test_historical_exact_rule_rows_are_not_replaced_by_latest(tmp_path):
     assert not strict["2330"].covered
 
 
+def test_historical_eligibility_uses_official_session_venue_after_transfer(tmp_path):
+    spec = _spec(tmp_path)
+    # Current metadata says TWSE, while the dated TPEx list proves membership.
+    (spec.parquet_root / "symbols.csv").write_text(
+        "code,market,security_type,name\n8908,twse,stock,A\n", encoding="utf-8")
+    _rules(tmp_path, "twse", "2330")
+    _rules(tmp_path, "tpex", "8908")
+    rules, coverage = load_live_eligibility(rule_data_dir=tmp_path,
+        parquet_root=spec.parquet_root, symbols=["8908"],
+        trading_date=date(2026, 8, 13), require_latest=False)
+    assert all(row["covered"] for row in coverage.values())
+    assert rules["8908"].venue == "tpex"
+    assert rules["8908"].security_type == "stock"
+    assert rules["8908"].eligible and rules["8908"].short_open
+    assert rules["8908"].source_date == "2026-08-13"
+
+
+def test_session_venue_conflict_fails_closed_instead_of_using_current_metadata(tmp_path):
+    spec = _spec(tmp_path)
+    _rules(tmp_path, "twse", "2330")
+    _rules(tmp_path, "tpex", "2330")
+    rules, _ = load_live_eligibility(rule_data_dir=tmp_path, parquet_root=spec.parquet_root,
+        symbols=["2330"], trading_date=date(2026, 8, 13), require_latest=False)
+    assert not rules["2330"].covered and not rules["2330"].eligible
+    assert rules["2330"].venue is None
+    assert rules["2330"].reason == "ambiguous_official_session_venue"
+
+
+def test_session_venue_transfer_respects_sell_first_suspension(tmp_path):
+    spec = _spec(tmp_path)
+    _rules(tmp_path, "twse", "9999")
+    pl.DataFrame({"date": ["2026-08-13", "2026-08-13"],
+                  "證券代號": ["2330", "2330"],
+                  "暫停現股賣出後現款買進當沖註記": ["暫停", "暫停"]}).write_parquet(
+                      tmp_path / "tpex_day_trade_eligibility.parquet")
+    rules, coverage = load_live_eligibility(rule_data_dir=tmp_path, parquet_root=spec.parquet_root,
+        symbols=["2330"], trading_date=date(2026, 8, 13), require_latest=False)
+    assert coverage["tpex"]["covered"]
+    assert rules["2330"].venue == "tpex" and rules["2330"].eligible
+    assert not rules["2330"].short_open
+    assert rules["2330"].reason == "sell_first_suspended"
+
+
+def test_conflicting_same_venue_suspension_rows_fail_closed(tmp_path):
+    spec = _spec(tmp_path)
+    pl.DataFrame({"date": ["2026-08-13", "2026-08-13"],
+                  "證券代號": ["2330", "2330"],
+                  "暫停現股賣出後現款買進當沖註記": ["", "暫停"]}).write_parquet(
+                      tmp_path / "twse_day_trade_eligibility.parquet")
+    _rules(tmp_path, "tpex", "9999")
+    rules, coverage = load_live_eligibility(rule_data_dir=tmp_path, parquet_root=spec.parquet_root,
+        symbols=["2330"], trading_date=date(2026, 8, 13), require_latest=False)
+    assert not coverage["twse"]["covered"]
+    assert "conflicting eligibility rows" in coverage["twse"]["error"]
+    assert not rules["2330"].covered and not rules["2330"].eligible
+
+
+def test_missing_other_venue_does_not_turn_unknown_membership_into_a_rejection(tmp_path):
+    spec = _spec(tmp_path)
+    (spec.parquet_root / "symbols.csv").write_text(
+        "code,market,security_type,name\n2330,twse,stock,A\n8908,twse,stock,B\n", encoding="utf-8")
+    _rules(tmp_path, "twse", "2330")
+    rules, coverage = load_live_eligibility(rule_data_dir=tmp_path, parquet_root=spec.parquet_root,
+        symbols=["2330", "8908"], trading_date=date(2026, 8, 13), require_latest=False)
+    assert not coverage["tpex"]["covered"]
+    assert rules["2330"].covered and rules["2330"].eligible
+    assert not rules["8908"].covered and not rules["8908"].eligible
+    assert rules["8908"].reason == "exact_session_eligibility_missing"
+
+
 def test_rule_cache_invalidates_on_atomic_source_repair(tmp_path, monkeypatch):
     spec = _spec(tmp_path)
     monkeypatch.setenv("STOCKAGENT_TW_DAY_TRADE_RULE_DATA_DIR", str(tmp_path))
     panel = _panel()
     panel.day_trade_eligible_mask = None
-    for venue in ("twse", "tpex"):
-        _rules(tmp_path, venue, "2330")
+    for venue, symbol in (("twse", "2330"), ("tpex", "9999")):
+        _rules(tmp_path, venue, symbol)
     kwargs = dict(session_date="2026-08-13", parquet_root=spec.parquet_root)
     first, _, _ = _day_trade_model_eligibility(panel, **kwargs)
     assert first.tolist() == [True, False]
@@ -113,6 +183,66 @@ def test_ruined_account_never_resets_to_initial_capital(tmp_path):
         quotes={"2330": _quote()}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7))
     assert result == "blocked"
     assert engine.state["modes"][spec.market]["blocked_reason"] == "nonpositive_account_nav"
+
+
+def test_research_account_ruin_is_absorbing_across_restart_and_later_positive_balance(tmp_path):
+    spec = replace(_spec(tmp_path), research_short_limit_up_close_penalty_rate=0.07,
+                   strict_intraday=True, terminal_liquidation_unlimited_capacity=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine._mode(spec)["cumulative_realized_net_pnl_twd"] = -10_000_000
+    assert engine.register_signal(spec=spec, summary=_summary(), signal_rows=[_row()],
+        quotes={"2330": _quote()}, eligibility=_eligibility(), eligibility_coverage={},
+        now=_now(9, 1, 7)) == "blocked"
+    mode = engine.state["modes"][spec.market]
+    assert mode["research_absorbing_ruin"]["economic_nav_twd"] == 0.0
+    # A later correction or credit may change the displayed ledger balance;
+    # it must not silently reactivate the dead research account.
+    mode["cumulative_realized_net_pnl_twd"] = -9_000_000
+    engine._persist(_now(9, 1, 8))
+    restarted = TwDayTradeSimulationEngine(engine.state_dir)
+    result = restarted.register_signal(spec=spec, summary=_summary() | {"signal_id": "later-revision"},
+        signal_rows=[_row()], quotes={"2330": _quote()}, eligibility=_eligibility(),
+        eligibility_coverage={}, now=_now(9, 2))
+    restored = restarted.state["modes"][spec.market]
+    assert result == "blocked"
+    assert restored["blocked_reason"] == "research_absorbing_account_ruin"
+    assert restored["research_absorbing_ruin"]["economic_nav_twd"] == 0.0
+    assert not restored["positions"]
+    changed_config = replace(spec, research_short_limit_up_close_penalty_rate=0.0)
+    assert restarted.register_signal(spec=changed_config, summary=_summary() | {"signal_id": "changed-config"},
+        signal_rows=[_row()], quotes={"2330": _quote()}, eligibility=_eligibility(),
+        eligibility_coverage={}, now=_now(9, 3)) == "blocked"
+    assert restarted.state["modes"][spec.market]["blocked_reason"] == "research_absorbing_account_ruin"
+
+
+def test_research_nonpositive_balance_with_open_inventory_does_not_claim_flat_ruin(tmp_path):
+    spec = replace(_spec(tmp_path), research_short_limit_up_close_penalty_rate=0.07,
+                   strict_intraday=True, terminal_liquidation_unlimited_capacity=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    mode = engine._mode(spec)
+    mode["cumulative_realized_net_pnl_twd"] = -10_000_000
+    mode["positions"] = {"existing": {"position_id": "existing", "symbol": "2330",
+                                      "session_date": "2026-08-13", "side": "long", "signed_shares": 1000}}
+    result = engine.register_signal(spec=spec, summary=_summary(), signal_rows=[_row()],
+        quotes={"2330": _quote()}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1, 7))
+    assert result == "waiting_prior_liquidation"
+    assert mode["pending_signal_id"] == _summary()["signal_id"]
+    assert mode.get("research_absorbing_ruin") is None
+    assert mode["positions"]["existing"]["signed_shares"] == 1000
+
+
+def test_research_ruin_latches_when_a_flat_close_is_marked_before_any_later_signal(tmp_path):
+    spec = replace(_spec(tmp_path), research_short_limit_up_close_penalty_rate=0.07,
+                   strict_intraday=True, terminal_liquidation_unlimited_capacity=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    mode = engine._mode(spec)
+    mode["cumulative_realized_net_pnl_twd"] = -10_000_500
+    engine._mark_mode(spec.market, _now(13, 30), {}, append_history=False)
+    engine._persist(_now(13, 30))
+    restored = TwDayTradeSimulationEngine(engine.state_dir).state["modes"][spec.market]
+    assert restored["research_absorbing_ruin"]["economic_nav_twd"] == -500.0
+    assert restored["total_equity_twd"] == -500.0  # no invented zero-value writeoff
+    assert restored["engine_status"] == "blocked_research_account_ruined"
 
 
 @pytest.mark.parametrize("volume, filled", [(5.0, 2000), (None, 0), (0.0, 0)])

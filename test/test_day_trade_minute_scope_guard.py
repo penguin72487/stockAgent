@@ -111,7 +111,10 @@ def test_expected_scope_is_optional_for_existing_callers() -> None:
 def test_wrong_scope_never_reaches_live_publication(tmp_path: Path, monkeypatch) -> None:
     live = tmp_path / "live"
     live.mkdir()
-    for name, content in (("marks.jsonl", ""), ("fills.jsonl", ""),
+    marks = "".join(json.dumps({"session_date": "2026-09-29", "market": "active",
+                                "minute": f"2026-09-29T{clock}+08:00"}) + "\n"
+                    for clock in ("09:01", "13:30"))
+    for name, content in (("marks.jsonl", marks), ("fills.jsonl", ""),
                           ("orders.jsonl", ""), ("benchmark_history.json", '{"marks":[]}')):
         (live / name).write_text(content)
     originals = {path.name: path.read_bytes() for path in live.iterdir()}
@@ -124,6 +127,7 @@ def test_wrong_scope_never_reaches_live_publication(tmp_path: Path, monkeypatch)
     class Store:
         kbar_roots = ()
         tick_minute_roots = ()
+        finmind_source_records = {}
 
         def __init__(self, *args, **kwargs):
             pass
@@ -168,7 +172,8 @@ def test_maintenance_forwards_scope_and_records_post_validation_failure(
     monkeypatch.setattr(maintenance, "_completed_scope", lambda _: ([day], {"active"}))
     monkeypatch.setattr(maintenance, "_missing_endpoints_with_cache", lambda *a, **k: ([], {}))
     monkeypatch.setattr(maintenance, "_tx_benchmark_source_state", lambda *a: {"ready": True})
-    monkeypatch.setattr(maintenance, "_stock_calendar_source_state", lambda *a: {"ready": True})
+    monkeypatch.setattr(maintenance, "_stock_calendar_source_state", lambda *a: {"ready": True, "sha256": "fixture"})
+    monkeypatch.setattr(maintenance, "_official_session_scope_state", lambda *a: {"ready": True, "sha256": "fixture"})
     monkeypatch.setattr(maintenance, "historical_query_is_protected", lambda _: False)
     calls = {"strategy": 0, "price": 0, "benchmark": 0}
     marker = ValueError("current attempt evidence rejected")

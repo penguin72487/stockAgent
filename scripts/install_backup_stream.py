@@ -226,6 +226,21 @@ def resume(evidence: Path, config: dict, role: Path) -> dict:
 
 
 
+def record_placement_wait(evidence: Path, error: BlockingIOError, *, now=None) -> dict:
+    """Preserve an independent GC wait instead of reissuing cutover priority."""
+    from downloader.artifact_io import atomic_write_json
+    result = {'state': 'waiting_for_original_owner_or_reader', 'retryable': True}
+    purpose = getattr(error, 'purpose', None)
+    if isinstance(purpose, str) and purpose in {'namespace_handoff', 'old_D_transport_retirement'}:
+        result['purpose'] = purpose
+    atomic_write_json(evidence / 'attempt.json', {
+        **result, 'observed_at_epoch': time.time() if now is None else now,
+        'reason_code': 'original_owner',
+        'private_wait_error': {'type': type(error).__name__, 'errno': error.errno,
+                               'message': str(error)[:4096]}})
+    return result
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=ROOT / "configs/data_sync/backup_stream.json")
@@ -241,15 +256,7 @@ def main() -> None:
         try:
             result=advance(args.evidence)
         except BlockingIOError as error:
-            result={'state':'waiting_for_original_owner_or_reader','retryable':True}
-            from downloader.artifact_io import atomic_write_json
-            atomic_write_json(args.evidence/'attempt.json', {
-                **result, 'observed_at_epoch': time.time(), 'reason_code': 'original_owner',
-                # Private evidence distinguishes a busy lock, namespace and
-                # process-reference wait. The public projection whitelists
-                # reason_code and never returns these error details.
-                'private_wait_error': {'type': type(error).__name__, 'errno': error.errno,
-                                       'message': str(error)[:4096]}})
+            result = record_placement_wait(args.evidence, error)
         except Exception as error:
             from downloader.artifact_io import atomic_write_json
             atomic_write_json(args.evidence/'attempt.json', {

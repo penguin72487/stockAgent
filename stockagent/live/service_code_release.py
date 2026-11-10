@@ -25,6 +25,7 @@ from stockagent.runtime_identity import identity_sha256, stable_source_sha256, v
 
 CODE_DIRS = ("stockagent", "downloader", "scripts")
 ENTRYPOINT = "services/discord_bot/bot.py"
+FORMAL_HISTORY_ENTRYPOINT = "train.py"
 SERVICE_DIR = "services/discord_bot"
 LIVE_INPUTS = ((".env", "file", True), ("markets", "directory", False),
                ("models", "directory", False), ("staged_accounts", "directory", False))
@@ -126,7 +127,8 @@ def _seal_release_directory(path: Path) -> None:
 
 def source_members(root: Path) -> list[str]:
     result = subprocess.run(["git", "ls-files", "--cached", "--others", "--exclude-standard", "-z",
-                             "--", *CODE_DIRS, f"{SERVICE_DIR}/*.py"], cwd=root, check=True, capture_output=True)
+                             "--", *CODE_DIRS, f"{SERVICE_DIR}/*.py", FORMAL_HISTORY_ENTRYPOINT],
+                            cwd=root, check=True, capture_output=True)
     names = sorted(set(result.stdout.decode().split("\0")) - {""})
     # Never copy ignored credentials, caches, downloads, checkpoints or artifacts.
     for name in names:
@@ -136,7 +138,8 @@ def source_members(root: Path) -> list[str]:
         info = (root / name).lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_size > 2 * 1024**2:
             raise ValueError(f"non-regular/oversized source member: {name}")
-    if ENTRYPOINT not in names or not all(any(n.startswith(d + "/") for n in names) for d in CODE_DIRS):
+    if (ENTRYPOINT not in names or FORMAL_HISTORY_ENTRYPOINT not in names
+            or not all(any(n.startswith(d + "/") for n in names) for d in CODE_DIRS)):
         raise ValueError("complete canonical source roots required")
     return names
 
@@ -547,6 +550,16 @@ def run_in_namespace(receipt: Path, root: Path, arguments: list[str], *, timeout
         command += ["--property=" + ("BindReadOnlyPaths=" if readonly else "BindPaths=") + pairs]
     result = subprocess.run([*command, sys.executable, *arguments], cwd=root,
                             capture_output=True, text=True, timeout=timeout + 5)
+    # The probe's own mounts are read-only, but a privileged process in a
+    # different namespace can still alter the on-disk release. A successful
+    # child therefore proves nothing about the same bytes unless the complete
+    # release is independently revalidated after the child exits as well.
+    try:
+        source_after = verify_frozen_source(receipt, root)
+    except (OSError, ValueError, RuntimeError) as exc:
+        raise RuntimeError("frozen source changed during namespace probe") from exc
+    if source_after != proof:
+        raise RuntimeError("frozen source identity changed during namespace probe")
     if inputs is not None and verify_probe_inputs(Path(inputs["receipt"]), root) != inputs:
         raise RuntimeError("verification inputs changed during namespace probe")
     return result
@@ -558,17 +571,15 @@ def namespace_identity(receipt: Path, root: Path, *, role: str = "discord") -> d
     probe = """import json,errno,os
 from pathlib import Path
 from stockagent.live.completed_inference_cache import implementation_identity,file_identity
-from stockagent.runtime_identity import verify_source_release
 from stockagent.live.service_code_release import verify_mounted_source
 root=Path.cwd()
 receipt=Path(os.environ['STOCKAGENT_SERVICE_CODE_RELEASE'])
-verify_source_release(receipt,root)
 verify_mounted_source(receipt,root,os.getpid())
 code=implementation_identity()
 files=json.loads(receipt.read_bytes())['code']['files']
 for item in code:
     name=str(Path(item['path']).relative_to(root))
-    if name not in files:
+    if name not in files or name=='train.py':
         raise RuntimeError('inference dependency is not pinned: '+name)
 try:
     (root/'stockagent/live/completed_inference_cache.py').open('ab').close()
@@ -613,7 +624,14 @@ def verify_mounted_source(receipt: Path, root: Path, python_pid: int) -> dict:
     proof = verify_frozen_source(receipt, root)
     value = json.loads(receipt.read_bytes())
     process = Path(f"/proc/{python_pid}")
+    mounted_count = 0
     for name, digest in value["code"]["files"].items():
+        if name == FORMAL_HISTORY_ENTRYPOINT:
+            # It is sealed and checksum-verified by verify_frozen_source, but
+            # deliberately not file-bound at its mutable workspace pathname.
+            # Formal inference executes its verified bytes through the pinned
+            # launcher; the Gateway must never claim this is a native mount.
+            continue
         # Keep /proc/pid/root magic resolution. Path.resolve() here would jump
         # back to the observer's mount namespace and silently read the workspace.
         native = process / "root" / str(root / name).lstrip("/")
@@ -622,6 +640,7 @@ def verify_mounted_source(receipt: Path, root: Path, python_pid: int) -> dict:
         if ((a.st_dev, a.st_ino) != (b.st_dev, b.st_ino)
                 or hashlib.sha256(native.read_bytes()).hexdigest() != digest):
             raise ValueError(f"native owner is not bound to the frozen source: {name}")
+        mounted_count += 1
     mounts = (process / "mountinfo").read_text().splitlines()
     for _source, target, readonly in mount_bindings(receipt, root):
         if not any(row.split()[4] == str(target) and ("ro" if readonly else "rw") in row.split()[5].split(",") for row in mounts):
@@ -633,7 +652,10 @@ def verify_mounted_source(receipt: Path, root: Path, python_pid: int) -> dict:
         if (a.st_dev, a.st_ino) != (b.st_dev, b.st_ino):
             raise ValueError(f"native live input differs from the service manager's original view: {name}")
     return {**proof, "native_python_pid": python_pid, "readonly_mounts_verified": True,
-            "native_file_count": len(value["code"]["files"]), "workspace_changes_not_auto_promoted": True}
+            "native_file_count": mounted_count,
+            "sealed_unmounted_entrypoints": ([FORMAL_HISTORY_ENTRYPOINT]
+                                             if FORMAL_HISTORY_ENTRYPOINT in value["code"]["files"] else []),
+            "workspace_changes_not_auto_promoted": True}
 
 
 def verify_owner_namespace(receipt: Path, root: Path, python_pid: int, *, role: str = "discord") -> dict:

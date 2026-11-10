@@ -37,6 +37,43 @@ def mounts(raw):
     return result
 
 
+def exited_only(process):
+    """Recognize only a stable zombie with no live tasks or mount namespaces.
+
+    A zombie retains a /proc entry until its parent reaps it, but it no longer
+    owns files or a mount namespace. A zombie group leader may still have live
+    threads, so check every task twice and fail closed on unreadable/racing
+    identities. A live process with inaccessible namespace stays blocking.
+    """
+    def identity(path):
+        tail = (path / 'stat').read_text().rsplit(') ', 1)[1].split()
+        if len(tail) <= 19 or tail[0] != 'Z':
+            raise ValueError('task is not a zombie')
+        return int(tail[19])  # /proc/<pid>/stat field 22: starttime
+
+    def tasks():
+        entries = sorted((process / 'task').iterdir())
+        if not entries or len(entries) > 4096 or any(not p.name.isdecimal() for p in entries):
+            raise ValueError('incomplete task census')
+        result = {}
+        for entry in entries:
+            result[entry.name] = identity(entry)
+            try:
+                os.readlink(entry / 'ns/mnt')
+            except FileNotFoundError:
+                pass
+            else:
+                raise ValueError('task still exposes a mount namespace')
+        return result
+
+    try:
+        first = identity(process)
+        observed = tasks()
+        return identity(process) == first and tasks() == observed
+    except (OSError, ValueError, IndexError):
+        return False
+
+
 def namespaces(proc=Path('/proc')):
     """Inspect each live namespace once; an unreadable live process defers work."""
     result = {}
@@ -48,7 +85,7 @@ def namespaces(proc=Path('/proc')):
             if identity not in result:
                 result[identity] = (process, mounts((process / 'mountinfo').read_text()))
         except FileNotFoundError:
-            if process.exists():
+            if process.exists() and not exited_only(process) and process.exists():
                 raise BlockingIOError('live mount namespace inspection incomplete')
         except (OSError, ValueError, IndexError) as error:
             if process.exists():

@@ -1,7 +1,6 @@
 from scripts.verify_public_price_projection import snapshot_contract_digest, verify_transaction_report, verify_official_reference_fields, verify_strategy_report, verify_entry_distances
 from pathlib import Path
 import hashlib
-import re
 import pytest
 
 
@@ -27,11 +26,10 @@ def test_deployment_and_source_identity_changes_are_not_ignored():
 def test_public_price_frontend_advances_both_immutable_asset_versions():
     root = Path(__file__).resolve().parents[1]
     html = (root / "services/tw_day_trade_dashboard/index.html").read_text()
-    # The renderer retains its monotonic release floor. The app has migrated
-    # from numeric releases to exact content identities: stale hashes must
-    # fail too, not merely pass because a version-shaped token is present.
-    match = re.search(r'src="detail-components\.js\?v=(\d+)"', html)
-    assert match is not None and int(match[1]) >= 19
+    # Both immutable assets use exact content identities; a version-shaped
+    # but stale token must fail independently for each file.
+    renderer = hashlib.sha256((root / "services/tw_day_trade_dashboard/detail-components.js").read_bytes()).hexdigest()[:12]
+    assert f'src="detail-components.js?v={renderer}"' in html
     expected = hashlib.sha256((root / "services/tw_day_trade_dashboard/app.js").read_bytes()).hexdigest()[:12]
     assert f'src="app.js?v={expected}"' in html
 

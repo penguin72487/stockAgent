@@ -77,6 +77,16 @@ class HttpStatusError(RuntimeError):
         self.url = url
 
 
+def _lock_still_owns_output(lock_handle, output_dir: Path) -> bool:
+    """Reject an old inode opened before the source alias changed."""
+    try:
+        held = os.fstat(lock_handle.fileno())
+        current = (output_dir / ".download.lock").stat()
+        return (held.st_dev, held.st_ino) == (current.st_dev, current.st_ino)
+    except OSError:
+        return False
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -1081,6 +1091,17 @@ def main() -> int:
         if args.output_dir.is_absolute()
         else repo_root / args.output_dir
     )
+    # Once this source is enrolled for E, never silently write into its
+    # C-side mount placeholder after an interrupted handoff or boot.
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from stockagent.data_sync.workspace_source_handoff import guard_path
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    try:
+        guard_path(output_dir)
+    except SnapshotError as error:
+        print(f"[crypto-etf] storage handoff unavailable; retry later: {error}", flush=True)
+        return 75
     env_file = (
         args.env_file if args.env_file.is_absolute() else repo_root / args.env_file
     )
@@ -1115,6 +1136,16 @@ def main() -> int:
             flush=True,
         )
         return 0
+    # The pathname can change between the initial check, open and flock. A
+    # paused old process must not acquire the retained C lock and write to E.
+    try:
+        guard_path(output_dir)
+    except SnapshotError as error:
+        print(f"[crypto-etf] storage handoff unavailable; retry later: {error}", flush=True)
+        return 75
+    if not _lock_still_owns_output(lock_handle, output_dir):
+        print("[crypto-etf] source lock path changed; retry on its current owner", flush=True)
+        return 75
     client = HttpClient(max_retries=args.max_retries, retry_base=args.retry_base)
     results: list[SourceResult] = []
     sec_entities: list[dict[str, Any]] = []

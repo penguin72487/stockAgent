@@ -8,7 +8,7 @@ from __future__ import annotations
 from collections import OrderedDict
 from collections.abc import Mapping
 from contextlib import contextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 import hashlib
 import math
 from pathlib import Path
@@ -78,6 +78,23 @@ def _closing_clock(value: Any) -> bool:
     return parsed.hour == 13 and parsed.minute == 30
 
 
+def _daily_receipt_may_exist(session: str, *, observed: datetime | None = None) -> bool:
+    """Mirror the existing receipt predicate before touching a daily file.
+
+    A publishable observation needs a receipt at or after this session's
+    13:30 close and no later than now. Before that instant, no row can pass
+    the predicate in ``_load_sessions``. This is not an inference about
+    trading, nor a replacement for any intraday quote or executable price.
+    """
+    day = _day(session)
+    if day is None:
+        return False
+    now = observed or datetime.now(TAIPEI)
+    if now.tzinfo is None:
+        raise ValueError("daily quote observation time must be timezone-aware")
+    return datetime.combine(date.fromisoformat(day), time(13, 30), tzinfo=TAIPEI) <= now
+
+
 def _projected_daily_quote_rows(
     path: Path, *, columns: list[str], sessions: set[str],
     symbol_column: str, symbols: set[str] | None,
@@ -143,6 +160,10 @@ class OfficialDailyQuoteSource:
         from polars.exceptions import PolarsError
 
         result: dict[str, dict[str, dict[str, Any]]] = {day: {} for day in sessions}
+        now = datetime.now(TAIPEI)
+        sessions = {day for day in sessions if _daily_receipt_may_exist(day, observed=now)}
+        if not sessions:
+            return result
         ambiguous: set[tuple[str, str]] = set()
         for dataset, venue, symbol_column, source, domains, columns in _SPECS:
             path = self.public_root / f"{dataset}.parquet"
@@ -248,7 +269,9 @@ class OfficialDailyQuoteSource:
             raise OSError("official daily source changed during public projection")
 
     def session(self, session: str) -> dict[str, dict[str, Any]]:
-        if _day(session) is None:
+        if not _daily_receipt_may_exist(session):
+            # Do not cache the temporary pre-close absence: the same source
+            # generation may become admissible at 13:30.
             return {}
         with self._lock:
             signature = self.signature()

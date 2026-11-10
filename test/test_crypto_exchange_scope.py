@@ -12,6 +12,30 @@ from stockagent.config import load_config
 from stockagent.data.crypto_exchange_scope import validate_crypto_exchange_scope
 
 
+@pytest.mark.parametrize('kind', ['repaired', 'midnight'])
+def test_registered_bybit_view_resolves_service_cache_only_after_alias_match(tmp_path, monkeypatch, kind):
+    from stockagent.data import crypto_exchange_scope as scope
+
+    (tmp_path / 'artifacts').mkdir()
+    service_cache = tmp_path / 'service_data/cache'
+    service_cache.mkdir(parents=True)
+    (tmp_path / 'artifacts/cache').symlink_to(service_cache, target_is_directory=True)
+    relative = scope.BYBIT_REPAIR_VIEW if kind == 'repaired' else scope.BYBIT_MIDNIGHT_VIEW
+    resolved_view = (tmp_path / relative).resolve()
+    calls = []
+    monkeypatch.setattr(scope, 'validate_bybit_repair_view' if kind == 'repaired' else 'validate_bybit_midnight_view',
+                        lambda path, *, venue_root: calls.append((path, venue_root)))
+    data = {'crypto_exchange_scope': 'bybit', 'parquet_root': relative,
+            'use_external_features': False, 'use_tw_public_features': False,
+            'use_tw_public_rules': False, 'feature_include': ['close_logret_1d'],
+            'feature_availability_indicators': []}
+    validate_crypto_exchange_scope(data, repo_root=tmp_path, check_schema=True)
+    assert calls == [(resolved_view, (tmp_path / 'data_bybit').resolve())]
+    data['parquet_root'] = str(resolved_view)
+    with pytest.raises(ValueError, match='parquet_root'):
+        validate_crypto_exchange_scope(data, repo_root=tmp_path)
+
+
 @pytest.mark.parametrize("name,venue", [
     ("bybit_perpetual_daily_0005_historical_pit_v1.yaml", "bybit"),
     (

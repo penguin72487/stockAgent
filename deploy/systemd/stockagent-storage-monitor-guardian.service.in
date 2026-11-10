@@ -1,0 +1,9 @@
+[Unit]
+Description=Ensure the storage monitor resumes after WSL startup
+After=stockagent-service-layout.service
+Requires=stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+# Starting an already-running unit is a no-op: do not reset its sample clock.
+ExecStart=/usr/bin/systemctl start --no-block stockagent-storage-monitor.service

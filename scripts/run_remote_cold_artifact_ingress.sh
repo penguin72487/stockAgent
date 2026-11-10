@@ -23,6 +23,9 @@ extra_args=()
 if [[ -n "${COLD_ARTIFACT_RETURN_POLICY:-}" ]]; then
   extra_args+=(--policy "$COLD_ARTIFACT_RETURN_POLICY")
 fi
+if [[ -n "${COLD_ARTIFACT_INGRESS_PRESTAGE_ROOT:-}" ]]; then
+  extra_args+=(--prestage-root "$COLD_ARTIFACT_INGRESS_PRESTAGE_ROOT")
+fi
 
 exec "$python_bin" scripts/ingest_remote_cold_artifacts.py \
   --scope "${COLD_ARTIFACT_INGRESS_SCOPE:-ablations}" \

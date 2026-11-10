@@ -2,6 +2,8 @@
 Description=Refresh and cross-check the current official Taiwan stock/ETF universe
 After=network-online.target
 Wants=network-online.target
+Requires=stockagent-rate-limit-directory@@SERVICE_UID@.service
+After=stockagent-rate-limit-directory@@SERVICE_UID@.service
 StartLimitIntervalSec=10min
 StartLimitBurst=3
 

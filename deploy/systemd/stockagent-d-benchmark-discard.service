@@ -1,0 +1,14 @@
+[Unit]
+Description=Retire explicitly reviewed old D workflow benchmark copies
+After=local-fs.target stockagent-service-layout.service
+Requires=stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecCondition=/usr/bin/bash /root/stockAgent/scripts/run_outside_tw_opening_resource_window.sh --minimum-runway-minutes 180 --protected-until 13:30
+ExecStart=/usr/bin/bash /root/stockAgent/scripts/run_authority_storage_operation.sh scripts/discard_local_testing_artifacts.py --policy /root/stockAgent/configs/data_sync/d_workflow_trial_directories_disposition_20261106.json --state /var/lib/stockagent/d-workflow-benchmark-cleanup-cohorts-20261106 --apply
+Nice=15
+IOSchedulingClass=idle
+TimeoutStartSec=3h
+

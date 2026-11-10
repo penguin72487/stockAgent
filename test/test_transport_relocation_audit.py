@@ -9,6 +9,7 @@ import pytest
 from stockagent.data_sync import transport_relocation_audit as audit
 from stockagent.data_sync import transport_relocation_delta as delta
 from stockagent.data_sync import transport_relocation_retirement as retirement
+from stockagent.data_sync import stream_repack
 from stockagent.data_sync import workspace_relocation as relocation
 
 
@@ -95,6 +96,43 @@ def test_difference_archive_preserves_originals_with_independent_readback(tmp_pa
         delta.preserve_differences(evidence, source, out, admit=admissions.append)
 
 
+def test_verified_delta_and_restore_receipts_survive_only_guarded_device_renumbering(tmp_path, monkeypatch):
+    source, target, evidence = fixture_copy(tmp_path)
+    (target/'changed').write_bytes(b'new version')
+    audit.compare_fixed_copy(evidence, target, workers=1)
+    monkeypatch.setattr(delta, '_validate_native_source', lambda *_args: None)
+    out = tmp_path/'delta'
+    receipt = delta.preserve_differences(evidence, source, out, admit=lambda _bytes: None)
+    restored = retirement.rehearse_delta_restore(evidence, tmp_path/'restore', admit=lambda _bytes: None)
+    previous_device = receipt['archive_signature'][0] + 1
+    for name in ('delta-receipt.json', 'delta-restore-receipt.json'):
+        path = evidence/name
+        value = json.loads(path.read_text())
+        value['archive_signature'][0] = previous_device
+        path.write_text(json.dumps(value))
+    monkeypatch.setattr(stream_repack, '_trusted_device_renumbering', lambda _path, _device: True)
+    def no_write(_bytes):
+        pytest.fail('reusing a fixed receipt must not require a new archive or restore')
+    reused = delta.preserve_differences(evidence, source, out, admit=no_write)
+    same_restore = retirement.rehearse_delta_restore(evidence, tmp_path/'restore', admit=no_write)
+    assert reused['archive_sha256'] == receipt['archive_sha256']
+    assert same_restore['archive_sha256'] == restored['archive_sha256']
+    changed = json.loads((evidence/'delta-receipt.json').read_text())
+    changed['archive_signature'][1] += 1
+    (evidence/'delta-receipt.json').write_text(json.dumps(changed))
+    with pytest.raises(ValueError, match='changed'):
+        delta.preserve_differences(evidence, source, out, admit=no_write)
+
+
+def test_device_renumbering_requires_the_enrolled_E_volume(tmp_path, monkeypatch):
+    path = tmp_path/'archive'
+    path.write_bytes(b'fixed')
+    expected = relocation.signature(path)
+    expected[0] += 1
+    monkeypatch.setattr(stream_repack, '_trusted_device_renumbering', lambda *_args: False)
+    assert not delta.same_E_generation(path, expected)
+
+
 def test_difference_archive_fails_closed_if_original_generation_changed(tmp_path, monkeypatch):
     source, target, evidence = fixture_copy(tmp_path)
     (target / 'changed').write_bytes(b'new version')
@@ -172,6 +210,83 @@ def test_retirement_holds_archived_only_members_until_same_name_is_verified(tmp_
     assert source.is_dir() and not list(source.iterdir())
     assert (target / 'changed').read_bytes() == b'old version'
     assert result['cold_objects_deleted'] == result['nas_objects_deleted'] == 0
+
+
+def test_user_enrolled_archived_controls_retire_without_rehashing_archive(tmp_path, monkeypatch):
+    source, target, evidence = setup_retirement(tmp_path, monkeypatch)
+    first = retirement.retire_fixed_copy(evidence, source, target, workers=2)
+    assert first['state'] == 'waiting_held_members' and first['files_held'] == 2
+    (target/'missing').write_bytes(b'new live control')
+    comparison = json.loads((evidence/'comparison-status.json').read_bytes())
+    archive = json.loads((evidence/'delta-receipt.json').read_bytes())
+    policy_path = tmp_path/'policy.json'
+    policy_path.write_text(json.dumps({'contract': retirement.ARCHIVED_FALLBACK_CONTRACT,
+        'comparison_identity_sha256': comparison['identity_sha256'],
+        'archive_sha256': archive['archive_sha256'], 'members': ['changed', 'missing']}))
+    policy = retirement.load_archived_controls_policy(policy_path, comparison, evidence)
+    monkeypatch.setattr(retirement, 'digest', lambda *_: pytest.fail('archive payload was reread'))
+    result = retirement.retire_fixed_copy(evidence, source, target, workers=2, archived_fallback=policy)
+    assert result['state'] == 'registered_files_retired' and result['files_completed'] == 3
+    assert result['archived_controls_retired'] == 2
+    assert result['archived_controls_full_payload_reread'] is False
+    assert not any(path.is_file() for path in source.iterdir())
+    assert (target/'changed').read_bytes() == b'new version'
+    assert (target/'missing').read_bytes() == b'new live control'
+    assert Path(archive['archive']).exists()
+
+
+def test_archived_control_fallback_keeps_missing_live_name_and_rejects_wrong_identity(tmp_path, monkeypatch):
+    source, target, evidence = setup_retirement(tmp_path, monkeypatch)
+    comparison = json.loads((evidence/'comparison-status.json').read_bytes())
+    archive = json.loads((evidence/'delta-receipt.json').read_bytes())
+    policy_path = tmp_path/'policy.json'
+    policy = {'contract': retirement.ARCHIVED_FALLBACK_CONTRACT,
+        'comparison_identity_sha256': comparison['identity_sha256'],
+        'archive_sha256': archive['archive_sha256'], 'members': ['changed', 'missing']}
+    policy_path.write_text(json.dumps({**policy, 'archive_sha256': '0'*64}))
+    with pytest.raises(ValueError, match='policy differs'):
+        retirement.load_archived_controls_policy(policy_path, comparison, evidence)
+    policy_path.write_text(json.dumps(policy))
+    enrolled = retirement.load_archived_controls_policy(policy_path, comparison, evidence)
+    result = retirement.retire_fixed_copy(evidence, source, target, workers=2, archived_fallback=enrolled)
+    assert result['state'] == 'waiting_held_members' and result['files_held'] == 1
+    assert (source/'missing').read_bytes() == b'preserve this'
+    assert not (source/'changed').exists()
+
+
+def test_archived_control_fallback_detects_changed_archive_and_reappearing_names(tmp_path, monkeypatch):
+    source, target, evidence = setup_retirement(tmp_path, monkeypatch)
+    first = retirement.retire_fixed_copy(evidence, source, target, workers=2)
+    assert first['files_held'] == 2
+    (target/'missing').write_bytes(b'new live control')
+    comparison = json.loads((evidence/'comparison-status.json').read_bytes())
+    archive = json.loads((evidence/'delta-receipt.json').read_bytes())
+    policy = {'contract': retirement.ARCHIVED_FALLBACK_CONTRACT,
+        'comparison_identity_sha256': comparison['identity_sha256'],
+        'archive_sha256': archive['archive_sha256'], 'members': ['changed', 'missing']}
+    with open(archive['archive'], 'r+b') as stream:
+        stream.seek(4096)
+        stream.write(b'X')
+    with pytest.raises(ValueError, match='archive'):
+        retirement.retire_fixed_copy(evidence, source, target, workers=2, archived_fallback=policy)
+    assert (source/'changed').exists() and (source/'missing').exists()
+
+
+def test_archived_control_fallback_does_not_claim_absence_for_recreated_names(tmp_path, monkeypatch):
+    source, target, evidence = setup_retirement(tmp_path, monkeypatch)
+    first = retirement.retire_fixed_copy(evidence, source, target, workers=2)
+    assert first['files_held'] == 2
+    (source/'same').write_bytes(b'recreated')
+    (target/'missing').write_bytes(b'new live control')
+    comparison = json.loads((evidence/'comparison-status.json').read_bytes())
+    archive = json.loads((evidence/'delta-receipt.json').read_bytes())
+    policy = {'contract': retirement.ARCHIVED_FALLBACK_CONTRACT,
+        'comparison_identity_sha256': comparison['identity_sha256'],
+        'archive_sha256': archive['archive_sha256'], 'members': ['changed', 'missing']}
+    result = retirement.retire_fixed_copy(evidence, source, target, workers=2, batch_size=1,
+                                          archived_fallback=policy)
+    assert result['state'] == 'waiting_unexpected_members'
+    assert (source/'same').read_bytes() == b'recreated'
 
 
 def test_retirement_holds_newly_changed_E_and_can_resume(tmp_path, monkeypatch):
@@ -317,6 +432,123 @@ def test_held_retry_does_not_rescan_retired_D_or_renew_the_progress_clock(tmp_pa
     assert wait['deletion_attempted'] is False and wait['recovery_acceptance_renewed'] is False
     assert (source / 'changed').read_bytes() == b'old version'
     assert (source / 'missing').read_bytes() == b'preserve this'
+
+
+def test_no_action_hold_observation_avoids_owner_but_never_approves_deletion(tmp_path, monkeypatch):
+    source, target, evidence = setup_retirement(tmp_path, monkeypatch)
+    first = retirement.retire_fixed_copy(evidence, source, target, workers=2)
+    assert first['files_held'] == 2
+    monkeypatch.setattr(retirement, '_delta_manifest', lambda *a: pytest.fail('must not reopen archive'))
+    monkeypatch.setattr(retirement, '_check_references', lambda *a: pytest.fail('must not rescan D'))
+    observed = retirement.observe_unchanged_held_copy(evidence, source, target, workers=2)
+    assert observed == first
+    wait = json.loads((evidence / 'retirement-wait-status.json').read_text())
+    assert wait['deletion_attempted'] is False and wait['recovery_acceptance_renewed'] is False
+    assert (source / 'changed').exists() and (source / 'missing').exists()
+    assert not (evidence / 'retirement-receipt.json').exists()
+    import shutil
+    shutil.copy2(source / 'missing', target / 'missing')
+    assert retirement.observe_unchanged_held_copy(evidence, source, target, workers=2) is None
+    # Newly usable E data requires the caller to acquire every original lock
+    # and run the complete destructive-path checks; observation does not act.
+    assert (source / 'missing').exists()
+
+
+def test_exact_archived_partials_restore_to_e_then_use_original_retirement(tmp_path, monkeypatch):
+    import contextlib
+    import fcntl
+    import hashlib
+    from stockagent.data_sync import transport_restore_held_partials as staged
+
+    source, target, evidence = tmp_path / 'D', tmp_path / 'E', tmp_path / 'evidence'
+    wave = 'd' * 64
+    payload = source / '.staging' / ('lake-raw-' + wave) / 'payload'
+    payload.mkdir(parents=True)
+    first = b'data'; second = b'\0' * 4
+    (payload / ('blobs-' + hashlib.sha256(first).hexdigest() + '.partial')).write_bytes(first)
+    # An empty interrupted fragment can have a different full-object SHA.
+    (payload / ('blobs-' + hashlib.sha256(second).hexdigest() + '.partial')).write_bytes(b'')
+    relocation.copy(source, target, evidence, workers=1)
+    for path in (target / '.staging' / ('lake-raw-' + wave) / 'payload').iterdir():
+        path.unlink()
+    (target / '.stignore').write_text('(?d).staging\n(?d).staging/**\n')
+    comparison = audit.compare_fixed_copy(evidence, target, workers=1)
+    monkeypatch.setattr(delta, '_validate_native_source', lambda root, intent: None)
+    archived = delta.preserve_differences(evidence, source, tmp_path / 'delta', admit=lambda size: None)
+    retirement.rehearse_delta_restore(evidence, tmp_path / 'restore', admit=lambda size: None)
+    monkeypatch.setattr(retirement, '_check_unreachable_namespaces', lambda: {'count': 0, 'reachable': 0})
+    monkeypatch.setattr(retirement, '_check_references', lambda *args: None)
+    held = retirement.retire_fixed_copy(evidence, source, target, workers=1)
+    assert held['files_held'] == 2
+    for name, value in [('COMPARISON', comparison['identity_sha256']), ('ARCHIVE_SHA', archived['archive_sha256']),
+                        ('WAVE', wave), ('FILES', 2), ('BYTES', 4), ('CHUNK_BYTES', 4)]:
+        monkeypatch.setattr(staged, name, value)
+    assert not staged.needs_restore(evidence, target, comparison)
+    body = {'contract': staged.CONTRACT, 'comparison_identity_sha256': staged.COMPARISON,
+            'archive_sha256': staged.ARCHIVE_SHA, 'wave_intent_sha256': staged.WAVE,
+            'files': 2, 'logical_bytes': 4, 'restore_to_sender_staging': True,
+            'retirement_authorized_by_restore': False}
+    body['identity_sha256'] = hashlib.sha256(json.dumps(body, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+    (evidence / 'partial-name-restore-enrollment.json').write_text(json.dumps(body))
+    state, archive_state = tmp_path / 'backup-state', tmp_path / 'lake-state'
+    state.mkdir(); archive_state.mkdir()
+    (archive_state / 'source-wave-current.json').write_text(json.dumps({'state': 'enrolled', 'intent_sha256': 'c' * 64}))
+    config = {'state_root': str(state), 'immutable_archive_state_root': str(archive_state)}
+    paths = (state / 'cycle.lock', state / 'owner.lock', archive_state / 'source-replication-owner.lock')
+    assert staged.needs_restore(evidence, target, comparison)
+    with pytest.raises(ValueError, match='lock set'):
+        staged.restore(evidence, target, config, (), admit=lambda size: None)
+    with contextlib.ExitStack() as stack:
+        locks = [stack.enter_context(p.open('a+')) for p in paths]
+        for lock in locks:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        current = archive_state / 'source-wave-current.json'
+        current.write_text(json.dumps({'state': 'copying', 'intent_sha256': wave}))
+        with pytest.raises(BlockingIOError, match='current or unknown'):
+            staged.restore(evidence, target, config, locks, admit=lambda size: None)
+        current.write_text(json.dumps({'state': 'enrolled', 'intent_sha256': 'c' * 64}))
+        conflict = target / '.staging' / ('lake-raw-' + wave) / 'payload' / next(payload.iterdir()).name
+        conflict.write_bytes(b'newer, do not overwrite')
+        with pytest.raises(ValueError, match='never overwrite'):
+            staged.restore(evidence, target, config, locks, admit=lambda size: None)
+        assert conflict.read_bytes() == b'newer, do not overwrite'
+        # If archive order placed the other file first, that valid file was
+        # installed before the conflict was encountered. Reset the synthetic
+        # E tree so the following test interrupts the second installation.
+        for path in conflict.parent.iterdir():
+            path.unlink()
+        original = staged._link_anonymous
+        calls = []
+        def interrupt_once(fd, directory, name):
+            calls.append(name)
+            if len(calls) == 2:
+                raise RuntimeError('simulated interruption')
+            original(fd, directory, name)
+        monkeypatch.setattr(staged, '_link_anonymous', interrupt_once)
+        with pytest.raises(RuntimeError, match='simulated interruption'):
+            staged.restore(evidence, target, config, locks, admit=lambda size: None)
+        assert staged.needs_restore(evidence, target, comparison)
+        monkeypatch.setattr(staged, '_link_anonymous', original)
+        result = staged.restore(evidence, target, config, locks, admit=lambda size: None)
+        assert result['state'] == 'restored' and result['files_completed'] == 2
+        assert result['source_files_deleted'] == 0 and not result['retirement_authorized']
+        assert not staged.needs_restore(evidence, target, comparison)
+        status_path = evidence/'partial-name-restore-status.json'
+        status = json.loads(status_path.read_text())
+        original_status = json.dumps(status)
+        for member in status['members']:
+            member['signature'][0] += 1
+        status_path.write_text(json.dumps(status))
+        monkeypatch.setattr(stream_repack, '_trusted_device_renumbering', lambda *_args: True)
+        assert not staged.needs_restore(evidence, target, comparison)
+        status['members'][0]['signature'][1] += 1
+        status_path.write_text(json.dumps(status))
+        assert staged.needs_restore(evidence, target, comparison)
+        status_path.write_text(original_status)
+        assert all(path.exists() for path in payload.iterdir())
+        # Only the established retirement owner deletes after every original gate.
+        result = retirement.retire_fixed_copy(evidence, source, target, workers=1)
+        assert result['state'] == 'registered_files_retired' and result['files_completed'] == 2
 
 
 def test_changed_held_target_reenters_all_retirement_gates(tmp_path, monkeypatch):

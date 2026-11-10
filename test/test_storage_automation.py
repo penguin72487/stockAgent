@@ -42,6 +42,62 @@ def test_data_layout_routes_to_readonly_release_owner_with_argv_and_exit_code(
         b'layout', b'--layout-output', str(output).encode(), b'--sync-root', cold.encode(), b'']
 
 
+def test_edge_wrapper_uses_only_verified_reader_release_and_keeps_original_argv(tmp_path):
+    import hashlib
+    repo, scripts = tmp_path/'repo', tmp_path/'repo/scripts'
+    scripts.mkdir(parents=True)
+    (repo/'configs').mkdir()
+    wrapper = scripts/'run_data_cache.sh'
+    wrapper.write_bytes((Path(__file__).resolve().parents[1]/'scripts/run_data_cache.sh').read_bytes())
+    (scripts/'runtime_env.sh').write_text(
+        'run_fintech_python() { printf "%s\\0" "$@" > "$TEST_ARGS"; printf "%s" "$PYTHONPATH" > "$TEST_PATH"; }\n')
+    edge_state, control = tmp_path/'edge-state', tmp_path/'reader-control'
+    edge_state.touch()
+    release = tmp_path/'release'
+    (release/'scripts').mkdir(parents=True)
+    (release/'vendor').mkdir()
+    (release/'configs').symlink_to(repo/'configs')
+    reader = release/'scripts/manage_packed_edge.py'
+    reader.write_text('fixture reader\n')
+    release.chmod(0o700)
+    manifest = release/'reader-manifest.sha256'
+    manifest.write_text(f'{hashlib.sha256(reader.read_bytes()).hexdigest()}  scripts/manage_packed_edge.py\n')
+    control.write_text(f'{release} {hashlib.sha256(manifest.read_bytes()).hexdigest()} {repo}\n')
+    control.chmod(0o600)
+    args_file, path_file = tmp_path/'args', tmp_path/'pythonpath'
+    env = {**os.environ, 'STOCKAGENT_PACKED_EDGE_STATE': str(edge_state),
+           'STOCKAGENT_PACKED_EDGE_READER_CONTROL': str(control), 'TEST_ARGS': str(args_file),
+           'TEST_PATH': str(path_file)}
+    result = subprocess.run(['bash', str(wrapper), 'use', 'fixture', '--snapshot-id', 'fixed'],
+                            env=env, capture_output=True, timeout=10)
+    assert result.returncode == 0, result.stderr
+    assert args_file.read_bytes().split(b'\0') == [str(reader).encode(), b'use', b'fixture',
+                                                   b'--snapshot-id', b'fixed', b'']
+    assert path_file.read_text().split(':')[0] == str(release/'vendor')
+    args_file.unlink()
+    reader.write_text('changed after installation\n')
+    result = subprocess.run(['bash', str(wrapper), 'use', 'fixture'], env=env, capture_output=True, timeout=10)
+    assert result.returncode != 0 and b'failed identity verification' in result.stderr
+    assert not args_file.exists()
+
+
+def test_edge_wrapper_rejects_unsafe_control_instead_of_falling_back(tmp_path):
+    repo, scripts = tmp_path/'repo', tmp_path/'repo/scripts'
+    scripts.mkdir(parents=True)
+    wrapper = scripts/'run_data_cache.sh'
+    wrapper.write_bytes((Path(__file__).resolve().parents[1]/'scripts/run_data_cache.sh').read_bytes())
+    (scripts/'runtime_env.sh').write_text('run_fintech_python() { exit 97; }\n')
+    state, target, control = tmp_path/'state', tmp_path/'target', tmp_path/'control'
+    state.touch()
+    target.write_text('invalid\n')
+    control.symlink_to(target)
+    env = {**os.environ, 'STOCKAGENT_PACKED_EDGE_STATE': str(state),
+           'STOCKAGENT_PACKED_EDGE_READER_CONTROL': str(control)}
+    result = subprocess.run(['bash', str(wrapper), 'use', 'fixture'], env=env, capture_output=True, timeout=10)
+    assert result.returncode != 0 and result.returncode != 97
+    assert b'packed edge reader control is unsafe' in result.stderr
+
+
 @pytest.fixture
 def lake_readiness(tmp_path):
     base, receipts = tmp_path / 'state', tmp_path / 'receipts'

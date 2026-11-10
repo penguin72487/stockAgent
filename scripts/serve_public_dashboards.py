@@ -122,6 +122,7 @@ from stockagent.live.tw_day_trade_dashboard import (  # noqa: E402
     warm_dashboard_session_indexes,
 )
 from stockagent.live.tw_day_trade_service_sync import (  # noqa: E402
+    PaperReadChanged,
     SERVICE_SYNC_DURABLE_ACK_FILENAME,
     age_seconds,
     committed_paper_read_guard,
@@ -130,6 +131,9 @@ from stockagent.live.tw_day_trade_service_sync import (  # noqa: E402
 )
 from stockagent.live.tw_day_trade_published_signals import (  # noqa: E402
     build_published_signal_snapshot,
+)
+from stockagent.live.tw_day_trade_research_candidates import (  # noqa: E402
+    build_research_candidates, build_research_minute_replay,
 )
 from stockagent.live.tw_day_trade_live_snapshot import build_live_paper_snapshot  # noqa: E402
 from stockagent.live.tw_day_trade_live_events import build_live_paper_events  # noqa: E402
@@ -212,6 +216,8 @@ _PUBLIC_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/summary",
         "/tw-day-trade/api/signals",
         "/tw-day-trade/api/published-signals",
+        "/tw-day-trade/api/research-candidates",
+        "/tw-day-trade/api/research-minute",
         "/tw-day-trade/api/live-snapshot",
         "/tw-day-trade/api/live-events",
         "/tw-day-trade/api/events",
@@ -270,6 +276,7 @@ _QUERY_API_ROUTES: Final[frozenset[str]] = frozenset(
         "/tw-day-trade/api/summary",
         "/tw-day-trade/api/positions",
         "/tw-day-trade/api/signals",
+        "/tw-day-trade/api/research-minute",
         "/tw-day-trade/api/events",
         "/openbb/api/history",
         "/data-monitor/api/provider",
@@ -517,7 +524,8 @@ class TrafficSecondBucket:
 class PublicTrafficObserver:
     """Bounded, anonymous request telemetry for the public reader dashboard."""
 
-    def __init__(self, *, history_root: Path | None = None) -> None:
+    def __init__(self, *, history_root: Path | None = None,
+                 background_history_restore: bool = False) -> None:
         self._lock = threading.Lock()
         self._started_monotonic = time.monotonic()
         self._started_at_utc = datetime.now(UTC)
@@ -541,6 +549,7 @@ class PublicTrafficObserver:
                     "其他／未命中",
                 },
                 allowed_cache_outcomes=_CACHE_OUTCOMES,
+                background_restore=background_history_restore,
             )
             if history_root is not None
             else None
@@ -961,11 +970,31 @@ class PublicTrafficObserver:
         expected_minutes = max(1, range_seconds // 60)
         current_minute = now_epoch - now_epoch % 60
         since_epoch = current_minute - (expected_minutes - 1) * 60
+        restore_was_in_progress = bool(
+            self._history_store is not None
+            and self._history_store.status().get("history_restore_in_progress")
+        )
         rows = (
             self._history_store.rows_since_readonly(since_epoch)
             if self._history_store is not None
             else []
         )
+        history_storage = (
+            self._history_store.status()
+            if self._history_store is not None
+            else {"enabled": False, "retention_days": 0}
+        )
+        if restore_was_in_progress and not history_storage.get("history_restore_in_progress"):
+            # The rows can precede the atomic index swap even if status is
+            # sampled just after it. Never label that partial snapshot ready.
+            history_storage = {
+                **history_storage,
+                "history_restore_in_progress": True,
+                "health": (
+                    "warming" if history_storage.get("health") == "ready"
+                    else history_storage.get("health")
+                ),
+            }
         with self._lock:
             if self._current_minute.epoch_second >= since_epoch:
                 rows.append(self._minute_payload_locked(self._current_minute))
@@ -1088,11 +1117,7 @@ class PublicTrafficObserver:
                 total_requests=aggregate.requests,
             ),
             "trend": trend,
-            "history_storage": (
-                self._history_store.status()
-                if self._history_store is not None
-                else {"enabled": False, "retention_days": 0}
-            ),
+            "history_storage": history_storage,
             "definitions": {
                 "source": "公開 gateway 的實際完成請求與每分鐘存活心跳；不含虛構或補零樣本。",
                 "latency": "從 Python gateway 開始處理至 body 寫入完成；Caddy、WAN 與瀏覽器繪製另由瀏覽器測速觀察。",
@@ -1718,7 +1743,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         self.tw_upstream = str(tw_upstream).rstrip("/")
         self._owns_traffic_observer = traffic_observer is None
         self.traffic_observer = traffic_observer or PublicTrafficObserver(
-            history_root=traffic_history_root
+            history_root=traffic_history_root, background_history_restore=True,
         )
         self.request_metrics = threading.local()
         self._cache: dict[str, CacheEntry] = {}
@@ -2137,6 +2162,28 @@ class PublicDashboardServer(ThreadingHTTPServer):
             refresh_in_background=refresh_in_background,
         )
 
+    @staticmethod
+    def _wait_for_paper_commit(root: Path, *, budget_seconds: float = 0.75) -> bool:
+        """Wait only for a bounded commit fence, without acquiring a writer lock.
+
+        Two immediate retries can both land between projection replacement and
+        its final marker. Poll compact metadata instead of repeating the costly
+        projection in that same window. A corrupt or perpetually moving commit
+        still fails closed after the budget; this never validates payload data.
+        """
+        deadline = time.monotonic() + budget_seconds
+        while time.monotonic() < deadline:
+            try:
+                with committed_paper_read_guard(root):
+                    pass
+                return True
+            except PaperReadChanged:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(0.02, remaining))
+        return False
+
     def cached_paper_json(
         self, topic: str, *, source_token: str, builder: Callable[..., Mapping[str, Any]],
         history_only: bool = False, **cache_options,
@@ -2166,10 +2213,12 @@ class PublicDashboardServer(ThreadingHTTPServer):
             try:
                 return self.cached_local_json(builder=checked,
                     **(cache_options | {"cache_key": prefix + observed_token}))
-            except OSError:
+            except OSError as exc:
                 if attempt:
                     raise
                 self._cache_observation("paper_view_commit_retry")
+                if isinstance(exc, (PaperReadChanged, DashboardSnapshotChanged)):
+                    self._wait_for_paper_commit(self.repo_root / "artifacts/live" / directory)
         raise AssertionError("bounded paper view retry exhausted")
 
     def cached_json(
@@ -2381,6 +2430,33 @@ class PublicDashboardServer(ThreadingHTTPServer):
         generation = revision.get("engine_generation")
         return prefix if generation is None else f"{prefix}owner:{generation}:"
 
+    @staticmethod
+    def _only_newer_engine_commit(before: Mapping[str, Any], after: Mapping[str, Any]) -> bool:
+        """Prove independent date/history/quote identities did not change."""
+        generation = before.get("engine_generation")
+        if not isinstance(generation, str) or not generation or generation != after.get("engine_generation"):
+            return False
+        for key in ("history_revision", "public_quote_revision"):
+            if not isinstance(before.get(key), str) or not before[key] or before[key] != after.get(key):
+                return False
+        if (not isinstance(before.get("enabled_markets"), list)
+                or before["enabled_markets"] != after.get("enabled_markets")
+                or not isinstance(before.get("session_clock"), dict)
+                or before["session_clock"] != after.get("session_clock")):
+            return False
+        old_content, new_content = before.get("content_revision"), after.get("content_revision")
+        old_state, new_state = before.get("state_revision"), after.get("state_revision")
+        if (any(type(value) is not int for value in (old_content, new_content, old_state, new_state))
+                or new_content <= old_content or new_state <= old_state):
+            return False
+        old_token, new_token = before.get("engine_revision_token"), after.get("engine_revision_token")
+        if not isinstance(old_token, str) or not isinstance(new_token, str):
+            return False
+        old_head, old_sep, old_tail = old_token.partition(":")
+        new_head, new_sep, new_tail = new_token.partition(":")
+        return bool(old_sep and new_sep and old_head == str(old_content) and new_head == str(new_content)
+                    and old_tail == new_tail)
+
     def _committed_status_response(
         self, *, revision_reader: Callable[[], PreparedResponse],
         cache_key: Callable[[Mapping[str, Any]], str],
@@ -2404,6 +2480,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
 
             def build_verified() -> Mapping[str, Any]:
                 payload = dict(builder())
+                captured = payload.pop("_verified_captured_commit", False) is True
                 sync = dict(payload.get("service_sync") or {})
                 expected_engine = revision.get("engine_revision_token")
                 if expected_engine is not None and sync.get("revision_token") != expected_engine:
@@ -2412,11 +2489,15 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     if field in revision and sync.get(field) != revision[field]:
                         raise DashboardSnapshotChanged("dashboard commit identity changed before publication")
                 after = _response_json(revision_reader())
-                if after.get("revision_token") != revision.get("revision_token"):
+                superseded = (captured and after.get("revision_token") != revision.get("revision_token")
+                              and self._only_newer_engine_commit(revision, after))
+                if after.get("revision_token") != revision.get("revision_token") and not superseded:
                     raise DashboardSnapshotChanged("dashboard source revision changed during status build")
                 for field in ("engine_generation", "content_revision"):
-                    if field in revision and after.get(field) != revision[field]:
+                    if field in revision and after.get(field) != revision[field] and not (superseded and field == "content_revision"):
                         raise DashboardSnapshotChanged("dashboard owner changed during status build")
+                if superseded:
+                    sync["snapshot_as_of_superseded"] = True
                 sync["revision_token"] = revision.get("revision_token")
                 sync["history_revision"] = revision.get("history_revision")
                 payload["service_sync"] = sync
@@ -2466,8 +2547,7 @@ class PublicDashboardServer(ThreadingHTTPServer):
         cache_key = f"{cache_prefix}{revision_token}:registry:{registry_token}"
 
         def build_status() -> Mapping[str, Any]:
-            payload = sanitize_tw_status(
-                build_dashboard_snapshot(
+            raw = build_dashboard_snapshot(
                     state_dir=self.repo_root
                     / "artifacts/live/tw_day_trade_simulation",
                     preopen_readiness_path=self.repo_root
@@ -2481,8 +2561,14 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     # benchmark history already enumerate the public selector.
                     include_ledger_session_dates=False,
                     require_committed_revision=True,
-                ), quote_source=self.public_quote_source, private_prices=self.is_owner,
+                    captured_commit_as_of=True,
+                )
+            payload = sanitize_tw_status(
+                raw, quote_source=self.public_quote_source, private_prices=self.is_owner,
             )
+            if raw.get("_captured_commit_as_of") is True:
+                # Internal proof is consumed before JSON serialization.
+                payload["_verified_captured_commit"] = True
             return payload
 
         def build_response() -> PreparedResponse:
@@ -2953,6 +3039,18 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 snapshot["service_layout_generation"] = read_storage_snapshot(self.repo_root / "service_data/layout_generation.json")
             except (OSError, ValueError):
                 pass
+            for key, name in (("d_backup_inventory", "d_backup_inventory.json"),
+                              ("d_pack_layout", "d_pack_layout.json"),
+                              ("d_backup_inventory_progress", "d_backup_inventory_progress.json")):
+                try:
+                    snapshot[key] = read_storage_snapshot(service_path("data_monitor/" + name, root=self.repo_root))
+                except (OSError, ValueError):
+                    pass
+            try:
+                snapshot["d_pack_trial"] = read_storage_snapshot(Path(
+                    "/srv/stockagent-workspace/verify/format-trial-tw-options-20261105T1049.json"))
+            except (OSError, ValueError):
+                pass
             return storage_public_status(snapshot)
         return self.cached_local_json(cache_key="data-monitor-storage", ttl_seconds=8.,
             cache_control="no-store", stale_grace_seconds=0., builder=build)
@@ -3370,6 +3468,23 @@ class PublicDashboardServer(ThreadingHTTPServer):
                     "public-dashboard critical_tw_history_prewarm_failed "
                     f"error={type(error).__name__}\n"
                 )
+            # Match the browser's EXACT first detail query. Warming all rows
+            # used another cache key (zero targets are hidden on the page), so
+            # a large progressive session was decoded again by its first user.
+            # Never warm an unbounded date range when status was unavailable.
+            try:
+                build_dashboard_signal_page(
+                    state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
+                    start_date=current_tw_session_date,
+                    end_date=current_tw_session_date,
+                    mode="all", status="all", hide_zero_targets=True, revision_scope="latest",
+                    offset=0, limit=100,
+                )
+            except Exception as error:
+                sys.stderr.write(
+                    "public-dashboard critical_tw_signals_prewarm_failed "
+                    f"error={type(error).__name__}\n"
+                )
         # Build the largest detail payload next.  An immediate request joins
         # this cache key's single flight, while the remaining detail views wait
         # instead of competing for CPU and disk bandwidth.
@@ -3395,22 +3510,10 @@ class PublicDashboardServer(ThreadingHTTPServer):
                 "public-dashboard full_history_prewarm_failed "
                 f"error={type(error).__name__}\n"
             )
-        # The overview already indexes the TW ledger dates. Prebuilding raw
-        # position and event pages here used to decode and retain every ledger
-        # row without storing a public response, inflating a fresh gateway to
-        # multiple GiB. The default signal page now retains only its bounded
-        # 100-row result, so it is safe and useful to warm the laptop's first
-        # visible detail table after the compact date index exists.
+        # Optional cross-dashboard views follow the requested TW first page.
+        # Do not prebuild unbounded position/event/signal histories here.
         builders: tuple[Callable[[], object], ...] = (
             lambda: self.openbb_history("1d"),
-            lambda: build_dashboard_signal_page(
-                state_dir=self.repo_root / "artifacts/live/tw_day_trade_simulation",
-                start_date=current_tw_session_date,
-                end_date=current_tw_session_date,
-                mode="all",
-                status="all",
-                limit=100,
-            ),
         )
         with ThreadPoolExecutor(
             max_workers=len(builders),
@@ -3715,6 +3818,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                     "chart-renderer.js",
                     "published-signals.js",
                     "live-snapshot.js",
+                    "research-candidates.js",
                 }
             ):
                 routes[path] = (
@@ -3762,6 +3866,19 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             raise
         except (ValueError, OverflowError) as error:
             raise InvalidPublicRequest("invalid date query") from error
+
+    @staticmethod
+    def _research_minute_query(raw_query: str) -> tuple[str, str]:
+        try:
+            query = parse_qs(raw_query, keep_blank_values=True, max_num_fields=2)
+            if set(query) != {"market", "date"} or any(len(values) != 1 for values in query.values()):
+                raise ValueError("invalid fields")
+            market, day = query["market"][0], query["date"][0]
+            if not re.fullmatch(r"[A-Za-z0-9_-]{1,80}", market) or date.fromisoformat(day).isoformat() != day:
+                raise ValueError("invalid parameters")
+            return market, day
+        except (ValueError, OverflowError) as error:
+            raise InvalidPublicRequest("invalid research minute query") from error
 
     @staticmethod
     def _tej_feature_query(raw_query: str) -> dict[str, Any]:
@@ -3890,7 +4007,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 raw_query,
                 keep_blank_values=True,
                 strict_parsing=False,
-                max_num_fields=8 + int(allow_hide_zero_targets),
+                max_num_fields=8 + 2 * int(allow_hide_zero_targets),
             )
             allowed = {
                 "date",
@@ -3904,6 +4021,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
             }
             if allow_hide_zero_targets:
                 allowed.add("hide_zero_targets")
+                allowed.add("revision_scope")
             if set(query) - allowed or any(
                 len(values) != 1 for values in query.values()
             ):
@@ -3948,6 +4066,11 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 if hide_zero_targets not in {"0", "1"}:
                     raise InvalidPublicRequest("hide_zero_targets must be 0 or 1")
                 normalized["hide_zero_targets"] = hide_zero_targets
+            if "revision_scope" in query:
+                revision_scope = query["revision_scope"][0]
+                if revision_scope not in {"all", "latest"}:
+                    raise InvalidPublicRequest("revision_scope must be all or latest")
+                normalized["revision_scope"] = revision_scope
             return urlencode(normalized)
         except InvalidPublicRequest:
             raise
@@ -4198,6 +4321,23 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                 stale_grace_seconds=0.0,
                 builder=lambda: build_published_signal_snapshot(repo_root=self.server.repo_root),
             )
+        if path == "/tw-day-trade/api/research-candidates":
+            if raw_query:
+                raise InvalidPublicRequest("research candidates do not accept query fields")
+            return self.server.cached_local_json(
+                cache_key="tw-research-candidates", ttl_seconds=60.0,
+                cache_control="no-store", stale_grace_seconds=0.0,
+                builder=lambda: build_research_candidates(repo_root=self.server.repo_root),
+            )
+        if path == "/tw-day-trade/api/research-minute":
+            market, day = self._research_minute_query(raw_query)
+            return self.server.cached_local_json(
+                cache_key=f"tw-research-minute:{market}:{day}", ttl_seconds=0.0,
+                cache_control="no-store", stale_grace_seconds=0.0, refresh_in_background=False,
+                builder=lambda: build_research_minute_replay(
+                    repo_root=self.server.repo_root, market=market, session_date=day,
+                ),
+            )
         if path == "/tw-day-trade/api/live-snapshot":
             if raw_query:
                 raise InvalidPublicRequest("live snapshot does not accept query fields")
@@ -4240,6 +4380,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
                         hide_zero_targets=query.get("hide_zero_targets", ["0"])[0] == "1",
+                        revision_scope=query.get("revision_scope", ["all"])[0],
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
                     ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,
@@ -4351,6 +4492,7 @@ class PublicDashboardHandler(BaseHTTPRequestHandler):
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
                         hide_zero_targets=query.get("hide_zero_targets", ["0"])[0] == "1",
+                        revision_scope=query.get("revision_scope", ["all"])[0],
                         offset=int(query.get("offset", ["0"])[0]),
                         limit=int(query.get("limit", [str(PUBLIC_SIGNAL_LIMIT)])[0]),
                     ), quote_source=self.server.public_quote_source, private_prices=self.server.is_owner,

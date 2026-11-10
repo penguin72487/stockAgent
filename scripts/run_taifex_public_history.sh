@@ -5,9 +5,21 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
 source "$repo_root/scripts/runtime_env.sh"
 
-state_dir="$repo_root/data_taifex_public_history/state"
+source_root="$repo_root/data_taifex_public_history"
+# Acquire the same shared root lock as direct collectors BEFORE opening the
+# native state lock. If a handoff changes the path while we are waiting,
+# verify the held inode and the mounted workspace before any source write.
+run_fintech_python -c 'import sys; from pathlib import Path; from stockagent.data_sync.workspace_source_handoff import guard_path; guard_path(Path(sys.argv[1]))' "$source_root"
+mkdir -p "$source_root"
+exec 8>>"$source_root/.download.lock"
+if ! flock -s -n 8; then
+  echo "[taifex-public-history] workspace handoff is active; retry later"
+  exit 75
+fi
+run_fintech_python -c 'import os,sys; from pathlib import Path; from stockagent.data_sync.workspace_source_handoff import guard_locked_path; handle=os.fdopen(os.dup(8),"wb"); guard_locked_path(Path(sys.argv[1]),handle); handle.close()' "$source_root"
+state_dir="$source_root/state"
 mkdir -p "$state_dir"
-exec 9>"$state_dir/collector.lock"
+exec 9>>"$state_dir/collector.lock"
 if ! flock -n 9; then
   echo "[taifex-public-history] another collector owns the lock; leaving it running"
   exit 0

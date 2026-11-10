@@ -7,6 +7,7 @@ import json
 import re
 import os
 from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -57,6 +58,30 @@ from stockagent.live.tw_day_trade_monitor_projection import validated_shioaji_mo
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+@pytest.mark.parametrize("progressive", [True, False])
+def test_close_ledger_uses_one_consistent_clock_without_changing_economics(progressive):
+    from stockagent.live.tw_day_trade_simulation import SIGNAL_UPDATE_PROGRESSIVE
+
+    engine = object.__new__(TwDayTradeSimulationEngine)
+    position = {"position_id": "p", "market": "mode", "symbol": "2241", "side": "long",
+                "signed_shares": 1000, "entry_price": 35.0, "remaining_entry_fee_twd": 9.975,
+                "sell_fee_rate": 0.002925, "commission_rebate_rate": 0.00114}
+    mode = {"session_date": "2026-11-05"}
+    if progressive:
+        mode["day_trade_signal_update_policy"] = SIGNAL_UPDATE_PROGRESSIVE
+    orders, fills = [], []
+    at = datetime.fromisoformat("2026-11-05T13:00:54.513326+08:00")
+    engine._book_position_close(position, mode, price=34.9,
+        quote={"quote_at": "2026-11-05T13:00:54.302491+08:00"}, now=at,
+        reason="stop_loss", order_type="MKT", quantity=1000, ledger_rows=(orders, fills))
+    expected = at.isoformat(timespec="microseconds" if progressive else "seconds")
+    assert position["last_exit_at"] == position["exit_at"] == expected
+    assert orders[0]["recorded_at"] == fills[0]["recorded_at"] == fills[0]["fill_at"] == expected
+    assert fills[0]["net_pnl_twd"] == pytest.approx(-172.2715)
+    assert mode["cumulative_realized_net_pnl_twd"] == pytest.approx(-172.2715)
+    assert ("execution_clock_contract" in fills[0]) is progressive
 
 
 def _now(hour: int, minute: int, second: int = 0) -> datetime:
@@ -570,6 +595,135 @@ def test_dashboard_strict_commit_read_fences_mutation_but_not_liveness(
     else:
         with pytest.raises(DashboardSnapshotChanged, match="commit"):
             build_dashboard_snapshot(**kwargs)
+
+
+def test_captured_compact_snapshot_is_as_of_one_durable_commit(tmp_path, verified_dashboard_calendar, monkeypatch):
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    previous = engine.state["state_revision"]
+    original = dashboard_module._available_session_dates
+
+    def newer_state_only(*args, **kwargs):
+        result = original(*args, **kwargs)
+        engine.update_readiness([spec], now=_now(8, 59, 1))
+        return result
+
+    monkeypatch.setattr(dashboard_module, "_available_session_dates", newer_state_only)
+    payload = build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(8, 59, 1),
+        include_ledger_session_dates=False, require_committed_revision=True, captured_commit_as_of=True)
+    assert payload["_captured_commit_as_of"] is True
+    assert payload["service_sync"]["state_revision"] == previous
+    assert engine.state["state_revision"] > previous
+
+
+def test_captured_compact_snapshot_matches_strict_projection_without_concurrent_writes(tmp_path, verified_dashboard_calendar):
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    kwargs = dict(state_dir=engine.state_dir, now=_now(8, 59),
+                  include_ledger_session_dates=False, require_committed_revision=True)
+    strict = build_dashboard_snapshot(**kwargs)
+    captured = build_dashboard_snapshot(**kwargs, captured_commit_as_of=True)
+    assert captured.pop("_captured_commit_as_of") is True
+    assert captured == strict
+
+
+def test_captured_compact_snapshot_retry_is_bounded_and_never_bypasses_validation(tmp_path, monkeypatch):
+    from stockagent.live.tw_day_trade_dashboard import DashboardSnapshotChanged
+    calls = []
+    expected = ({"identity": 1}, {"state": 1}, {"status": 1})
+
+    def transient(root):
+        calls.append(root)
+        if len(calls) < 4:
+            raise DashboardSnapshotChanged("transient commit")
+        return expected
+
+    monkeypatch.setattr(dashboard_module.time, "sleep", lambda _seconds: None)
+    monkeypatch.setattr(dashboard_module, "_capture_committed_snapshot_inputs_once", transient)
+    assert dashboard_module._capture_committed_snapshot_inputs(tmp_path) == expected
+    assert len(calls) == 4
+    calls.clear()
+    def corrupt(root):
+        calls.append(root)
+        raise DashboardSnapshotChanged("permanent corruption")
+    monkeypatch.setattr(dashboard_module, "_capture_committed_snapshot_inputs_once", corrupt)
+    with pytest.raises(DashboardSnapshotChanged, match="permanent corruption"):
+        dashboard_module._capture_committed_snapshot_inputs(tmp_path)
+    assert len(calls) == 16
+
+
+def test_captured_compact_snapshot_unsupported_layout_uses_existing_strict_reader(
+    tmp_path, verified_dashboard_calendar, monkeypatch,
+):
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    def unsupported(_root):
+        raise dashboard_module._CapturedSnapshotUnsupported("mode object layout")
+    monkeypatch.setattr(dashboard_module, "_capture_committed_snapshot_inputs", unsupported)
+    payload = build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(8, 59),
+        include_ledger_session_dates=False, require_committed_revision=True, captured_commit_as_of=True)
+    assert "_captured_commit_as_of" not in payload
+    assert payload["service_sync"]["state_revision"] == engine.state["state_revision"]
+
+
+@pytest.mark.parametrize("change", ["journal", "journal_rewrite", "journal_replace", "journal_commit", "owner", "preopen"])
+def test_captured_compact_snapshot_rejects_unrelated_source_or_owner_change(
+    tmp_path, verified_dashboard_calendar, monkeypatch, change,
+):
+    from stockagent.live.tw_day_trade_dashboard import DashboardSnapshotChanged
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    if change in {"journal_rewrite", "journal_replace", "journal_commit"}:
+        engine.events_path.write_bytes(b'{"event":"existing"}\n')
+        engine._persist(_now(8, 59))
+    preopen = tmp_path / "preopen.json"
+    preopen.write_text("{}")
+    original = dashboard_module._available_session_dates
+
+    def mutate(*args, **kwargs):
+        result = original(*args, **kwargs)
+        if change in {"journal", "journal_commit"}:
+            with engine.events_path.open("ab") as handle:
+                handle.write(b'{"event":"uncommitted"}\n')
+            if change == "journal_commit":
+                engine._persist(_now(8, 59, 1))
+        elif change == "journal_rewrite":
+            previous = engine.events_path.stat()
+            engine.events_path.write_bytes(engine.events_path.read_bytes())
+            os.utime(engine.events_path, ns=(previous.st_atime_ns, previous.st_mtime_ns))
+        elif change == "journal_replace":
+            replacement = engine.events_path.with_suffix(".replacement")
+            replacement.write_bytes(engine.events_path.read_bytes())
+            replacement.replace(engine.events_path)
+        elif change == "owner":
+            engine._engine_run_id = "different-engine-run"
+            engine._persist(_now(8, 59, 1))
+        else:
+            preopen.write_text('{"changed":true}')
+        return result
+
+    monkeypatch.setattr(dashboard_module, "_available_session_dates", mutate)
+    with pytest.raises(DashboardSnapshotChanged, match="commit"):
+        build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(8, 59, 1),
+            preopen_readiness_path=preopen, include_ledger_session_dates=False,
+            require_committed_revision=True, captured_commit_as_of=True)
+
+
+def test_captured_compact_snapshot_rejects_projection_replacement_without_receipt(tmp_path, verified_dashboard_calendar):
+    from stockagent.live.tw_day_trade_dashboard import DashboardSnapshotChanged
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    engine.update_readiness([spec], now=_now(8, 59))
+    replacement = engine.state_path.with_suffix(".replacement")
+    replacement.write_bytes(engine.state_path.read_bytes())
+    replacement.replace(engine.state_path)
+    with pytest.raises(DashboardSnapshotChanged, match="projection"):
+        build_dashboard_snapshot(state_dir=engine.state_dir, now=_now(8, 59),
+            include_ledger_session_dates=False, require_committed_revision=True, captured_commit_as_of=True)
 
 
 @pytest.mark.parametrize("overnight", [False, True])
@@ -1925,10 +2079,16 @@ def test_runner_loads_all_configured_day_trade_modes() -> None:
         repo_root / "services/discord_bot/markets",
         include_disabled=True,
     )
-    assert errors == {}
-    all_configured = {name for name, config in load_market_configs(
-        repo_root / "services/discord_bot/markets").items() if config.day_trade_simulation_enabled}
-    assert {spec.market for spec in specs} == all_configured
+    all_configs = load_market_configs(repo_root / "services/discord_bot/markets")
+    all_configured = {name for name, config in all_configs.items() if config.day_trade_simulation_enabled}
+    # A disabled research candidate is intentionally inspectable but not
+    # admitted to the normal paper executor until its accounting is verified.
+    # Never hide an error in an enabled mode or another unexpected candidate.
+    for name, error in errors.items():
+        assert name == "tw_day_trade_unit_mgda_2m_20261103"
+        assert all_configs[name].enabled is False
+        assert "unsupported_paper_accounting" in error
+    assert {spec.market for spec in specs} == all_configured - set(errors)
     assert set(live_configs) == all_configured
     assert all(spec.signal_market is None for spec in specs)
     assert all(spec.price_limit_offset_ticks == 1 for spec in specs)
@@ -1937,6 +2097,30 @@ def test_runner_loads_all_configured_day_trade_modes() -> None:
         for spec in specs
     )
     assert all(spec.entry_price_offset_ticks == 0 for spec in specs)
+
+
+def test_runner_rejects_unimplemented_research_close_penalty(monkeypatch, tmp_path):
+    from scripts import run_tw_day_trade_simulation as service
+
+    market = "tw_day_trade_unit_mgda_2m"
+    live = SimpleNamespace(
+        enabled=True,
+        day_trade_simulation_enabled=True,
+        config_path="candidate.yaml",
+    )
+    experiment = SimpleNamespace(trading=SimpleNamespace(
+        execution_mode="tw_day_trade",
+        tw_day_trade_short_limit_up_penalty_rate=0.07,
+    ))
+    monkeypatch.setattr(service, "load_market_configs", lambda _: {market: live})
+    monkeypatch.setattr(service, "load_config", lambda _: experiment)
+
+    specs, selected, errors = service._mode_specs(tmp_path)
+
+    assert specs == []
+    assert selected == {market: live}
+    assert "unsupported_paper_accounting" in errors[market]
+    assert "tw_day_trade_short_limit_up_penalty_rate" in errors[market]
 
 
 def test_runner_blocks_weekend_before_quote_or_eligibility_work(tmp_path: Path) -> None:
@@ -4028,6 +4212,41 @@ def test_next_day_signal_blocks_when_prior_position_is_unflattened(
         engine.state["modes"][spec.market]["engine_status"]
         == "critical_prior_position_unflattened"
     )
+
+
+def test_new_live_session_preserves_prior_provisional_equity_provenance(tmp_path):
+    spec = _spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    mode = engine._mode(spec)
+    mode.update(session_date="2026-08-12", simulation_replay=True,
+                provisional_minute_source_coverage=True,
+                entry_completed_at="2026-08-12T09:01:00+08:00")
+    result = engine.register_signal(spec=spec, summary=_summary(), signal_rows=[_row(0)],
+        quotes={"2330": _quote()}, eligibility=_eligibility(), eligibility_coverage={},
+        now=_now(9, 1, 7))
+    assert result == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert mode["simulation_replay"] is False
+    assert mode["provisional_minute_source_coverage"] is False
+    assert mode["cumulative_provisional_minute_source_coverage"] is True
+    recovered = TwDayTradeSimulationEngine(tmp_path / "state")
+    assert recovered.state["modes"][spec.market]["cumulative_provisional_minute_source_coverage"] is True
+
+
+def test_first_provisional_replay_marks_cumulative_account_quality(tmp_path):
+    spec = replace(_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                   historical_counterfactual_provisional=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    summary = {**_summary(), "simulation_replay": True,
+               "historical_minute_valuation": True,
+               "provisional_minute_source_coverage": True,
+               "entry_fill_contract": REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE}
+    assert engine.register_signal(spec=spec, summary=summary, signal_rows=[_row(0)],
+        quotes={"2330": _quote()}, eligibility=_eligibility(), eligibility_coverage={},
+        now=_now(9, 1), counterfactual_open_replay=True) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert mode["provisional_minute_source_coverage"] is True
+    assert mode["cumulative_provisional_minute_source_coverage"] is True
 
 
 def test_only_one_daily_entry_is_allowed_after_the_first_is_closed(
@@ -6724,7 +6943,7 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert 'class="compact-table position-table"' in html
     assert 'class="compact-table signal-table"' in html
     assert "<th>損益拆分／估值</th>" in html
-    assert "<th>開盤計價／市價成交</th>" in html
+    assert "<th>開盤計價／紙上進場</th>" in html
     assert "<th>現在市價／該檔盈虧</th>" in html
     assert "<th>損益／模式總權益</th>" in html
     assert 'class="skip-link"' in html
@@ -6746,6 +6965,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     assert "未實現 ${money(unrealizedNet)}" in javascript
     assert "reconciled_total_net_pnl_twd" in javascript
     assert "function resolvedPositionPnl(row = {})" in javascript
+    assert 'class="mode-replay-warning" role="status"' in javascript
+    assert "分鐘資料可能不完整；缺口估值延用，結果可能改變，並非券商成交" in javascript
     assert "名目 ${money(entryNotional)}" in javascript
     assert "佔該模式總權益" in javascript
     assert (
@@ -6827,7 +7048,8 @@ def test_dashboard_html_is_local_and_refreshes_api() -> None:
     # Details default to the latest session; YTD remains an explicit action.
     assert "let followLatestSession = true;" in javascript
     assert "let followPerformanceRange = false;" in javascript
-    assert 'const DEFAULT_PERFORMANCE_START_DATE = "2026-01-01";' in javascript
+    assert 'function performanceYear(data)' in javascript
+    assert 'timeZone: "Asia/Taipei"' in javascript
     assert 'id="performance-range"' in html
     assert "function chartHistoryMatchesSelection()" in javascript
     assert "不以最新即時點代替歷史曲線" in javascript
@@ -7673,6 +7895,49 @@ def test_compact_benchmark_history_index_survives_process_cache_loss(
     assert restored.origins == first.origins
 
 
+@pytest.mark.parametrize("product", ["tw_day_trade", "tw_overnight"])
+@pytest.mark.parametrize("view", ["signals-all", "signals-latest", "positions", "events"])
+def test_detail_cache_preserves_literal_date_bounds_when_trading_sessions_are_identical(
+    tmp_path: Path, monkeypatch, product: str, view: str,
+) -> None:
+    root = tmp_path / product
+    root.mkdir()
+    day = "2026-01-02"
+    signal = {"session_date": day, "market": "mode_a", "signal_id": "decision",
+              "symbol": "2330", "target_weight": 0.1, "status": "ready"}
+    position = {"position_id": "position", "market": "mode_a", "session_date": day,
+                "symbol": "2330", "signed_shares": 1000, "target_weight": 0.1}
+    state = {"product": product, "enabled_markets": ["mode_a"], "modes": {"mode_a": {
+        "session_date": day, "signal_id": "decision", "target_symbol_count": 1,
+        "initial_capital_twd": 10_000_000, "positions": {"position": position}}}}
+    (root / "state.json").write_text(json.dumps(state), encoding="utf-8")
+    (root / "signals.jsonl").write_text(json.dumps(signal) + "\n", encoding="utf-8")
+    order = {"session_date": day, "market": "mode_a", "symbol": "2330",
+             "recorded_at": f"{day}T09:01:00+08:00", "quantity": 1000, "status": "filled"}
+    (root / "orders.jsonl").write_text(json.dumps(order) + "\n", encoding="utf-8")
+    monkeypatch.setattr(dashboard_module, "_available_session_dates", lambda **kwargs: [day])
+    if view.startswith("signals"):
+        def read(**bounds):
+            return build_dashboard_signal_page(state_dir=root,
+                revision_scope="latest" if view.endswith("latest") else "all", **bounds)
+    else:
+        reader = build_dashboard_position_page if view == "positions" else build_dashboard_event_page
+        def read(**bounds):
+            return reader(state_dir=root, **bounds)
+    first_bounds = {"start_date": "2026-01-01", "end_date": "2026-01-04"}
+    second_bounds = {"start_date": day, "end_date": "2026-01-05"}
+    first = read(**first_bounds)
+    second = read(**second_bounds)
+    repeated = read(**first_bounds)
+    assert first["total"] == second["total"] == repeated["total"] == 1
+    assert first["session_dates"] == second["session_dates"] == [day]
+    assert first["rows"] == second["rows"] == repeated["rows"]
+    for payload, expected in ((first, first_bounds), (second, second_bounds), (repeated, first_bounds)):
+        assert payload["start_date"] == expected["start_date"]
+        assert payload["end_date"] == expected["end_date"]
+        assert payload["session_date"] == expected["end_date"]
+
+
 def test_signal_page_cache_ignores_unrelated_live_state_marks(
     tmp_path: Path, monkeypatch
 ) -> None:
@@ -7962,6 +8227,326 @@ def test_signal_page_hides_zero_targets_without_changing_audit_or_ledger(
     assert empty["rows"] == [] and empty["has_more"] is False
     assert signal_path.read_bytes() == original
     assert json.loads((state_dir / "state.json").read_bytes()) == state
+
+
+@pytest.mark.parametrize("batch_bytes", [1, 7, 64, 4096])
+def test_complete_ledger_batches_preserve_selected_bytes_without_per_row_io(batch_bytes):
+    import io
+
+    class BlockOnly(io.BytesIO):
+        def readline(self, *args):
+            raise AssertionError("complete projection must use block reads")
+
+        def tell(self):
+            raise AssertionError("complete projection must not query file position per row")
+
+    body = (json.dumps({"symbol": "2330", "name": "台積電", "value": "x" * 77}, ensure_ascii=False) + "\n").encode() * 31
+    source = BlockOnly(b"not-selected\n" + body + b"also-not-selected\n")
+    start = len(b"not-selected\n")
+    blocks = list(dashboard_module._ledger_span_batches(source, start, start + len(body), batch_bytes=batch_bytes))
+    assert b"".join(blocks) == body
+    assert all(block.endswith(b"\n") for block in blocks)
+    assert source.read() == b"also-not-selected\n"
+
+
+def test_latest_signal_view_matches_full_projection_and_never_drops_revisions(tmp_path, monkeypatch):
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MIN_BYTES", 1)
+    root = tmp_path / "state"
+    root.mkdir()
+    day = "2026-08-14"
+    modes = {market: {"session_date": day, "signal_id": f"{market}-new",
+        "target_symbol_count": 2, "initial_capital_twd": 2_000_000} for market in ("mode_a", "mode_b")}
+    state = {"enabled_markets": list(modes), "modes": modes}
+    (root / "state.json").write_text(json.dumps(state))
+    rows = [{"session_date": day, "market": market, "signal_id": f"{market}-{revision}",
+        "symbol": symbol, "target_weight": weight, "status": "ready" if weight else "hold",
+        "ask": 100.0, "bid": 99.0, "filled_weight": 0.0, "filled_shares": 0,
+        "requested_shares": 1000 if weight else 0, "sizing_open_price": 100.0,
+        "execution_price": None, "reason": "ready" if weight else "zero_target_weight"}
+        for revision in ("old", "new") for market in modes
+        for symbol, weight in (("2330", 0.8 if revision == "old" else 0.0), ("2317", -0.2))]
+    source = root / "signals.jsonl"
+    original = ("".join(json.dumps(row) + "\n" for row in rows)).encode()
+    source.write_bytes(original)
+    request = dict(state_dir=root, session_date=day, revision_scope="latest", hide_zero_targets=True)
+    fast = build_dashboard_signal_page(**request)
+    assert fast["revision_scope"] == "latest"
+    assert fast["total"] == fast["returned"] == 2
+    assert {row["symbol"] for row in fast["rows"]} == {"2317"}
+    assert all(item["model_signal_rows_complete"] for item in fast["opening_execution_audit"].values())
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    oracle = build_dashboard_signal_page(**request, _allow_narrow_projection=False)
+    for key in ("rows", "direction_summary", "opening_execution_audit", "total"):
+        assert oracle[key] == fast[key]
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(dashboard_module, "_ledger_session_index", lambda *_args, **_kwargs: pytest.fail("latest complete decisions do not need a full ledger index"))
+        patcher.setattr(dashboard_module, "_signal_page_record_count", lambda *_: pytest.fail("must not count all historical records"))
+        assert build_dashboard_signal_page(**request)["rows"] == fast["rows"]
+    full = build_dashboard_signal_page(**(request | {"revision_scope": "all"}))
+    assert full["total"] == 6
+    assert source.read_bytes() == original
+    assert json.loads((root / "state.json").read_bytes()) == state
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    modes["mode_a"]["target_symbol_count"] = 3
+    (root / "state.json").write_text(json.dumps(state))
+    assert dashboard_module._latest_committed_signal_rows(root, state, day=day, mode="all", maximum_scan_rows=100) is None
+    incomplete = build_dashboard_signal_page(**request)
+    assert incomplete["opening_execution_audit"]["mode_a"]["model_signal_rows_complete"] is False
+
+
+def test_latest_range_reuses_verified_current_decisions_without_building_full_current_shard(tmp_path, monkeypatch):
+    root, cache = tmp_path / "state", tmp_path / "cache"
+    root.mkdir()
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    day_old, day_current = "2026-08-13", "2026-08-14"
+    modes = {market: {"session_date": day_current, "signal_id": f"{market}-new",
+             "target_symbol_count": 2, "initial_capital_twd": 2_000_000}
+             for market in ("mode_a", "mode_b")}
+    state = {"enabled_markets": list(modes), "modes": modes}
+    (root / "state.json").write_text(json.dumps(state))
+    rows = [{"session_date": day, "market": market, "signal_id": f"{market}-{revision}",
+             "symbol": symbol, "name": name,
+             "target_weight": (0.0 if symbol == "2330" and revision == "new" else weight),
+             "status": ("blocked" if symbol == "2317" else "hold"),
+             "ask": 101.0, "bid": 99.0, "filled_weight": 0.0, "filled_shares": 0,
+             "requested_shares": 1000, "sizing_open_price": 100.0,
+             "execution_price": None, "reason": "missing_quote"}
+            for day in (day_old, day_current) for revision in ("old", "new")
+            for market in modes for symbol, name, weight in (("2330", "台積電", 0.8), ("2317", "鴻海", -0.2))]
+    signal_path = root / "signals.jsonl"
+    original = ("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows)).encode()
+    signal_path.write_bytes(original)
+    base = dict(state_dir=root, start_date=day_old, end_date=day_current, revision_scope="latest")
+    options = ({"limit": 2}, {"offset": 1, "limit": 2}, {"mode": "mode_a"},
+               {"symbol": "台積"}, {"status": "blocked"}, {"hide_zero_targets": True})
+    # Independent full reader supplies the oracle and creates historical shards.
+    expected = []
+    for option in options:
+        dashboard_module._SIGNAL_PAGE_CACHE.clear()
+        dashboard_module._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+        expected.append(build_dashboard_signal_page(**base, **option, _allow_narrow_projection=False))
+    projection = dashboard_module._detail_session_projection_root(signal_path, dashboard_module._SIGNAL_PAGE_COLUMN_TYPES)
+    assert projection is not None
+    (projection / f"{day_current}.json").unlink()
+    (projection / f"{day_current}.parquet").unlink()
+    original_reader = dashboard_module._projected_ledger_session_frame
+
+    def no_current_full_shard(*args, **kwargs):
+        if kwargs.get("session_date") == day_current:
+            pytest.fail("a complete current decision must not trigger the full revision shard")
+        return original_reader(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_module, "_projected_ledger_session_frame", no_current_full_shard)
+    for option, oracle in zip(options, expected, strict=True):
+        dashboard_module._SIGNAL_PAGE_CACHE.clear()
+        dashboard_module._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+        actual = build_dashboard_signal_page(**base, **option)
+        for key in ("rows", "total", "returned", "has_more", "direction_summary", "opening_execution_audit"):
+            assert actual[key] == oracle[key], (option, key)
+    latest_cache = projection / "latest-decisions-v1" / f"{day_old}.parquet"
+    assert latest_cache.is_file()
+    saved = latest_cache.read_bytes()
+    unchanged = latest_cache.stat().st_mtime_ns
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    dashboard_module._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+    assert build_dashboard_signal_page(**base, **options[0])["rows"] == expected[0]["rows"]
+    assert latest_cache.stat().st_mtime_ns == unchanged  # persisted source-bound cache hit
+    latest_cache.write_bytes(b"corrupt derived data")
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    dashboard_module._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+    assert build_dashboard_signal_page(**base, **options[0])["rows"] == expected[0]["rows"]
+    assert latest_cache.read_bytes() == saved  # corruption rebuilt from the full verified shard
+    assert signal_path.read_bytes() == original
+    assert json.loads((root / "state.json").read_bytes()) == state
+
+
+def test_latest_range_refuses_unbounded_fallback_after_large_shard_build_fails(tmp_path, monkeypatch):
+    root, cache = tmp_path / "state", tmp_path / "cache"
+    root.mkdir()
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MAX_BYTES", 1)
+    day_old, day_current = "2026-08-13", "2026-08-14"
+    state = {"enabled_markets": ["mode_a"], "modes": {"mode_a": {
+        "session_date": day_current, "signal_id": "current", "target_symbol_count": 1,
+        "initial_capital_twd": 2_000_000,
+    }}}
+    (root / "state.json").write_text(json.dumps(state))
+    rows = [{"session_date": day, "market": "mode_a", "signal_id": signal,
+             "symbol": "2330", "target_weight": 0.2, "status": "ready",
+             "filled_weight": 0.0, "filled_shares": 0, "requested_shares": 1000,
+             "sizing_open_price": 100.0, "reason": "ready"}
+            for day, signal in ((day_old, "old"), (day_current, "current"))]
+    (root / "signals.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+    monkeypatch.setattr(dashboard_module, "_materialize_projected_ledger_session_bounded", lambda *_a, **_k: False)
+    monkeypatch.setattr(dashboard_module, "_projected_ledger_session_frame",
+                        lambda *_a, **_k: pytest.fail("unbounded fallback must not start"))
+    with pytest.raises(RuntimeError, match="complete historical signal projection is not ready"):
+        build_dashboard_signal_page(state_dir=root, start_date=day_old, end_date=day_current,
+                                    revision_scope="latest")
+
+
+def test_latest_range_deep_pages_use_the_same_bounded_projection(tmp_path, monkeypatch):
+    root, cache = tmp_path / "state", tmp_path / "cache"
+    root.mkdir()
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    old_day, current_day = "2026-08-13", "2026-08-14"
+    state = {"enabled_markets": ["mode_a"], "modes": {"mode_a": {
+        "session_date": current_day, "signal_id": "current", "target_symbol_count": 2,
+        "initial_capital_twd": 2_000_000,
+    }}}
+    (root / "state.json").write_text(json.dumps(state))
+    rows = [{"session_date": day, "market": "mode_a", "signal_id": signal,
+             "symbol": f"{index:04d}", "target_weight": (index + 1) / 10_000,
+             "status": "ready", "filled_weight": 0.0, "filled_shares": 0,
+             "requested_shares": 1000, "sizing_open_price": 100.0, "reason": "ready"}
+            for day, signal, count in ((old_day, "old", 1_150), (current_day, "current", 2))
+            for index in range(count)]
+    source = root / "signals.jsonl"
+    original = "".join(json.dumps(row) + "\n" for row in rows)
+    source.write_text(original)
+    base = dict(state_dir=root, start_date=old_day, end_date=current_day, revision_scope="latest")
+    options = ({"offset": 1_001, "limit": 25}, {"offset": 10**12, "limit": 25})
+    oracle = []
+    for option in options:
+        dashboard_module._SIGNAL_PAGE_CACHE.clear()
+        dashboard_module._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+        oracle.append(build_dashboard_signal_page(**base, **option, _allow_narrow_projection=False))
+    projection = dashboard_module._detail_session_projection_root(source, dashboard_module._SIGNAL_PAGE_COLUMN_TYPES)
+    assert projection is not None
+    (projection / f"{current_day}.json").unlink()
+    (projection / f"{current_day}.parquet").unlink()
+    original_reader = dashboard_module._projected_ledger_session_frame
+
+    def no_current_full_shard(*args, **kwargs):
+        if kwargs.get("session_date") == current_day:
+            pytest.fail("deep pages must not rebuild the full current revision shard")
+        return original_reader(*args, **kwargs)
+
+    monkeypatch.setattr(dashboard_module, "_projected_ledger_session_frame", no_current_full_shard)
+    for option, expected in zip(options, oracle, strict=True):
+        dashboard_module._SIGNAL_PAGE_CACHE.clear()
+        dashboard_module._SIGNAL_RANGE_SUMMARY_CACHE.clear()
+        actual = build_dashboard_signal_page(**base, **option)
+        for key in ("rows", "total", "returned", "has_more", "direction_summary", "opening_execution_audit"):
+            assert actual[key] == expected[key], (option, key)
+    assert source.read_text() == original
+
+
+@pytest.mark.parametrize("native", [False, True])
+def test_latest_signal_native_decoder_preserves_extensions_and_corruption(tmp_path, monkeypatch, native):
+    root = tmp_path
+    day = "2026-08-14"
+    state = {"modes": {"m": {"session_date": day, "signal_id": "s", "target_symbol_count": 1}}}
+    monkeypatch.setattr(dashboard_module, "_NATIVE_HISTORY_POINTS", native and dashboard_module._NATIVE_HISTORY_POINTS)
+    row = {"session_date": day, "market": "m", "signal_id": "s", "symbol": "2330", "unknown": float("nan"), "negative_zero": -0.0, "big": 2**100}
+    path = root / "signals.jsonl"
+    path.write_text(json.dumps(row) + "\n")
+    result = dashboard_module._latest_committed_signal_rows(root, state, day=day, mode="all", maximum_scan_rows=10)
+    assert result[0]["big"] == 2**100
+    assert np.isnan(result[0]["unknown"])
+    assert np.signbit(result[0]["negative_zero"])
+    path.write_bytes(b'{broken-json}\n')
+    with pytest.raises(ValueError):
+        dashboard_module._latest_committed_signal_rows(root, state, day=day, mode="all", maximum_scan_rows=10)
+
+
+@pytest.mark.parametrize("body,maximum", [(b"incomplete", 64), (b"abcdef\n", 6), (b"abcdef", 6)])
+def test_complete_ledger_batches_reject_incomplete_or_oversized_lines(monkeypatch, body, maximum):
+    import io
+
+    monkeypatch.setattr(dashboard_module, "_MAX_LEDGER_LINE_BYTES", maximum)
+    with pytest.raises(ValueError, match="incomplete|too large"):
+        list(dashboard_module._ledger_span_batches(io.BytesIO(body), 0, len(body), batch_bytes=4))
+
+
+def test_complete_ledger_batches_keep_exact_line_limit_and_detect_truncation(monkeypatch):
+    import io
+
+    monkeypatch.setattr(dashboard_module, "_MAX_LEDGER_LINE_BYTES", 6)
+    assert b"".join(dashboard_module._ledger_span_batches(io.BytesIO(b"abcde\nx\n"), 0, 8, batch_bytes=4)) == b"abcde\nx\n"
+    with pytest.raises(ValueError, match="truncated"):
+        list(dashboard_module._ledger_span_batches(io.BytesIO(b"x\n"), 0, 4))
+
+
+def test_bounded_complete_session_projection_matches_canonical_reader(tmp_path, monkeypatch):
+    import polars as pl
+
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    source = tmp_path / "signals.jsonl"
+    day = "2026-08-13"
+    rows = [{"session_date": day, "market": "m", "signal_id": f"s{i // 2}",
+             "symbol": f"{i:04}", "target_weight": -0.0 if i == 0 else i / 100,
+             "filled_shares": i, "status": "ready", "name": "台積電"}
+            for i in range(10)]
+    source.write_text("".join(json.dumps(row, ensure_ascii=False) + "\n" for row in rows))
+    index = dashboard_module._ledger_session_index(source, recorded_at_fallback=False)
+    original_batches = dashboard_module._ledger_span_batches
+    monkeypatch.setattr(dashboard_module, "_ledger_span_batches",
+                        lambda handle, start, end, **_kw: original_batches(handle, start, end, batch_bytes=64))
+    assert dashboard_module._materialize_projected_ledger_session_bounded(
+        source, index=index, session_date=day, projected_schema=dashboard_module._SIGNAL_PAGE_COLUMN_TYPES,
+    )
+    validated = dashboard_module._validated_projected_ledger_session_file(
+        source, index=index, session_date=day, projected_schema=dashboard_module._SIGNAL_PAGE_COLUMN_TYPES,
+    )
+    assert validated is not None and validated[2] == len(rows)
+    actual = pl.read_parquet(validated[0])
+    _, oracle = dashboard_module._columnar_ledger_frame(
+        source, selected_spans=[(start, end, day) for start, end in index.spans[day]],
+        maximum_rows=None, projected_schema=dashboard_module._SIGNAL_PAGE_COLUMN_TYPES, minimum_bytes=0,
+    )
+    assert actual.equals(oracle)
+    assert np.signbit(actual["target_weight"][0])
+    assert "execution_price" not in actual.columns  # globally unknown stays absent
+
+
+@pytest.mark.parametrize("failure", ["source_changed", "size_limit"])
+def test_bounded_projection_never_publishes_incomplete_or_changed_source(tmp_path, monkeypatch, failure):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    monkeypatch.setenv("STOCKAGENT_DASHBOARD_INDEX_CACHE_DIR", str(cache))
+    source = tmp_path / "signals.jsonl"
+    day = "2026-08-13"
+    row = {"session_date": day, "market": "m", "signal_id": "s", "symbol": "2330"}
+    source.write_text(json.dumps(row) + "\n")
+    index = dashboard_module._ledger_session_index(source, recorded_at_fallback=False)
+    if failure == "size_limit":
+        monkeypatch.setattr(dashboard_module, "_DETAIL_SESSION_PROJECTION_MAX_BYTES", 64)
+    else:
+        original_batches = dashboard_module._ledger_span_batches
+        def changed(handle, start, end, **kwargs):
+            for batch in original_batches(handle, start, end, **kwargs):
+                yield batch
+                with source.open("a") as output:
+                    output.write(json.dumps(row) + "\n")
+        monkeypatch.setattr(dashboard_module, "_ledger_span_batches", changed)
+    assert not dashboard_module._materialize_projected_ledger_session_bounded(
+        source, index=index, session_date=day, projected_schema=dashboard_module._SIGNAL_PAGE_COLUMN_TYPES,
+    )
+    projection = dashboard_module._detail_session_projection_root(source, dashboard_module._SIGNAL_PAGE_COLUMN_TYPES)
+    assert not (projection / f"{day}.json").exists()
+
+
+def test_complete_columnar_block_projection_preserves_disjoint_spans(tmp_path, monkeypatch):
+    source = tmp_path / "signals.jsonl"
+    first = b'{"symbol":"2330","value":1}\n'
+    excluded = b'{"symbol":"EXCLUDED","value":100}\n'
+    last = b'{"symbol":"2317","value":2}\n'
+    source.write_bytes(first + excluded + last)
+    monkeypatch.setattr(dashboard_module, "_COLUMNAR_LEDGER_MAX_BYTES", 1)
+    result = dashboard_module._columnar_ledger_frame(source,
+        selected_spans=[(0, len(first), "2026-11-04"),
+                        (len(first) + len(excluded), source.stat().st_size, "2026-11-05")],
+        maximum_rows=None, minimum_bytes=0,
+        projected_schema={"symbol": "string", "value": "int"})
+    assert result is not None
+    assert result[1].to_dicts() == [{"symbol": "2330", "value": 1}, {"symbol": "2317", "value": 2}]
 
 
 def test_columnar_signal_range_matches_strict_json_path(
@@ -8345,6 +8930,13 @@ def test_narrow_signal_page_matches_complete_history_and_falls_back_safely(
         patcher.setattr(dashboard_module, "_rehydrate_narrow_signal_page", lambda *_: None)
         fallback = build_dashboard_signal_page(**base, limit=2)
     assert fallback == repaired
+
+    dashboard_module._SIGNAL_PAGE_CACHE.clear()
+    with monkeypatch.context() as patcher:
+        patcher.setattr(dashboard_module, "_COLUMNAR_LEDGER_MAX_BYTES", 1)
+        patcher.setattr(dashboard_module, "_rehydrate_narrow_signal_page", lambda *_: None)
+        with pytest.raises(dashboard_module.DashboardSnapshotChanged, match="signal projection changed"):
+            build_dashboard_signal_page(**base, limit=2)
 
 
 def test_dashboard_signal_page_filters_sorts_and_bounds_payload(tmp_path: Path) -> None:

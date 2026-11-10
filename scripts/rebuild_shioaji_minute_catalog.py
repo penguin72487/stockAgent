@@ -58,8 +58,7 @@ def _read_json(path: Path) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-def main() -> None:
-    args = parse_args()
+def _run(args: argparse.Namespace) -> None:
     start = date.fromisoformat(str(args.start_date))
     end = date.fromisoformat(str(args.end_date))
     chunks = list(iter_date_chunks(start, end, DEFAULT_CHUNK_DAYS))
@@ -183,6 +182,13 @@ def main() -> None:
         f"end_date={end} api_requests_started=0",
         flush=True,
     )
+
+
+def main() -> None:
+    args = parse_args()
+    from stockagent.data_sync.shioaji_minute_workspace_guard import writer_guard
+    with writer_guard(args.minute_root):
+        _run(args)
 
 
 if __name__ == "__main__":

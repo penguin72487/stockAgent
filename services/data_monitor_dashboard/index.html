@@ -9,8 +9,8 @@
   <link rel="stylesheet" href="../dashboard-core.css?v=6">
   <link rel="stylesheet" href="styles.css?v=21">
   <link rel="stylesheet" href="ticks.css?v=1">
-  <link rel="stylesheet" href="storage.css?v=4">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=11">
+  <link rel="stylesheet" href="storage.css?v=9">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=12">
   <link rel="stylesheet" href="../dashboard-acquisition.css?v=4">
 </head>
 <body data-acquisition-page="data-monitor">
@@ -158,10 +158,20 @@
         <p id="storage-operations-eta" class="storage-copy"></p>
         <p id="storage-operations-focus" class="storage-copy"></p>
         <div id="storage-operation-attention" class="storage-operation-attention" aria-label="目前阻礙與接續方式"></div>
+        <div id="storage-archive-policy" class="storage-archive-policy" aria-label="目標分工與增量規則"></div>
+        <div class="storage-phase-overview" aria-labelledby="storage-phase-overview-title">
+          <h4 id="storage-phase-overview-title">遷移各階段與預計時間</h4>
+          <p class="storage-clock">每分鐘更新本機遷移階段。各資料集逐批接續、可互相平行；NAS 備份及暫緩的獨立還原另列於下方完整排程，不作這次遷移的共同前置。可估時間只涵蓋已量測步驟。</p>
+          <table class="storage-phase-table" data-responsive="scroll">
+            <colgroup><col class="storage-phase-name"><col class="storage-phase-state"><col class="storage-phase-time"></colgroup>
+            <thead><tr><th scope="col">階段</th><th scope="col">狀態</th><th scope="col">預計完成／等待條件（台北時間）</th></tr></thead>
+            <tbody id="storage-phase-timeline"></tbody>
+          </table>
+        </div>
         <div id="storage-operation-tasks" class="storage-operation-tasks"></div>
         <details id="storage-operations-more" class="storage-operation-details" hidden><summary id="storage-operations-more-label">其他工作與已完成階段</summary><div id="storage-operation-other-tasks" class="storage-operation-tasks"></div></details>
         <details id="storage-operation-schedules" class="storage-operation-details"><summary>完整流程、排程與阻擋條件</summary>
-          <p class="storage-copy">以下時間來自已安裝的原排程器；下次檢查不保證立即開始。傳送、NAS 讀回與驗證可並行；回收需等各自的驗收與引用檢查完成。</p>
+          <p class="storage-copy">以下時間來自已安裝的原排程器；下次檢查不保證立即開始。來源封裝、路徑交接、回收與獨立還原分別顯示；暫緩的階段不視為已完成。</p>
           <div id="storage-operation-flow" class="storage-operation-flow"></div>
           <div id="storage-operation-schedule-list" class="storage-operation-schedule-list"></div>
           <p id="storage-operation-remote-schedule" class="storage-clock"></p>
@@ -171,6 +181,19 @@
       <div id="storage-capacities" class="storage-capacities" aria-label="各機器磁碟容量"></div>
       <p id="storage-efficiency" class="storage-copy" hidden></p>
       <p id="storage-tiers" class="storage-copy" hidden></p>
+      <div class="storage-explorer-heading"><h3>D／E 已登錄封存內容</h3><span class="storage-copy">唯讀清冊</span></div>
+      <p id="storage-pack-layout" class="storage-copy" role="status" hidden></p>
+      <p id="storage-d-backup-summary" class="storage-copy" role="status">等待備份清冊分類。</p>
+      <details id="storage-d-backup-details" class="storage-operation-details" hidden>
+        <summary>依資料種類展開清冊</summary>
+        <p class="storage-clock">依固定 D 清冊分類，常用封包的實際位置可在 E；群組可能共用物件，因此不能相加。顯示的是已登錄檔案長度，不是 D 的實際占用；未列入的私有與未發布資料不當作零。清冊不代表 NAS 或原件還原驗收。</p>
+        <div id="storage-d-backup-groups"></div>
+      </details>
+      <details class="storage-operation-details"><summary>D 備份分批整理規劃與目前階段</summary>
+        <p class="storage-clock">C 留服務、帳本與控制索引；E 負責下載增量、整理與備份中轉；D 保存按資料集封裝的壓縮備份。仍需保留的舊包優先移 E，整理後回 D；D 不足時已登錄封存可暫留 E。NAS 驗收另列，當沖服務優先。</p>
+        <p id="storage-d-pack-trial" class="storage-copy">2026-11-05 E 槽小樣本：選擇權 Parquet 原始 4,262,994 bytes；Zstd 3 為 3,895,882 bytes、寫入 0.54 秒，Zstd 19 為 3,791,292 bytes、寫入 3.72 秒。已核對欄位、數值與空值；僅單次熱快取樣本，未改動正式檔案，不代表 D 槽整批效能。</p>
+        <p class="storage-copy">每批最多 8 GiB，自動中斷續跑；一般增量每日 03:00–07:00 合併，研究固定版本共用未變動的封包。舊版獨有資料及研究引用繼續保留。上方依本批實際位元組估時；等待鎖或容量時顯示原因，不沿用過期時間。</p>
+      </details>
       <p id="storage-error" class="storage-error" role="status" hidden></p>
       <div class="storage-explorer" id="storage-explorer" hidden>
         <div class="storage-explorer-heading"><h3 id="storage-selected-title">資料分類</h3><button id="storage-close" type="button">收起分類</button></div>
@@ -315,12 +338,12 @@
   </main>
 
   <footer>StockAgent 全資料監控 · 介面時鐘為台北時間；實存首末筆保留來源欄位原值 · 每 10 秒讀取最新回執</footer>
-  <script src="../dashboard-core.js?v=15" defer></script>
+  <script src="../dashboard-core.js?v=20" defer></script>
   <script src="../dashboard-acquisition.js?v=11" defer></script>
   <script src="../feature-page-constraints.js?v=1" defer></script>
   <script src="../feature-page-contract.js?v=1" defer></script>
   <script src="app.js?v=53" defer></script>
   <script src="ticks.js?v=6" defer></script>
-  <script src="storage.js?v=27" defer></script>
+  <script src="storage.js?v=95" defer></script>
 </body>
 </html>

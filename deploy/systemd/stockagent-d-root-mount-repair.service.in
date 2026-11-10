@@ -1,0 +1,15 @@
+[Unit]
+Description=Repair only an idle enrolled D root mount when its 8 KiB option drifts
+After=stockagent-d-cold-mount.service
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=__REPO_ROOT__
+Environment="HOME=/root"
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/repair_d_volume_mount_drift.py --apply'
+SuccessExitStatus=75
+UMask=0077
+TimeoutStartSec=120
+NoNewPrivileges=true

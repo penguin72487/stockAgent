@@ -1,0 +1,15 @@
+[Unit]
+Description=Archive the reviewed offline replay pairs to D and retire their C hardlinks
+Requires=stockagent-e-workspace-mount.service
+After=stockagent-e-workspace-mount.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_offline_replay_pair_pending.py'
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/run_bounded_storage_maintenance.py scripts/run_offline_replay_pair_migration.py'
+SuccessExitStatus=75
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6
+TimeoutStartSec=infinity

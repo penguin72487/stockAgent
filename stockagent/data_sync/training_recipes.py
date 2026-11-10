@@ -11,9 +11,10 @@ import subprocess
 import sys
 import tempfile
 
-from stockagent.data_sync.desync_snapshots import atomic_write_json, sha256_file, SnapshotError
+from stockagent.data_sync.desync_snapshots import atomic_write_bytes, atomic_write_json, sha256_file, SnapshotError
 from stockagent.data_sync.packed_snapshots import (
-    resolve_latest_packed, resolve_packed_snapshot_id, verify_packed_snapshot,
+    _existing_packed_publication_owner, resolve_latest_packed, resolve_packed_pin,
+    resolve_packed_snapshot_id, verify_packed_snapshot, write_packed_pin,
 )
 
 CONTRACT = 'source_pinned_training_recipes_v1'
@@ -136,10 +137,88 @@ def refresh_recipes(*, repo: Path, sync_root: Path, output_root: Path,
     return result
 
 
+def _protect_research_build(*, repo: Path, sync_root: Path, materialized_root: Path,
+                            recipe_path: Path, recipe: dict, parameters: dict,
+                            resolved_parameter_sha256: dict, output_root: Path,
+                            receipt_path: Path) -> dict:
+    """Pin only a requested persistent research build under the retention owner.
+
+    Pins are retained even if the builder fails: an interrupted build can still
+    have created research output, and failure alone is not a retirement proof.
+    """
+    from stockagent.data_sync.packed_retention import (
+        RESEARCH_PIN_CONTRACT, RESEARCH_PIN_MARKER, RetentionConfig,
+    )
+    cfg = RetentionConfig.load(repo/'configs/data_sync/packed_retention.json', repo_root=repo)
+    sync_root, materialized_root = sync_root.absolute(), materialized_root.absolute()
+    if (sync_root != cfg.sync_root.absolute() or materialized_root != cfg.materialized_root.absolute()
+            or materialized_root.resolve(strict=True) != materialized_root):
+        raise SnapshotError('research pins need the configured retention roots')
+    recipe_bytes = recipe_path.read_bytes()
+    if len(recipe_bytes) > 32 * 1024**2 or json.loads(recipe_bytes) != recipe:
+        raise SnapshotError('research recipe changed or exceeds its metadata bound')
+    recipe_sha = hashlib.sha256(recipe_bytes).hexdigest()
+    payload = {'contract': 'stockagent.research_input_binding.v1',
+               'recipe_sha256': recipe_sha, 'input_bindings': recipe['inputs'],
+               'parameters': parameters, 'resolved_parameter_sha256': resolved_parameter_sha256,
+               'output_root': str(output_root.resolve()),
+               'receipt_path': str(receipt_path.absolute())}
+    research_id = digest(payload)
+    state_root = cfg.state_dir.absolute()
+    pin_parent = state_root/'research-pins'
+    with _existing_packed_publication_owner(sync_root, shared=True):
+        state_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if state_root.resolve(strict=True) != state_root:
+            raise SnapshotError('research state root is redirected')
+        marker = state_root/RESEARCH_PIN_MARKER
+        marker_value = {'contract': RESEARCH_PIN_CONTRACT, 'schema_version': 1}
+        if marker.exists() or marker.is_symlink():
+            if (marker.is_symlink() or not marker.is_file() or not 0 < marker.stat().st_size <= 4096
+                    or json.loads(marker.read_text()) != marker_value
+                    or not pin_parent.is_dir() or pin_parent.is_symlink()):
+                raise SnapshotError('research protection marker/root differs')
+        elif pin_parent.exists() and any(pin_parent.iterdir()):
+            raise SnapshotError('nonempty research pin root has no protection marker')
+        pin_parent.mkdir(mode=0o700, exist_ok=True)
+        if pin_parent.resolve(strict=True) != pin_parent:
+            raise SnapshotError('research pin parent is redirected')
+        if not marker.exists():
+            atomic_write_json(marker, marker_value)
+        pin_root = pin_parent/research_id
+        pin_root.mkdir(mode=0o700, exist_ok=True)
+        if pin_root.resolve(strict=True) != pin_root:
+            raise SnapshotError('research pin root is redirected')
+        for slot, binding in sorted(recipe['inputs'].items()):
+            release = resolve_packed_snapshot_id(sync_root, binding['dataset'], binding['snapshot_id'])
+            if release.manifest_sha256 != binding['manifest_sha256']:
+                raise SnapshotError('research source manifest changed before pinning')
+            pin = pin_root/(hashlib.sha256(slot.encode()).hexdigest()+'.pin.json')
+            if pin.exists() or pin.is_symlink():
+                previous = resolve_packed_pin(sync_root, pin, expected_dataset=binding['dataset'])
+                if previous.manifest_sha256 != release.manifest_sha256:
+                    raise SnapshotError('existing research pin names a different release')
+            else:
+                write_packed_pin(pin, release, exclusive=True)
+        fixed_recipe = pin_root/'recipe.json'
+        if fixed_recipe.exists() or fixed_recipe.is_symlink():
+            if fixed_recipe.is_symlink() or sha256_file(fixed_recipe) != recipe_sha:
+                raise SnapshotError('existing research recipe differs')
+        else:
+            atomic_write_bytes(fixed_recipe, recipe_bytes, mode=0o600)
+        record = pin_root/'research-binding.json'
+        if record.exists() or record.is_symlink():
+            if record.is_symlink() or json.loads(record.read_text()) != payload:
+                raise SnapshotError('existing research binding differs')
+        else:
+            atomic_write_json(record, payload)
+    return {'research_id': research_id, 'binding_path': str(record), 'recipe_sha256': recipe_sha,
+            'binding_sha256': sha256_file(record), 'pins': len(recipe['inputs'])}
+
+
 def build_recipe(recipe_path: Path, *, repo: Path, sync_root: Path,
                  input_paths: dict[str, str], parameters: dict[str, str],
                  receipt_path: Path, output_root: Path | None = None,
-                 trial: bool = True) -> dict:
+                 trial: bool = True, research_materialized_root: Path | None = None) -> dict:
     recipe = json.loads(recipe_path.read_text())
     if recipe.get('contract') != CONTRACT:
         raise SnapshotError('unsupported pinned recipe')
@@ -153,6 +232,8 @@ def build_recipe(recipe_path: Path, *, repo: Path, sync_root: Path,
         raise SnapshotError('recipe inputs/parameters do not match its contract')
     if not trial and output_root is None:
         raise SnapshotError('persistent assembly needs explicit output root')
+    if not trial and output_root.resolve().exists():
+        raise SnapshotError('recipe never overwrites an existing assembly')
     inputs = {}
     for slot, binding in recipe['inputs'].items():
         release = resolve_packed_snapshot_id(sync_root, binding['dataset'], binding['snapshot_id'])
@@ -170,10 +251,23 @@ def build_recipe(recipe_path: Path, *, repo: Path, sync_root: Path,
         from stockagent.config import load_config
         from dataclasses import asdict
         param_sha['base_config'] = digest(asdict(load_config(path)))
-    result = {'contract': CONTRACT, 'recipe_sha256': sha256_file(recipe_path),
+    binding = None
+    if not trial:
+        if research_materialized_root is None:
+            raise SnapshotError('persistent research build requires the retention materialized root')
+        binding = _protect_research_build(repo=repo, sync_root=sync_root,
+            materialized_root=research_materialized_root, recipe_path=recipe_path, recipe=recipe,
+            parameters=parameters, resolved_parameter_sha256=param_sha,
+            output_root=output_root, receipt_path=receipt_path)
+    current_recipe_sha = sha256_file(recipe_path)
+    if binding is not None and current_recipe_sha != binding['recipe_sha256']:
+        raise SnapshotError('research recipe changed after its source pins were committed')
+    result = {'contract': CONTRACT, 'recipe_sha256': current_recipe_sha,
               'input_bindings': recipe['inputs'], 'parameters': parameters,
               'resolved_parameter_sha256': param_sha, 'trial': trial,
               'assembled_data_retained': not trial, 'state': 'running', 'steps': []}
+    if binding is not None:
+        result['research_binding'] = binding
     from importlib.metadata import version, PackageNotFoundError
     result['runtime'] = {'python': sys.version, 'packages': {}}
     for package in ('polars', 'pyarrow', 'numpy', 'torch'):

@@ -196,7 +196,7 @@ function networkRecorder() {
 
 test("API timing distinguishes server, response, download and timeout without recording secrets", () => {
   const {requests, record} = networkRecorder();
-  record("Network.requestWillBeSent", {requestId:"signal", request:{url:"https://example.test/tw-day-trade/api/signals?offset=0&token=secret", method:"GET", headers:{Authorization:"secret"}}, timestamp:10, wallTime:20, type:"Fetch"});
+  record("Network.requestWillBeSent", {requestId:"signal", request:{url:"https://example.test/tw-day-trade/api/signals?offset=0&revision_scope=latest&token=secret", method:"GET", headers:{Authorization:"secret"}}, timestamp:10, wallTime:20, type:"Fetch"});
   record("Network.responseReceived", {requestId:"signal", timestamp:11,
     response:{status:200, protocol:"h2", headers:{"Server-Timing":"app;dur=200", "Set-Cookie":"secret", "Content-Length":"42"}, timing:{receiveHeadersEnd:200}}});
   record("Network.loadingFinished", {requestId:"signal", timestamp:12, encodedDataLength:42});
@@ -205,6 +205,7 @@ test("API timing distinguishes server, response, download and timeout without re
   assert.equal(entry.responseSeconds, 11);
   assert.equal(entry.finishedSeconds, 12);
   assert.equal(entry.headers["server-timing"], "app;dur=200");
+  assert.equal(new URL(entry.path,"https://example.test").searchParams.get("revision_scope"),"latest");
   assert.equal(JSON.stringify(entry).includes("secret"), false);
   record("Network.loadingFailed", {requestId:"signal", timestamp:25, errorText:"net::ERR_ABORTED", canceled:true});
   assert.equal(entry.failedSeconds, 25);

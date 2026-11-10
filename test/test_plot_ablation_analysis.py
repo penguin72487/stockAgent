@@ -12,11 +12,161 @@ import pytest
 from scripts.plot_ablation_analysis import (
     _absolute_records,
     _fold_color_map,
+    _risk_return_figure,
+    _test_year_records,
+    _write_test_year_plots,
+    _write_completed_fold_plots,
     _write_absolute_plots,
     display_label,
     load,
     ordered_variant_names,
 )
+
+
+def test_test_year_alignment_uses_first_year_and_preserves_actual_session_rows(tmp_path):
+    dates = np.array(['2025-01-02', '2025-01-03', '2025-01-06', '2026-01-02'],
+                     dtype='datetime64[D]')
+    calendar = {'accepted': True, 'identical_target_intervals': True, 'cases': {}}
+    for name, fold_id in [('first', 10), ('second', 11)]:
+        run = tmp_path / name
+        fold = run / f'fold_{fold_id:02d}'
+        fold.mkdir(parents=True)
+        (run / 'summary.json').write_text(json.dumps([{'fold_id': fold_id,
+            'train_years': [2023], 'val_years': [2024], 'test_years': [2025, 2026]}]))
+        (fold / 'fold_complete.json').write_text(json.dumps({'status': 'complete',
+            'fold_id': fold_id, 'test_rows': 4, 'test_date_start': str(dates[0]),
+            'test_date_end': str(dates[-1])}))
+        np.savez(fold / 'test_backtest.npz', dates=dates,
+                 strategy_returns=np.array([.01, 0., -.005, .9]),
+                 benchmark_returns=np.array([.002, 0., -.001, .1]),
+                 turnovers=np.array([.1, 0., .1, .1]))
+        calendar['cases'][name] = {'actual_intervals': [{'fold_id': fold_id,
+            'test': {'rows': 4, 'start': str(dates[0]), 'end': str(dates[-1])}}]}
+    receipt = tmp_path / 'calendar.json'
+    receipt.write_text(json.dumps(calendar))
+    records, series = _test_year_records(tmp_path, receipt)
+    assert {(row['test_year'], row['fold_id']) for row in records} == {(2025, 10), (2025, 11)}
+    assert len({row['cohort_id'] for row in records}) == 1
+    assert all(row['sessions'] == 3 and row['cumulative_return'] == pytest.approx(np.expm1(.005))
+               for row in records)
+    assert series['first', 2025][1][1] == 0.  # An observed idle session stays flat.
+    output = tmp_path / 'charts'
+    status = _write_test_year_plots(tmp_path, output, 'test', 'test', receipt)
+    directory = output / 'test_by_test_year'
+    metrics = ('cagr', 'sharpe', 'sortino', 'turnover', 'daily_hit_rate')
+    assert set(status['png_files']) == {'all_folds_connected.png', 'year_2025.png',
+        'year_2025_equity.png', *(f'{metric}/all_folds_connected.png' for metric in metrics),
+        *(f'{metric}/year_2025.png' for metric in metrics)}
+    assert status['rendering_contract'] == 'canonical_ablation_risk_return_v1'
+    assert (directory / 'all_folds_connected.png').read_bytes() == (directory / 'cagr/all_folds_connected.png').read_bytes()
+    for filename in status['png_files']:
+        assert (directory / filename).read_bytes().startswith(b'\x89PNG\r\n\x1a\n')
+    before = (directory / 'all_folds_connected.png').stat().st_mtime_ns
+    assert _write_test_year_plots(tmp_path, output, 'test', 'test', receipt) == status
+    assert (directory / 'all_folds_connected.png').stat().st_mtime_ns == before
+    # Adding a year changes the shared scale/color timeline, so existing yearly
+    # views must refresh too; otherwise they would cease to be comparable.
+    old_year_mtime = (directory / 'year_2025.png').stat().st_mtime_ns
+    run = tmp_path / 'first'
+    fold = run / 'fold_09'
+    fold.mkdir()
+    earlier = np.array(['2024-01-02', '2024-01-03'], dtype='datetime64[D]')
+    np.savez(fold / 'test_backtest.npz', dates=earlier, strategy_returns=[.01, -.01],
+             benchmark_returns=[0., 0.], turnovers=[.1, .1])
+    (fold / 'fold_complete.json').write_text(json.dumps({'status': 'complete', 'fold_id': 9,
+        'test_rows': 2, 'test_date_start': str(earlier[0]), 'test_date_end': str(earlier[-1])}))
+    first_summary = json.loads((run / 'summary.json').read_text())
+    first_summary.append({'fold_id': 9, 'train_years': [2022], 'val_years': [2023], 'test_years': [2024]})
+    (run / 'summary.json').write_text(json.dumps(first_summary))
+    calendar['cases']['first']['actual_intervals'].append({'fold_id': 9, 'test':
+        {'rows': 2, 'start': str(earlier[0]), 'end': str(earlier[-1])}})
+    calendar['identical_target_intervals'] = False
+    receipt.write_text(json.dumps(calendar))
+    _write_test_year_plots(tmp_path, output, 'test', 'test', receipt)
+    assert (directory / 'year_2024.png').is_file()
+    assert (directory / 'year_2025.png').stat().st_mtime_ns > old_year_mtime
+    calendar['cases']['second']['actual_intervals'][0]['test']['rows'] = 3
+    receipt.write_text(json.dumps(calendar))
+    with pytest.raises(ValueError, match='admitted calendar differ'):
+        _test_year_records(tmp_path, receipt)
+
+
+def test_canonical_risk_return_style_aligns_years_keeps_names_and_breaks_missing_years():
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import to_rgba
+
+    rows = [dict(variant=name, test_year=year, fold_id=fold_id, max_drawdown=x, cagr=y)
+        for name, year, fold_id, x, y in [
+            ('baseline', 2024, 8, -.1, .2), ('baseline', 2026, 10, -.05, .3),
+            ('variant', 2024, 9, -.12, .4), ('variant', 2025, 10, -.08, .5),
+            ('variant', 2026, 11, -.04, .6)]]
+    kwargs = dict(scope_label='test account', period_key='test_year', period_name='Test year',
+                  periods=[2024, 2025, 2026], show_fold_ids=True)
+    connected = _risk_return_figure(rows, 'cagr', 'CAGR', **kwargs)
+    ax = connected.axes[0]
+    assert len(connected.axes) == 2  # Chronological blue colorbar, no experiment legend.
+    assert ax.get_legend() is None
+    assert any(text.get_text() == 'Baseline (capital TWD 10M) [F10]' for text in ax.texts)
+    assert any(text.get_text() == 'Variant [F11]' for text in ax.texts)
+    baseline_line = next(line for line in ax.lines if line.get_alpha() == .72)
+    assert np.isnan(baseline_line.get_ydata()[1])
+    assert baseline_line.get_color() == '#252A34'
+    first, last = ax.collections[0], ax.collections[1]
+    assert last.get_sizes()[0] > first.get_sizes()[0]
+    assert np.allclose(last.get_facecolors()[0], _fold_color_map([2024, 2025, 2026])[2026])
+    # Baseline retains a diamond; the variant retains circles and white edges.
+    assert len(first.get_paths()[0].vertices) == 5
+    assert np.allclose(ax.collections[-1].get_edgecolors()[0], to_rgba('white'))
+    first_year = _risk_return_figure(rows, 'cagr', 'CAGR', period_id=2024, **kwargs)
+    last_year = _risk_return_figure(rows, 'cagr', 'CAGR', period_id=2026, **kwargs)
+    assert first_year.axes[0].get_xlim() == last_year.axes[0].get_xlim() == ax.get_xlim()
+    assert first_year.axes[0].get_ylim() == last_year.axes[0].get_ylim() == ax.get_ylim()
+    assert any(text.get_text() == 'Variant [F9]' for text in first_year.axes[0].texts)
+    for figure in (connected, first_year, last_year):
+        plt.close(figure)
+
+
+def test_legacy_completed_report_paths_keep_partial_runs_and_original_windows(tmp_path):
+    root, output = tmp_path / 'runs', tmp_path / 'plots'
+    calendar = {'accepted': True, 'cases': {}}
+    saved = {}
+    for name, folds in [('baseline', [(10, 2026)]), ('variant', [(8, 2025), (9, 2026)])]:
+        run = root / name
+        run.mkdir(parents=True)
+        summaries, intervals = [], []
+        for fold_id, year in folds:
+            folder = run / f'fold_{fold_id:02d}'
+            folder.mkdir()
+            dates = np.array([f'{year}-01-02', f'{year}-01-03'], dtype='datetime64[D]')
+            metrics = dict(cagr=.1 + fold_id / 10, sharpe=fold_id / 2, sortino=fold_id,
+                           max_drawdown=-.01 * fold_id, turnover=.1, daily_hit_rate=.5)
+            saved[name, fold_id] = metrics
+            summaries.append(dict(fold_id=fold_id, train_years=[year-2], val_years=[year-1],
+                                  test_years=[year], val_metrics=metrics, test_metrics=metrics))
+            np.savez(folder / 'test_backtest.npz', dates=dates, strategy_returns=[.01, -.01])
+            (folder / 'fold_complete.json').write_text(json.dumps(dict(status='complete',fold_id=fold_id,
+                test_rows=2,test_date_start=str(dates[0]),test_date_end=str(dates[-1]))))
+            intervals.append(dict(fold_id=fold_id, test=dict(rows=2,start=str(dates[0]),end=str(dates[-1])),
+                                  val=dict(rows=2,start=f'{year-1}-01-02',end=f'{year-1}-01-03')))
+        (run / 'summary.json').write_text(json.dumps(summaries))
+        calendar['cases'][name] = dict(fold_ids=[fold for fold,_ in folds],actual_intervals=intervals)
+    receipt = tmp_path / 'calendar.json'
+    receipt.write_text(json.dumps(calendar))
+    for split, prefix in [('val', 'ofat_val'), ('test', 'ofat_test_diagnostic')]:
+        status = _write_completed_fold_plots(root, output, split, prefix, split, receipt)
+        directory = output / f'{prefix}_risk_return_by_fold'
+        assert status['completed_observations'] == 3
+        assert status['fold_aliases'] == {'8':2025,'9':2026,'10':2026}
+        for row in status['records']:
+            assert all(row[key] == value for key,value in saved[row['variant'],row['fold_id']].items())
+        for metric_name in ('cagr','sharpe','sortino','turnover','daily_hit_rate'):
+            assert (directory / metric_name / 'all_folds_connected.png').is_file()
+            assert (directory / metric_name / 'year_2025.png').is_file()
+            assert (directory / metric_name / 'year_2026.png').read_bytes() == (
+                directory / metric_name / 'fold_10.png').read_bytes()
+        before = (directory / 'cagr/all_folds_connected.png').stat().st_mtime_ns
+        assert _write_completed_fold_plots(root, output, split, prefix, split, receipt) == status
+        assert (directory / 'cagr/all_folds_connected.png').stat().st_mtime_ns == before
 
 
 def _absolute_fixture(root, name, fold_id=11, first='2026-02-26', rows=3):

@@ -14,6 +14,233 @@ from scripts import promote_tw_day_trade_replay as promotion
 MARKETS = {"mode_a", "mode_b", "mode_c"}
 
 
+def _provisional_open_pair():
+    proof = {
+        "contract": "completed_session_official_open_as_0901_paper_entry_assumption_v1",
+        "session_date": "2026-11-09", "symbol": "3150", "simulation_only": True,
+        "broker_fill": False, "exchange_fill": False, "opening_time_known": False,
+        "full_quantity_assumed": True, "price": 14.95,
+        "source_path": "/retained/twse_daily_ohlcv/2026-11-09.json",
+        "source_sha256": "a" * 64,
+    }
+    shared = {
+        "session_date": "2026-11-09", "market": "mode_a", "symbol": "3150",
+        "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+        "historical_open_fallback_fill": True, "historical_open_fallback_evidence": proof,
+        "entry_price_method": "official_open_fallback_assumption",
+        "entry_price_source": "official_daily_session_open_assumed_for_0901",
+        "entry_price_guard_contract": "strict_inside_original_take_profit_stop_loss_v1",
+        "entry_price_offset_ticks": 0, "stop_trigger_price": 15.4,
+        "take_profit_price": 12.7, "counterfactual_0901_price_fill": False,
+        "counterfactual_open_price_fill": False, "synthetic_fill": False,
+        "synthetic_fallback_fill": False, "paper_market_fill": False,
+        "simulation_replay": True,
+    }
+    signal = {
+        **shared, "side": "short", "action": "SELL",
+        "recorded_at": "2026-11-09T09:01:00+08:00", "requested_shares": 3000,
+        "filled_shares": 3000, "execution_price": 14.95, "sizing_open_price": 14.95,
+        "sizing_nav_twd": 2_000_000.0, "filled_weight_basis": "session_start_account_nav",
+        "reason": "counterfactual_official_open_when_0901_unavailable",
+    }
+    fill = {
+        **shared, "purpose": "entry", "simulation_only": True,
+        "fill_contract": "completed_session_official_open_as_0901_paper_entry_assumption_v1",
+        "fill_at": "2026-11-09T09:01:00+08:00", "quantity": 3000,
+        "price": 14.95,
+    }
+    return signal, fill
+
+
+def _write_provisional_open_pair(path, signals, fills):
+    for name, rows in (("signals.jsonl", signals), ("fills.jsonl", fills)):
+        (path / name).write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+
+def test_provisional_open_assumption_requires_matched_disclosed_signal_and_fill(tmp_path):
+    signal, fill = _provisional_open_pair()
+    _write_provisional_open_pair(tmp_path, [signal], [fill])
+    failures = []
+    result = promotion._validate_provisional_open_assumptions(
+        tmp_path, expected_by_session_market={("2026-11-09", "mode_a"): 1}, failures=failures)
+    assert failures == []
+    assert result["assumption_entries"] == 1
+
+
+@pytest.mark.parametrize("mutation", [
+    "different_quantity", "different_price", "different_proof", "duplicate_fill",
+    "duplicate_signal", "bad_bracket", "bad_nav", "bad_clock", "no_disclosure",
+    "wrong_session_count",
+])
+def test_provisional_open_assumption_rejects_ambiguous_or_inconsistent_evidence(tmp_path, mutation):
+    from copy import deepcopy
+    signal, fill = _provisional_open_pair()
+    signal, fill = deepcopy(signal), deepcopy(fill)
+    signals, fills = [signal], [fill]
+    expected = {("2026-11-09", "mode_a"): 1}
+    if mutation == "different_quantity": fill["quantity"] = 2000
+    elif mutation == "different_price": fill["price"] = 15.0
+    elif mutation == "different_proof": fill["historical_open_fallback_evidence"]["price"] = 15.0
+    elif mutation == "duplicate_fill": fills.append(deepcopy(fill))
+    elif mutation == "duplicate_signal": signals.append(deepcopy(signal))
+    elif mutation == "bad_bracket": signal["stop_trigger_price"] = 14.95
+    elif mutation == "bad_nav": signal["sizing_nav_twd"] = 0
+    elif mutation == "bad_clock": signal["recorded_at"] = "2026-11-09T09:02:00+08:00"
+    elif mutation == "no_disclosure": signal["historical_open_fallback_evidence"]["exchange_fill"] = True
+    elif mutation == "wrong_session_count": expected[("2026-11-09", "mode_a")] = 2
+    _write_provisional_open_pair(tmp_path, signals, fills)
+    failures = []
+    promotion._validate_provisional_open_assumptions(
+        tmp_path, expected_by_session_market=expected, failures=failures)
+    assert failures
+
+
+def test_provisional_promotion_needs_explicit_market_and_successful_full_audit(tmp_path, monkeypatch):
+    from scripts import audit_tw_day_trade_margin_replay as independent_audit
+    from stockagent.live.tw_day_trade_simulation import (
+        HISTORICAL_BRACKET_FULL_CROSS_CONTRACT, HISTORICAL_OPEN_FALLBACK_CONTRACT,
+    )
+
+    candidate = _candidate(tmp_path)
+    state_path, receipt_path = candidate / "state.json", candidate / "rebuild_receipt.json"
+    state = json.loads(state_path.read_text())
+    state["modes"] = {"mode_a": state["modes"]["mode_a"]}
+    state["modes"]["mode_a"].update(entry_fill_policy=promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+        entry_fill_contract=promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT)
+    state_path.write_text(json.dumps(state))
+    receipt = json.loads(receipt_path.read_text())
+    receipt.update(provisional_minute_source_coverage=True,
+        historical_open_fallback_assumption=HISTORICAL_OPEN_FALLBACK_CONTRACT,
+        historical_bracket_cross_assumption=HISTORICAL_BRACKET_FULL_CROSS_CONTRACT,
+        official_daily_close_reference_when_minute_missing=True,
+        replay_contract={"entry": promotion.MINUTE_PRICE_0901_REPLAY_CONTRACT,
+                         "terminal_close_contract": promotion.TERMINAL_CLOSE_UNLIMITED_CONTRACT})
+    session = receipt["sessions"][0]
+    session["session_date"] = "2026-11-09"
+    session["close"] = {"status": "session_flat_with_nontrade_book_assumptions"}
+    session["modes"] = [row for row in session["modes"] if row["market"] == "mode_a"]
+    session["modes"][0]["entry"] = {
+        "entry_fill_policy": promotion.MINUTE_VWAP_0901_ENTRY_POLICY,
+        "entry_fill_count": 1, "entry_0901_minute_price_fill_count": 0,
+        "entry_fill_is_synthetic": False,
+    }
+    receipt_path.write_text(json.dumps(receipt))
+    signal, fill = _provisional_open_pair()
+    _write_provisional_open_pair(candidate, [signal], [fill])
+    monkeypatch.setattr(promotion, "_validate_minute_curve_coverage", lambda *a, **kw: {})
+    monkeypatch.setattr(promotion, "_validate_provisional_signal_lineage", lambda *a, **kw: {
+        "signal_count": 1, "source_hashes": {}})
+    audit = {"full_requested_range_passed": True, "provisional_minute_source_coverage": True,
+             "complete_minute_source_coverage_verified": False,
+             "official_open_0901_assumption_entries": 1,
+             "provisional_nontrade_accounting_assumptions": 1, "errors": []}
+    monkeypatch.setattr(independent_audit, "audit", lambda *a, **kw: audit)
+    with pytest.raises(RuntimeError):
+        promotion._validate_rebuild(candidate, expected_markets={"mode_a"})
+    with pytest.raises(ValueError, match="market"):
+        promotion._validate_rebuild(candidate, expected_markets={"mode_a"},
+                                    allow_provisional_research_market="mode_b")
+    result = promotion._validate_rebuild(candidate, expected_markets={"mode_a"},
+                                        allow_provisional_research_market="mode_a")
+    assert result["provisional_research"]["official_open_assumptions"] == 1
+    assert result["provisional_research"]["complete_minute_source_coverage_verified"] is False
+    audit["full_requested_range_passed"] = False
+    with pytest.raises(RuntimeError, match="audit failed"):
+        promotion._validate_rebuild(candidate, expected_markets={"mode_a"},
+                                    allow_provisional_research_market="mode_a")
+
+
+def _provisional_signal_lineage_fixture(tmp_path):
+    import hashlib
+    source = tmp_path / "source"
+    source.mkdir()
+    opening, weights, summary = source / "official_open.csv", source / "target_weights.parquet", source / "summary.json"
+    opening.write_bytes(b"official opening")
+    weights.write_bytes(b"weights")
+    digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+    summary.write_text(json.dumps({"market": "mode_a", "signal_id": "exact-signal",
+        "checkpoint_fingerprint": "exact-checkpoint", "counterfactual_signal_regeneration": True,
+        "simulation_only": True, "production_order_possible": False,
+        "counterfactual_open_provenance": {"source": "official_daily_session_open",
+            "input_path": str(opening), "input_sha256": digest(opening)}}))
+    item = {"session_date": "2026-11-09", "market": "mode_a", "signal_id": "exact-signal",
+        "summary_path": str(summary), "summary_sha256": digest(summary),
+        "weights_path": str(weights), "weights_sha256": digest(weights),
+        "open_input_path": str(opening), "open_input_sha256": digest(opening)}
+    candidate = tmp_path / "candidate"
+    candidate.mkdir()
+    preflight = {"contract": "exact_selected_signal_preflight_v1", "status": "accepted_sources_only",
+        "simulation_only": True, "production_order_possible": False,
+        "execution_or_minute_coverage_accepted": False, "expected_signals": 1,
+        "accepted_signals": 1, "failures": [], "artifacts": [item]}
+    (candidate / "signal_preflight.json").write_text(json.dumps(preflight))
+    receipt = {"signal_preflight": {"sha256": digest(candidate / "signal_preflight.json")},
+        "sessions": [{"session_date": "2026-11-09", "modes": [dict(item)]}]}
+    return candidate, receipt, item
+
+
+def test_provisional_lineage_pins_checkpoint_all_input_files_and_session(tmp_path):
+    candidate, receipt, item = _provisional_signal_lineage_fixture(tmp_path)
+    result = promotion._validate_provisional_signal_lineage(
+        candidate, receipt=receipt, market="mode_a", checkpoint_fingerprint="exact-checkpoint")
+    assert result["signal_count"] == 1
+    assert result["source_hashes"][item["open_input_path"]] == item["open_input_sha256"]
+
+
+@pytest.mark.parametrize("field", ["summary_path", "weights_path", "open_input_path"])
+def test_provisional_lineage_rejects_any_changed_source(tmp_path, field):
+    candidate, receipt, item = _provisional_signal_lineage_fixture(tmp_path)
+    Path(item[field]).write_bytes(b"changed after preflight")
+    with pytest.raises((ValueError, RuntimeError), match="signal|source|hash"):
+        promotion._validate_provisional_signal_lineage(
+            candidate, receipt=receipt, market="mode_a", checkpoint_fingerprint="exact-checkpoint")
+
+
+@pytest.mark.parametrize("field", ["official_open_fallback_source_hashes", "research_close_source_hashes",
+    "nontrade_source_hashes", "finmind_projection_source_hashes"])
+def test_cutover_rechecks_each_independent_source_hash(tmp_path, field):
+    import hashlib
+
+    source = tmp_path / "source.dat"
+    source.write_bytes(b"verified original")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    audit = {"source_hashes": {}, "corporate_action_source_hashes": {}, field: {str(source): digest}}
+    acceptance = {"strict_intraday_audit": audit, "signal_ledger_validation": {}}
+    promotion._revalidate_margin_sources(tmp_path, acceptance)
+    source.write_bytes(b"changed after validation")
+    with pytest.raises(RuntimeError, match="source changed"):
+        promotion._revalidate_margin_sources(tmp_path, acceptance)
+
+
+def test_cutover_rechecks_receipted_official_calendar(tmp_path):
+    import hashlib
+
+    calendar = tmp_path / "calendar.parquet"
+    calendar.write_bytes(b"verified calendar")
+    digest = hashlib.sha256(calendar.read_bytes()).hexdigest()
+    audit = {"source_hashes": {}, "corporate_action_source_hashes": {},
+             "official_calendar_verification": {"path": str(calendar), "sha256": digest}}
+    acceptance = {"strict_intraday_audit": audit, "signal_ledger_validation": {}}
+    promotion._revalidate_margin_sources(tmp_path, acceptance)
+    calendar.write_bytes(b"calendar changed")
+    with pytest.raises(RuntimeError, match="calendar.*changed"):
+        promotion._revalidate_margin_sources(tmp_path, acceptance)
+
+
+def test_cutover_rechecks_provisional_signal_sources(tmp_path):
+    import hashlib
+    source = tmp_path / "signal.parquet"
+    source.write_bytes(b"verified")
+    digest = hashlib.sha256(source.read_bytes()).hexdigest()
+    acceptance = {"strict_intraday_audit": {"source_hashes": {}, "corporate_action_source_hashes": {}},
+                  "signal_ledger_validation": {"provisional_signal_lineage": {
+                      "source_hashes": {str(source): digest}}}}
+    promotion._revalidate_margin_sources(tmp_path, acceptance)
+    source.write_bytes(b"modified")
+    with pytest.raises(RuntimeError, match="signal source changed"):
+        promotion._revalidate_margin_sources(tmp_path, acceptance)
+
+
 def test_daily_entry_sweeps_and_lifetime_reductions_have_distinct_clocks(tmp_path, monkeypatch):
     from copy import deepcopy
 
@@ -419,6 +646,60 @@ def test_validate_rebuild_accepts_exact_flat_mode_set(tmp_path: Path) -> None:
     )
 
 
+@pytest.mark.parametrize("broken", [None, "readback", "symbol", "other_opening", "claim_complete"])
+@pytest.mark.parametrize("first_bar", [False, True])
+def test_explicit_cost_valuation_preserves_other_opening_source_gates(tmp_path, broken, first_bar):
+    from scripts.rebuild_tw_day_trade_minute_curves import opening_assumption_policy
+    policy = opening_assumption_policy(first_bar)
+    contract = policy["contract"]
+    candidate = _candidate(tmp_path)
+    fills = candidate / "fills.jsonl"
+    fills.touch()
+    path = candidate / "minute_curve_receipt.json"
+    receipt = json.loads(path.read_text())
+    receipt.update(opening_marks_revalued_at_completed_minute=False,
+        accepted_13_30_endpoints_preserved=True,
+        accepted_09_01_strategy_and_13_30_endpoints_preserved=False,
+        unchanged_fills_sha256=promotion._sha256(fills))
+    receipt[policy["flag"]] = True
+    receipt["strategy"][policy["key"]] = {
+        "contract": contract, "authorized_targets": [["mode_a", "2026-08-13", "2330"]]}
+    receipt["strategy"][policy["readback"]] = {
+        "contract": contract, "verified_symbol_points": 1,
+        "market_observation_verified": False, "financial_journals_changed": False,
+        **({"later_bar_source_verified": True} if first_bar else {})}
+    marks = candidate / "marks.jsonl"
+    rows = [json.loads(line) for line in marks.read_text().splitlines()]
+    for row in rows:
+        if row["minute"][11:16] == "09:01" and row["market"] == "mode_a":
+            symbol = "2330" if broken != "symbol" else "2317"
+            row["valuation_stale"] = True
+            row[policy["key"]] = {
+                "contract": contract, "cohorts": [{"symbol": symbol,
+                    **({"reference_bar": {"symbol": symbol, "session_date": "2026-08-13",
+                         "source_minute": "2026-08-13T09:02+08:00"}} if first_bar else {})}],
+                **({"uses_later_observation": True, "causal_0901_market_observation": False} if first_bar else {})}
+        if broken == "other_opening" and row["minute"][11:16] == "09:01" and row["market"] == "mode_b":
+            row.pop("historical_minute_replay")
+    if broken == "readback":
+        receipt["strategy"].pop(policy["readback"])
+    if broken == "claim_complete":
+        receipt["opening_marks_revalued_at_completed_minute"] = True
+    marks.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    receipt["outputs"]["marks"]["sha256"] = promotion._sha256(marks)
+    path.write_text(json.dumps(receipt))
+    failures = []
+    accepted = promotion._validate_minute_curve_coverage(candidate,
+        completed_session_dates=["2026-08-13"], expected_markets=MARKETS, failures=failures)
+    if broken:
+        assert failures
+    else:
+        assert failures == [] and accepted["validated_rows"] == 810
+        assert accepted["opening_marks_revalued_at_completed_minute"] is False
+        assert accepted[policy["key"]]["verified_minute_points"] == 1
+        assert accepted[policy["key"]]["market_observation_verified"] is False
+
+
 def test_v2_replay_is_not_promoted_without_independent_source_audit(tmp_path, monkeypatch):
     candidate = _candidate(tmp_path)
     path = candidate / "rebuild_receipt.json"
@@ -555,6 +836,20 @@ def test_validate_rebuild_rejects_stale_daily_only_curve(tmp_path: Path) -> None
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="270 points per completed session"):
+        promotion._validate_rebuild(candidate, expected_markets=MARKETS)
+
+
+def test_validate_rebuild_rejects_duplicate_minute_even_if_grid_is_complete(tmp_path: Path) -> None:
+    candidate = _candidate(tmp_path)
+    marks_path = candidate / "marks.jsonl"
+    first = marks_path.read_text().splitlines()[0]
+    with marks_path.open("a", encoding="utf-8") as handle:
+        handle.write(first + "\n")
+    receipt_path = candidate / "minute_curve_receipt.json"
+    receipt = json.loads(receipt_path.read_text())
+    receipt["outputs"]["marks"]["sha256"] = promotion._sha256(marks_path)
+    receipt_path.write_text(json.dumps(receipt))
+    with pytest.raises(RuntimeError, match="duplicate minute"):
         promotion._validate_rebuild(candidate, expected_markets=MARKETS)
 
 

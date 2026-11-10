@@ -16,6 +16,7 @@ import stat
 
 from stockagent.data_sync.desync_snapshots import _fsync_directory
 from stockagent.data_sync.immutable_replication import digest, read_manifest, safe
+from stockagent.data_sync.work_progress import report_work
 
 CONTRACT = 'ducklake_incremental_data_v1'
 _LINK_UNAVAILABLE = {errno.EXDEV, errno.EOPNOTSUPP, errno.ENOSYS, errno.EPERM,
@@ -114,6 +115,7 @@ def copy_catalog_data(source: Path, destination: Path, *, previous: Path | Catal
     destination.mkdir()
     copied_files = copied_bytes = linked_files = linked_bytes = link_fallbacks = 0
     expected = {}
+    report_work('catalog_copy', total=len(observed))
     for relative, before in observed.items():
         origin, target = safe(source, relative), safe(destination, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -158,6 +160,7 @@ def copy_catalog_data(source: Path, destination: Path, *, previous: Path | Catal
             copied_files += 1
             copied_bytes += descriptor['bytes']
         expected[donor_key] = descriptor
+        report_work('catalog_copy', done=len(expected), total=len(observed))
     # The original catalog lock excludes its writer, but retain a complete
     # path/type/stat fence rather than assuming the lock proves stability.
     if _files(source) != observed:

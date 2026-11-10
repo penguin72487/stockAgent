@@ -105,7 +105,9 @@ def quality_attempt(root: Path, code: str, *, tail_only: bool):
             # Collector dataset locks already serialize upstream work. This
             # small lock also protects concurrently arriving audit intents.
             try:
-                with (root / '.quality_priority.lock').open('a') as lock:
+                from stockagent.data_sync.bybit_workspace_guard import writer_guard as bybit_writer_guard
+                from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+                with yahoo_writer_guard(root), bybit_writer_guard(root), (root / '.quality_priority.lock').open('a') as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
                     plan = load_plan(root)
                     for row in plan['requests']:

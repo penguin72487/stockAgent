@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
@@ -17,7 +18,7 @@ sys.path.insert(0, str(ROOT))
 from scripts.return_remote_legacy_archives import private_control_prefix
 from stockagent.data_sync.artifact_discard import DEFAULT_POLICY, load_policy
 from stockagent.data_sync.desync_snapshots import atomic_write_json
-from stockagent.remote_ssh import ssh_base, validate_ssh_target
+from stockagent.remote_ssh import ssh_base, validate_remote_absolute, validate_ssh_target
 
 
 def main():
@@ -29,7 +30,10 @@ def main():
     p.add_argument("--ssh-target", default="root@114.32.64.6")
     p.add_argument("--ssh-port", type=int, default=40032)
     p.add_argument("--identity-file", type=Path, default=Path("/root/.ssh/stockagent_vastai1t_ed25519"))
+    p.add_argument("--remote-env-dir", help="Explicit discovered FINTECH_ENV_PATH for the remote control and selected config loader")
     args = p.parse_args()
+    remote_env = (validate_remote_absolute(args.remote_env_dir, "remote environment")
+                  if args.remote_env_dir else None)
     if args.receipt.exists():
         p.error("retain a fresh receipt")
     policy = load_policy(args.policy)
@@ -80,6 +84,9 @@ with real(state/'owner.lock').open('a') as owner:
  print(json.dumps(result),flush=True)
 '''
     command = "cd /root/stockAgent && source scripts/runtime_env.sh && run_fintech_python -"
+    if remote_env:
+        command = ("cd /root/stockAgent && export FINTECH_ENV_PATH=" + shlex.quote(remote_env)
+                   + " && source scripts/runtime_env.sh && run_fintech_python -")
     log = args.receipt.with_suffix(".log")
     log.parent.mkdir(parents=True, exist_ok=True)
     with log.open("x") as output:

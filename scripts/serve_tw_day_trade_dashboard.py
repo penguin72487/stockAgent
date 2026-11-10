@@ -135,8 +135,22 @@ class DashboardServer(ThreadingHTTPServer):
             maximum_event_rows=500,
             maximum_mark_rows=32,
             include_position_rows=False,
-            include_ledger_session_dates=self.session_indexes_ready.is_set(),
+            include_order_fill_rows=False,
+            # A ready detail index is not immutable: live appends would make
+            # date discovery re-hash its entire legacy prefix synchronously.
+            # Use the committed replay calendar/state/archive metadata here;
+            # signal/detail requests retain the full index/source validation.
+            include_ledger_session_dates=self._status_indexes_ready(),
         )
+
+    def _status_indexes_ready(self) -> bool:
+        from stockagent.live.paper_journal import managed
+        # Immutable append lineage makes live index extension cheap and
+        # verifiable. Legacy prefixes keep warming in the original background
+        # owner; expose counts as pending rather than block the current state.
+        return self.session_indexes_ready.is_set() and all(
+            managed(path) for name in ("signals.jsonl", "orders.jsonl", "fills.jsonl")
+            if (path := self.state_dir / name).is_file())
 
     def signal_page(self, **kwargs: object) -> dict[str, object]:
         return build_dashboard_signal_page(state_dir=self.state_dir, **kwargs)
@@ -168,7 +182,7 @@ class DashboardServer(ThreadingHTTPServer):
             state_dir=self.state_dir,
             preopen_readiness_path=self.preopen_readiness_path,
             session_date=session_date,
-            include_ledger_session_dates=self.session_indexes_ready.is_set(),
+            include_ledger_session_dates=self._status_indexes_ready(),
         )
 
     def revision(self) -> dict[str, object]:
@@ -311,6 +325,9 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 display_filter = query.get("hide_zero_targets", ["0"])
                 if len(display_filter) != 1 or display_filter[0] not in {"0", "1"}:
                     raise ValueError("hide_zero_targets must be 0 or 1")
+                revision_scope = query.get("revision_scope", ["all"])
+                if len(revision_scope) != 1 or revision_scope[0] not in {"all", "latest"}:
+                    raise ValueError("revision_scope must be all or latest")
                 self._json(
                     HTTPStatus.OK,
                     self.server.signal_page(
@@ -318,6 +335,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
                         symbol=str(query.get("symbol", [""])[0]),
                         status=str(query.get("status", ["all"])[0]),
                         hide_zero_targets=display_filter[0] == "1",
+                        revision_scope=revision_scope[0],
                         session_date=str(query.get("date", [""])[0]) or None,
                         start_date=str(query.get("start_date", [""])[0]) or None,
                         end_date=str(query.get("end_date", [""])[0]) or None,

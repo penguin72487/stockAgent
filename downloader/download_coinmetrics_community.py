@@ -37,6 +37,9 @@ from artifact_io import (  # noqa: E402
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_path,
 )
+from dataset_lock import (  # noqa: E402
+    DEFAULT_LOCK_TIMEOUT_SECONDS, exclusive_dataset_lock, parse_lock_timeout_seconds,
+)
 
 
 BASE_URL = "https://community-api.coinmetrics.io/v4"
@@ -82,6 +85,11 @@ def parse_args() -> argparse.Namespace:
         )
     )
     parser.add_argument("--output-dir", default="data_coinmetrics_community")
+    parser.add_argument(
+        "--lock-timeout-seconds", type=parse_lock_timeout_seconds,
+        default=DEFAULT_LOCK_TIMEOUT_SECONDS,
+        help="Bounded wait for the canonical dataset writer lock, in seconds",
+    )
     parser.add_argument("--start-date", default="2009-01-01")
     parser.add_argument("--end-date", default="today")
     parser.add_argument("--workers", type=int, default=4)
@@ -594,8 +602,7 @@ def _download_batch(
     ]
 
 
-def main() -> None:
-    args = parse_args()
+def _run_locked_download(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     start_date = date.fromisoformat(str(args.start_date)).isoformat()
@@ -811,6 +818,21 @@ def main() -> None:
         raise RuntimeError(
             f"Coin Metrics Community incomplete: {status_counts['failed']} assets failed"
         )
+
+
+def main() -> None:
+    args = parse_args()
+    repo_root = SCRIPT_DIR.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from stockagent.data_sync.workspace_source_handoff import guard_path
+    output_dir = Path(args.output_dir)
+    guard_path(output_dir)
+    with exclusive_dataset_lock(output_dir / ".download.lock",
+                                provider="coinmetrics_community",
+                                timeout_seconds=args.lock_timeout_seconds):
+        guard_path(output_dir)
+        _run_locked_download(args)
 
 
 if __name__ == "__main__":

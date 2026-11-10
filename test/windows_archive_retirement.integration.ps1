@@ -1,9 +1,12 @@
 # Native integration test. Generates and removes only its own tiny fixtures.
+[CmdletBinding()]
+param([ValidateSet('D','E')][string]$DestinationDrive='D')
 $ErrorActionPreference='Stop'
 $worker=Join-Path (Split-Path -Parent $PSScriptRoot) 'scripts\retire_windows_download_archive.ps1'
 $id=[Guid]::NewGuid().ToString('N')
 $srcDir=Join-Path $env:TEMP ('stockagent-archive-selftest-'+$id)
-$dstDir='D:\OffloadedFromC\stockagent-archive-selftest-'+$id
+$destinationParent=if ($DestinationDrive -eq 'E') { 'E:\StockAgent' } else { 'D:\OffloadedFromC' }
+$dstDir=Join-Path $destinationParent ('stockagent-archive-selftest-'+$id)
 [void][IO.Directory]::CreateDirectory($srcDir)
 [void][IO.Directory]::CreateDirectory($dstDir)
 function Invoke-Worker($source,$size,$stamp) {
@@ -11,7 +14,10 @@ function Invoke-Worker($source,$size,$stamp) {
     $errors=$output+'.err'
     $arguments=@('-NoProfile','-NonInteractive','-ExecutionPolicy','Bypass','-File',('"'+$worker+'"'),
         '-Source',('"'+$source+'"'),'-DestinationDirectory',('"'+$dstDir+'"'),
-        '-ExpectedSize',([string]$size),'-ExpectedLastWriteUtc',('"'+$stamp+'"'),'-DestinationReserveBytes','0')
+        '-ExpectedSize',([string]$size),'-ExpectedLastWriteUtc',('"'+$stamp+'"'),
+        '-DestinationReserveBytes','0')
+    # Keep exercising the worker's original implicit D: behavior as well.
+    if ($DestinationDrive -ne 'D') { $arguments+=@('-DestinationDrive',$DestinationDrive) }
     $p=Start-Process -FilePath powershell.exe -ArgumentList $arguments -Wait -PassThru -NoNewWindow -RedirectStandardOutput $output -RedirectStandardError $errors
     return $p.ExitCode
 }
@@ -38,8 +44,8 @@ try {
     $info=Get-Item -LiteralPath $linked; $stamp=$info.LastWriteTimeUtc.ToString('o')
     if ((Invoke-Worker $linked $info.Length $stamp) -eq 0 -or -not (Test-Path -LiteralPath $linked) -or
         -not (Test-Path -LiteralPath $alias)) { throw 'Hardlinked source was not preserved' }
-    Write-Output '{"test":"windows_archive_retirement","success":true,"cases":["verified_retirement","exclusive_lock","size_pin","destination_collision","hardlink_refusal"]}'
+    Write-Output ('{"test":"windows_archive_retirement","destination_drive":"'+$DestinationDrive+'","success":true,"cases":["verified_retirement","exclusive_lock","size_pin","destination_collision","hardlink_refusal"]}')
 } finally {
     if ($srcDir -like (Join-Path $env:TEMP 'stockagent-archive-selftest-*') -and (Test-Path -LiteralPath $srcDir)) { Remove-Item -LiteralPath $srcDir -Recurse -Force }
-    if ($dstDir -like 'D:\OffloadedFromC\stockagent-archive-selftest-*' -and (Test-Path -LiteralPath $dstDir)) { Remove-Item -LiteralPath $dstDir -Recurse -Force }
+    if ($dstDir -eq (Join-Path $destinationParent ('stockagent-archive-selftest-'+$id)) -and (Test-Path -LiteralPath $dstDir)) { Remove-Item -LiteralPath $dstDir -Recurse -Force }
 }

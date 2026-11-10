@@ -230,7 +230,9 @@ class FinLabHistoryTest(unittest.TestCase):
         self.assertNotIn("finlab_timeout_count", wrapper)
         self.assertIn("--confirm-daily-reset --wait-seconds 120", wrapper)
         self.assertIn("finlab_preopen_deadline", wrapper)
-        self.assertIn("finlab_runway_seconds <= finlab_key_timeout_seconds + 30", wrapper)
+        self.assertIn("runway_seconds > finlab_key_timeout_seconds + 30", wrapper)
+        self.assertIn('"$finlab_local_clock" > "035959"', wrapper)
+        self.assertIn("finlab_confirm_daily_reset_if_due", wrapper)
         self.assertLess(wrapper.index('download_finlab_history.py" sync'),
                         wrapper.index('download_finlab_market_intraday.py'))
         self.assertLess(wrapper.index('download_finlab_market_intraday.py'),

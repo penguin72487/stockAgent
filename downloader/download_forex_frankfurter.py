@@ -804,9 +804,15 @@ def _run_download(args: argparse.Namespace) -> None:
 
 def main() -> None:
     args = parse_args()
-    with exclusive_dataset_lock(Path(args.output_dir) / ".download.lock",
-                                provider="frankfurter", timeout_seconds=args.lock_timeout_seconds):
-        _run_download(args)
+    from stockagent.data_sync.workspace_source_handoff import guard_path
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(args.output_dir, getattr(args, 'symbols_file', None),
+                            timeout_seconds=args.lock_timeout_seconds):
+        guard_path(Path(args.output_dir))
+        with exclusive_dataset_lock(Path(args.output_dir) / ".download.lock",
+                                    provider="frankfurter", timeout_seconds=args.lock_timeout_seconds):
+            guard_path(Path(args.output_dir))
+            _run_download(args)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,8 @@
 import json
+import os
 from pathlib import Path
 import subprocess
+import time
 
 import pytest
 
@@ -12,6 +14,89 @@ OLD = ('21 1 0:171 /stockagent-backup-ingress-lab203.relocated-to-E-v1 '
 ROOT = '1 0 8:64 / / ro,nosuid,relatime shared:11 - ext4 /dev/sde rw\n'
 NEW = ('31 1 8:80 /workspace/transport/lab203 /srv/stockagent-backup-ingress-lab203 '
        'ro,nosuid,noatime - ext4 /dev/sdf rw\n')
+
+
+def fake_task(path, state, start=123):
+    path.mkdir(parents=True, exist_ok=True)
+    (path / 'stat').write_text(f'{path.name} (command with ) space) {state} '
+                               + ' '.join(['0'] * 18 + [str(start)]) + '\n')
+
+
+def test_exited_zombie_does_not_block_an_otherwise_complete_namespace_scan(tmp_path):
+    from stockagent.data_sync import transport_relocation as relocation
+    live = tmp_path / '1'
+    (live / 'ns').mkdir(parents=True)
+    os.symlink('mnt:[1]', live / 'ns/mnt')
+    (live / 'mountinfo').write_text(ROOT)
+    zombie = tmp_path / '2'
+    fake_task(zombie, 'Z')
+    fake_task(zombie / 'task/2', 'Z')
+    assert handoff.exited_only(zombie)
+    assert list(handoff.namespaces(tmp_path)) == ['mnt:[1]']
+    assert relocation.stale_transport_namespaces(tmp_path) == {
+        'count': 0, 'reachable': 0, 'inspection_complete': True}
+
+
+@pytest.mark.parametrize('leader,task,has_task_namespace', [
+    ('S', 'S', False), ('Z', 'S', False), ('Z', 'Z', True)])
+def test_live_or_ambiguous_task_never_bypasses_namespace_scan(tmp_path, leader, task, has_task_namespace):
+    from stockagent.data_sync import transport_relocation as relocation
+    process = tmp_path / '2'
+    fake_task(process, leader)
+    fake_task(process / 'task/2', task)
+    if has_task_namespace:
+        (process / 'task/2/ns').mkdir()
+        os.symlink('mnt:[2]', process / 'task/2/ns/mnt')
+    assert not handoff.exited_only(process)
+    with pytest.raises(BlockingIOError, match='inspection incomplete'):
+        handoff.namespaces(tmp_path)
+    assert relocation.stale_transport_namespaces(tmp_path)['inspection_complete'] is False
+
+
+@pytest.mark.parametrize('missing', ['tasks', 'stat'])
+def test_incomplete_zombie_evidence_never_bypasses_namespace_scan(tmp_path, missing):
+    process = tmp_path / '2'
+    fake_task(process, 'Z')
+    if missing == 'stat':
+        (process / 'stat').unlink()
+        fake_task(process / 'task/2', 'Z')
+    assert not handoff.exited_only(process)
+    with pytest.raises(BlockingIOError, match='inspection incomplete'):
+        handoff.namespaces(tmp_path)
+
+
+def test_reused_process_identity_is_not_accepted_as_exited(tmp_path, monkeypatch):
+    process = tmp_path / '2'
+    fake_task(process, 'Z')
+    fake_task(process / 'task/2', 'Z')
+    original = Path.read_text
+    reads = []
+    def changing_identity(path, *args, **kwargs):
+        value = original(path, *args, **kwargs)
+        if path == process / 'stat':
+            reads.append(True)
+            if len(reads) > 1:
+                value = value.rsplit(' ', 1)[0] + ' 124\n'
+        return value
+    monkeypatch.setattr(Path, 'read_text', changing_identity)
+    assert not handoff.exited_only(process)
+
+
+def test_real_zombie_has_no_live_tasks_and_remains_reaped_by_its_parent():
+    child = subprocess.Popen(['/bin/true'])
+    process = Path('/proc') / str(child.pid)
+    deadline = time.monotonic() + 5
+    try:
+        while time.monotonic() < deadline:
+            tail = (process / 'stat').read_text().rsplit(') ', 1)[1].split()
+            if tail[0] == 'Z':
+                break
+            time.sleep(.01)
+        else:
+            pytest.fail('child did not enter zombie state')
+        assert handoff.exited_only(process)
+    finally:
+        assert child.wait(timeout=5) == 0
 
 
 def observation(tmp_path, raw=ROOT + OLD):

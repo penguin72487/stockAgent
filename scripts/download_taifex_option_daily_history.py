@@ -974,4 +974,6 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    from stockagent.data_sync.tw_option_raw_workspace_guard import cli_writer_guard
+    with cli_writer_guard():
+        raise SystemExit(main())

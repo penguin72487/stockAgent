@@ -1,0 +1,50 @@
+# Intentionally outside the active market directory until all gates pass.
+market: tw_day_trade_unit_mgda_2m_20261103
+label: 參數空間 Unit MGDA 當沖研究模擬（初始 200 萬）
+enabled: false
+market_type: tw
+timezone: Asia/Taipei
+open_time: '09:00'
+close_time: '13:30'
+schedule_time: '09:00'
+preopen_prepare_time: '08:15'
+summary_time: '14:00'
+data_ready_time: '13:40'
+freshness_max_lag_days: 3
+freshness_scan_limit: 0
+holidays: ['2026-10-23']
+initial_capital: 2000000.0
+day_trade_simulation_enabled: true
+day_trade_opening_reference_policy: known_prior_trade_provisional_v1
+# Explicit user choice: update on changed opening inputs and rebalance filled
+# paper inventory. This differs from the artifact's once-daily research ABI.
+day_trade_signal_update_policy: progressive_open_reference_rebalance_v1
+day_trade_simulation_state_dir: artifacts/live/tw_day_trade_simulation
+day_trade_rule_data_dir: /srv/stockagent-live/data_tw_public
+day_trade_strict_intraday: true
+day_trade_terminal_liquidation_unlimited_capacity: true
+day_trade_quote_interval_seconds: 60
+pre_signal_command:
+  - scripts/update_tw_day_trade_factorized_live.py
+  - --phase
+  - preopen
+pre_signal_timeout_seconds: 1200
+completed_session_command:
+  - scripts/update_tw_day_trade_factorized_live.py
+  - --phase
+  - completed
+completed_session_timeout_seconds: 1800
+formal_history_timeout_seconds: 1800
+previous_signal_backfill_limit: 512
+model_selection_path: tw_day_trade_unit_mgda_2m_20261103_model.yaml
+live_output_dir: artifacts/live_signals/tw_day_trade_unit_mgda_2m_20261103
+panel_date: latest
+device: cuda
+price_source: panel
+top_n: 2400
+min_abs_delta: 0.001
+benchmark_window_days: 32
+max_turnover_warning: 1.5
+max_top_weight_warning: 0.1
+max_gross_warning: 1.05
+unsupported_message: 此研究模擬候選尚待逐版訊號、成本契約與歷史驗收，不會下券商委託。

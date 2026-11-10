@@ -111,7 +111,7 @@ def _unique(pairs):
     return result
 
 
-def _read_reservation(descriptor: int, path: Path, root_info) -> dict:
+def _read_reservation(descriptor: int, path: Path, root_info, *, stale_device_renumbered: bool = False) -> dict:
     before = os.fstat(descriptor)
     if (not stat.S_ISREG(before.st_mode) or before.st_size > MAX_RECORD_BYTES
             or stat.S_IMODE(before.st_mode) != 0o600 or before.st_nlink != 1
@@ -131,7 +131,8 @@ def _read_reservation(descriptor: int, path: Path, root_info) -> dict:
                 or record["contract"] != CONTRACT or record["key"] != match[1]
                 or record["token"] != match[2]
                 or type(record["root_device"]) is not int or type(record["root_inode"]) is not int
-                or record["root_device"] != root_info.st_dev or record["root_inode"] != root_info.st_ino
+                or record["root_device"] < 0 or record["root_inode"] != root_info.st_ino
+                or (record["root_device"] != root_info.st_dev and not stale_device_renumbered)
                 or type(record["control_bytes"]) is not int
                 or record["control_bytes"] != CONTROL_HEADROOM_BYTES):
             raise ValueError("reservation identity mismatch")
@@ -144,9 +145,9 @@ def _read_reservation(descriptor: int, path: Path, root_info) -> dict:
     return record
 
 
-def _unlink_own_record(root: Path, root_info, path: Path, descriptor: int) -> None:
+def _unlink_own_record(root: Path, root_info, path: Path, descriptor: int, *, stale_device_renumbered=False) -> None:
     _same_root(root, root_info)
-    _read_reservation(descriptor, path, root_info)
+    _read_reservation(descriptor, path, root_info, stale_device_renumbered=stale_device_renumbered)
     path.unlink()
 
 
@@ -171,15 +172,22 @@ def _observe_locked(root: Path, root_info, *, reap: bool) -> dict:
             continue
         descriptor = os.open(path, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK)
         try:
-            record = _read_reservation(descriptor, path, root_info)
             try:
                 fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
             except BlockingIOError:
+                # A live reservation must still have the exact current
+                # device identity; never reinterpret an active writer.
+                record = _read_reservation(descriptor, path, root_info)
                 active.append(record)
                 continue
+            # WSL may assign a different st_dev to the same ext4 filesystem
+            # after a restart. A now-unlocked, otherwise valid old control
+            # record with the same root inode cannot reserve a live writer.
+            # Only this exact lease record is reaped; payloads are untouched.
+            record = _read_reservation(descriptor, path, root_info, stale_device_renumbered=True)
             stale.append(record)
             if reap:
-                _unlink_own_record(root, root_info, path, descriptor)
+                _unlink_own_record(root, root_info, path, descriptor, stale_device_renumbered=True)
                 allocations.pop((info.st_dev, info.st_ino))
         finally:
             os.close(descriptor)

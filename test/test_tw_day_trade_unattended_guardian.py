@@ -1,4 +1,5 @@
 import json
+from argparse import Namespace
 from datetime import time as datetime_time
 import os
 from pathlib import Path
@@ -14,6 +15,13 @@ from scripts import check_tw_day_trade_unattended_health as guardian
 
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+@pytest.fixture(autouse=True)
+def _never_inspect_or_mutate_the_test_hosts_kernel_clock(monkeypatch):
+    monkeypatch.setattr(time_sync, "_kernel_time_discipline", lambda: {
+        "tick_us": 10000, "nominal_tick_us": 10000, "frequency_ppm": 0.0, "status": 0,
+    })
 
 
 def _read(relative: str) -> str:
@@ -292,6 +300,85 @@ def test_wsl_uncertain_clock_does_not_step_the_system(monkeypatch) -> None:
     assert any("uncertainty" in row for row in payload["failures"])
 
 
+@pytest.mark.parametrize("tick", [9625, 9994, 10026])
+def test_abnormal_wsl_tick_does_not_pass_or_step_on_a_momentarily_correct_offset(monkeypatch, tick):
+    monkeypatch.setattr(time_sync, "_is_wsl", lambda: True)
+    monkeypatch.setattr(time_sync, "_chrony_tracking", lambda: {})
+    monkeypatch.setattr(time_sync, "_kernel_time_discipline", lambda: {
+        "tick_us": tick, "nominal_tick_us": 10000, "frequency_ppm": 34.0, "status": 0})
+    monkeypatch.setattr(time_sync, "_sample_windows_host_offset", lambda **_kwargs: {
+        "offset_seconds": 0.01, "uncertainty_seconds": 0.001,
+        "round_trip_seconds": 0.001, "sample_monotonic_seconds": 1.0})
+    monkeypatch.setattr(time_sync.time, "clock_settime", lambda *_: pytest.fail("no step"))
+    result = time_sync.evaluate_time_sync(
+        repair=True, max_offset_ms=500, max_repair_offset_seconds=300, samples=3)
+    assert not result["ready"]
+    assert not result["repaired"]
+    assert "kernel tick rate is abnormal" in " ".join(result["failures"])
+
+
+def test_clock_discipline_observer_rejects_mutating_modes():
+    command = time_sync._Timex()
+    command.modes = 0x4000
+    with pytest.raises(ValueError, match="read-only"):
+        time_sync._adjtimex(command)
+
+
+def _wsl_rate_payload(*, rate_bad=False, other_failure=False):
+    failures = (["WSL kernel tick rate is abnormal and is not continuously synchronized"] if rate_bad else [])
+    if other_failure:
+        failures.append("another measurement failed")
+    return {"status": "failed" if failures else "ok", "ready": not failures,
+            "failures": failures, "simulation_schedule_authority": {"source": "wsl_windows_host_clock"},
+            "repair_evidence": {"kernel_time_discipline": {"tick_us": 10000, "nominal_tick_us": 10000}}}
+
+
+def test_wsl_rate_fault_requires_five_consecutive_good_checks():
+    previous = _wsl_rate_payload(rate_bad=True)
+    time_sync._apply_wsl_rate_stability_guard(previous, None)
+    assert previous["wsl_rate_stability"]["status"] == "unstable"
+    for count in range(1, 6):
+        current = _wsl_rate_payload()
+        time_sync._apply_wsl_rate_stability_guard(current, previous)
+        assert current["wsl_rate_stability"]["consecutive_good_samples"] == count
+        assert current["ready"] is (count == 5)
+        previous = current
+
+
+def test_wsl_rate_failed_sample_resets_recovery_and_old_receipt_is_recognized():
+    previous = _wsl_rate_payload(rate_bad=True)  # legacy receipt without a guard field
+    current = _wsl_rate_payload()
+    time_sync._apply_wsl_rate_stability_guard(current, previous)
+    assert current["wsl_rate_stability"]["consecutive_good_samples"] == 1
+    failed = _wsl_rate_payload(other_failure=True)
+    time_sync._apply_wsl_rate_stability_guard(failed, current)
+    assert failed["wsl_rate_stability"]["status"] == "unstable"
+    assert failed["wsl_rate_stability"]["consecutive_good_samples"] == 0
+
+
+def test_wsl_rate_guard_rejects_corrupt_prior_state():
+    current = _wsl_rate_payload()
+    time_sync._apply_wsl_rate_stability_guard(current, {"wsl_rate_stability": {"status": "stable"}})
+    assert not current["ready"]
+    assert "previous WSL clock stability receipt is invalid" in current["failures"]
+
+
+def test_time_main_never_steps_during_remembered_rate_instability(tmp_path, monkeypatch):
+    receipt = tmp_path / "latest.json"
+    previous = _wsl_rate_payload(rate_bad=True)
+    time_sync._apply_wsl_rate_stability_guard(previous, None)
+    receipt.write_text(json.dumps(previous), encoding="utf-8")
+    monkeypatch.setattr(time_sync, "parse_args", lambda: Namespace(
+        repair=True, max_offset_ms=500.0, max_repair_offset_seconds=300.0,
+        samples=3, receipt=receipt))
+    requested = []
+    monkeypatch.setattr(time_sync, "evaluate_time_sync", lambda **kwargs: (
+        requested.append(kwargs) or _wsl_rate_payload()))
+    assert time_sync.main() == 1
+    assert requested[0]["repair"] is False
+    assert json.loads(receipt.read_text())["wsl_rate_stability"]["status"] == "recovering"
+
+
 def test_weekly_guardian_uses_existing_authoritative_units_without_active_restart() -> None:
     guardian = _read("scripts/check_tw_day_trade_unattended_health.py")
     timer = _read(
@@ -446,9 +533,60 @@ def test_guardian_rearms_failed_unit_without_restart(monkeypatch) -> None:
 
     assert commands == [
         ("reset-failed", "stockagent-discord-bot.service"),
-        ("enable", "--now", "stockagent-discord-bot.service"),
+        ("enable", "--now", "--no-block", "stockagent-discord-bot.service"),
     ]
     assert all("restart" not in row["command"] for row in actions)
+    assert actions[-1]["readiness"] == "unverified_until_next_observation"
+
+
+@pytest.mark.parametrize("state", ["activating", "deactivating", "reloading", "unknown", ""])
+@pytest.mark.parametrize("timer", [False, True])
+def test_guardian_never_rearms_an_unverified_or_transitioning_owner(state, timer):
+    assert not guardian._required_unit_repair_needed({"ActiveState": state}, timer=timer)
+
+
+@pytest.mark.parametrize("state", ["inactive", "failed"])
+@pytest.mark.parametrize("timer", [False, True])
+def test_guardian_rearms_only_a_known_stopped_unit(state, timer):
+    assert guardian._required_unit_repair_needed(
+        {"ActiveState": state, "LoadState": "loaded", "show_returncode": "0"}, timer=timer)
+    assert not guardian._required_unit_repair_needed(
+        {"ActiveState": state, "LoadState": "not-found", "show_returncode": "0"}, timer=timer)
+    assert not guardian._required_unit_repair_needed(
+        {"ActiveState": state, "show_returncode": "1"}, timer=timer)
+
+
+def test_guardian_rearms_a_disabled_but_active_timer_without_restart():
+    assert guardian._required_unit_repair_needed(
+        {"ActiveState": "active", "UnitFileState": "disabled"}, timer=True)
+    assert not guardian._required_unit_repair_needed(
+        {"ActiveState": "active", "UnitFileState": "enabled"}, timer=True)
+    assert not guardian._required_unit_repair_needed(
+        {"ActiveState": "active", "UnitFileState": "disabled"}, timer=False)
+
+
+def test_systemctl_timeout_is_unverified_not_a_success_or_guardian_crash(monkeypatch):
+    import subprocess
+
+    def timeout(command, **_kwargs):
+        raise subprocess.TimeoutExpired(command, 10)
+
+    monkeypatch.setattr(guardian.subprocess, "run", timeout)
+    assert guardian._systemctl_show("gateway.service") == {
+        "ActiveState": "unknown", "show_returncode": "-1", "show_error_type": "TimeoutExpired"}
+    result = guardian._run_systemctl("enable", "--now", "--no-block", "gateway.service")
+    assert result["returncode"] is None and result["outcome"] == "unverified"
+    assert result["error_type"] == "TimeoutExpired"
+
+
+def test_failed_systemctl_show_never_trusts_partial_output(monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr(guardian.subprocess, "run", lambda *args, **kwargs:
+        subprocess.CompletedProcess(args[0], 1, stdout="ActiveState=inactive\n", stderr="error"))
+    result = guardian._systemctl_show("gateway.service")
+    assert result["ActiveState"] == "unknown" and result["show_returncode"] == "1"
+    assert not guardian._required_unit_repair_needed(result, timer=False)
 
 
 def test_user_acquisition_pause_is_strict_and_fails_closed(tmp_path: Path) -> None:
@@ -488,11 +626,11 @@ def test_user_acquisition_pause_blocks_only_named_guardian_starts(monkeypatch) -
     guardian._trigger_oneshot("stockagent-tw-day-trade-eligibility.service", **kwargs)
     guardian._repair_unit("stockagent-discord-bot.service", timer=False, **kwargs)
     assert commands == [("reset-failed", "stockagent-tw-public-source-events.service"),
-                        ("enable", "--now", "stockagent-tw-public-source-events.service"),
+                        ("enable", "--now", "--no-block", "stockagent-tw-public-source-events.service"),
                         ("start", "--no-block", "stockagent-tw-public-0830-check.service"),
                         ("start", "--no-block", "stockagent-tw-day-trade-eligibility.service"),
                         ("reset-failed", "stockagent-discord-bot.service"),
-                        ("enable", "--now", "stockagent-discord-bot.service")]
+                        ("enable", "--now", "--no-block", "stockagent-discord-bot.service")]
 
 
 def test_user_acquisition_pause_preserves_pending_resume(monkeypatch) -> None:

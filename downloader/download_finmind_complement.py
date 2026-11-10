@@ -38,7 +38,9 @@ import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import requests
 from urllib3.exceptions import ReadTimeoutError
-from stockagent.data_sync.acquisition_capacity_sampler import AcquisitionCapacitySampler
+from stockagent.data_sync.acquisition_capacity_sampler import (
+    AcquisitionCapacitySampler, capacity_retry_delay_seconds,
+)
 
 from downloader.artifact_io import (atomic_write_bytes, atomic_write_json, atomic_write_parquet,
                                     durable_replace, table_from_records)
@@ -1966,16 +1968,10 @@ def _capacity_pause(root: Path, admission: dict[str, Any]) -> dict[str, Any]:
     return result
 
 
-def _finite_status(connection: sqlite3.Connection, root: Path, *, state: str,
-                   active: Task | None = None, last: dict[str, Any] | None = None,
-                   delegated: frozenset[str] = frozenset()) -> dict[str, Any]:
-    """Report exact-key worker activity without relabelling old global counts.
-
-    Global queue aggregates and frontier estimates remain the most recent full
-    snapshot, with their original clock. The exact tasks and their receipts
-    remain authoritative; this heartbeat is not a fresh whole-queue readback.
-    """
-    del connection  # The finite source task is checked by the canonical owner.
+def _carried_status(root: Path, *, state: str, scope: str,
+                    active: Task | None = None, last: dict[str, Any] | None = None,
+                    delegated: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """Publish activity with the original clock on the last global summary."""
     previous = _read_metadata(root / 'status.json')
     source_stamp = previous.get('source_status_observed_at_utc', previous.get('observed_at_utc'))
     if last is None and isinstance(previous.get('last_task'), dict):
@@ -1984,7 +1980,7 @@ def _finite_status(connection: sqlite3.Connection, root: Path, *, state: str,
               'dispatch_contract_version': DISPATCH_CONTRACT_VERSION,
               'source_status_observed_at_utc': source_stamp,
               'status_aggregate_state': 'carried_previous_snapshot' if source_stamp else 'unavailable',
-              'status_scope': 'finite_exact_keys',
+              'status_scope': scope,
               'current_delegated_to_sponsor': sorted(delegated),
               'active_task': {'dataset': active.dataset, 'data_id': active.data_id,
                               'partition': active.partition} if active else None,
@@ -1992,6 +1988,43 @@ def _finite_status(connection: sqlite3.Connection, root: Path, *, state: str,
     result.pop('capacity_admission', None)
     atomic_write_json(root / 'status.json', result)
     return result
+
+
+def _finite_status(connection: sqlite3.Connection, root: Path, *, state: str,
+                   active: Task | None = None, last: dict[str, Any] | None = None,
+                   delegated: frozenset[str] = frozenset()) -> dict[str, Any]:
+    """Report exact-key activity while preserving the old global summary clock."""
+    del connection  # The finite source task is checked by the canonical owner.
+    return _carried_status(root, state=state, scope='finite_exact_keys', active=active,
+                           last=last, delegated=delegated)
+
+
+def _background_transient_capacity(capacity: AcquisitionCapacitySampler,
+                                   admission: dict[str, Any]) -> dict[str, Any] | None:
+    """Wait only on a running unknown-capacity probe; never override a reserve."""
+    if (admission.get('probe_inflight') is True and admission.get('reason') in {
+            'capacity_sample_pending', 'capacity_sample_expired',
+            'physical_backing_headroom_unconfirmed', 'capacity_probe_failed',
+    }):
+        return capacity.wait_for_refresh(timeout_seconds=29)
+    return None
+
+
+def _pipeline_capacity_recheck(root: Path, capacity: AcquisitionCapacitySampler) -> dict[str, Any]:
+    """Recheck both real-volume and local reserves after draining a pipeline.
+
+    A bounded in-flight probe may finish while the pipeline drains. Its fresh
+    result can resume the same cycle; an unconfirmed or genuinely low volume
+    remains blocked and is returned with its actual admission reason.
+    """
+    if shutil.disk_usage(root).free < MIN_FREE_BYTES:
+        return {'state': 'deferred', 'reason': 'filesystem_reserve', 'probe_inflight': False}
+    admission = capacity.sample()
+    if admission.get('state') not in {'admitted', 'not_enrolled'}:
+        admission = _background_transient_capacity(capacity, admission) or admission
+    if admission.get('state') in {'admitted', 'not_enrolled'} and shutil.disk_usage(root).free < MIN_FREE_BYTES:
+        return {'state': 'deferred', 'reason': 'filesystem_reserve', 'probe_inflight': False}
+    return admission
 
 
 def _interrupt_on_sigterm(_signum: int, _frame: Any) -> None:
@@ -2113,8 +2146,15 @@ def run_once(root: Path, *, max_requests: int = 0,
                      if finite_option_priority or finite_priority_request_id is not None else capacity.initial_sample())
         if admission.get('state') not in {'admitted', 'not_enrolled'}:
             return _capacity_pause(root, admission)
-        report_status(connection, root, state="running", delegated=delegated)
+        if keep_prepared_on_priority_wait and required_keys is None:
+            # A full queue aggregate can outlive a physical-capacity sample.
+            # Mark the old counters as carried and admit source work first.
+            _carried_status(root, state='running', scope='background_pre_dispatch',
+                            delegated=delegated)
+        else:
+            report_status(connection, root, state="running", delegated=delegated)
         last_status_at = time.monotonic()
+        paused_priority_marker = None
         while not max_requests or completed < max_requests:
             now = _now()
             if finite_option_validate is not None:
@@ -2133,9 +2173,26 @@ def run_once(root: Path, *, max_requests: int = 0,
             local = now.astimezone(TAIPEI)
             if shutil.disk_usage(root).free < MIN_FREE_BYTES:
                 return report_status(connection, root, state="disk_guard", last=last, delegated=delegated)
-            admission = capacity.sample()
+            # A source request can take longer than the sample lifetime. For
+            # bounded, explicitly requested work, await the new physical
+            # probe in the same owner rather than tear down and reinitialize
+            # its queue on a transient expired sample. Unknown or failed
+            # capacity still returns disk_guard before any next dispatch.
+            admission = (capacity.initial_sample(timeout_seconds=29)
+                         if finite_option_priority or finite_priority_request_id is not None
+                         else capacity.sample())
             if admission.get('state') not in {'admitted', 'not_enrolled'}:
-                report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                if keep_prepared_on_priority_wait and required_keys is None:
+                    _carried_status(root, state='disk_guard', scope='background_capacity_wait',
+                                    last=last, delegated=delegated)
+                    refreshed = _background_transient_capacity(capacity, admission)
+                    if refreshed is not None and refreshed.get('state') in {'admitted', 'not_enrolled'}:
+                        # Re-run all calendar, reservation and capacity checks.
+                        continue
+                    if refreshed is not None:
+                        admission = refreshed
+                else:
+                    report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
                 return _capacity_pause(root, admission)
             if protected_stock_opening(now):
                 return report_status(connection, root, state="protected_opening", last=last, delegated=delegated)
@@ -2152,6 +2209,18 @@ def run_once(root: Path, *, max_requests: int = 0,
                 # releases, future reservations and quota remain protected.
                 reservation = prioritize_source_checks(
                     connection, reservation, now, delegated, finite_query_ready=True)
+                from downloader.finmind_product_query_verification import yield_explicitly_paused_owners
+                from downloader.paused_provider_owners import explicitly_paused
+                paused = explicitly_paused({'free', 'sponsor', 'complement'})
+                reservation = yield_explicitly_paused_owners(reservation, now, paused)
+                marker = (tuple(sorted(paused)), reservation.get('paused_owner_ready_yielded', 0),
+                          reservation.get('reserve_requests'))
+                if marker != paused_priority_marker:
+                    print(json.dumps({'state': 'finite_priority_paused_owner_observation',
+                                      'paused_owners': list(marker[0]), 'due_requests_yielded': marker[1],
+                                      'reserved_requests': marker[2], 'owner_service_state_changed': False,
+                                      'provider_calls_by_observation': 0}), flush=True)
+                    paused_priority_marker = marker
             budget = backfill_budget(
                 account, root.parent, fixed_incremental_requests=reservation['reserve_requests'],
                 in_flight=0, now=now, prioritize_due=True, reservation_plan=reservation,
@@ -2207,7 +2276,8 @@ def run_once(root: Path, *, max_requests: int = 0,
                 return report_status(connection, root,
                                state="current_queue" if budget["allowed"] else "incremental_reserve",
                                last=last, delegated=delegated)
-            if time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS:
+            if ((completed or not keep_prepared_on_priority_wait)
+                    and time.monotonic() - last_status_at >= STATUS_INTERVAL_SECONDS):
                 report_status(connection, root, state="running", active=task, last=last, delegated=delegated)
                 last_status_at = time.monotonic()
             other_started = time.monotonic()
@@ -2233,10 +2303,11 @@ def run_once(root: Path, *, max_requests: int = 0,
                 if parallel['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'local_cpu_worker_interrupted'}:
                     cycle_costs.calibration_invalid = True
                     if parallel['state'] == 'disk_guard':
-                        admission = capacity.sample()
-                        if admission.get('state') not in {'admitted', 'not_enrolled'}:
-                            report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
-                            return _capacity_pause(root, admission)
+                        admission = _pipeline_capacity_recheck(root, capacity)
+                        if admission.get('state') in {'admitted', 'not_enrolled'}:
+                            continue  # Recheck the normal calendar, quota and queue before dispatch.
+                        report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                        return _capacity_pause(root, admission)
                     return report_status(connection, root, state=parallel['state'], last=last, delegated=delegated)
                 report_status(connection, root, state='running', last=last, delegated=delegated)
                 last_status_at = time.monotonic()
@@ -2259,10 +2330,11 @@ def run_once(root: Path, *, max_requests: int = 0,
                 if parallel_json['state'] in {'disk_guard', 'protected_opening', 'rate_limited', 'invalid_token', 'ip_banned', 'not_entitled'} | json_pipeline.LOCAL_PREFLIGHT_ERRORS:
                     if parallel_json['state'] == 'disk_guard':
                         cycle_costs.calibration_invalid = True
-                        admission = capacity.sample()
-                        if admission.get('state') not in {'admitted', 'not_enrolled'}:
-                            report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
-                            return _capacity_pause(root, admission)
+                        admission = _pipeline_capacity_recheck(root, capacity)
+                        if admission.get('state') in {'admitted', 'not_enrolled'}:
+                            continue  # Resume through the same owner and all normal admission checks.
+                        report_status(connection, root, state='disk_guard', last=last, delegated=delegated)
+                        return _capacity_pause(root, admission)
                     return report_status(connection, root, state=parallel_json['state'], last=last, delegated=delegated)
                 if parallel_json['state'] == 'incremental_reserve' and not parallel_json['calls']:
                     return report_status(connection, root, state='incremental_reserve', last=last, delegated=delegated)
@@ -2577,6 +2649,19 @@ def main(argv: list[str] | None = None) -> int:
                          else 600 if result["state"] in {"rate_limited", "protected_opening", "not_entitled"}
                          else 60 if result["state"] in {"incremental_reserve", "waiting_history_retry"}
                          else 0 if result['state'] == 'batch_complete' and result.get('next_task') else 5)
+                admission = result.get('capacity_admission') or {}
+                if (result['state'] == 'disk_guard' and admission.get('probe_inflight') is True
+                        and admission.get('reason') in {
+                            'capacity_sample_pending', 'capacity_sample_expired',
+                            'physical_backing_headroom_unconfirmed', 'capacity_probe_failed',
+                        }):
+                    # Wait on the *same* in-flight probe without reopening the
+                    # queue or spending a provider request. A failed/low-space
+                    # result remains deferred; no old sample grants admission.
+                    refreshed = _background_transient_capacity(capacity, admission)
+                    assert refreshed is not None
+                    delay = (0 if refreshed.get('state') in {'admitted', 'not_enrolled'}
+                             else capacity_retry_delay_seconds(refreshed))
                 wait_for_next_cycle(root, result, delay,
                                     sources=supplemental.SOURCES.values(), snapshot_hours=(0, 8, 14, 17))
         except KeyboardInterrupt:

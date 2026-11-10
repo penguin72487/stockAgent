@@ -304,6 +304,64 @@ def test_production_binding_uses_existing_catalog_and_retention_and_fences_chang
         binding.guard()
 
 
+def test_production_binding_ignores_unrelated_new_dataset_format_but_uses_original_family_validator(tmp_path, monkeypatch):
+    fixture = _fixture(tmp_path, monkeypatch)
+    source, _, _, catalog, _, _, retention = fixture
+    config_dir = tmp_path / "configs/data_sync"
+    config_dir.mkdir(parents=True)
+    catalog.rename(config_dir / "packed_datasets.json")
+    retention.rename(config_dir / "packed_retention.json")
+    path = config_dir / "packed_datasets.json"
+    value = json.loads(path.read_text())
+    value["datasets"].append({"dataset": "other-new-format", "file_chunk_bytes": 8 * 1024**2,
+                               "reader_contract": "packed-v3-content-alias"})
+    path.write_text(json.dumps(value))
+    monkeypatch.setattr(restore, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(restore, "CANONICAL_CACHE", Path("cache"))
+    original = releases._load_catalog
+    views = []
+    def older_owner_parser(view, include_families=False):
+        document = json.loads(view.read_text(encoding="utf-8"))
+        views.append(document)
+        for entry in document["datasets"] + document.get("publication_families", []):
+            if "file_chunk_bytes" in entry and entry.get("reader_contract") != "packed-v2-chunks":
+                raise SnapshotError("old parser does not understand the unrelated reader")
+        return original(view, include_families=include_families)
+    monkeypatch.setattr(releases, "_load_catalog", older_owner_parser)
+    binding = restore.production_binding(source)
+    assert binding is not None and binding.entry["publication_family"] == restore.FAMILY
+    assert views[0]["datasets"] == [] and len(views[0]["publication_families"]) == 1
+    # The real shared catalog is still the guarded configuration generation.
+    path.write_text(json.dumps(value) + " ")
+    with pytest.raises(SnapshotError, match="configuration changed"):
+        binding.guard()
+
+
+@pytest.mark.parametrize("mutation", ["duplicate_name", "duplicate_family", "forbidden_family_lock", "unknown_family_reader"])
+def test_production_binding_keeps_its_family_and_global_identity_strict(tmp_path, monkeypatch, mutation):
+    source, _, _, catalog, _, _, retention = _fixture(tmp_path, monkeypatch)
+    config_dir = tmp_path / "configs/data_sync"
+    config_dir.mkdir(parents=True)
+    catalog.rename(config_dir / "packed_datasets.json")
+    retention.rename(config_dir / "packed_retention.json")
+    path = config_dir / "packed_datasets.json"
+    value = json.loads(path.read_text())
+    family = value["publication_families"][0]
+    if mutation == "duplicate_name":
+        value["datasets"].append({"dataset": family["dataset"]})
+    elif mutation == "duplicate_family":
+        value["publication_families"].append({**family, "dataset": "second-forward"})
+    elif mutation == "forbidden_family_lock":
+        family["source_coordination_lock"] = "other.lock"
+    else:
+        family.update(file_chunk_bytes=1024, reader_contract="packed-v3-content-alias")
+    path.write_text(json.dumps(value))
+    monkeypatch.setattr(restore, "REPO_ROOT", tmp_path)
+    monkeypatch.setattr(restore, "CANONICAL_CACHE", Path("cache"))
+    with pytest.raises(SnapshotError):
+        restore.production_binding(source)
+
+
 def test_registered_service_alias_keeps_production_admission_and_one_cache_owner(tmp_path, monkeypatch):
     from stockagent import service_layout
 

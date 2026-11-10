@@ -694,7 +694,9 @@ def test_pack_member_boundaries_keep_fused_hash_across_many_windows(
     with zipfile.ZipFile(reference, 'w', compression=zipfile.ZIP_DEFLATED,
                          compresslevel=compression_level, allowZip64=True) as archive:
         for entry in entries:
-            with archive.open(packed_snapshots._zip_info(entry), 'w', force_zip64=True) as member:
+            info = packed_snapshots._zip_info(entry)
+            info._compresslevel = compression_level
+            with archive.open(info, 'w', force_zip64=True) as member:
                 member.write((source / entry.path).read_bytes())
     assert target.read_bytes() == reference.getvalue()
     assert digest == hashlib.sha256(reference.getvalue()).hexdigest()
@@ -702,6 +704,23 @@ def test_pack_member_boundaries_keep_fused_hash_across_many_windows(
         assert archive.testzip() is None
         for name in archive.namelist():
             assert archive.read(name) == (source / name).read_bytes()
+
+
+def test_pack_honors_requested_compression_level(tmp_path):
+    source = tmp_path / 'source'
+    source.mkdir()
+    payload = b'{"ticker":"2330","quantity":1274,"price":742.5}\n' * 20000
+    (source / 'market.json').write_bytes(payload)
+    sizes = {}
+    for level in (0, 1, 6, 9):
+        entries, _ = packed_snapshots._collect_entries(source)
+        output = tmp_path / f'level-{level}.zip'
+        packed_snapshots._write_pack(source, entries, output, compression_level=level)
+        with zipfile.ZipFile(output) as archive:
+            assert archive.read('market.json') == payload
+            sizes[level] = archive.getinfo('market.json').compress_size
+    assert sizes[0] > sizes[1] > sizes[6]
+    assert sizes[9] <= sizes[6]
 
 
 @pytest.mark.parametrize('capacity,rehashes', [(1024**2, 0), (32, 1)])
@@ -826,6 +845,45 @@ def test_private_observation_stability_reports_its_own_stage_without_early_accep
     assert cohort['phase_completed_items'] == 0 and cohort['phase_total_items'] > 0
     assert all(event['acceptance'] is False for event in events)
     assert verify_packed_snapshot(cold, selected, reconstruct_all=True)['independently_reconstructed_files'] == 4
+
+
+def test_portable_observation_fingerprint_reports_a_distinct_phase(tmp_path):
+    from stockagent.data_sync.dataset_migration import private_history_root
+    source = _source_tree(tmp_path)
+    parent = tmp_path/'cold'
+    initialize_packed_layout(parent, node_id='test')
+    cold = private_history_root(parent, {'private_history': {
+        'enabled': True, 'relative_root': '.local-state/private-history',
+        'shared_export': False, 'nas_export': False, 'source_retirement': False}})
+    events = []
+    publish_packed_snapshot(cold, 'observation', source, node_id='test',
+        private_observation_cohort=True, private_atomic_json_controls=True, progress=events.append)
+    stages = [event['stage'] for event in events]
+    assert (stages.index('verifying_complete_file_storage')
+            < stages.index('computing_portable_cohort_fingerprint')
+            < stages.index('committing_complete_inventory'))
+    fingerprint = [event for event in events if event['stage'] == 'computing_portable_cohort_fingerprint']
+    assert fingerprint[0]['phase_completed_items'] == 0
+    assert fingerprint[-1]['phase_completed_items'] == fingerprint[-1]['phase_total_items'] > 0
+    assert all(event['acceptance'] is False for event in fingerprint)
+    assert stages.index('source_fences_verified') < stages.index('counting_inventory_object_references')
+    references = [event for event in events if event['stage'] == 'counting_inventory_object_references']
+    assert references[0]['phase_completed_items'] == 0
+    assert references[-1]['phase_completed_items'] == references[-1]['phase_total_items'] > 0
+    assert all(event['acceptance'] is False for event in references)
+
+
+def test_single_large_source_reports_chunk_bytes_before_file_completion(tmp_path):
+    source = tmp_path/'source'
+    source.mkdir()
+    (source/'large.bin').write_bytes(bytes(range(256)) * 1024)
+    events = []
+    publish_packed_snapshot(tmp_path/'cold', 'large-source', source, node_id='test',
+        loose_file_threshold_bytes=1, file_chunk_bytes=65536, progress=events.append)
+    during = [event for event in events if event['stage'] == 'routing_and_hashing'
+              and event['files_completed'] == 0 and event['logical_bytes_processed'] > 0]
+    assert during and during[-1]['logical_bytes_processed'] == during[-1]['logical_bytes_total']
+    assert all(event['acceptance'] is False for event in during)
 
 
 @pytest.mark.parametrize("selection", ["all", "excluded", "maximum", "selected", "override", "staging"])
@@ -2344,6 +2402,29 @@ def test_reused_cas_installer_durability_does_not_depend_on_its_peers(tmp_path, 
         assert destination.parent in pending and cold in pending and not flushed
     else:
         assert flushed == [destination.parent]
+
+
+def test_bucket_completes_after_all_its_bounded_packs(tmp_path, monkeypatch):
+    import itertools
+    source = tmp_path / 'source'
+    source.mkdir()
+    for name in ('one', 'two', 'three'):
+        (source / name).write_bytes(('original-' + name).encode())
+    monkeypatch.setattr(packed_snapshots, 'MAX_PACK_MEMBERS', 1)
+    # Make each progress callback observable without wall-clock sleeps. This
+    # changes reporting cadence only; source clocks and byte hashes stay real.
+    ticks = itertools.count(step=10)
+    monkeypatch.setattr(packed_snapshots.time, 'monotonic', lambda: next(ticks))
+    observed = []
+    cold = tmp_path / 'cold'
+    result = publish_packed_snapshot(cold, 'fixture', source, pack_buckets=1,
+        loose_file_threshold_bytes=1024, progress=observed.append)
+    packing = [row for row in observed if row['stage'] == 'packing_changed_small_files']
+    assert len([row for row in packing if row['files_completed'] < 3]) >= 3
+    assert all(row['phase_completed_items'] == 0 for row in packing if row['files_completed'] < 3)
+    assert packing[-1]['phase_completed_items'] == packing[-1]['phase_total_items'] == 1
+    assert packing[-1]['files_completed'] == 3
+    verify_packed_snapshot(cold, result)
 
 
 @pytest.mark.parametrize('outcome', ['valid', 'corrupt', 'missing_member', 'guard_failed'])

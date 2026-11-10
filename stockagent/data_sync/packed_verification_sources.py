@@ -21,7 +21,7 @@ class PackSources:
 
     def _signature(self, item):
         from stockagent.data_sync import packed_snapshots as packed
-        info = (self.root / item['relpath']).lstat()
+        info = packed._read_object_path(self.root, item['relpath']).lstat()
         if not stat.S_ISREG(info.st_mode) or info.st_size != item['bytes']:
             raise packed.SnapshotError('batched native pack is redirected or changed')
         return packed._source_stat(info), info.st_nlink
@@ -41,7 +41,7 @@ class PackSources:
         signatures = {item['sha256']: self._signature(item) for item in items}
         buffers = {}
         try:
-            with binary_reader_many([(self.root/item['relpath'], item['bytes']) for item in items]) as stream:
+            with binary_reader_many([(packed._read_object_path(self.root, item['relpath']), item['bytes']) for item in items]) as stream:
                 for item in items:
                     buffer = buffers[item['sha256']] = io.BytesIO()
                     digest, remaining = hashlib.sha256(), item['bytes']
@@ -75,11 +75,13 @@ class PackSources:
         from stockagent.data_sync import packed_snapshots as packed
         key = item['sha256']
         self.pending.pop(key, None)
-        path = self.root/item['relpath']
-        if key not in self.buffers and self.native and self._candidate(item):
+        from stockagent.data_sync.packed_object_placement import is_archive_path
+        path = packed._read_object_path(self.root, item['relpath'])
+        if key not in self.buffers and self.native and self._candidate(item) and not is_archive_path(path):
             items, size = [item], item['bytes']
             for candidate in self.pending.values():
-                if self._candidate(candidate) and size+candidate['bytes'] <= 128*1024**2:
+                if (self._candidate(candidate) and size+candidate['bytes'] <= 128*1024**2
+                        and not is_archive_path(packed._read_object_path(self.root, candidate['relpath']))):
                     items.append(candidate)
                     size += candidate['bytes']
                     if len(items) == 8:

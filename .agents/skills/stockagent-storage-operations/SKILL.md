@@ -20,13 +20,24 @@ description: "操作 StockAgent 四節點架構：penguin authority、D immutabl
 | 節點／位置 | 保存與工作責任 |
 | --- | --- |
 | penguin C WSL ext4／SSD | 程式、正式服務、PostgreSQL／下單 ledger、控制索引、網站必要 projection／模型；舊 raw 在正式切換及還原驗收前仍保護，不代表已遷移 |
-| penguin E NVMe 原生 ext4 工作卷 | 進 D 冷庫前的下載、增量、封裝、驗證、還原及傳輸暫存；核對原生 volume GUID、VHD 登錄、ext4 UUID、實體與 guest 空間，不回退 C |
-| penguin D HDD，packed 及 guarded immutable lake | 唯一本機主冷庫；不可變 CAS／packs／manifests／heads、Parquet/ZSTD registry 與封閉版本；mutable PG 放 SSD |
+| penguin E NVMe 原生 ext4 工作卷 | 下載增量、封裝、還原及備份中轉；D 不足時保存已登錄的封存。核對原生 volume GUID、VHD 登錄、ext4 UUID、實體與 guest 空間，不回退 C |
+| penguin D HDD，packed 及 guarded immutable lake | 預設主冷庫與固定邏輯清冊；不可變 CAS／packs／manifests／heads、Parquet/ZSTD registry 與封閉版本；已登錄常用封包可由同一索引定位 E，mutable PG 放 SSD |
 | lab203 | Receive Only 封閉 ingress、中繼 NAS、獨立驗證及回傳機器收據；不承接網站或訓練 |
 | NAS | immutable archive 保存 lake/source 版本；Restic 保存 code/config/SQL 與原歷史；保留／prune 是獨立政策 |
 | Vastai1T | 非持久訓練節點；cold index、當期 exact source、遠端生成的工作集／cache、尚未驗證回傳的結果 |
 
-2026-10-25 使用者指定 D 為唯一本機 immutable raw history 正本；2026-11-02
+同日最新要求為 C 服務、E 備份與中轉、D 少檔案壓縮備份；普通增量每日
+03:00–07:00 合併，研究固定版本共用未變的物件。沿原回收 owner 保留當前、研究、
+服務與救援引用；最新版缺少的舊路徑繼續保留。已登錄私有封存優先搬舊包到 E，
+不另做全量備份或先解出歷史。見 `docs/storage_daily_deduplicated_archives_2026-11-10.md`。
+完整本機階段、每日時段與未知 ETA 由原觀測器每分鐘投影；搬移加入原回收輪替，
+固定已驗證錨點與所有當前 head 的保留證據見
+`docs/storage_archive_plan_and_fair_retirement_2026-11-10.md`。
+
+2026-11-10 使用者補充 D 空間不足時，常用資料與服務封存可留 E；依
+`docs/storage_warm_archive_placement_2026-11-10.md` 沿原 owner、固定物件 SHA 與
+唯一位置索引交接，不產生第二份正本，也不代表 NAS 驗收。2026-10-25 使用者原指定 D
+為本機 immutable raw history 正本；2026-11-02
 補充 C 留服務／控制，進冷庫前的工作資料使用 E，實作與已完成範圍見
 `docs/storage_c_e_d_layout_2026-11-02.md`。沿用原 owner 逐項遷移，不以角色表或 symlink
 代替 reader／writer、完整恢復及退休驗收。增量／穩定冷區保持同一 CAS 位元組與路徑，

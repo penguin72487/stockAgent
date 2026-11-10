@@ -290,6 +290,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--peer-name", default="penguin")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("audit")
+    reader = sub.add_parser("reader-status", help="inspect one indexed release without hydrating it")
+    reader.add_argument("dataset")
+    reader.add_argument("--snapshot-id")
     enable = sub.add_parser("enable")
     enable.add_argument("--apply", action="store_true")
     prune = sub.add_parser("prune")
@@ -324,6 +327,20 @@ def _print(payload: object) -> None:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.command == "reader-status":
+        try:
+            root = args.sync_root.resolve()
+            resolved = (resolve_packed_snapshot_id(root, args.dataset, args.snapshot_id, require_objects=False)
+                        if args.snapshot_id else resolve_latest_packed(root, args.dataset, require_objects=False))
+            _print({"mode": "index-only-reader-status", "dataset": resolved.manifest["dataset"],
+                    "snapshot_id": resolved.manifest["snapshot_id"],
+                    "manifest_sha256": resolved.manifest_sha256,
+                    "schema_version": resolved.manifest["schema_version"],
+                    "payload_fetched": False, "payload_verified": False})
+            return 0
+        except (OSError, SnapshotError, ValueError) as exc:
+            print(f"ERROR: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
     api_key = os.environ.get("STGUIAPIKEY") or os.environ.get("OPEN_BUTTON_TOKEN")
     if not api_key:
         print("ERROR: Syncthing API key is unavailable", file=sys.stderr)

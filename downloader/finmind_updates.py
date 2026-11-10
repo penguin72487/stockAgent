@@ -204,6 +204,11 @@ def set_next_check(root: Path, task: Any, due: str | None) -> None:
     if not (root / DB_NAME).is_file():
         return
     with closing(sqlite3.connect(root / DB_NAME, timeout=5)) as conn, conn:
+        # Another publication thread can create the SQLite file before its
+        # observation schema exists. An unmonitored task has no stream row
+        # to update; let the observing writer finish its own initialization.
+        if not conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='streams'").fetchone():
+            return
         conn.execute("UPDATE streams SET next_check_at_utc=? WHERE dataset=? AND data_id=? AND partition=?",
                      (due, task.dataset, task.data_id, task.partition))
 

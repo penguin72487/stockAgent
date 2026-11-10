@@ -29,6 +29,7 @@ from stockagent.live.service_code_release import (
 
 ENTRY = ROOT / "scripts/run_discord_artifact_maintenance.py"
 MAX_SOURCE_BYTES = 2 * 1024 * 1024
+MODEL_RUNTIME_KEYS = frozenset({"STOCKAGENT_SPARSE_ADJOINT_BACKEND", "STOCKAGENT_SPARSE_ADJOINT_ALGORITHM"})
 RECEIPT_CONTROL_ARGS = frozenset({
     ("--retry-check-only",), ("--request-due-retry",), ("--request-due-work",),
 })
@@ -62,6 +63,8 @@ with os.fdopen(fd, "rb") as source:
         raise RuntimeError("maintenance entrypoint changed before execution")
 print(json.dumps({"status": "verified_gateway_source_for_maintenance", "owner_pid": pid,
                   "release": str(receipt), "entry_sha256": hashlib.sha256(body).hexdigest(),
+                  "selected_model_runtime": {k: os.environ.get(k) for k in (
+                      "STOCKAGENT_SPARSE_ADJOINT_BACKEND", "STOCKAGENT_SPARSE_ADJOINT_ALGORITHM")},
                   "worker_cgroup_unchanged": True}), flush=True)
 if os.environ.pop("STOCKAGENT_MAINTENANCE_VERIFY_ONLY", "0") == "1":
     raise SystemExit(0)
@@ -103,6 +106,32 @@ def _verified_interop_for_maintenance() -> str | None:
     return environment.get("WSL_INTEROP") if environment else None
 
 
+def _read_owner_environ(pid: int) -> bytes:
+    with Path(f"/proc/{pid}/environ").open("rb") as stream:
+        return stream.read(256 * 1024 + 1)
+
+
+def _owner_model_environment(pid: int) -> dict[str, str]:
+    """Forward only explicit model-semantic switches, never owner credentials."""
+    raw = _read_owner_environ(pid)
+    if len(raw) > 256 * 1024:
+        raise RuntimeError("owner environment exceeds bounded model-switch read")
+    allowed = {key.encode(): key for key in MODEL_RUNTIME_KEYS}
+    result = {}
+    for entry in raw.split(b"\0"):
+        key, separator, value = entry.partition(b"=")
+        if separator and key in allowed:
+            name = allowed[key]
+            if name in result:
+                raise RuntimeError("duplicate owner model switch")
+            result[name] = value.decode("ascii")
+    if (result.get("STOCKAGENT_SPARSE_ADJOINT_BACKEND", "native") not in {
+            "native", "cusparse_csr_transpose"}
+            or result.get("STOCKAGENT_SPARSE_ADJOINT_ALGORITHM", "6") not in {"0", "6"}):
+        raise RuntimeError("unsupported owner sparse model runtime")
+    return result
+
+
 def owner_command(arguments: list[str], *, verify_only: bool = False) -> tuple[list[str], dict[str, str]]:
     receipt = configured_release(ROOT)
     if receipt is None:
@@ -112,9 +141,18 @@ def owner_command(arguments: list[str], *, verify_only: bool = False) -> tuple[l
     if configured_release(ROOT) != receipt or native_owner_pid(ROOT, role="discord") != pid:
         raise RuntimeError("Discord owner or configured release changed during pinning")
     environment = os.environ.copy()
+    selected_runtime = _owner_model_environment(pid)
+    for key in MODEL_RUNTIME_KEYS:
+        environment.pop(key, None)
+    environment.update(selected_runtime)
     environment.update({"PYTHONDONTWRITEBYTECODE": "1",
                         "STOCKAGENT_MAINTENANCE_ROOT": str(ROOT),
                         "STOCKAGENT_MAINTENANCE_RELEASE": str(receipt),
+                        # The maintenance process enters the owner's mount
+                        # namespace but does not inherit its environment.
+                        # Give the formal-history launcher the SAME verified
+                        # release instead of falling back to mutable train.py.
+                        "STOCKAGENT_SERVICE_CODE_RELEASE": str(receipt),
                         "STOCKAGENT_MAINTENANCE_OWNER_PID": str(pid),
                         "STOCKAGENT_MAINTENANCE_ENTRY_SHA256": _stable_entry_digest(ENTRY)})
     if verify_only:

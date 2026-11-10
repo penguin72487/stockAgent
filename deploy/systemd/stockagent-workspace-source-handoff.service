@@ -1,0 +1,13 @@
+[Unit]
+Description=Advance the enrolled StockAgent source handoff to E
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service stockagent-workspace-source-handoff-boot.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service stockagent-workspace-source-handoff-boot.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/run_workspace_source_handoff.py'
+SuccessExitStatus=75
+TimeoutStartSec=infinity
+UMask=0077
+

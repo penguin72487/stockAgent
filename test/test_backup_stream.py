@@ -202,6 +202,97 @@ def test_transport_placement_hint_does_not_block_on_invalid_or_completed_metadat
     assert module.transport_placement_pending(config, evidence=tmp_path, now=1000) is False
 
 
+@pytest.mark.parametrize('purpose, expected', [
+    ('namespace_handoff', True), ('old_D_transport_retirement', False),
+    ('unknown', False), ([], False)])
+def test_old_d_retirement_wait_cannot_veto_next_source_capture(tmp_path, purpose, expected):
+    config = {'transport_namespace_handoff_contract': 'stockagent.transport_namespace_handoff.v1'}
+    (tmp_path / 'attempt.json').write_text(json.dumps({
+        'state': 'waiting_for_original_owner_or_reader', 'observed_at_epoch': 1000, 'purpose': purpose}))
+    assert module.transport_placement_pending(config, evidence=tmp_path, now=1000) is expected
+
+
+@pytest.mark.parametrize('change', [None, 'stale', 'future', 'contract', 'candidate', 'progress', 'forced', 'accepted'])
+def test_drained_worker_handoff_keeps_priority_independently_of_gc(tmp_path, change):
+    config = {'transport_namespace_handoff_contract': 'stockagent.transport_namespace_handoff.v1'}
+    (tmp_path / 'attempt.json').write_text(json.dumps({
+        'state': 'waiting_for_original_owner_or_reader', 'observed_at_epoch': 1000,
+        'purpose': 'old_D_transport_retirement'}))
+    worker = {'contract': 'stockagent.workspace_worker_handoff.v1',
+        'state': 'waiting_for_original_owner', 'observed_at_epoch': 1000,
+        'candidate_code_identity_sha256': 'a' * 64,
+        'publication_progress_renewed': False, 'original_active_owner_forced': False}
+    if change == 'stale':
+        worker['observed_at_epoch'] = 879
+    elif change == 'future':
+        worker['observed_at_epoch'] = 1006
+    elif change == 'contract':
+        worker['contract'] = 'unknown'
+    elif change == 'candidate':
+        worker['candidate_code_identity_sha256'] = 'invalid'
+    elif change == 'progress':
+        worker['publication_progress_renewed'] = True
+    elif change == 'forced':
+        worker['original_active_owner_forced'] = True
+    elif change == 'accepted':
+        worker['state'] = 'accepted'
+    (tmp_path / 'worker-reload.json').write_text(json.dumps(worker))
+    assert module.transport_placement_pending(config, evidence=tmp_path, now=1000) is (change is None)
+    assert module.transport_placement_pending({}, evidence=tmp_path, now=1000) is False
+
+
+@pytest.mark.parametrize('lock,expected', [('catalog-owner.lock', False),
+                                          ('dataset-versions/owner.lock', False),
+                                          ('source-replication-owner.lock', True)])
+def test_worker_yield_applies_only_to_a_boundary_the_stream_can_release(tmp_path, lock, expected):
+    config = {'transport_namespace_handoff_contract': 'stockagent.transport_namespace_handoff.v1',
+              'immutable_archive_state_root': str(tmp_path / 'catalog')}
+    (tmp_path / 'worker-reload.json').write_text(json.dumps({
+        'contract': 'stockagent.workspace_worker_handoff.v1', 'state': 'waiting_for_original_owner',
+        'observed_at_epoch': 1000, 'candidate_code_identity_sha256': 'a' * 64,
+        'publication_progress_renewed': False, 'original_active_owner_forced': False,
+        'waiting_owner_lock': str(tmp_path / 'catalog' / lock)}))
+    assert module.transport_placement_pending(config, evidence=tmp_path, now=1000) is expected
+    (tmp_path / 'attempt.json').write_text(json.dumps({
+        'state': 'waiting_for_original_owner_or_reader', 'observed_at_epoch': 1000,
+        'purpose': 'namespace_handoff'}))
+    assert module.transport_placement_pending(config, evidence=tmp_path, now=1000) is True
+
+
+@pytest.mark.parametrize('independent_lock', [None, 'catalog-owner.lock', 'dataset-versions/owner.lock'])
+def test_independent_gc_wait_continues_real_backup_cycle(stream, tmp_path, monkeypatch, independent_lock):
+    queue, *_ = stream
+    readiness(queue)
+    queue.cycle()
+    queue.config['transport_namespace_handoff_contract'] = 'stockagent.transport_namespace_handoff.v1'
+    (tmp_path / 'attempt.json').write_text(json.dumps({
+        'state': 'waiting_for_original_owner_or_reader',
+        'observed_at_epoch': time.time(), 'purpose': 'old_D_transport_retirement'}))
+    if independent_lock:
+        archive = str(tmp_path / 'catalog')
+        queue.config['immutable_archive_state_root'] = archive
+        (tmp_path / 'worker-reload.json').write_text(json.dumps({
+            'contract': 'stockagent.workspace_worker_handoff.v1', 'state': 'waiting_for_original_owner',
+            'observed_at_epoch': time.time(), 'candidate_code_identity_sha256': 'a' * 64,
+            'publication_progress_renewed': False, 'original_active_owner_forced': False,
+            'waiting_owner_lock': str(Path(archive) / independent_lock)}))
+    pending = module.transport_placement_pending
+    monkeypatch.setattr(module, 'transport_placement_pending', lambda config: pending(config, evidence=tmp_path))
+    capture = module.capture_catalog
+    captures = []
+
+    def observed_capture(*args, **kwargs):
+        captures.append(True)
+        return capture(*args, **kwargs)
+
+    monkeypatch.setattr(module, 'capture_catalog', observed_capture)
+    result = queue.cycle()
+    assert captures == [True] and result['state'] != 'waiting_for_transport_placement'
+    assert result['all_history_backup_verified'] is False
+    assert result['source_cleanup_authorized'] is False
+    assert not result['receipt_errors']
+
+
 def test_queued_placement_yields_catalog_after_receipt_ingestion_and_keeps_catalog_clock(stream, monkeypatch):
     queue, *_ = stream
     readiness(queue)
@@ -1475,6 +1566,47 @@ def test_optional_unreferenced_cold_evidence_is_backed_without_inventing_release
     assert coverage(observed, empty_ledger())['unreferenced_cold_object_bytes'] == len(raw)
 
 
+def test_canonical_orphan_census_avoids_recursive_type_probes_and_preserves_catalog(stream, monkeypatch):
+    queue, cold, *_ = stream
+    original = module._cold_object_paths
+    monkeypatch.setattr(module, '_cold_object_paths', lambda cold, _pins:
+                        module._recursive_cold_object_paths(cold))
+    baseline = capture_catalog(cold, Path(queue.config['publication_catalog']), include_unreferenced_objects=True)
+    monkeypatch.setattr(module, '_cold_object_paths', original)
+    def no_recursive_walk(*args, **kwargs):
+        pytest.fail('canonical CAS enumeration must not re-stat every known file type')
+    monkeypatch.setattr(os, 'walk', no_recursive_walk)
+    observed = capture_catalog(cold, Path(queue.config['publication_catalog']), include_unreferenced_objects=True)
+    assert observed['identity_sha256'] == baseline['identity_sha256']
+    assert observed['files'] == baseline['files']
+    assert observed['releases'] == baseline['releases']
+    assert observed['metadata_errors'] == []
+
+
+def test_noncanonical_cold_namespace_keeps_original_recursive_error_evidence(stream):
+    queue, cold, *_ = stream
+    odd = cold / 'objects/unknown/nested/unique-original'
+    odd.parent.mkdir(parents=True)
+    odd.write_bytes(b'unique evidence retained')
+    observed = capture_catalog(cold, Path(queue.config['publication_catalog']), include_unreferenced_objects=True)
+    assert {'relative': odd.relative_to(cold).as_posix(), 'reason': 'SnapshotError'} in observed['metadata_errors']
+    assert odd.read_bytes() == b'unique evidence retained'
+
+
+def test_canonical_cold_census_rejects_redirected_unreferenced_shard(stream, tmp_path):
+    queue, cold, *_ = stream
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    shard = cold / 'objects/blobs/00'
+    if shard.exists():
+        # Pick a genuinely unused prefix; retain every real fixture object.
+        shard = next(cold / 'objects/blobs' / f'{i:02x}' for i in range(256)
+                     if not (cold / 'objects/blobs' / f'{i:02x}').exists())
+    shard.symlink_to(outside, target_is_directory=True)
+    with pytest.raises((OSError, SnapshotError)):
+        capture_catalog(cold, Path(queue.config['publication_catalog']), include_unreferenced_objects=True)
+
+
 def test_missing_old_object_remains_a_gap_without_erasing_history(stream):
     queue, cold, _, first, second = stream
     old = {r["relpath"] for r in first.manifest["archive"]["objects"]}
@@ -1520,6 +1652,22 @@ def test_unreadable_restricted_manifest_blocks_unreferenced_export(stream):
         {'dataset': 'prices', 'publish': True}, {'dataset': 'restricted', 'publish': False}]}))
     result = capture_catalog(cold, Path(queue.config['publication_catalog']), include_unreferenced_objects=True)
     assert result['unreferenced_cold_objects_included'] is False and result['metadata_errors']
+
+
+@pytest.mark.parametrize('damage', ['manifest', 'head', 'historical_head'])
+def test_unreadable_public_metadata_blocks_only_unreferenced_census(stream, damage):
+    queue, cold, _source, first, _second = stream
+    if damage == 'manifest':
+        first.manifest_path.write_text('{invalid')
+    elif damage == 'head':
+        next((cold/'heads').glob('*/*.json')).write_text('{invalid')
+    else:
+        path = cold/'head-history/heads/prices/test'/('a'*64+'.json')
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{invalid')
+    result = capture_catalog(cold, Path(queue.config['publication_catalog']), include_unreferenced_objects=True)
+    assert result['unreferenced_cold_objects_included'] is False
+    assert result['metadata_errors'] and result['releases']
 
 
 def test_incremental_deliveries_reconstruct_the_exact_canonical_union(stream, tmp_path):

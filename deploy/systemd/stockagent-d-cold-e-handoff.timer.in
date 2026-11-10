@@ -1,0 +1,11 @@
+[Unit]
+Description=Continue bounded D to E cold handoff after each completed wave
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=20s
+AccuracySec=1s
+Unit=stockagent-d-cold-e-handoff.service
+
+[Install]
+WantedBy=timers.target

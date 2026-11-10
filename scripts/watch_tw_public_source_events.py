@@ -80,13 +80,24 @@ from stockagent.live.tw_public_opening_revision import (  # noqa: E402
 
 TAIPEI = ZoneInfo("Asia/Taipei")
 SCHEMA_VERSION = 1
-VERSION_CONTRACT = "canonical_body_sha256_v2"
+VERSION_CONTRACT = "canonical_body_sha256_v3_twse_t187ap11_equivalence"
+LEGACY_BODY_VERSION_CONTRACT = "canonical_body_sha256_v2"
 TWT96U_CSV_URL = "https://www.twse.com.tw/SBL/TWT96U?response=open_data"
 TWT96U_CSV_HEADER = (
     "集中市場證券代號", "集中市場可借券賣出股數",
     "店頭市場證券代號", "店頭市場可借券賣出股數",
 )
 TWT96U_JSON_FIELDS = ("TWSECode", "TWSEAvailableVolume", "GRETAICode", "GRETAIAvailableVolume")
+T187AP11_CSV_FIELDS = (
+    "出表日期", "資料年月", "公司代號", "公司名稱", "職稱", "姓名", "選任時持股",
+    "目前持股", "設質股數", "設質股數佔持股比例", "內部人關係人目前持股合計",
+    "內部人關係人設質股數", "內部人關係人設質比例",
+)
+# The TWSE JSON representation has one trailing ASCII space in this key; its
+# CSV header does not. All row values and duplicate rows remain unchanged.
+T187AP11_JSON_FIELDS = tuple(
+    "選任時持股 " if field == "選任時持股" else field for field in T187AP11_CSV_FIELDS
+)
 USER_AGENT = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "Chrome/124.0 Safari/537.36 stockAgent-tw-public-event-monitor/1"
@@ -287,6 +298,7 @@ def _response_body_sha256(
     expected_json: bool,
     content_type: str | None,
     content_disposition: str | None,
+    source_url: str | None = None,
 ) -> str:
     """Fingerprint an official structured response without assuming one format.
 
@@ -306,6 +318,10 @@ def _response_body_sha256(
     first_line = stripped.splitlines()[0] if stripped.splitlines() else b""
     csv_hint = "csv" in descriptor or (b"," in first_line and b"\n" in stripped)
     if csv_hint:
+        parsed_url = urlparse(source_url or "")
+        if (parsed_url.scheme == "https" and parsed_url.hostname == "openapi.twse.com.tw"
+                and parsed_url.path.casefold() == "/v1/opendata/t187ap11_l"):
+            return _t187ap11_csv_json_sha256(content)
         decoded: str | None = None
         for encoding in ("utf-8-sig", "cp950", "big5"):
             try:
@@ -329,6 +345,32 @@ def _response_body_sha256(
         return hashlib.sha256(canonical).hexdigest()
     # Preserve fail-closed behavior for a publisher error page returned as 200.
     return _body_sha256(content, expected_json=True)
+
+
+def _t187ap11_csv_json_sha256(content: bytes) -> str:
+    """Fingerprint this TWSE CSV as its exact JSON record multiset.
+
+    The same official endpoint alternates representations. Only the evidenced
+    schema/key alias is normalized; every value and duplicate remains material.
+    Unknown or malformed CSV is rejected, never silently acknowledged.
+    """
+    for encoding in ("utf-8-sig", "cp950", "big5"):
+        try:
+            decoded = content.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        raise ValueError("TWSE t187ap11 CSV has no supported text encoding")
+    try:
+        rows = list(csv.reader(io.StringIO(decoded, newline=""), strict=True))
+    except csv.Error as exc:
+        raise ValueError("invalid TWSE t187ap11 CSV") from exc
+    if (len(rows) < 2 or tuple(rows[0]) != T187AP11_CSV_FIELDS
+            or any(len(row) != len(T187AP11_JSON_FIELDS) for row in rows[1:])):
+        raise ValueError("unexpected or empty TWSE t187ap11 CSV schema")
+    records = [dict(zip(T187AP11_JSON_FIELDS, row, strict=True)) for row in rows[1:]]
+    return _body_sha256(json.dumps(records, ensure_ascii=False).encode("utf-8"), expected_json=True)
 
 
 def _twt96u_csv_json_sha256(content: bytes) -> str:
@@ -432,6 +474,16 @@ def _migrate_version_contract(state: dict[str, Any]) -> None:
         return
     rows = state.get("datasets")
     if not isinstance(rows, Mapping):
+        state["version_contract"] = VERSION_CONTRACT
+        return
+    if state.get("version_contract") == LEGACY_BODY_VERSION_CONTRACT:
+        # v2 hashes remain evidence of what was observed/accepted, not proof
+        # that a v3 CSV representation has already been downloaded. Keep both
+        # hashes and pending state untouched; a fresh v3 probe and the normal
+        # downloader decide whether one more update is required.
+        for value in rows.values():
+            if isinstance(value, dict):
+                value["version_contract"] = VERSION_CONTRACT
         state["version_contract"] = VERSION_CONTRACT
         return
     for value in rows.values():
@@ -577,6 +629,7 @@ def _request(
                 expected_json=expected_json,
                 content_type=response.headers.get("content-type"),
                 content_disposition=content_disposition,
+                source_url=url,
             )
             return {
                 "http_status": int(response.status_code),

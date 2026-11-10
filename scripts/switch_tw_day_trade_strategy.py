@@ -15,21 +15,25 @@ every existing signal decision, and permits only an earlier missing prefix.
 from __future__ import annotations
 
 import argparse
-from contextlib import ExitStack, redirect_stderr, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stderr, redirect_stdout
 from dataclasses import replace
 from datetime import date, datetime, time, timedelta
 import fcntl
+import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
 import shlex
+import stat
 import subprocess
 import sys
 import tempfile
 import time as wall_time
 from typing import Any, Mapping, Sequence
 import urllib.parse
+import uuid
 from zoneinfo import ZoneInfo
 
 import polars as pl
@@ -59,7 +63,10 @@ from scripts.rebuild_tw_day_trade_open_price_replay import (  # noqa: E402
     _source_ledger_signal_artifacts,
     _source_ledger_signal_ids,
 )
-from scripts.run_tw_day_trade_simulation import _mode_specs  # noqa: E402
+from scripts.run_tw_day_trade_simulation import (  # noqa: E402
+    _mode_specs,
+    _require_supported_paper_accounting,
+)
 from scripts.reload_tw_day_trade_services_if_flat import fresh as _require_fresh_receipt  # noqa: E402
 from stockagent.config import load_config  # noqa: E402
 from stockagent.data.tw_price_rules import TW_ORDER_PRICE_CONTRACT_VERSION  # noqa: E402
@@ -67,7 +74,7 @@ from stockagent.live.market_config import (  # noqa: E402
     load_market_config,
     resolved_live_output_dir,
 )
-from stockagent.live.market_status import short_file_fingerprint  # noqa: E402
+from stockagent.live.market_status import short_file_fingerprint, tw_stock_day_decision  # noqa: E402
 from stockagent.live.feature_source_contract import (  # noqa: E402
     inspect_live_feature_source,
     require_live_feature_source,
@@ -164,6 +171,29 @@ def _latest_completed_session(
     return completed[-1], completed, calendar_sha256
 
 
+def _requested_start_date(args: argparse.Namespace, *, observed: datetime | None = None) -> date:
+    """Default additions to this year's first verified completed session.
+
+    An explicit date is always honored; existing replacement/history-extension
+    defaults are unchanged. No calendar day is invented when source evidence
+    for the new year has not yet arrived.
+    """
+    if args.start_date is not None:
+        return date.fromisoformat(args.start_date)
+    if not (getattr(args, "add_mode", False) or getattr(args, "candidate_preflight", False)):
+        return DEFAULT_START_DATE
+    if observed is not None and (observed.tzinfo is None or observed.utcoffset() is None):
+        raise ValueError("candidate observation time must be timezone-aware")
+    now = (observed or datetime.now(TAIPEI)).astimezone(TAIPEI)
+    start_of_year = date(now.year, 1, 1)
+    _, sessions, _ = _latest_completed_session(
+        tw_public_dir=_resolved(args.tw_public_dir), start_date=start_of_year,
+    )
+    if not sessions or sessions[0] < start_of_year or sessions[0].year != now.year:
+        raise RuntimeError("no receipt-verified completed TAIEX session in the current year")
+    return sessions[0]
+
+
 def _active_specs(markets_dir: Path) -> tuple[list[Any], dict[str, Any], list[str]]:
     specs, configs, errors = _mode_specs(markets_dir, include_disabled=False)
     if errors:
@@ -195,20 +225,19 @@ def _flat_live_state(live_dir: Path, expected_markets: set[str]) -> dict[str, An
             "live mode set differs from enabled config: "
             f"live={sorted(modes)} expected={sorted(expected_markets)}"
         )
-    active: list[str] = []
-    for market, mode in modes.items():
-        positions = mode.get("positions") or {}
-        if int(mode.get("open_position_count") or 0) != 0 or any(
-            int(row.get("signed_shares") or 0) != 0
-            for row in positions.values()
-            if isinstance(row, Mapping)
-        ):
-            active.append(market)
-    if active:
-        raise RuntimeError(
-            "refusing strategy replacement while paper positions are open: "
-            f"{sorted(active)}"
+    # The same check is applied by merge, retained-account readback and final
+    # candidate validation; a plan must not be more permissive than cutover.
+    from stockagent.live.day_trade_addition import _flat
+    try:
+        _flat(state)
+        from scripts.repair_tw_day_trade_flat_opening import _require_evidenced_cutover_orders
+        from scripts.reload_tw_day_trade_services_if_flat import terminal_entry_price_rejection
+        _require_evidenced_cutover_orders(
+            state, live_dir / "events.jsonl", now=datetime.now(TAIPEI),
+            terminal_entry_validator=terminal_entry_price_rejection,
         )
+    except ValueError as exc:
+        raise RuntimeError(f"refusing strategy cutover: {exc}") from exc
     return {
         "path": str(state_path),
         "updated_at": state.get("updated_at"),
@@ -217,8 +246,62 @@ def _flat_live_state(live_dir: Path, expected_markets: set[str]) -> dict[str, An
     }
 
 
+def _require_research_cost_identity(mode_contract: Mapping[str, Any], experiment: Any) -> None:
+    """A selector cannot erase or invent the completed run's close expense."""
+    configured = float(experiment.trading.tw_day_trade_short_limit_up_penalty_rate)
+    details = mode_contract.get("mode_details") or {}
+    if not isinstance(details, Mapping):
+        raise ValueError("mode artifact has an invalid research cost contract")
+    penalty = details.get("short_limit_up_close_penalty")
+    if penalty is None:
+        if configured != 0.0:
+            raise ValueError("research close penalty is absent from the selected artifact")
+        return
+    if not isinstance(penalty, Mapping):
+        raise ValueError("mode artifact has an invalid research close penalty")
+    rate = penalty.get("rate")
+    if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+            or not math.isfinite(rate) or not 0.0 < rate <= 1.0
+            or penalty.get("contract") != "official_limit_up_close_source_residual_short_expense_v1"
+            or penalty.get("assessment") != "after_source_capacity_before_synthetic_terminal_liquidation"
+            or penalty.get("base") != "uncovered_short_shares_times_official_close"
+            or penalty.get("research_only") is not True):
+        raise ValueError("mode artifact has an invalid research close penalty")
+    if configured != float(rate):
+        raise ValueError("research close penalty differs between artifact and selected configuration")
+
+
+def _native_research_accounting_capability() -> dict[str, Any]:
+    """Require the running pinned engine, not just workspace code, to support admission."""
+    from stockagent.live.service_code_release import (
+        configured_release, native_owner_pid, run_in_namespace, verify_owner_namespace,
+    )
+
+    release = configured_release(REPO_ROOT, role="engine")
+    if release is None:
+        raise ValueError("research cost requires a verified pinned native engine release")
+    release = Path(release).resolve(strict=True)
+    pid = native_owner_pid(REPO_ROOT, role="engine")
+    verify_owner_namespace(release, REPO_ROOT, pid, role="engine")
+    code = ("from scripts.run_tw_day_trade_simulation import PROMOTED_RESEARCH_ACCOUNTING_CAPABILITY; "
+            "print('RESEARCH_ACCOUNTING_CAPABILITY=' + PROMOTED_RESEARCH_ACCOUNTING_CAPABILITY)")
+    probe = run_in_namespace(release, REPO_ROOT, ["-c", code], timeout=90)
+    capability = "promoted_research_paper_accounting_admission_v1"
+    markers = [line for line in probe.stdout.splitlines() if line.startswith("RESEARCH_ACCOUNTING_CAPABILITY=")]
+    if probe.returncode != 0 or markers != ["RESEARCH_ACCOUNTING_CAPABILITY=" + capability]:
+        raise ValueError("the running engine does not yet support promoted research accounting")
+    if (configured_release(REPO_ROOT, role="engine") != release
+            or native_owner_pid(REPO_ROOT, role="engine") != pid):
+        raise RuntimeError("native engine identity changed during research capability probe")
+    verify_owner_namespace(release, REPO_ROOT, pid, role="engine")
+    return {"contract": capability, "engine_release": str(release),
+            "engine_release_sha256": _sha256(release), "native_engine_pid": pid,
+            "native_data_or_warmup_readiness_claimed": False}
+
+
 def _fold_lifecycle_evidence(
-    *, market_config: Any, market_config_path: Path, checkpoint: Path
+    *, market_config: Any, market_config_path: Path, checkpoint: Path,
+    experiment: Any | None = None,
 ) -> dict[str, Any]:
     if market_config.fold_id is None:
         raise ValueError("strategy replacement requires an explicit fold_id")
@@ -245,6 +328,8 @@ def _fold_lifecycle_evidence(
         raise ValueError(f"invalid fold completion contract: {complete_path}")
     if str(mode_contract.get("execution_mode") or "") != "tw_day_trade":
         raise ValueError(f"wrong mode artifact contract: {mode_contract_path}")
+    if experiment is not None:
+        _require_research_cost_identity(mode_contract, experiment)
     selection = Path(str(market_config.model_selection_path or ""))
     if not selection.is_absolute():
         selection = (market_config_path.parent / selection).resolve()
@@ -373,10 +458,97 @@ def _current_deployment_evidence(
     }
 
 
+def _candidate_history_scope(
+    args: argparse.Namespace, *, market_config: Any, active_count: int,
+    observed: datetime | None = None,
+) -> tuple[dict[str, Any], bool]:
+    """Distinguish a scheduled current session from a completed replay.
+
+    The forward-only result is diagnostic and never authorizes an addition. A
+    prior completed-session receipt and a verified exchange schedule are both
+    necessary; neither fabricates an open price, signal, fill, or minute mark.
+    """
+    start = _requested_start_date(args, observed=observed)
+    if observed is not None and (observed.tzinfo is None or observed.utcoffset() is None):
+        raise ValueError("candidate observation time must be timezone-aware")
+    now = (observed or datetime.now(TAIPEI)).astimezone(TAIPEI)
+    public_dir = _resolved(args.tw_public_dir)
+    current_only = start == now.date() and args.end_date in {"latest", start.isoformat()}
+    requested = {"requested_start_date": args.start_date or start.isoformat(),
+                 "requested_end_date": args.end_date}
+    if current_only:
+        decision = tw_stock_day_decision(
+            start, tuple(getattr(market_config, "holidays", ()) or ()),
+            parquet_root=public_dir, observed=now,
+        )
+        if decision.status not in {"actual_open", "scheduled_open"}:
+            raise ValueError(f"current session is not confirmed open: {decision.reason}")
+        latest, all_sessions, calendar_sha256 = _latest_completed_session(
+            tw_public_dir=public_dir, start_date=start - timedelta(days=370),
+        )
+        if latest < start:
+            clock = now.timetz().replace(tzinfo=None)
+            phase = ("scheduled_not_started" if clock < time(9, 0) else
+                     "in_progress" if clock < time(13, 30) else "waiting_completed_receipt")
+            return ({**requested, "scope": "current_session_forward_only",
+                     "start_date": start.isoformat(), "end_date": None,
+                     "current_session_date": start.isoformat(),
+                     "current_session_phase": phase,
+                     "current_session_calendar_status": decision.status,
+                     "current_session_calendar_reason": decision.reason,
+                     "latest_completed_session": latest.isoformat(),
+                     "session_count": 0, "official_calendar_sha256": calendar_sha256,
+                     "points_per_session_mode": 270,
+                     "expected_strategy_minute_rows_after_addition": 0,
+                     "expected_rows_after_current_session_completes": (active_count + 1) * 270,
+                     "current_session_data_complete": False}, True)
+    else:
+        latest, all_sessions, calendar_sha256 = _latest_completed_session(
+            tw_public_dir=public_dir, start_date=start,
+        )
+    end = latest if args.end_date == "latest" else date.fromisoformat(args.end_date)
+    sessions = [day for day in all_sessions if start <= day <= end]
+    if end > latest or not sessions or sessions[0] != start or sessions[-1] != end:
+        raise ValueError("candidate start/end must be receipt-verified completed TAIEX sessions")
+    return ({**requested, "start_date": start.isoformat(), "end_date": end.isoformat(),
+             "latest_completed_session": latest.isoformat(), "session_count": len(sessions),
+             "official_calendar_sha256": calendar_sha256, "points_per_session_mode": 270,
+             "expected_strategy_minute_rows_after_addition": len(sessions) * (active_count + 1) * 270}, False)
+
+
+def _forward_candidate_feature_blockers(features: Mapping[str, Any], history: Mapping[str, Any]) -> list[dict[str, str]]:
+    """Keep metadata presence distinct from same-session inference proof.
+
+    The bounded feature inspector intentionally does not read every member or
+    compare an actual model input to the selected checkpoint. Its ``ready``
+    flag is only metadata admission, not permission to start an account.
+    """
+    if not features.get("required"):
+        return []
+    blockers: list[dict[str, str]] = []
+    paper = features.get("paper_inference")
+    if isinstance(paper, Mapping):
+        for source_field, history_field, code in (
+            ("decision_session", "current_session_date", "factorized_decision_session_mismatch"),
+            ("completed_session", "latest_completed_session", "factorized_completed_session_mismatch"),
+        ):
+            actual, expected = paper.get(source_field), history.get(history_field)
+            if not expected or actual != expected:
+                blockers.append({"code": code, "detail": f"{source_field}: {actual!r}; expected {expected!r}"})
+    if features.get("member_hashes_verified") is not True:
+        blockers.append({"code": "factorized_members_not_verified",
+                         "detail": "Metadata inspection did not independently read and verify all model-input members."})
+    if features.get("checkpoint_input_parity_proven") is not True:
+        blockers.append({"code": "checkpoint_input_parity_not_verified",
+                         "detail": "The selected checkpoint has not been verified against the actual prepared inference input."})
+    return blockers
+
+
 def _candidate_preflight(
     args: argparse.Namespace, *, market_config: Any,
     market_config_path: Path, experiment_path: Path, experiment: Any,
     requested_artifact: Any, lifecycle: Mapping[str, Any], capital: float,
+    accounting_blockers: tuple[Mapping[str, str], ...] = (),
 ) -> dict[str, Any]:
     """Inspect an unenabled, additive candidate, never an applicable switch.
 
@@ -389,17 +561,27 @@ def _candidate_preflight(
         raise ValueError("candidate preflight requires a disabled independent market")
     live_dir = _resolved(args.live_dir)
     features = inspect_live_feature_source(experiment.data)
-    blockers = list(features["blockers"])
+    blockers = [*accounting_blockers, *features["blockers"]]
     blockers.append({
         "code": "additive_cutover_not_verified",
         "detail": "This is a disabled candidate preflight, not replacement apply; additive account promotion and retained-history parity are not yet verified.",
     })
     dependencies = []
+    physical_field = "day_trade_physical_public_feature_path"
+    if getattr(experiment.data, "day_trade_inference_public_feature_path", None):
+        # Keep the trained physical path in the checkpoint contract. Inference
+        # deliberately resolves a different, source-verified local binding;
+        # checking the unused training-host path would reject a valid restored
+        # model. Reuse the runner's exact policy instead of duplicating it.
+        from train import _day_trade_physical_source_path
+
+        _day_trade_physical_source_path(experiment, mode="infer")
+        physical_field = "day_trade_inference_public_feature_path"
     for field, kind in (
         ("parquet_root", "directory"),
         ("factorized_feature_manifest", "file"),
         ("tw_public_feature_path", "file"),
-        ("day_trade_physical_public_feature_path", "file"),
+        (physical_field, "file"),
         ("day_trade_minute_execution_root", "directory"),
     ):
         value = str(getattr(experiment.data, field, "") or "")
@@ -417,20 +599,15 @@ def _candidate_preflight(
         blockers.append({"code": "live_flat_gate_not_ready", "detail": str(exc)})
     history: dict[str, Any] = {"requested_start_date": args.start_date, "requested_end_date": args.end_date}
     try:
-        start = date.fromisoformat(args.start_date)
-        latest, all_sessions, calendar_sha256 = _latest_completed_session(
-            tw_public_dir=_resolved(args.tw_public_dir), start_date=start,
+        history, current_only = _candidate_history_scope(
+            args, market_config=market_config, active_count=len(active_markets),
         )
-        end = latest if args.end_date == "latest" else date.fromisoformat(args.end_date)
-        sessions = [day for day in all_sessions if day <= end]
-        if end > latest or not sessions or sessions[0] != start or sessions[-1] != end:
-            raise ValueError("candidate start/end must be receipt-verified completed TAIEX sessions")
-        history.update({
-            "start_date": start.isoformat(), "end_date": end.isoformat(),
-            "latest_completed_session": latest.isoformat(), "session_count": len(sessions),
-            "official_calendar_sha256": calendar_sha256, "points_per_session_mode": 270,
-            "expected_strategy_minute_rows_after_addition": len(sessions) * (len(active_markets) + 1) * 270,
-        })
+        if current_only:
+            blockers.extend(_forward_candidate_feature_blockers(features, history))
+            blockers.append({
+                "code": "forward_only_addition_not_admitted",
+                "detail": "A current-session genesis, retained-ledger parity, recovery, and post-close minute acceptance remain unverified; this is not an applicable plan.",
+            })
     except (RuntimeError, ValueError, OSError) as exc:
         blockers.append({"code": "official_completed_calendar_not_ready", "detail": str(exc)})
     checkpoint = _resolved(Path(str(market_config.checkpoint_path)))
@@ -457,7 +634,13 @@ def _candidate_preflight(
         },
         "preserve_existing_signal_pins": True, "existing_history_parity_proven": False,
         "live_state": flat, "history": history,
-        "live_features": features, "source_dependencies": dependencies, "blockers": blockers,
+        "live_features": features, "source_dependencies": dependencies,
+        "paper_accounting": {
+            "status": "unsupported" if accounting_blockers else "supported",
+            "deployment_admitted": False,
+            "blockers": list(accounting_blockers),
+        },
+        "blockers": blockers,
     }
 
 
@@ -477,6 +660,29 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     add_mode = bool(getattr(args, "add_mode", False))
     if add_mode and candidate_preflight:
         raise ValueError("independent apply and read-only candidate inspection are distinct operations")
+    # A read-only disabled-candidate inspection reports every independently
+    # inspectable gate, rather than losing its artifact/source inventory at the
+    # first known accounting blocker. Formal plans and ALL writes keep the
+    # original early rejection; this diagnostic cannot admit a deployment.
+    accounting_blockers: tuple[Mapping[str, str], ...] = ()
+    research_capability = None
+    try:
+        _require_supported_paper_accounting(experiment)
+    except ValueError as exc:
+        if not str(exc).startswith("unsupported_paper_accounting:"):
+            raise
+        if candidate_preflight:
+            accounting_blockers = ({"code": "unsupported_paper_accounting", "detail": str(exc)},)
+        elif (add_mode and getattr(args, "allow_provisional_addition_history", False)
+              and (getattr(args, "prepared_addition_component", None)
+                   or getattr(args, "resume_addition_candidate", None))
+              and getattr(args, "staged_signal_root", None)):
+            # This permits staging only when the exact running pinned engine
+            # advertises its promotion-receipt gate. Component, cost ABI,
+            # retained accounts, source, journal and cutover audits still run.
+            research_capability = _native_research_accounting_capability()
+        else:
+            raise
     if not market_config.day_trade_simulation_enabled or (not candidate_preflight and not add_mode and not market_config.enabled):
         raise ValueError("selected market is not an enabled paper day-trade mode")
     capital = float(
@@ -495,6 +701,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
         market_config=market_config,
         market_config_path=market_config_path,
         checkpoint=checkpoint,
+        experiment=experiment,
     )
     if getattr(args, "history_extension", False):
         if candidate_preflight or add_mode:
@@ -510,10 +717,15 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
             args, market_config=market_config, market_config_path=market_config_path,
             experiment_path=experiment_path, experiment=experiment,
             requested_artifact=requested_artifact, lifecycle=lifecycle, capital=capital,
+            accounting_blockers=accounting_blockers,
         )
     if add_mode:
-        return _build_addition_plan(args, market_config, market_config_path, experiment_path,
+        plan = _build_addition_plan(args, market_config, market_config_path, experiment_path,
                                     experiment, requested_artifact, lifecycle, capital)
+        if research_capability is not None:
+            plan["research_runtime_capability"] = research_capability
+            plan["isolated_provisional_research_signals"] = True
+        return plan
     # Do not make a training-only wide checkpoint applicable merely by changing
     # its label/enablement or by constructing the six-column executable base.
     require_live_feature_source(experiment.data)
@@ -521,7 +733,7 @@ def _build_plan(args: argparse.Namespace) -> dict[str, Any]:
     live_dir = _resolved(args.live_dir)
     markets_dir = _resolved(args.markets_dir)
     tw_public_dir = _resolved(args.tw_public_dir)
-    start = date.fromisoformat(args.start_date)
+    start = _requested_start_date(args)
     latest, all_sessions, calendar_sha256 = _latest_completed_session(
         tw_public_dir=tw_public_dir, start_date=start
     )
@@ -740,7 +952,7 @@ def _build_history_extension_plan(args, *, market_config, market_config_path,
     if market_config.market not in expected:
         raise ValueError("history verification target is not a configured mode")
     flat = _flat_live_state(live, expected)
-    start = date.fromisoformat(args.start_date)
+    start = _requested_start_date(args)
     latest, calendar, digest = _latest_completed_session(tw_public_dir=_resolved(args.tw_public_dir), start_date=start)
     end = latest if args.end_date == "latest" else date.fromisoformat(args.end_date)
     sessions = [day for day in calendar if day <= end]
@@ -791,10 +1003,53 @@ def _build_history_extension_plan(args, *, market_config, market_config_path,
             "disk": {"filesystem": str(live.parent), "free_bytes": shutil.disk_usage(live.parent).free}}
 
 
+def _retained_minute_endpoint_preflight(
+    live: Path, *, sessions: Sequence[date], markets: set[str],
+) -> dict[str, Any]:
+    """Find impossible missing endpoints before copying an additive ledger.
+
+    This is only a necessary condition: it does not validate interior marks,
+    their provenance, or the current data and execution readiness. The full
+    isolated candidate must still pass the unmodified promotion validator.
+    """
+    from scripts.rebuild_tw_day_trade_minute_curves import missing_accepted_endpoints
+    from stockagent.live.paper_journal import layout_generations, open_paper_journal
+
+    if (not sessions or list(sessions) != sorted(set(sessions)) or not markets
+            or any(not isinstance(market, str) or not market.strip() for market in markets)):
+        raise ValueError("retained endpoint preflight needs ordered unique sessions and active markets")
+    path = live / "marks.jsonl"
+    before = path.stat()
+    before_heads = layout_generations(live, names=("marks.jsonl",))
+    with open_paper_journal(path, "r", encoding="utf-8") as stream:
+        rows = (json.loads(line) for line in stream if line.strip())
+        missing = missing_accepted_endpoints(
+            rows, start=sessions[0], end=sessions[-1],
+            expected_sessions=[day.isoformat() for day in sessions],
+            expected_markets=markets,
+        )
+    after = path.stat()
+    after_heads = layout_generations(live, names=("marks.jsonl",))
+    identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
+    if identity(before) != identity(after) or before_heads != after_heads:
+        raise RuntimeError("retained minute journal changed during endpoint preflight; retry")
+    return {
+        "contract": "retained_completed_session_endpoint_preflight_v1",
+        "status": "blocked" if missing else "passed_necessary_condition_only",
+        "session_count": len(sessions), "retained_market_count": len(markets),
+        "marks_file_size_bytes": before.st_size,
+        "missing_session_markets": missing,
+        "full_minute_grid_or_source_validation_claimed": False,
+    }
+
+
 def _build_addition_plan(args, config, config_path, experiment_path, experiment,
                          requested_artifact, lifecycle, capital):
+    markets_dir = _resolved(args.markets_dir)
+    if config_path.resolve().parent != markets_dir or _market_config_paths(markets_dir).get(config.market) != config_path:
+        raise ValueError("addition config must be staged inside the active markets directory before formal planning")
     require_live_feature_source(experiment.data)
-    start = date.fromisoformat(args.start_date)
+    start = _requested_start_date(args)
     latest, calendar, digest = _latest_completed_session(
         tw_public_dir=_resolved(args.tw_public_dir), start_date=start)
     end = latest if args.end_date == "latest" else date.fromisoformat(args.end_date)
@@ -825,9 +1080,51 @@ def _build_addition_plan(args, config, config_path, experiment_path, experiment,
                 "recovery_requires_preserved_activation_evidence": True}
     else:
         flat = _flat_live_state(live, set(active))
-    return {"schema_version": 1, "operation": "add_independent_mode", "plan_complete": True,
-            "status": "already_current" if current["matches"] else "ready_to_apply",
+    # A fresh union copies the live retained marks. The later curve builder
+    # cannot recreate a missing accepted endpoint, so detect it before copying
+    # potentially many GiB. A resumed candidate can contain separate verified
+    # repair evidence and is still checked by the full candidate validator.
+    endpoint_preflight = None
+    if not current["matches"] and not resumed:
+        endpoint_preflight = _retained_minute_endpoint_preflight(
+            live, sessions=sessions, markets=set(active))
+        if (endpoint_preflight["status"] == "blocked"
+                and getattr(args, "recover_retained_cash_curve_gaps", False)):
+            from stockagent.live.day_trade_addition import inspect_retained_curve_recovery
+            proof, _rows = inspect_retained_curve_recovery(live,
+                sessions=[day.isoformat() for day in sessions], markets=set(active))
+            endpoint_preflight["cash_and_opening_recovery"] = proof
+            endpoint_preflight["status"] = "verified_cash_valuation_recovery_not_applied"
+    endpoint_blocked = bool(endpoint_preflight and endpoint_preflight["status"] == "blocked")
+    cost_targets = []
+    for value in getattr(args, "provisional_opening_cost_valuation", ()):
+        try:
+            mode, day, symbol = value.rsplit(":", 2)
+            if (mode not in active or day not in {d.isoformat() for d in sessions}
+                    or not symbol.strip() or value in cost_targets):
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("retained cost valuation requires a unique existing MARKET:SESSION:SYMBOL") from exc
+        cost_targets.append(value)
+    first_bar_targets = []
+    for value in getattr(args, "provisional_opening_first_bar_valuation", ()):
+        try:
+            mode, day, symbol = value.rsplit(":", 2)
+            if (mode not in active or day not in {d.isoformat() for d in sessions}
+                    or not symbol.strip() or value in first_bar_targets):
+                raise ValueError
+        except (AttributeError, ValueError) as exc:
+            raise ValueError("retained first-bar valuation requires a unique existing MARKET:SESSION:SYMBOL") from exc
+        first_bar_targets.append(value)
+    if first_bar_targets and cost_targets:
+        raise ValueError("choose first-bar or cost opening assumption, not both")
+    return {"schema_version": 1, "operation": "add_independent_mode",
+            "plan_complete": not endpoint_blocked,
+            "status": ("already_current" if current["matches"] else
+                       "blocked_retained_minute_endpoints" if endpoint_blocked else "ready_to_apply"),
             "simulation_only": True, "production_order_possible": False,
+            "provisional_retained_opening_cost_valuation": sorted(cost_targets),
+            "provisional_retained_opening_first_bar_valuation": sorted(first_bar_targets),
             "replacement": {"stable_market_id": config.market, "label": config.label,
                 "market_config_path": str(config_path), "experiment_config_path": str(experiment_path),
                 "checkpoint_path": str(_resolved(Path(config.checkpoint_path))),
@@ -845,6 +1142,7 @@ def _build_addition_plan(args, config, config_path, experiment_path, experiment,
                     "historical_entry_time": "09:01:00 Asia/Taipei",
                     "liquidity_assumption": "full_legal_NAV_funded_target_no_liquidity_claim"}
                    if getattr(args, "historical_full_fill_0901", False) else {})},
+            "retained_minute_endpoint_preflight": endpoint_preflight,
             "source_ledger": {"policy": "retain_existing_decision_and_execution_bytes_and_account_states"},
             "source_ledger_repairs": []}
 
@@ -855,7 +1153,12 @@ def _verify_generated_signals(
     replacement = plan["replacement"]
     market_config = load_market_config(Path(str(replacement["market_config_path"])))
     if plan.get("operation") == "add_independent_mode":
-        specs, _configs, errors = _mode_specs(markets_dir, include_disabled=True)
+        if plan.get("isolated_provisional_research_signals") is True:
+            specs, _configs, errors = _mode_specs(markets_dir, include_disabled=True,
+                isolated_provisional_research_replay=True,
+                preflight_market_config=Path(str(replacement["market_config_path"])))
+        else:
+            specs, _configs, errors = _mode_specs(markets_dir, include_disabled=True)
         if errors:
             raise RuntimeError(f"candidate mode configuration errors: {errors}")
     else:
@@ -868,8 +1171,9 @@ def _verify_generated_signals(
     expected_fingerprint = str(replacement["checkpoint_fingerprint"] or "")
     fingerprints: set[str] = set()
     signal_ids: set[str] = set()
+    verified_artifacts: list[dict[str, str]] = []
     for day in sessions:
-        _generated_at, _summary_path, _weights_path, summary, _rows = (
+        _generated_at, summary_path, weights_path, summary, _rows = (
             _latest_valid_signal(spec, day)
         )
         if not bool(summary.get("counterfactual_signal_regeneration")):
@@ -882,6 +1186,9 @@ def _verify_generated_signals(
             )
         fingerprints.add(fingerprint)
         signal_ids.add(str(summary.get("signal_id") or ""))
+        verified_artifacts.append({"session_date": day.isoformat(),
+            "signal_id": str(summary.get("signal_id") or ""),
+            "summary_sha256": _sha256(summary_path), "weights_sha256": _sha256(weights_path)})
     if len(signal_ids) != len(sessions):
         raise RuntimeError("replacement history does not have one signal per session")
     return {
@@ -889,7 +1196,63 @@ def _verify_generated_signals(
         "sessions": len(sessions),
         "checkpoint_fingerprints": sorted(fingerprints),
         "distinct_signal_ids": len(signal_ids),
+        "verified_artifacts": verified_artifacts,
     }
+
+
+def _verify_prepared_addition_component(
+    component: Path, *, market: str, checkpoint_fingerprint: str, initial_capital: float,
+    sessions: Sequence[date], verified_signals: Sequence[Mapping[str, Any]],
+    allow_provisional_research: bool,
+) -> dict[str, Any]:
+    """Admit an already built independent component without changing a ledger."""
+    from scripts.promote_tw_day_trade_replay import _validate_rebuild
+
+    receipt_path, state_path = component / "rebuild_receipt.json", component / "state.json"
+    receipt_hash, state_hash = _sha256(receipt_path), _sha256(state_path)
+    receipt, state = _object(receipt_path), _object(state_path)
+    modes = state.get("modes") or {}
+    mode = modes.get(market) or {}
+    expected_days = [day.isoformat() for day in sessions]
+    if (set(modes) != {market} or mode.get("checkpoint_fingerprint") != checkpoint_fingerprint
+            or float(mode.get("initial_capital_twd") or 0) != float(initial_capital)):
+        raise ValueError("prepared addition market, checkpoint or capital differs")
+    rows = receipt.get("sessions")
+    if not isinstance(rows, list) or [row.get("session_date") for row in rows] != expected_days:
+        raise ValueError("prepared addition sessions differ from the requested trading calendar")
+    artifacts = {}
+    for signal in verified_signals:
+        day = str(signal.get("session_date") or "")
+        if not day or day in artifacts:
+            raise ValueError("verified staged signal sessions are missing or duplicated")
+        artifacts[day] = signal
+    if set(artifacts) != set(expected_days):
+        raise ValueError("verified staged signal session set differs from prepared addition")
+    for row in rows:
+        day = row["session_date"]
+        mode_rows = row.get("modes") or []
+        if len(mode_rows) != 1 or mode_rows[0].get("market") != market:
+            raise ValueError("prepared addition contains another market")
+        if any(mode_rows[0].get(field) != artifacts[day].get(field)
+               for field in ("signal_id", "summary_sha256", "weights_sha256")):
+            raise ValueError(f"{day}: prepared replay and staged signal lineage differ")
+    acceptance = _validate_rebuild(component, expected_markets={market},
+        allow_provisional_research_market=market if allow_provisional_research else None)
+    if acceptance.get("session_dates") != expected_days:
+        raise ValueError("prepared addition independent acceptance has a different session set")
+    if allow_provisional_research and (acceptance.get("provisional_research") or {}).get("market") != market:
+        raise ValueError("prepared provisional addition lacks its accepted market disclosure")
+    if _sha256(receipt_path) != receipt_hash or _sha256(state_path) != state_hash:
+        raise RuntimeError("prepared addition changed during verification")
+    return {"market": market, "session_count": len(expected_days),
+            "rebuild_receipt_sha256": receipt_hash, "state_sha256": state_hash,
+            "provisional_research": acceptance.get("provisional_research")}
+
+
+def _has_provisional_addition_history(acceptance: Mapping[str, Any]) -> bool:
+    component = acceptance.get("new_component_acceptance") or {}
+    disclosure = component.get("provisional_research") if isinstance(component, Mapping) else None
+    return isinstance(disclosure, Mapping) and disclosure.get("source_gaps_may_change_results") is True
 
 
 def _verify_repaired_signals(
@@ -1127,9 +1490,114 @@ def _addition_replay_flags(args, *, market: str, live: Path) -> list[str]:
             "--allow-unpinned-market", market]
 
 
+def _addition_tree_logical_bytes(root: Path) -> int:
+    """Count every copied name, rejecting redirects and unmeasured members."""
+    root = Path(root).resolve(strict=True)
+    root_device = root.stat().st_dev
+    total = 0
+    for directory, names, files in os.walk(root, followlinks=False):
+        parent = Path(directory)
+        for name in (*names, *files):
+            item = parent / name
+            info = item.lstat()
+            if stat.S_ISLNK(info.st_mode):
+                raise ValueError(f"prepared addition refuses a symlink: {item}")
+            if info.st_dev != root_device:
+                raise ValueError("prepared addition inventory crosses a filesystem")
+            if stat.S_ISREG(info.st_mode):
+                total += info.st_size
+            elif not stat.S_ISDIR(info.st_mode):
+                raise ValueError(f"prepared addition refuses an unmeasured member: {item}")
+    return total
+
+
+@contextmanager
+def _prepared_addition_capacity_lease(*, live: Path, component: Path, signals: Path,
+                                      operations: Path, accepted_signals: Path, market: str,
+                                      resume_candidate: Path | None = None):
+    """Reserve actual clone growth on the live filesystem and its WSL backing."""
+    from stockagent.data_sync.cache_capacity import (
+        _admit_backing_volume, _control_directory, load_acquisition_verification_reserve,
+        load_capacity_policy,
+    )
+    from stockagent.data_sync.completed_forward_capacity import reserve_capacity
+
+    live, component, signals = (Path(value).resolve(strict=True) for value in (live, component, signals))
+    device = live.stat().st_dev
+    for destination in (Path(operations).resolve(), Path(accepted_signals).resolve()):
+        existing = destination
+        while not existing.exists():
+            if existing == existing.parent:
+                raise ValueError("prepared addition has no existing destination ancestor")
+            existing = existing.parent
+        if existing.stat().st_dev != device:
+            raise ValueError("prepared addition destinations must use the live filesystem")
+    live_bytes = _addition_tree_logical_bytes(live)
+    component_bytes = _addition_tree_logical_bytes(component)
+    signal_bytes = _addition_tree_logical_bytes(signals)
+    measured = live if resume_candidate is None else Path(resume_candidate).resolve(strict=True)
+    if resume_candidate is not None:
+        if measured == live or live in measured.parents or measured in live.parents or measured.stat().st_dev != device:
+            raise ValueError("resumed addition requires an isolated same-filesystem candidate")
+        _addition_tree_logical_bytes(measured)  # Retain the redirect/member gate.
+    curve_bytes = sum((measured / name).stat().st_size for name in ("marks.jsonl", "benchmark_history.json")
+                      if (measured / name).is_file())
+    execution_bytes = sum((measured / name).stat().st_size for name in ("orders.jsonl", "fills.jsonl")
+                          if (measured / name).is_file())
+    growth = ((live_bytes + 4 * component_bytes + max(live_bytes // 10, 4 * 1024**3)
+               if resume_candidate is None else 32 * 1024**2)
+              + 2 * signal_bytes + 4 * curve_bytes + 2 * execution_bytes + 2 * 1024**3)
+    if not 0 < growth < 2**63 - 1:
+        raise ValueError("prepared addition growth estimate is invalid")
+    controls = _control_directory(f"filesystem-{device}")
+    if controls.stat().st_dev != device:
+        raise ValueError("prepared addition capacity controls are on a different filesystem")
+    minimum_free = max(int(load_capacity_policy()["minimum_free_bytes"]),
+                       int(load_acquisition_verification_reserve()))
+    key = hashlib.sha256(f"day-trade-addition:{market}:{uuid.uuid4().hex}".encode()).hexdigest()
+    with reserve_capacity(controls, key=key, maximum_growth_bytes=growth,
+                          capacity_bytes=2**63 - 1, minimum_free_bytes=minimum_free) as reservation:
+        other = int(reservation["other_reserved_growth_bytes"]) + int(reservation["control_bytes"])
+        backing = _admit_backing_volume(live, growth + minimum_free + other)
+        @contextmanager
+        def journal_capacity_reservation(required):
+            if type(required) is not int or not 0 < required <= growth:
+                raise ValueError("journal enrollment exceeds the reserved addition growth")
+            _admit_backing_volume(live, required + minimum_free + other)
+            yield
+        yield {"maximum_growth_bytes": growth, "minimum_free_bytes": minimum_free,
+               "live_logical_bytes": live_bytes, "component_logical_bytes": component_bytes,
+               "signal_logical_bytes": signal_bytes, "backing_admission": backing,
+               "journal_capacity_reservation": journal_capacity_reservation}
+
+
 def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
+    prepared = getattr(args, "prepared_addition_component", None)
+    resumed = getattr(args, "resume_addition_candidate", None)
+    if prepared is None and not (resumed and getattr(args, "allow_provisional_addition_history", False)):
+        return _apply_addition_impl(args, plan)
+    if prepared is None:
+        from stockagent.live.day_trade_addition import evidence_path
+        candidate = _resolved(resumed)
+        prepared = evidence_path(candidate, _object(candidate / "rebuild_receipt.json")["new_mode_component"])
+    target = plan["replacement"]
+    with _prepared_addition_capacity_lease(
+        live=_resolved(args.live_dir), component=_resolved(prepared),
+        signals=_resolved(args.staged_signal_root), operations=_resolved(args.operations_root),
+        accepted_signals=_resolved(Path(target["live_signal_output_dir"])),
+        market=str(target["stable_market_id"]),
+        **({"resume_candidate": _resolved(resumed)} if resumed else {}),
+    ) as lease:
+        return _apply_addition_impl(args, plan, capacity_lease=lease)
+
+
+def _apply_addition_impl(args: argparse.Namespace, plan: dict[str, Any], *,
+                         capacity_lease: Mapping[str, Any] | None = None) -> dict[str, Any]:
     """Accept an independent replay, retain old accounts, then use the promoter."""
-    from stockagent.live.day_trade_addition import merge_addition, preserve_aborted_activation, validate_aborted_activation
+    from stockagent.live.day_trade_addition import (
+        enroll_research_execution_journals, merge_addition,
+        preserve_aborted_activation, validate_aborted_activation,
+    )
     from stockagent.live.day_trade_maintenance import control_lease
     target, history = plan["replacement"], plan["history"]
     market = target["stable_market_id"]
@@ -1143,6 +1611,9 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
     candidate = (_resolved(resumed) if reuse else Path(tempfile.mkdtemp(prefix=f"{market}.addition.", dir=live.parent)))
     component = run / "new_mode_replay"
     stages = []
+    if capacity_lease is not None:
+        stages.append({"stage": "prepared_addition_capacity_admission", **{
+            key: value for key, value in capacity_lease.items() if key != "journal_capacity_reservation"}})
     status_path = root / "status.json"
     if resumed:
         previous_operation = _object(status_path)
@@ -1179,7 +1650,8 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
         # Reuse is never acceptance: inspect every summary/checkpoint first.
         isolated_configs = run / "markets"
         isolated_configs.mkdir()
-        staged = dict(raw, enabled=True, live_output_dir=str(signal_root))
+        provisional = bool(getattr(args, "allow_provisional_addition_history", False))
+        staged = dict(raw, enabled=not provisional, live_output_dir=str(signal_root))
         if raw.get("model_selection_path"):
             staged["model_selection_path"] = str((config_path.parent / raw["model_selection_path"]).resolve())
         staged_path = isolated_configs / config_path.name
@@ -1195,6 +1667,32 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
                        "verification_signal_dir": str(scoped)}
         signals = _verify_generated_signals(staged_plan, sessions, isolated_configs)
         stages.append({"stage": "verify_generated_signals", **signals})
+        prepared_component = getattr(args, "prepared_addition_component", None)
+        if prepared_component:
+            from stockagent.live.paper_journal import rebind_cloned_journals
+            source_component = _resolved(prepared_component)
+            if (not source_component.is_dir() or source_component == live
+                    or live in source_component.parents or source_component in live.parents):
+                raise ValueError("prepared addition must be a separate existing replay component")
+            source_receipt = _sha256(source_component / "rebuild_receipt.json")
+            source_state = _sha256(source_component / "state.json")
+            shutil.copytree(source_component, component, ignore=shutil.ignore_patterns("*.lock", ".lock"))
+            rebind_cloned_journals(source_component, component)
+            prepared_acceptance = _verify_prepared_addition_component(
+                component, market=market, checkpoint_fingerprint=str(target["checkpoint_fingerprint"]),
+                initial_capital=float(target["initial_capital_twd"]), sessions=sessions,
+                verified_signals=signals["verified_artifacts"], allow_provisional_research=provisional)
+            if (_sha256(source_component / "rebuild_receipt.json") != source_receipt
+                    or _sha256(source_component / "state.json") != source_state
+                    or prepared_acceptance["rebuild_receipt_sha256"] != source_receipt
+                    or prepared_acceptance["state_sha256"] != source_state):
+                raise RuntimeError("prepared addition changed while being copied and verified")
+            stages.append({"stage": "verify_prepared_addition_component", **prepared_acceptance})
+            from stockagent.live.day_trade_addition import finalize_completed_replay_entries
+            finalization = finalize_completed_replay_entries(component, live=live, market=market,
+                completed_day=end, recorded_at=datetime.now(TAIPEI))
+            if finalization is not None:
+                stages.append({"stage": "finalize_expired_replay_entries", "receipt": finalization})
         if accepted_signals.exists():
             # A previous failed operation may already have published these exact
             # immutable signals. Never replace a different accepted artifact.
@@ -1208,7 +1706,7 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
             pending = Path(tempfile.mkdtemp(prefix=".signals-addition.", dir=accepted_signals.parent))
             shutil.copytree(scoped, pending, dirs_exist_ok=True)
             os.replace(pending, accepted_signals)
-        if not reuse:
+        if not reuse and not prepared_component:
             stages.append(_run("new_mode_replay", [sys.executable,
             str(REPO_ROOT / "scripts/rebuild_tw_day_trade_open_price_replay.py"),
             "--markets-dir", str(isolated_configs), "--only-market", market,
@@ -1222,26 +1720,56 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
             state = _object(state_dir / "state.json")
             carried = any(mode.get("margin_carry_contract") for mode in state["modes"].values())
             flags = ["--revalue-carried-marks"] if carried else ["--repair-unverified-strategy-marks"]
+            scoped_recovery = (stage == "combined_minute_curves"
+                               and getattr(args, "recover_retained_cash_curve_gaps", False))
+            output = run / stage
+            if scoped_recovery:
+                from stockagent.live.day_trade_addition import evidence_path
+                addition_receipt = _object(state_dir / "rebuild_receipt.json")
+                output = evidence_path(state_dir, addition_receipt["new_mode_component"]).parent / "retained_curves"
+                flags.extend(("--preserve-addition-component", "--recover-proven-cash-sessions"))
+                flags.append("--complete-opening-prices-from-local-backup")
+                recovery = (plan.get("retained_minute_endpoint_preflight") or {}).get("cash_and_opening_recovery") or {}
+                for item in recovery.get("opening_projection_repairs", []):
+                    flags.extend(("--repair-replayed-opening-endpoint", item))
+                for item in plan.get("provisional_retained_opening_cost_valuation", []):
+                    flags.extend(("--provisional-opening-cost-valuation", item))
+                for item in plan.get("provisional_retained_opening_first_bar_valuation", []):
+                    flags.extend(("--provisional-opening-first-bar-valuation", item))
             command = [sys.executable,
                 str(REPO_ROOT / "scripts/rebuild_tw_day_trade_minute_curves.py"),
                 "--state-dir", str(state_dir), "--start-date", history["start_date"],
-                "--end-date", history["end_date"], "--output-dir", str(run / stage),
-                "--simulation", "--fetch-missing-kbars", *flags,
-                "--revalue-opening-marks", "--publish"]
+                "--end-date", history["end_date"], "--output-dir", str(output),
+                "--simulation", *([] if scoped_recovery else ["--fetch-missing-kbars"]), *flags,
+                "--revalue-opening-marks"]
+            if not scoped_recovery:
+                command.append("--publish")
             for day in sessions:
                 command.extend(("--expected-session-date", day.isoformat()))
             for item in state["modes"]:
                 command.extend(("--expected-market", item))
-            return _run(stage, command, run_dir=run)
+            result = _run(stage, command, run_dir=run)
+            if scoped_recovery:
+                from stockagent.live.day_trade_addition import adopt_isolated_addition_curves
+                result["isolated_curve_adoption"] = adopt_isolated_addition_curves(
+                    state_dir, output, live=live, provisional_opening_cost_targets={
+                        tuple(item.rsplit(":", 2)) for item in
+                        plan.get("provisional_retained_opening_cost_valuation", [])},
+                    provisional_opening_first_bar_targets={tuple(item.rsplit(":", 2)) for item in
+                        plan.get("provisional_retained_opening_first_bar_valuation", [])})
+            return result
         if not reuse:
-            stages.append(curves(component, "new_mode_minute_curves"))
+            if not prepared_component:
+                stages.append(curves(component, "new_mode_minute_curves"))
             aborted_candidate = None
             if resumed and market in (_object(live / "state.json").get("modes") or {}):
                 aborted_candidate = _resolved(resumed)
             else:
                 _flat_live_state(live, retained)
             addition = merge_addition(live, component, candidate, added_market=market,
-                                      aborted_activation_candidate=aborted_candidate)
+                                      aborted_activation_candidate=aborted_candidate,
+                                      allow_provisional_research_market=market if provisional else None,
+                                      pin_research_model=provisional)
             stages.append({"stage": "retain_old_accounts_and_execution_bytes", "receipt": addition})
             stages.append(curves(candidate, "combined_minute_curves"))
         else:
@@ -1256,6 +1784,13 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
                                "receipt": preserve_aborted_activation(live, candidate)})
             stages.append({"stage": "reuse_candidate_not_acceptance", "candidate": str(candidate),
                            "previous_run_dir": previous_operation["run_dir"]})
+        if provisional:
+            if capacity_lease is None:
+                raise RuntimeError("provisional journal preparation requires the held capacity lease")
+            journal = enroll_research_execution_journals(
+                candidate, live=live,
+                capacity_reservation=capacity_lease["journal_capacity_reservation"])
+            stages.append({"stage": "prepare_private_research_execution_journals", "receipt": journal})
         promote = [sys.executable, str(REPO_ROOT / "scripts/promote_tw_day_trade_replay.py"),
                    "--live-dir", str(live), "--candidate-dir", str(candidate), "--added-market", market]
         for item in sorted(expected):
@@ -1271,6 +1806,9 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
                 validate_aborted_activation(candidate, live=live)
             else:
                 _flat_live_state(live, retained)
+            if (plan.get("research_runtime_capability") is not None
+                    and _native_research_accounting_capability() != plan["research_runtime_capability"]):
+                raise RuntimeError("native research accounting capability changed before cutover")
             subprocess.run(["systemctl", "stop", SIMULATION_SERVICE], check=True)
             stopped = True
             if config_path.read_bytes() != config_bytes:
@@ -1300,7 +1838,8 @@ def _apply_addition(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str,
         if (promotion["acceptance"]["minute_curve_validation"]["validated_rows"]
                 != history["expected_strategy_minute_rows"]):
             raise RuntimeError("combined minute count does not meet the planned all-mode scope")
-        result = {**status, "status": "complete_with_data_gaps" if dashboard["local_status"]["operational_issues"] else "complete",
+        provisional_history = _has_provisional_addition_history(promotion["acceptance"])
+        result = {**status, "status": "complete_with_data_gaps" if dashboard["local_status"]["operational_issues"] or provisional_history else "complete",
                   "completed_at": datetime.now(TAIPEI).isoformat(), "signal_acceptance": signals,
                   "promotion_completed": True,
                   "promotion_receipt": str(live / "promotion_receipt.json"),
@@ -1373,6 +1912,8 @@ def _prepare_replacement_candidate(args, plan, *, candidate, live_dir, sessions,
 
 
 def _apply(args: argparse.Namespace, plan: dict[str, Any]) -> dict[str, Any]:
+    if plan.get("status") == "blocked_retained_minute_endpoints":
+        raise RuntimeError("retained completed-session minute endpoints are missing; repair and replan before copying")
     if getattr(args, "candidate_preflight", False) or plan.get("plan_complete") is False:
         raise RuntimeError("a read-only candidate preflight cannot be applied")
     if plan.get("operation") == "add_independent_mode":
@@ -1581,7 +2122,7 @@ def _verify_current(
     runtime_issues = dashboard["local_status"]["operational_issues"]
     return {
         "schema_version": 1,
-        "status": "verified_with_data_gaps" if runtime_issues else "verified",
+        "status": "verified_with_data_gaps" if runtime_issues or _has_provisional_addition_history(acceptance) else "verified",
         "verified_at": datetime.now(TAIPEI).isoformat(timespec="seconds"),
         "simulation_only": True,
         "production_order_possible": False,
@@ -1609,7 +2150,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("action", choices=("plan", "apply", "verify", "status"))
     parser.add_argument("--market-config", type=Path, default=DEFAULT_MARKET_CONFIG)
-    parser.add_argument("--start-date", default=DEFAULT_START_DATE.isoformat())
+    parser.add_argument("--start-date", default=None,
+                        help="Explicit first trading day; new-mode additions default to the first receipt-verified completed session of this Taipei calendar year.")
     parser.add_argument("--end-date", default="latest")
     parser.add_argument("--accepted-repair-manifest", action="append", type=Path, default=[],
                         help="Receipt-backed original/repair signal lineage, validated before planning and replay.")
@@ -1621,6 +2163,18 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--historical-full-fill-0901", action="store_true",
                         help="Explicit addition-only historical scenario: a full legal NAV-funded target at sourced 09:01 prices; no liquidity or broker-fill claim. Keep this flag for verify.")
     parser.add_argument("--staged-signal-root", type=Path, help="Reuse an isolated signal root only after full checkpoint/session validation; addition only.")
+    parser.add_argument("--prepared-addition-component", type=Path,
+                        help="Reuse one independently audited new-mode replay; requires staged signals and --add-mode.")
+    parser.add_argument("--allow-provisional-addition-history", action="store_true",
+                        help="Explicitly authorize disclosed source-incomplete research history for the new mode only; never changes live execution.")
+    parser.add_argument("--recover-retained-cash-curve-gaps", action="store_true",
+                        help="Addition only: derive proven cash-only missed-session valuations and separately verify eligible opening projections; never add a trade.")
+    parser.add_argument("--provisional-opening-cost-valuation", action="append", default=[],
+                        metavar="MARKET:YYYY-MM-DD:SYMBOL",
+                        help="Explicitly authorize named retained 09:01 cost valuations only; preserve executions and disclose missing market prices.")
+    parser.add_argument("--provisional-opening-first-bar-valuation", action="append", default=[],
+                        metavar="MARKET:YYYY-MM-DD:SYMBOL",
+                        help="Authorize named retained opening valuations using later first observed bars, with original bar clocks and unchanged executions.")
     parser.add_argument("--resume-addition-candidate", type=Path,
                         help="Revalidate an exact failed, unpromoted additive candidate; preserve any provably unfunded aborted activation.")
     parser.add_argument("--rebuild-resumed-addition", action="store_true",
@@ -1727,7 +2281,10 @@ def _recover_promoted_consumers(args, plan, previous_operation):
                 _atomic_json(status_path, failed)
             raise
         else:
-            completed_status = "complete_with_data_gaps" if dashboard["local_status"]["operational_issues"] else "complete"
+            completed_status = "complete_with_data_gaps" if (
+                dashboard["local_status"]["operational_issues"]
+                or _has_provisional_addition_history(promotion.get("acceptance") or {})
+            ) else "complete"
             progress.update(status=completed_status, stage="complete", finished_at=datetime.now(TAIPEI).isoformat())
             _atomic_json(attempt_path, progress)
             result = {**previous_operation,
@@ -1753,10 +2310,28 @@ def main() -> None:
     if args.prepared_candidate and not args.history_extension:
         raise ValueError("--prepared-candidate requires --history-extension")
     if args.history_extension and (args.add_mode or args.candidate_preflight or args.staged_signal_root
-                                   or args.resume_addition_candidate or args.rebuild_resumed_addition):
+                                   or args.resume_addition_candidate or args.rebuild_resumed_addition
+                                   or args.prepared_addition_component or args.allow_provisional_addition_history):
         raise ValueError("history extension cannot be combined with strategy addition/replacement inputs")
     if args.staged_signal_root and not args.add_mode:
         raise ValueError("--staged-signal-root requires --add-mode")
+    if args.recover_retained_cash_curve_gaps and (not args.add_mode or args.action not in {"plan", "apply"}):
+        raise ValueError("--recover-retained-cash-curve-gaps requires additive plan/apply")
+    if args.provisional_opening_cost_valuation and not (
+            args.add_mode and args.recover_retained_cash_curve_gaps and args.action in {"plan", "apply"}):
+        raise ValueError("provisional retained cost valuation requires additive cash/curve recovery plan/apply")
+    if args.provisional_opening_first_bar_valuation and not (
+            args.add_mode and args.recover_retained_cash_curve_gaps and args.action in {"plan", "apply"}):
+        raise ValueError("provisional first-bar valuation requires additive cash/curve recovery plan/apply")
+    if args.provisional_opening_cost_valuation and args.provisional_opening_first_bar_valuation:
+        raise ValueError("first-bar and cost valuation policies cannot be mixed")
+    if args.prepared_addition_component and (
+        not args.add_mode or not args.staged_signal_root or args.resume_addition_candidate
+        or args.historical_full_fill_0901 or args.action not in {"plan", "apply"}
+    ):
+        raise ValueError("--prepared-addition-component requires --add-mode and --staged-signal-root, without resume or alternate replay")
+    if args.allow_provisional_addition_history and not (args.prepared_addition_component or args.resume_addition_candidate):
+        raise ValueError("--allow-provisional-addition-history requires --prepared-addition-component or --resume-addition-candidate")
     if args.resume_addition_candidate and (not args.add_mode or args.action not in {"plan", "apply"}):
         raise ValueError("--resume-addition-candidate requires additive plan/apply")
     if args.rebuild_resumed_addition and not args.resume_addition_candidate:

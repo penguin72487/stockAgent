@@ -9,7 +9,7 @@ const sample = (overrides = {}) => ({schema_version: 1, simulation_only: true, p
   modes: [{market: "m", label: "模型", open_position_count: 1, engine_status: "active"}],
   rows: [{market: "m", symbol: "2330", signed_shares: 1000, target_weight: 0.1}], ...overrides});
 
-test("temporary commit conflicts get one bounded retry, never a fabricated snapshot", async () => {
+test("temporary commit conflicts get bounded retries, never a fabricated snapshot", async () => {
   const context = vm.createContext({Date});
   vm.runInContext(source, context);
   const {retryTransientRead} = context.StockAgentTwLivePaper;
@@ -26,10 +26,18 @@ test("temporary commit conflicts get one bounded retry, never a fabricated snaps
     assert.deepEqual(delays, [250]);
   }
   let calls = 0;
+  const delays = [];
   const unavailable = await retryTransientRead(async () => { calls++; return {status: 503}; },
-    "api/live-events", options, async () => {});
+    "api/live-events", options, async ms => delays.push(ms));
   assert.equal(unavailable.status, 503);
-  assert.equal(calls, 2);
+  assert.equal(calls, 4);
+  assert.deepEqual(delays, [250, 750, 1500]);
+  let closed = 0;
+  const responses = [503, 503, 200];
+  const recovered = await retryTransientRead(async () => ({status: responses.shift(),
+    body: {cancel: async () => { closed++; }}}), "api/live-events", options, async () => {});
+  assert.equal(recovered.status, 200);
+  assert.equal(closed, 2);
   calls = 0;
   assert.equal((await retryTransientRead(async () => { calls++; return {status: 404}; },
     "api/live-events", options, async () => {})).status, 404);
@@ -49,7 +57,7 @@ test("only complete, simulated committed open-position views are accepted", () =
 });
 
 test("live view updates without status API, retains last committed version on failure", async () => {
-  const nodes = new Map(), requests = [], scheduled = [], optionsSeen = [];
+  const nodes = new Map(), requests = [], scheduled = [], optionsSeen = [], fetchOptions = [];
   function node(id) {
     if (!nodes.has(id)) nodes.set(id, {textContent: "", html: "", listeners: {}, classList: {remove() {}, add() {}, toggle() {}},
       addEventListener(k, fn) { this.listeners[k] = fn; }});
@@ -59,12 +67,12 @@ test("live view updates without status API, retains last committed version on fa
   const Dashboard = {
     byId: node, escapeHtml: value => String(value ?? "").replaceAll("&", "&amp;").replaceAll("<", "&lt;"),
     setTrustedHtml: (id, html) => { node(id).html = html; },
-    createFetch: () => async (url, options) => {
+    createFetch: config => { fetchOptions.push(config); return async (url, options) => {
       requests.push({url, headers: options.headers});
       if (fail) throw new Error("offline");
       if (options.headers["If-None-Match"] === etag) return {status: 304};
       return {status: 200, headers: {get: () => etag}, payload: data};
-    },
+    }; },
     readJsonResponse: async response => response.payload,
     scheduleRefresh: (callback, options) => { optionsSeen.push(options); scheduled.push(callback); return {run: callback}; },
   };
@@ -72,12 +80,19 @@ test("live view updates without status API, retains last committed version on fa
     detailComponents: {positionRow: row => `<tr><td>${row.symbol}</td></tr>`},
     document: {getElementById: node}, location: {pathname: "/tw-day-trade/"}});
   vm.runInContext(source, context);
+  assert.equal(fetchOptions[0].timeoutMs, 10000);
   assert.deepEqual(optionsSeen.map(option => option.intervalMs), [60000, 60000]);
   assert.ok(optionsSeen.every(option => option.cadenceFromLastStart && option.refreshOnVisible === "overdue"));
   await scheduled[0]();
   assert.match(node("live-paper-body").html, /2330/);
   assert.equal(context.StockAgentTwLivePaper.getSnapshot().data.rows[0].symbol, "2330");
   assert.deepEqual(requests.map(row => row.url), ["api/live-snapshot"]);
+  data = sample({state_revision: 8, modes: [{...sample().modes[0], nontrade_settlement_count: 2,
+    nontrade_settlement_shares: 2000, cumulative_nontrade_settlement_net_pnl_twd: -100}]});
+  etag = '"nontrade"';
+  await scheduled[0]();
+  assert.match(node("live-paper-status").html, /非成交帳面結算/);
+  assert.match(node("live-paper-status").html, /累積帳面已結算（含假設）/);
   await scheduled[0]();
   assert.equal(requests[1].headers["If-None-Match"], '"one"');
   data = sample({state_revision: 8, rows: [{...sample().rows[0], symbol: "2317"}]});

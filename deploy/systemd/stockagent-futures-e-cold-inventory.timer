@@ -1,0 +1,11 @@
+[Unit]
+Description=Check the completed futures E copy against a fixed D inventory
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=10min
+AccuracySec=1s
+Unit=stockagent-futures-e-cold-inventory.service
+
+[Install]
+WantedBy=timers.target

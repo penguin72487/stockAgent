@@ -87,6 +87,93 @@ def test_native_durable_copy_requires_both_full_checksums_and_closes_writer(tmp_
     assert source.read_bytes() == payload and writers[0].stream.closed
 
 
+def test_scoped_native_write_floor_reaches_windows_writer_without_changing_default(tmp_path, monkeypatch):
+    source = tmp_path/'original'
+    source.write_bytes(b'fixed source content')
+    seen = []
+    class Writer:
+        def __init__(self, path, **kwargs):
+            self.stream = path.open('xb')
+            self.digest = hashlib.sha256()
+            seen.append(kwargs)
+        def write(self, block):
+            self.stream.write(block)
+            self.digest.update(block)
+        def finish(self):
+            self.stream.flush()
+            return {'sha256': self.digest.hexdigest()}
+        def close(self):
+            self.stream.close()
+    monkeypatch.setattr(native, 'BinaryWriter', Writer)
+    expected = hashlib.sha256(source.read_bytes()).hexdigest()
+    assert packed._native_copy_and_hash(source, tmp_path/'default') == expected
+    floor = 12 * 1024**3
+    assert packed._native_copy_and_hash(source, tmp_path/'scoped', reserve_bytes=floor) == expected
+    assert seen == [{}, {'reserve_bytes': floor}]
+    with pytest.raises(SnapshotError, match='reserve'):
+        packed._native_copy_and_hash(source, tmp_path/'invalid', reserve_bytes=floor-1)
+    assert not (tmp_path/'invalid').exists()
+
+
+def test_eight_GiB_native_floor_is_restricted_to_exact_enrolled_E_stage(tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_volume
+    stage = tmp_path/'enrolled-stage'
+    stage.mkdir()
+    source = stage/('pack-'+'a'*64+'.zip')
+    source.write_bytes(b'exact sealed payload')
+    seen = []
+    class Writer:
+        def __init__(self, path, **kwargs):
+            self.stream, self.digest = path.open('xb'), hashlib.sha256()
+            seen.append(kwargs)
+        def write(self, block):
+            self.stream.write(block)
+            self.digest.update(block)
+        def finish(self):
+            self.stream.flush()
+            return {'sha256': self.digest.hexdigest()}
+        def close(self):
+            self.stream.close()
+    monkeypatch.setattr(native, 'BinaryWriter', Writer)
+    monkeypatch.setattr(packed, '_E_FIRST_8G_SOURCE_DIR', stage)
+    checked = []
+    monkeypatch.setattr(workspace_volume, 'check', lambda **_kw: checked.append(True))
+    floor = 8 * 1024**3
+    assert packed._native_copy_and_hash(source, tmp_path/'accepted', reserve_bytes=floor) == hashlib.sha256(source.read_bytes()).hexdigest()
+    assert seen == [{'reserve_bytes': floor}] and checked == [True]
+    outside = tmp_path/('pack-'+'b'*64+'.zip')
+    outside.write_bytes(b'other')
+    with pytest.raises(SnapshotError, match='exact E-first scope'):
+        packed._native_copy_and_hash(outside, tmp_path/'rejected', reserve_bytes=floor)
+    with pytest.raises(SnapshotError, match='bounded migration range'):
+        packed._native_copy_and_hash(source, tmp_path/'too-small', reserve_bytes=floor-1)
+
+
+def test_native_creation_callback_binds_the_empty_inode_before_source_bytes(tmp_path, monkeypatch):
+    source = tmp_path/'source'
+    source.write_bytes(b'source bytes')
+    events = []
+    class Writer:
+        def __init__(self, path):
+            self.stream = path.open('xb')
+            self.digest = hashlib.sha256()
+        def write(self, block):
+            events.append('write')
+            self.stream.write(block)
+            self.digest.update(block)
+        def finish(self):
+            self.stream.flush()
+            return {'sha256': self.digest.hexdigest()}
+        def close(self):
+            self.stream.close()
+    monkeypatch.setattr(native, 'BinaryWriter', Writer)
+    def created(path):
+        assert path.stat().st_size == 0
+        events.append('created')
+    packed._native_copy_and_hash(source, tmp_path/'incoming', on_created=created)
+    assert events == ['created', 'write']
+
+
 @pytest.mark.parametrize('flag', [True, 1, 'true', None])
 def test_native_write_cannot_use_an_unenrolled_cold_namespace(tmp_path, flag):
     with pytest.raises(SnapshotError, match='native D blob writes|explicit boolean'):

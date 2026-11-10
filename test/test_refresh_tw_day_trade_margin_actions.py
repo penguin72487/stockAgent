@@ -1,5 +1,6 @@
 from datetime import date
 import json
+from pathlib import Path
 import subprocess
 import sys
 from types import SimpleNamespace
@@ -15,12 +16,17 @@ def test_new_execution_source_does_not_claim_current_year_is_baseline(tmp_path):
     output = tmp_path / "execution_actions"
     output.mkdir()
     planned = commands(tmp_path, output, 2026, date(2026, 9, 10))
-    assert planned[0][planned[0].index("--start-year") + 1] == "2000"
-    assert planned[1][planned[1].index("--retained-source-dir") + 1] == str(tmp_path)
+    assert [Path(command[1]).name for command in planned] == [
+        "download_tw_share_replacement_reference.py",
+        "download_tw_corporate_action_reference.py",
+        "download_tw_corporate_action_entitlements.py",
+    ]
+    assert planned[1][planned[1].index("--start-year") + 1] == "2000"
+    assert planned[2][planned[2].index("--retained-source-dir") + 1] == str(tmp_path)
     assert all(command[command.index("--output-dir") + 1] == str(output) for command in planned)
     (output / "tw_corporate_action_reference.summary.json").write_text(json.dumps({"baseline_established": True}))
     planned = commands(tmp_path, output, 2026, date(2026, 9, 11))
-    assert planned[0][planned[0].index("--start-year") + 1] == "2026"
+    assert planned[1][planned[1].index("--start-year") + 1] == "2026"
     assert all(command[command.index("--end-date") + 1] == "2026-09-11" for command in planned)
 
 
@@ -76,6 +82,94 @@ def test_margin_action_readiness_records_step_timings_without_changing_result(
     if failing_step is None:
         assert receipt["validation_elapsed_seconds"] >= 0
         assert receipt["historical_catalog_sync"]["status"] == "waiting_baseline"
+
+
+def test_share_catalog_is_independently_available_even_if_entitlements_fail(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    live.mkdir()
+    catalog = tmp_path / "configs/data_sync/packed_datasets.json"
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text(json.dumps({"datasets": [{"dataset": "tw-public", "source": "live"}]}))
+    monkeypatch.setattr(margin_actions, "ROOT", tmp_path)
+    seen = []
+
+    def run(command, **_kwargs):
+        name = Path(command[1]).name
+        seen.append(name)
+        return subprocess.CompletedProcess(command, 1 if name == "download_tw_corporate_action_entitlements.py" else 0)
+
+    monkeypatch.setattr(margin_actions.subprocess, "run", run)
+    monkeypatch.setattr(margin_actions, "load_share_replacements", lambda *a, **kw: ["source-verified"])
+    def sync(*_args):
+        seen.append("verified_catalog_merge")
+        return {"status": "ready", "action": "merged_verified_tail"}
+    monkeypatch.setattr(margin_actions, "sync_historical_share_catalog", sync)
+    monkeypatch.setattr(sys, "argv", ["refresh", "--start-year", "2026", "--session-date", "2026-09-23"])
+    with pytest.raises(RuntimeError, match="collector failed"):
+        margin_actions.main()
+    receipt = json.loads((live / "execution_actions/readiness.json").read_text())
+    assert seen == ["download_tw_share_replacement_reference.py", "verified_catalog_merge",
+                    "download_tw_corporate_action_reference.py", "download_tw_corporate_action_entitlements.py"]
+    assert receipt["share_replacement_preflight"]["status"] == "source_ready"
+    assert receipt["historical_catalog_sync"]["status"] == "ready"
+    assert receipt["status"] == "blocked"  # Never claim the dependent execution actions are ready.
+
+
+def test_catalog_merge_failure_does_not_falsify_independent_action_readiness(tmp_path, monkeypatch):
+    live = tmp_path / "live"
+    live.mkdir()
+    catalog = tmp_path / "configs/data_sync/packed_datasets.json"
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text(json.dumps({"datasets": [{"dataset": "tw-public", "source": "live"}]}))
+    monkeypatch.setattr(margin_actions, "ROOT", tmp_path)
+    monkeypatch.setattr(margin_actions.subprocess, "run", lambda command, **kw: subprocess.CompletedProcess(command, 0))
+    monkeypatch.setattr(margin_actions, "load_share_replacements", lambda *a, **kw: ["source-verified"])
+    monkeypatch.setattr(margin_actions, "sync_historical_share_catalog", lambda *a: {
+        "status": "blocked", "error": "independent catalog merge rejected"})
+    monkeypatch.setattr(margin_actions, "_load_corporate_action_reference", lambda *_: SimpleNamespace(
+        coverage_end=np.datetime64("2026-09-23"), exact_coverage_end=np.datetime64("2026-09-23")))
+    monkeypatch.setattr(sys, "argv", ["refresh", "--start-year", "2026", "--session-date", "2026-09-23"])
+    margin_actions.main()
+    receipt = json.loads((live / "execution_actions/readiness.json").read_text())
+    assert receipt["status"] == "source_ready"
+    assert receipt["share_replacement_preflight"]["status"] == "source_ready"
+    assert receipt["historical_catalog_sync"]["status"] == "blocked"
+
+
+@pytest.mark.parametrize("failure", ["invalid_receipt", "invalid_parquet", "collector_exit", "collector_exception"])
+def test_share_failure_never_merges_and_does_not_stop_independent_collectors(tmp_path, monkeypatch, failure):
+    live = tmp_path / "live"
+    live.mkdir()
+    catalog = tmp_path / "configs/data_sync/packed_datasets.json"
+    catalog.parent.mkdir(parents=True)
+    catalog.write_text(json.dumps({"datasets": [{"dataset": "tw-public", "source": "live"}]}))
+    monkeypatch.setattr(margin_actions, "ROOT", tmp_path)
+    seen = []
+    def run(command, **_kwargs):
+        name = Path(command[1]).name
+        seen.append(name)
+        if name == "download_tw_share_replacement_reference.py":
+            if failure == "collector_exception":
+                raise subprocess.TimeoutExpired(command, 900)
+            if failure == "collector_exit":
+                return subprocess.CompletedProcess(command, 1)
+        return subprocess.CompletedProcess(command, 0)
+    monkeypatch.setattr(margin_actions.subprocess, "run", run)
+    def reject_tail(*_args, **_kwargs):
+        if failure == "invalid_parquet":
+            import polars as pl
+            raise pl.exceptions.ComputeError("bad parquet")
+        raise ValueError("bad receipt")
+    monkeypatch.setattr(margin_actions, "load_share_replacements", reject_tail)
+    monkeypatch.setattr(margin_actions, "sync_historical_share_catalog", lambda *a: pytest.fail("unverified tail must not merge"))
+    monkeypatch.setattr(sys, "argv", ["refresh", "--start-year", "2026", "--session-date", "2026-09-23"])
+    with pytest.raises(RuntimeError, match="share-replacement source failed"):
+        margin_actions.main()
+    receipt = json.loads((live / "execution_actions/readiness.json").read_text())
+    assert seen == ["download_tw_share_replacement_reference.py",
+                    "download_tw_corporate_action_reference.py", "download_tw_corporate_action_entitlements.py"]
+    assert receipt["status"] == "blocked" and receipt["share_replacement_preflight"]["status"] == "blocked"
+    assert "historical_catalog_sync" not in receipt
 
 
 def _catalog_metadata(tmp_path):

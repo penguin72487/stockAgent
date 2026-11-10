@@ -16,6 +16,7 @@ import hashlib
 import json
 import os
 from pathlib import Path, PurePosixPath
+import stat
 import threading
 from typing import Any, Final
 
@@ -380,3 +381,51 @@ def load_benchmark_projection(
         },
         marks_by_session=marks_by_session,
     )
+
+
+def adopt_benchmark_projection(
+    *, state_dir: Path, source_state_dir: Path,
+    expected_source_sha256: str, created_at: str,
+) -> dict[str, Any] | None:
+    """Rebind verified shards to an identical, privately adopted source file.
+
+    A head cannot simply be copied: its stat fence belongs to the old file.
+    Reuse the canonical shard writer, preserving every row and origin while
+    binding the new head to the destination's real generation. No large JSON
+    document is decoded, and the ordinary state-reader limit stays unchanged.
+    """
+    original = Path(source_state_dir) / "benchmark_history.json"
+    target = Path(state_dir) / original.name
+    projection = load_benchmark_projection(state_dir=source_state_dir, source_path=original)
+    if projection is None:
+        if projection_head_path(source_state_dir).exists():
+            raise ValueError("source benchmark projection is invalid or stale")
+        return None  # Legacy small documents retain their original fallback.
+    if projection.source_sha256 != expected_source_sha256:
+        raise ValueError("source benchmark projection has a different content identity")
+
+    def identity(path):
+        value = path.lstat()
+        if not stat.S_ISREG(value.st_mode):
+            raise ValueError("benchmark adoption requires regular source files")
+        return (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns)
+
+    before = [identity(path) for path in (original, target)]
+    for path in (original, target):
+        digest = hashlib.sha256()
+        with path.open("rb") as stream:
+            for block in iter(lambda: stream.read(8 * 1024**2), b""):
+                digest.update(block)
+        if digest.hexdigest() != expected_source_sha256:
+            raise ValueError("adopted benchmark content differs from its accepted projection")
+    if before != [identity(path) for path in (original, target)]:
+        raise OSError("benchmark source changed during projection adoption")
+    result = write_benchmark_projection(state_dir=state_dir, source_path=target,
+        source_sha256=expected_source_sha256, origins=projection.origins,
+        marks=projection.marks, created_at=created_at)
+    accepted = load_benchmark_projection(state_dir=state_dir, source_path=target)
+    if (accepted is None or accepted.session_entries != projection.session_entries
+            or accepted.origins != projection.origins
+            or before != [identity(path) for path in (original, target)]):
+        raise ValueError("adopted benchmark projection failed independent readback")
+    return result

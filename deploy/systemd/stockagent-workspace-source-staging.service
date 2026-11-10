@@ -1,0 +1,18 @@
+[Unit]
+Description=Resume enrolled source copies to the StockAgent E workspace
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/run_workspace_source_staging.py'
+SuccessExitStatus=75
+TimeoutStartSec=infinity
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7
+
+[Install]
+WantedBy=multi-user.target

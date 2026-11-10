@@ -85,9 +85,11 @@ def _check_private(cold: Path) -> None:
         raise SnapshotError("source link dependencies cannot grant export or source retirement")
 
 
-def _read_fixed_dependency(cold: Path, row: dict, recovery: dict):
+def _read_fixed_dependency(cold: Path, row: dict, recovery: dict | None, *, recovery_deferred=False):
     selected = resolve_packed_snapshot_id(cold, TARGET_DATASET, row["snapshot_id"])
-    if (selected.manifest_sha256 != row.get("manifest_sha256")
+    if selected.manifest_sha256 != row.get("manifest_sha256"):
+        raise SnapshotError("cross-root source dependency has a different fixed manifest")
+    if not recovery_deferred and (not isinstance(recovery, dict)
             or recovery.get("manifest_sha256") != selected.manifest_sha256
             or recovery.get("snapshot_id") != row["snapshot_id"]
             or recovery.get("dataset") != TARGET_DATASET
@@ -97,7 +99,7 @@ def _read_fixed_dependency(cold: Path, row: dict, recovery: dict):
 
 
 def prepare_source_links(repo: Path, entry: dict, source: Path, cold: Path,
-                         operation: Path, *, progress=None) -> list[dict]:
+                         operation: Path, *, progress=None, recovery_pause_path=None) -> list[dict]:
     if entry["dataset"] != "local-tw-futures":
         return []
     if source != repo / "data_tw_futures" or source.resolve() != source:
@@ -105,10 +107,13 @@ def prepare_source_links(repo: Path, entry: dict, source: Path, cold: Path,
     _check_private(cold)
     journal = json.loads((operation / "progress.json").read_text())
     target_row = journal["datasets"].get(TARGET_DATASET, {})
-    if target_row.get("state") != "verified":
+    from stockagent.data_sync.dataset_migration import _recovery_paused
+    deferred = (target_row.get('state') == 'recovery_deferred_user_migration'
+                and _recovery_paused(recovery_pause_path))
+    if target_row.get("state") != "verified" and not deferred:
         raise SnapshotError("futures interface target must finish its original migration first")
-    recovery = json.loads(Path(target_row["recovery_receipt"]).read_text())
-    selected = _read_fixed_dependency(cold, target_row, recovery)
+    recovery = None if deferred else json.loads(Path(target_row["recovery_receipt"]).read_text())
+    selected = _read_fixed_dependency(cold, target_row, recovery, recovery_deferred=deferred)
     sqlite_states = json.loads(selected.manifest.get("metadata", {}).get("consistent_sqlite_bindings", "[]"))
     if not isinstance(sqlite_states, list):
         raise SnapshotError("fixed target SQLite dependencies are invalid")
@@ -130,6 +135,8 @@ def prepare_source_links(repo: Path, entry: dict, source: Path, cold: Path,
                 "dataset": TARGET_DATASET, "snapshot_id": selected.manifest["snapshot_id"],
                 "manifest_sha256": selected.manifest_sha256,
                 "subtree": "preparation_sources/" + name}
+            if deferred:
+                binding['dependency_recovery'] = 'deferred_by_user'
             states = [row for row in sqlite_states if isinstance(row, dict)
                       and str(row.get("source_relative", "")).startswith(binding["subtree"] + "/")]
             if states:
@@ -137,14 +144,14 @@ def prepare_source_links(repo: Path, entry: dict, source: Path, cold: Path,
                     sqlite_capture_basis="original_fixed_native_backup_not_current_main_wal_bytes")
                 for row in _sqlite_rows(binding):
                     fixed = resolve_packed_snapshot_id(cold, row["dataset"], row["snapshot_id"])
-                    proof = json.loads((operation / "recovery" / (row["dataset"] + ".json")).read_text())
+                    proof = None if deferred else json.loads((operation / "recovery" / (row["dataset"] + ".json")).read_text())
                     if (fixed.manifest_sha256 != row["manifest_sha256"]
                             or fixed.manifest.get("metadata", {}).get("role") != "private_consistent_sqlite_state"
                             or fixed.manifest["metadata"].get("source_relative") != row["source_relative"]
-                            or proof.get("manifest_sha256") != row["manifest_sha256"]
-                            or proof.get("snapshot_id") != row["snapshot_id"]
-                            or proof.get("dataset") != row["dataset"]
-                            or proof.get("full_original_file_reconstruction_verified") is not True):
+                            or not deferred and (proof.get("manifest_sha256") != row["manifest_sha256"]
+                                or proof.get("snapshot_id") != row["snapshot_id"]
+                                or proof.get("dataset") != row["dataset"]
+                                or proof.get("full_original_file_reconstruction_verified") is not True)):
                         raise SnapshotError("source-interface SQLite state lacks exact full recovery")
                     relative = row["source_relative"]
                     if any(relative + suffix not in selected.manifest["source"]["excluded_subtrees"]
@@ -209,7 +216,18 @@ def prepare_source_links(repo: Path, entry: dict, source: Path, cold: Path,
     return bindings
 
 
-def guard_source_links(source: Path, bindings: list[dict]) -> None:
+def guard_source_links(source: Path, bindings: list[dict], *, cold: Path, recovery_pause_path=None) -> None:
+    if any(binding.get('dependency_recovery') == 'deferred_by_user' for binding in bindings):
+        from stockagent.data_sync.dataset_migration import _recovery_paused
+        if not _recovery_paused(recovery_pause_path):
+            raise SnapshotError('user-deferred source dependency requires the active recovery pause')
+    # This guard runs under the publication/retention shared lock. A target
+    # may have been retired since the initial preparation; check the exact
+    # fixed dependency and its object presence before committing the link.
+    for row in source_link_dependencies(bindings):
+        fixed = resolve_packed_snapshot_id(cold, row['dataset'], row['snapshot_id'])
+        if fixed.manifest_sha256 != row['manifest_sha256']:
+            raise SnapshotError('fixed source-link dependency changed before publication commit')
     for binding in bindings:
         target = Path(binding["original_target"])
         if (target.resolve(strict=True) != target
@@ -246,6 +264,7 @@ def manifest_source_links(selected) -> list[dict]:
                 or not isinstance(row.get("snapshot_id"), str) or not row["snapshot_id"]
                 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("manifest_sha256"))) is None
                 or re.fullmatch(r"[0-9a-f]{64}", str(row.get("target_stability_sha256"))) is None
+                or row.get('dependency_recovery') not in (None, 'deferred_by_user')
                 or any(type(row.get(field)) is not int or row[field] < 0
                        for field in ("files", "logical_bytes"))
                 or row["name"] not in selected.manifest["source"].get("excluded_subtrees", [])):

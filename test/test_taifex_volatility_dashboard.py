@@ -1405,7 +1405,7 @@ def test_dashboard_html_is_local_and_refreshes_the_read_only_api() -> None:
     assert 'snapshot.health === "degraded"' in javascript
     assert 'href="styles.css?v=15"' in html
     assert 'src="../time-axis.js?v=4"' in html
-    assert 'src="app.js?v=29"' in html
+    assert 'src="app.js?v=31"' in html
     assert 'rows.length < 2 ? "waiting" : behind ? "degraded" : "ready"' in javascript
     assert "response.status === 503" in javascript
     assert "scheduleHistoryRetry(requestedRange)" in javascript

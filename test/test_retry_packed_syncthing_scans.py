@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import fcntl
+import os
 from pathlib import Path
 import sys
 from threading import Event
@@ -516,6 +517,119 @@ def test_batch_policy_is_not_scan_execution_when_no_pending(tmp_path, monkeypatc
     assert result["requested_scan_policy"] == {"batch_object_paths": True, "request_timeout_seconds": 480}
     assert result["status"] == "idle_no_pending"
     assert result["peer_convergence"] == result["release_verification"] == "not_checked"
+
+
+def test_bounded_retry_drains_oldest_first_and_leaves_later_intent(tmp_path, monkeypatch):
+    pending, receipt_path = _setup(tmp_path, monkeypatch)
+    for name, stamp in [('z-old', 10), ('a-new', 30), ('m-middle', 20)]:
+        path = pending / f'{name}.json'
+        path.write_text('{}')
+        os.utime(path, ns=(stamp, stamp))
+    scanned = []
+
+    def scan(root, dataset, **kwargs):
+        scanned.append(dataset)
+        (pending / f'{dataset}.json').unlink()
+        return True
+
+    monkeypatch.setattr(retry, 'scan_after_publish', scan)
+    assert retry.main(['--max-datasets', '2', '--budget-seconds', '40']) == 0
+    result = json.loads(receipt_path.read_bytes())
+    assert scanned == ['z-old', 'm-middle']
+    assert result['status'] == 'scan_batch_processed'
+    assert (result['pending_before'], result['pending_after']) == (3, 1)
+    assert (result['attempted_count'], result['acknowledged_count'], result['failed_count']) == (2, 2, 0)
+    assert result['peer_convergence'] == result['release_verification'] == 'not_checked'
+    assert (pending / 'a-new.json').exists()
+
+
+def test_bounded_retry_retains_failed_item_and_continues_unrelated_work(tmp_path, monkeypatch):
+    pending, receipt_path = _setup(tmp_path, monkeypatch)
+    for name in ('a-bad', 'b-good'):
+        (pending / f'{name}.json').write_text('{}')
+
+    def scan(root, dataset, **kwargs):
+        if dataset == 'a-bad':
+            raise SnapshotError('do not expose private API error in per-item receipt')
+        (pending / f'{dataset}.json').unlink()
+        return True
+
+    monkeypatch.setattr(retry, 'scan_after_publish', scan)
+    assert retry.main(['--max-datasets', '8']) == 1
+    result = json.loads(receipt_path.read_bytes())
+    assert result['status'] == 'retry_partial_failure'
+    assert (result['attempted_count'], result['acknowledged_count'], result['failed_count']) == (2, 1, 1)
+    assert result['datasets'][0] == {'dataset': 'a-bad', 'status': 'retry_failed', 'error_type': 'SnapshotError'}
+    assert (pending / 'a-bad.json').exists()
+    assert not (pending / 'b-good.json').exists()
+
+
+def test_repeated_failure_prefix_rotates_without_discarding_pending_intents(tmp_path, monkeypatch):
+    pending, receipt_path = _setup(tmp_path, monkeypatch)
+    for name in ('a-bad', 'b-bad', 'c-bad', 'd-good'):
+        path = pending/f'{name}.json'
+        path.write_text('{}')
+        os.utime(path, ns=(10, 10))
+    calls = []
+
+    def scan(root, dataset, **kwargs):
+        calls.append(dataset)
+        if dataset.endswith('-bad'):
+            raise SnapshotError('retain this intent')
+        (pending/f'{dataset}.json').unlink()
+        return True
+
+    monkeypatch.setattr(retry, 'scan_after_publish', scan)
+    assert retry.main(['--max-datasets', '2']) == 1
+    assert calls == ['a-bad', 'b-bad']
+    assert json.loads(receipt_path.read_bytes())['retry_cursor'] == 'b-bad'
+    assert retry.main(['--max-datasets', '2']) == 1
+    assert calls[-2:] == ['c-bad', 'd-good']
+    assert not (pending/'d-good.json').exists()
+    assert all((pending/f'{name}.json').exists() for name in ('a-bad', 'b-bad', 'c-bad'))
+
+
+def test_bounded_retry_stops_when_existing_folder_scan_is_busy(tmp_path, monkeypatch):
+    pending, receipt_path = _setup(tmp_path, monkeypatch)
+    for name in ('a', 'b'):
+        (pending / f'{name}.json').write_text('{}')
+    monkeypatch.setattr(retry, 'scan_folder_state', lambda: 'scanning')
+    monkeypatch.setattr(retry, 'scan_after_publish', lambda *a, **kw: pytest.fail('must not queue new scans'))
+    assert retry.main(['--max-datasets', '8']) == 0
+    result = json.loads(receipt_path.read_bytes())
+    assert result['status'] == 'deferred_existing_folder_scan'
+    assert result['attempted_count'] == 1
+    assert result['pending_after'] == 2
+
+
+def test_bounded_retry_budget_stops_starting_new_scans(tmp_path, monkeypatch):
+    pending, receipt_path = _setup(tmp_path, monkeypatch)
+    for name in ('a', 'b'):
+        (pending / f'{name}.json').write_text('{}')
+    now = [0.0]
+    monkeypatch.setattr(retry.time, 'monotonic', lambda: now[0])
+
+    def scan(root, dataset, **kwargs):
+        (pending / f'{dataset}.json').unlink()
+        now[0] = 45.0
+        return True
+
+    monkeypatch.setattr(retry, 'scan_after_publish', scan)
+    assert retry.main(['--max-datasets', '8', '--budget-seconds', '40']) == 0
+    result = json.loads(receipt_path.read_bytes())
+    assert result['attempted_count'] == 1
+    assert result['pending_after'] == 1
+
+
+@pytest.mark.parametrize('arguments', [
+    ['--max-datasets', '0'], ['--max-datasets', '33'],
+    ['--budget-seconds', '0'], ['--budget-seconds', '241'],
+    ['--dataset', 'a', '--max-datasets', '2'],
+])
+def test_bounded_retry_rejects_invalid_limits_or_scoped_batch(tmp_path, monkeypatch, arguments):
+    _setup(tmp_path, monkeypatch)
+    with pytest.raises(SystemExit):
+        retry.main(arguments)
 
 
 def test_batch_failure_records_requested_policy_and_keeps_pending(tmp_path, monkeypatch):

@@ -8,6 +8,7 @@ from pathlib import Path
 import select
 import subprocess
 import sys
+import threading
 import time
 from types import SimpleNamespace
 
@@ -72,6 +73,37 @@ def test_real_subprocess_contention_times_out_then_releases(tmp_path, capsys):
     ]
     assert events[1]["reason"] == "dataset_writer_lock_timeout"
     assert events[1]["lock_wait_seconds"] >= 0.08
+
+
+def test_waiter_rejects_replaced_lock_inode_without_entering_workspace(tmp_path, monkeypatch):
+    path = tmp_path/'.download.lock'
+    original = fcntl.flock
+    started = threading.Event()
+    outcome = []
+
+    def instrumented(fd, operation):
+        if operation == fcntl.LOCK_EX | fcntl.LOCK_NB:
+            started.set()
+        return original(fd, operation)
+
+    monkeypatch.setattr(locks.fcntl, 'flock', instrumented)
+    def waiter():
+        try:
+            with locks.exclusive_dataset_lock(path, provider='test', timeout_seconds=3, poll_interval_seconds=.01):
+                outcome.append('entered')
+        except Exception as error:
+            outcome.append(error)
+
+    with _locked_by_child(path):
+        thread = threading.Thread(target=waiter)
+        thread.start()
+        assert started.wait(2)
+        path.rename(tmp_path/'preserved-old.lock')
+        path.write_text('')
+    thread.join(timeout=3)
+    assert not thread.is_alive()
+    assert len(outcome) == 1 and isinstance(outcome[0], locks.DatasetLockPathChanged)
+    assert (tmp_path/'preserved-old.lock').exists()
 
 
 def test_deadline_uses_nonblocking_attempts_and_caps_the_last_sleep(tmp_path, monkeypatch):

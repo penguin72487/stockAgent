@@ -145,6 +145,38 @@ def test_failed_relay_then_ready_relay_invokes_one_bridge_only(launch_request, m
     assert timing['request_sha256'] == hashlib.sha256(request.read_bytes()).hexdigest()
 
 
+def test_owned_relay_can_fall_back_only_before_permit_and_with_session_gate(launch_request, monkeypatch):
+    request = launch_request
+    _relay_candidates(monkeypatch)
+    calls = []
+    def launch(argv, **kwargs):
+        assert 'SessionId -ne 1' in argv[-1]
+        process = Process(argv[-1], acknowledgement=bool(calls))
+        calls.append((process, kwargs['env']['WSL_INTEROP']))
+        return process
+    monkeypatch.setattr(transport.subprocess, 'Popen', launch)
+    result = transport.run_guarded_windows('SOURCE_ACTION', request=request, windows_path=str,
+        readiness_seconds=.1, windows_session_id=1, interop_socket='/run/WSL/123_interop')
+    assert result.returncode == 0
+    assert [socket for _, socket in calls] == ['/run/WSL/123_interop', '/run/WSL/1_interop']
+    assert not calls[0][0].permit.exists() and calls[1][0].permit.exists()
+    assert result.windows_interop_socket == '/run/WSL/1_interop'
+
+
+def test_owned_relay_admitted_failure_never_falls_back(launch_request, monkeypatch):
+    _relay_candidates(monkeypatch)
+    calls = []
+    def launch(argv, **kwargs):
+        process = Process(argv[-1], timeout=True)
+        calls.append(process)
+        return process
+    monkeypatch.setattr(transport.subprocess, 'Popen', launch)
+    with pytest.raises(subprocess.TimeoutExpired):
+        transport.run_guarded_windows('SOURCE_ACTION', request=launch_request, windows_path=str,
+            readiness_seconds=.1, windows_session_id=1, interop_socket='/run/WSL/123_interop')
+    assert len(calls) == 1 and calls[0].permit.exists()
+
+
 @pytest.mark.parametrize('timeout', [False, True])
 def test_admitted_failures_never_launch_second_worker(launch_request, monkeypatch, timeout):
     request = launch_request

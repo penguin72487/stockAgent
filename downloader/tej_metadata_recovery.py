@@ -17,7 +17,9 @@ import subprocess
 import uuid
 
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json
-from downloader.tej_operation_clock import CONTRACT as CLOCK_CONTRACT, OperationClockError, source_operation_clock
+from downloader.tej_operation_clock import (
+    CONTRACT as CLOCK_CONTRACT, MAX_CLOCK_SKEW_SECONDS, OperationClockError, source_operation_clock,
+)
 
 CONTRACT = "exact_metadata_only_table_retry_window_v1"
 RECONCILIATION_CONTRACT = "exact_negative_plan_failure_commit_reconciliation_v1"
@@ -28,6 +30,7 @@ FAILURE_CODES = (
     "metadata_preparation_failed_deferred", "vendor_metadata_allocation_failed_deferred",
 )
 LEGACY_REQUEUE_CONTRACT = 'explicit_exact_legacy_metadata_requeue_v1'
+FILE_CLOCK_CONTRACT = 'bounded_metadata_file_order_clock_v2'
 
 
 def requeue_legacy_metadata(root: Path, task_id: str, bridge, prepared: Path, *,
@@ -190,13 +193,22 @@ def _plan_failure_evidence(root: Path, task: dict, started: datetime,
     if not 0 <= (finished - started).total_seconds() <= 1200:
         raise ValueError("Metadata failure is outside its finite attempt window")
     request = task_request(root, task)
-    candidates = []
+    # A small local wall-clock step can put a newly created request just
+    # before the recorded transaction start. Its immutable launch binding,
+    # outcome, file order and unique traffic interval are still mandatory.
+    candidates, early_candidates = [], []
+    earliest = (started - timedelta(seconds=MAX_CLOCK_SKEW_SECONDS)).timestamp()
     for path in (root / "requests").glob(task["task_id"] + "-*.json"):
-        if not started.timestamp() <= path.stat().st_mtime <= finished.timestamp():
+        if not earliest <= path.stat().st_mtime <= finished.timestamp():
             continue
         original = _read(path)
         if original.get("action") == "plan":
-            candidates.append((path, original))
+            target = candidates if path.stat().st_mtime >= started.timestamp() else early_candidates
+            target.append((path, original))
+    # Prior failures for the same task may be only seconds apart. A request
+    # inside the strict interval takes precedence; early files are considered
+    # only when that interval has no candidate at all.
+    candidates = candidates or early_candidates
     if len(candidates) != 1:
         raise ValueError("One unambiguous original plan request required")
     prepared, original = candidates[0]
@@ -210,7 +222,10 @@ def _plan_failure_evidence(root: Path, task: dict, started: datetime,
     outcome_path = output.with_suffix(".json.outcome.json")
     outcome = _read(outcome_path, 4096)
     clock_evidence = source_operation_clock(outcome["observed_at_utc"], started, finished)
+    prepared_mtime, outcome_mtime = prepared.stat().st_mtime, outcome_path.stat().st_mtime
+    prepared_clock = source_operation_clock(datetime.fromtimestamp(prepared_mtime, UTC).isoformat(), started, finished)
     if (output.exists() or output.with_suffix(".json.stage.json").exists()
+            or prepared_mtime > outcome_mtime
             or not started.timestamp() <= outcome_path.stat().st_mtime <= finished.timestamp()
             or outcome.get("provider") != "tej_smart_wizard"
             or outcome.get("contract_version") != CONTRACT_VERSION or outcome.get("action") != "plan"
@@ -219,6 +234,19 @@ def _plan_failure_evidence(root: Path, task: dict, started: datetime,
             or outcome.get("market_data_query_submission_possible") is not False
             or any(outcome.get(k) != request.get(k) for k in ("type", "smart_id", "table"))):
         raise ValueError("Exact source-bound no-Preview outcome required")
+    if prepared_mtime < started.timestamp():
+        # Do not attach an early file to this traffic record if another
+        # discovery could have produced it during the same operation window.
+        with closing(sqlite3.connect((root/'queue.sqlite3').resolve().as_uri()+'?mode=ro', uri=True, timeout=2)) as con:
+            competing = con.execute(
+                "SELECT 1 FROM traffic WHERE action='discover' AND event_id<>? AND started_at_utc<=? "
+                "AND ((completed_at_utc IS NOT NULL AND completed_at_utc>=?) OR "
+                "(completed_at_utc IS NULL AND started_at_utc>=?)) LIMIT 1",
+                (event_id, datetime.fromtimestamp(outcome_mtime, UTC).isoformat(),
+                 datetime.fromtimestamp(prepared_mtime, UTC).isoformat(),
+                 datetime.fromtimestamp(prepared_mtime, UTC).isoformat())).fetchone()
+        if competing:
+            raise ValueError("Ambiguous overlapping metadata traffic")
     manifest_path = root / "launches" / (prepared.stem + ".bridge.json")
     manifest = _read(manifest_path, 4096)
     digest = manifest.get("bridge_script_sha256", "")
@@ -236,7 +264,9 @@ def _plan_failure_evidence(root: Path, task: dict, started: datetime,
             "prepared_request_sha256": manifest["request_sha256"],
             "prequery_outcome_sha256": hashlib.sha256(outcome_path.read_bytes()).hexdigest(),
             "bridge_script_sha256": digest, "failed_event_id": event_id,
-            "source_clock_evidence": clock_evidence}
+            "source_clock_evidence": clock_evidence,
+            "prepared_file_clock_evidence": prepared_clock,
+            "file_clock_contract": FILE_CLOCK_CONTRACT}
 
 
 def uncommitted_plan_failure_proof(root: Path, task: dict) -> dict:
@@ -359,7 +389,8 @@ def _retry_hint(root: Path, con, candidate: dict, policy: dict, now: datetime) -
             if due > now + timedelta(seconds=policy['max_seconds']):
                 raise ValueError('Retry clock exceeds its bounded window')
             same_validator = (previous.get('state') != 'metadata_evidence_requires_review'
-                              or previous.get('evidence_clock_contract') == CLOCK_CONTRACT)
+                              or (previous.get('evidence_clock_contract') == CLOCK_CONTRACT
+                                  and previous.get('evidence_file_clock_contract') == FILE_CLOCK_CONTRACT))
             if same_validator and now < due:
                 return None
         return previous
@@ -440,6 +471,7 @@ def recover_failed_metadata(root: Path, bridge, *, policy: dict | None,
                          'next_check_at_utc':(now+timedelta(seconds=seconds)).isoformat(),
                          'exception_type':type(exc).__name__,'data_query_repeated':False,
                          'evidence_clock_contract':CLOCK_CONTRACT,
+                         'evidence_file_clock_contract':FILE_CLOCK_CONTRACT,
                          'failure_reason_code':str(exc) if isinstance(exc,OperationClockError)
                              else 'metadata_source_evidence_unverified'}
                 with con:
@@ -460,6 +492,7 @@ def recover_failed_metadata(root: Path, bridge, *, policy: dict | None,
               "next_check_at_utc": (now + timedelta(seconds=seconds)).isoformat(),
               "data_query_repeated": False, "source_rows_adopted": False,
               "evidence_clock_contract": CLOCK_CONTRACT,
+              "evidence_file_clock_contract": FILE_CLOCK_CONTRACT,
               "source_clock_evidence": proof["source_clock_evidence"]}
     def save():
         with closing(connect(root)) as con, con:

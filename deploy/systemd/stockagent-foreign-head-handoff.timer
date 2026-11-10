@@ -1,0 +1,12 @@
+[Unit]
+Description=Continue bounded packed-head handoffs and peer confirmations
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-foreign-head-handoff.service
+
+[Install]
+WantedBy=timers.target

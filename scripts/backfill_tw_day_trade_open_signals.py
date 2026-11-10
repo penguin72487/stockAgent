@@ -10,7 +10,9 @@ separate evidence for the historical 09:00 paper replay.
 from __future__ import annotations
 
 import argparse
+from bisect import bisect_left
 from datetime import date, datetime, time, timedelta
+import hashlib
 import json
 import math
 import os
@@ -22,6 +24,7 @@ from typing import Any, Mapping
 from zoneinfo import ZoneInfo
 
 import polars as pl
+import numpy as np
 import torch
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,20 +36,99 @@ from scripts.rebuild_tw_day_trade_open_price_replay import (  # noqa: E402
     DEFAULT_TWSE_DAILY_OHLCV_PATH,
     _atomic_json,
     _load_price_limits,
-    _official_aggregate_daily_rows,
+    _official_aggregate_daily_rows_batch,
     _sha256,
 )
 from stockagent.config import load_config  # noqa: E402
 from stockagent.live.market_config import (  # noqa: E402
     load_market_config,
+    OPENING_PROVISIONAL_REFERENCE_POLICY,
     resolved_live_output_dir,
 )
-from stockagent.live.signal_engine import _build_panel, _resolve_checkpoint, generate_live_signal  # noqa: E402
+from stockagent.live.signal_engine import _build_panel, _cached_checkpoint, _resolve_checkpoint, generate_live_signal  # noqa: E402
 from stockagent.live.signal_engine import live_tw_public_source_read_guard  # noqa: E402
+from stockagent.live.completed_inference_cache import (  # noqa: E402
+    array_identity,
+    configuration_identity,
+    loaded_implementation_identity,
+)
 from stockagent.live.tw_public_source_guard import TWPublicSourceUpdatePending  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+
+
+def _stable_digest(value: Any) -> str:
+    return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
+                                     allow_nan=False).encode()).hexdigest()
+
+
+def _require_checkpoint_sparse_adjoint_environment(experiment: Any, checkpoint: Mapping[str, Any]) -> None:
+    """Reject a known environment mismatch before copying or building a panel.
+
+    The full checkpoint manifest is still validated after panel alignment.
+    This early check only reports the exact sparse-adjoint contract when both
+    the current configuration and a schema-4 saved model contract require it.
+    """
+    training = experiment.training
+    model = getattr(training, "financial_transformer", None)
+    if (getattr(training, "model_name", None) != "financial_transformer"
+            or not bool(getattr(model, "factorized_sparse_projection", False))):
+        return
+    manifest = checkpoint.get("experiment_manifest")
+    if not isinstance(manifest, Mapping) or manifest.get("schema_version") != 4:
+        return
+    contract = ((manifest.get("contracts") or {}).get("model") or {}).get("model")
+    if not isinstance(contract, Mapping):
+        return  # The canonical full checkpoint validator will reject corruption.
+    expected = contract.get("factorized_sparse_adjoint_contract")
+    from stockagent.models.factorized_sparse_projection import sparse_adjoint_contract
+    current = sparse_adjoint_contract()
+    if current != expected:
+        raise RuntimeError(
+            "checkpoint sparse-adjoint runtime environment mismatch before panel preparation: "
+            f"saved={expected!r}, current={current!r}; use the exact selected deployment runtime "
+            "environment, without weakening checkpoint validation"
+        )
+
+
+def _config_source_proofs(signatures: Mapping[Path, tuple[int, ...]]) -> dict[str, str]:
+    """Bind all inherited configuration files to the generation loaded."""
+    proofs = {}
+    for path, signature in sorted(signatures.items(), key=lambda item: str(item[0])):
+        def generation():
+            info = path.stat()
+            return (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+        if generation() != signature:
+            raise RuntimeError(f"config source changed after load: {path}")
+        proofs[str(path.resolve())] = _sha256(path)
+        if generation() != signature:
+            raise RuntimeError(f"config source changed during hashing: {path}")
+    return proofs
+
+
+def _panel_replay_identity(panel: Any) -> str:
+    """Bind reusable historical panels, including masks and last-trade inputs."""
+    fields = (
+        "returns_1d", "tradable_mask", "alive_mask", "benchmark_returns", "close_prices",
+        "daily_volumes", "can_buy_mask", "can_sell_mask", "can_short_open_mask",
+        "can_short_open_open_mask", "force_short_cover_mask", "force_exit_mask",
+        "open_prices", "intraday_returns", "day_trade_eligible_mask",
+        "day_trade_can_short_open_mask", "day_trade_can_buy_open_mask", "day_trade_can_sell_open_mask",
+        "raw_close_returns_1d", "corporate_action_avoidance_mask", "unresolved_corporate_action_mask",
+        "cash_dividend_yield", "cash_dividend_payment_delay_sessions", "short_capacity_shares", "short_margin_rate",
+    )
+    features = panel.features
+    feature_proof = getattr(features, "content_fingerprint", None)
+    if not isinstance(feature_proof, dict) or not feature_proof.get("sha256"):
+        feature_proof = array_identity(np.asarray(features))
+    return _stable_digest({
+        "dates": np.asarray(panel.dates).astype("datetime64[D]").astype(str).tolist(),
+        "symbols": list(panel.symbols), "feature_names": list(panel.feature_names),
+        "features": feature_proof,
+        "arrays": {name: None if (value := getattr(panel, name, None)) is None
+                   else array_identity(np.asarray(value)) for name in fields},
+    })
 
 
 def _with_source_wait(operation, *, seconds: float):
@@ -165,6 +247,34 @@ def _previous_official_session_date(
     return value
 
 
+def _official_session_index(twse_path: Path, tpex_path: Path) -> tuple[date, ...]:
+    """Build one exact prior-session index; invalid historical dates stay null."""
+    sessions: set[date] = set()
+    for path in (twse_path, tpex_path):
+        values = (
+            pl.scan_parquet(path)
+            .select(pl.col("date").cast(pl.Date, strict=False).alias("date"))
+            .filter(pl.col("date").is_not_null())
+            .unique()
+            .collect()
+            .get_column("date")
+            .to_list()
+        )
+        sessions.update(values)
+    return tuple(sorted(sessions))
+
+
+def _previous_indexed_official_session_date(
+    sessions: tuple[date, ...], trading_date: date,
+) -> date:
+    index = bisect_left(sessions, trading_date)
+    if index == 0:
+        raise ValueError(
+            f"official venue data has no completed session before {trading_date}"
+        )
+    return sessions[index - 1]
+
+
 def _open_input_rows(
     *,
     official_rows: Mapping[str, Mapping[str, Any]],
@@ -267,6 +377,19 @@ def main() -> None:
 
     market_config_path = args.market_config.resolve()
     market_config = load_market_config(market_config_path)
+    current_clock = datetime.now(TAIPEI)
+    if end == current_clock.date():
+        from stockagent.live.shioaji_schedule import HISTORICAL_QUERY_RESUME
+        if (current_clock.time() < HISTORICAL_QUERY_RESUME or market_config.enabled
+                or args.live_output_dir is None):
+            raise ValueError("same-day counterfactual requires a disabled candidate and completed session")
+        candidate_root = args.live_output_dir.resolve()
+        accepted_root = resolved_live_output_dir(market_config).resolve()
+        input_scope = args.input_root.resolve()
+        if (candidate_root == accepted_root or candidate_root in accepted_root.parents
+                or accepted_root in candidate_root.parents or input_scope == accepted_root
+                or input_scope in accepted_root.parents or accepted_root in input_scope.parents):
+            raise ValueError("same-day counterfactual inputs and outputs must be isolated from live signals")
     if args.resume_verified and args.live_output_dir is None:
         raise ValueError("--resume-verified requires an isolated --live-output-dir")
     if args.source_snapshot_dir and args.live_output_dir is None:
@@ -288,9 +411,19 @@ def main() -> None:
         checkpoint = candidate_artifact_root / f"fold_{int(market_config.fold_id):02d}" / "checkpoint_best.pt"
         if not checkpoint.is_file():
             raise FileNotFoundError(checkpoint)
-    experiment = load_config(market_config.config_path)
+    config_signatures: dict[Path, tuple[int, ...]] = {}
+    experiment = load_config(market_config.config_path, source_signatures=config_signatures)
+    config_proofs = _config_source_proofs(config_signatures)
     if str(experiment.trading.execution_mode) != "tw_day_trade":
         raise ValueError("market config must resolve to execution_mode=tw_day_trade")
+    _, early_checkpoint_path = _resolve_checkpoint(
+        candidate_artifact_root or market_config.output_dir or experiment.runner.output_dir,
+        market_config.fold_id,
+        (candidate_artifact_root / f"fold_{int(market_config.fold_id):02d}" / "checkpoint_best.pt"
+         if candidate_artifact_root is not None else market_config.checkpoint_path),
+    )
+    checkpoint_payload, _, _ = _cached_checkpoint(early_checkpoint_path)
+    _require_checkpoint_sparse_adjoint_environment(experiment, checkpoint_payload)
     feature_path = Path(experiment.data.tw_public_feature_path).resolve()
     if not feature_path.is_file():
         raise FileNotFoundError(feature_path)
@@ -325,7 +458,13 @@ def main() -> None:
     experiment.data.live_tail_panel_rows = max(
         int(experiment.data.live_tail_panel_rows or 0), requested_tail_rows
     )
-    required_panel_end = _previous_official_session_date(twse_path, tpex_path, end)
+    # Bind the sources before the session index or panel is read. Hashing only
+    # after panel construction could falsely bless an earlier generation.
+    source_hashes = {"feature_path_sha256": _sha256(feature_path),
+                     "twse_daily_ohlcv_sha256": _sha256(twse_path),
+                     "tpex_daily_ohlcv_sha256": _sha256(tpex_path)}
+    session_index = _official_session_index(twse_path, tpex_path)
+    required_panel_end = _previous_indexed_official_session_date(session_index, end)
     panel, panel_cache_hit, panel_cache_tier = _with_source_wait(
         lambda: _build_panel(experiment, live_tail=True, panel_end_date=required_panel_end.isoformat()),
         seconds=args.source_wait_seconds)
@@ -337,6 +476,8 @@ def main() -> None:
         "market": market_config.market,
         "simulation_only": True,
         "production_order_possible": False,
+        "status": "building_source_not_yet_verified",
+        "candidate_accepted": False,
         "contract": (
             "prior completed panel plus official session open; actual generation "
             "time is never backdated"
@@ -367,26 +508,51 @@ def main() -> None:
                        "market_config_sha256": _sha256(market_config_path),
                        "config_sha256": _sha256(Path(market_config.config_path)),
                        "checkpoint_sha256": _sha256(checkpoint_path)}
+    recipe_identity["config_dependencies_sha256"] = _stable_digest(config_proofs)
+    recipe_identity["resolved_panel_config_sha256"] = configuration_identity(experiment)
+    recipe_identity["panel_inputs_sha256"] = _panel_replay_identity(panel)
+    recipe_identity["implementation_closure_sha256"] = _stable_digest([
+        {"path": item["path"], "sha256": item["sha256"]}
+        for item in loaded_implementation_identity()
+    ])
+    selection = None
+    if market_config.model_selection_path:
+        selection = Path(market_config.model_selection_path)
+        if not selection.is_absolute():
+            selection = market_config_path.parent / selection
+        selection = selection.resolve(strict=True)
+        recipe_identity["model_selection_sha256"] = _sha256(selection)
     if experiment.data.factorized_feature_manifest:
         recipe_identity["factorized_manifest_sha256"] = _sha256(Path(experiment.data.factorized_feature_manifest))
-    source_hashes = {"feature_path_sha256": _sha256(feature_path),
-                     "twse_daily_ohlcv_sha256": _sha256(twse_path),
-                     "tpex_daily_ohlcv_sha256": _sha256(tpex_path)}
     receipt.update(recipe_identity=recipe_identity, source_hashes=source_hashes)
     if args.source_snapshot_dir:
         receipt["immutable_source_snapshot_receipt"] = str(args.source_snapshot_dir.resolve() / "source_snapshot_receipt.json")
 
     current = start
+    batch_end = start - timedelta(days=1)
+    batch_rows: dict[date, dict[str, dict[str, Any]]] = {}
     while current <= end:
+        if _config_source_proofs(config_signatures) != config_proofs:
+            raise RuntimeError("inherited model configuration changed during the backfill")
         if current.weekday() >= 5:
             receipt["skipped"].append(
                 {"session_date": current.isoformat(), "reason": "weekend"}
             )
             current += timedelta(days=1)
             continue
-        official_rows = _official_aggregate_daily_rows(
-            twse_path, tpex_path, current
-        )
+        if current > batch_end:
+            # Bound memory while amortizing venue scans. Calendar days, not
+            # synthetic trading sessions, are used as the batch boundary.
+            batch_end = min(current + timedelta(days=31), end)
+            batch_dates = (
+                current + timedelta(days=offset)
+                for offset in range((batch_end - current).days + 1)
+                if (current + timedelta(days=offset)).weekday() < 5
+            )
+            batch_rows = _official_aggregate_daily_rows_batch(
+                twse_path, tpex_path, batch_dates
+            )
+        official_rows = batch_rows.get(current, {})
         if not official_rows:
             receipt["skipped"].append(
                 {
@@ -407,8 +573,8 @@ def main() -> None:
         input_path = input_root / current.isoformat() / "official_open.csv"
         _write_open_input(input_path, input_rows)
         input_sha256 = _sha256(input_path)
-        previous_panel_date = _previous_official_session_date(
-            twse_path, tpex_path, current
+        previous_panel_date = _previous_indexed_official_session_date(
+            session_index, current
         )
         effective_at = datetime.combine(current, time(9, 0), tzinfo=TAIPEI)
         signal_id = (
@@ -430,6 +596,21 @@ def main() -> None:
             ),
             write=True,
         )
+        if market_config.day_trade_opening_reference_policy == OPENING_PROVISIONAL_REFERENCE_POLICY:
+            if args.live_output_dir is None:
+                raise ValueError("provisional counterfactual replay requires an isolated --live-output-dir")
+            kwargs.update(publish_latest=False, _counterfactual_official_open_session=current.isoformat())
+            if current == datetime.now(TAIPEI).date():
+                from scripts.settle_tw_day_trade_official_close import official_closes
+                from stockagent.live.tw_day_trade_completed_replay import verify_completed_open_sources
+                raw_root = Path(experiment.data.parquet_root).resolve().parent / "raw"
+                _, official_sources = official_closes(raw_root, current, pin_sources=True)
+                pinned = {Path(entry["path"]).parent.name.removesuffix("_daily_ohlcv"): entry["path"]
+                          for entry in official_sources}
+                completed_source = verify_completed_open_sources(
+                    session=current, observed_at=datetime.now(TAIPEI), prices_csv=input_path,
+                    raw_root=raw_root, source_paths=pinned)
+                kwargs["_counterfactual_completed_source_evidence"] = completed_source
         if candidate_artifact_root is not None:
             fold_dir = candidate_artifact_root / f"fold_{int(market_config.fold_id):02d}"
             kwargs.update(
@@ -454,6 +635,8 @@ def main() -> None:
             "feature_path_sha256": source_hashes["feature_path_sha256"],
             "feature_cutoff_date": previous_panel_date.isoformat(),
         }
+        if "_counterfactual_completed_source_evidence" in kwargs:
+            provenance["completed_same_day_source_evidence"] = kwargs["_counterfactual_completed_source_evidence"]
         expected_dir = Path(kwargs["live_output_dir"]) / effective_at.isoformat(timespec="seconds") / signal_id
         summary_path = expected_dir / "summary.json"
         summary = (_resume_summary(summary_path, identity=recipe_identity, signal_id=signal_id,
@@ -478,6 +661,11 @@ def main() -> None:
                 "recipe_identity": recipe_identity,
                 "weights_sha256": _sha256(summary_path.parent / "target_weights.parquet"),
             }
+        if "_counterfactual_completed_source_evidence" in kwargs:
+            verify_completed_open_sources(
+                session=current, observed_at=datetime.now(TAIPEI), prices_csv=input_path,
+                raw_root=Path(experiment.data.parquet_root).resolve().parent / "raw",
+                expected=kwargs["_counterfactual_completed_source_evidence"])
         summary.update(
             {
                 "counterfactual_signal_regeneration": True,
@@ -530,6 +718,18 @@ def main() -> None:
                          "twse_daily_ohlcv_sha256": _sha256(twse_path),
                          "tpex_daily_ohlcv_sha256": _sha256(tpex_path)}:
         raise RuntimeError("source files changed during the backfill; candidate is not accepted")
+    if (_config_source_proofs(config_signatures) != config_proofs
+            or _sha256(market_config_path) != recipe_identity["market_config_sha256"]
+            or _sha256(checkpoint_path) != recipe_identity["checkpoint_sha256"]
+            or (selection is not None
+                and _sha256(selection) != recipe_identity["model_selection_sha256"])
+            or (experiment.data.factorized_feature_manifest
+                and _sha256(Path(experiment.data.factorized_feature_manifest))
+                != recipe_identity["factorized_manifest_sha256"])):
+        raise RuntimeError("model identity changed during the backfill; candidate is not accepted")
+    loaded_implementation_identity()
+    receipt["status"] = "source_hashes_unchanged_candidate_not_yet_accepted"
+    receipt["source_hashes_verified_at"] = datetime.now(TAIPEI).isoformat(timespec="seconds")
     _atomic_json(input_root / "backfill_receipt.json", receipt)
     print(
         json.dumps(

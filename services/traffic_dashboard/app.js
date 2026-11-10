@@ -253,6 +253,8 @@ function renderHistory(data) {
   const storage = data.history_storage || {};
   $("history-status").textContent = storage.health === "ready"
     ? `持久監測正常 · 保留 ${count(storage.retention_days)} 天 · 記憶體索引 ${count(storage.resident_rows)} 個分鐘區段 · 待寫入 ${count(storage.queued_writes)}`
+    : storage.health === "warming"
+      ? "歷史測速資料載入中；目前的統計尚未包含完整保留期間。"
     : storage.enabled
       ? `持久監測有缺口 · 丟棄 ${count(storage.dropped_rows)} · 寫入錯誤 ${count(storage.write_errors)}${storage.last_error_type ? ` · ${storage.last_error_type}` : ""}`
       : `持久監測未啟用${storage.last_error_type ? `：${storage.last_error_type}` : ""}`;

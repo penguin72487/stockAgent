@@ -235,6 +235,7 @@ from stockagent.training.runtime_configuration import (
     _configure_torch_compile_runtime,
     _env_truthy,
     _prepend_compile_toolchain_paths,
+    _resolve_host_compilers,
 )
 from stockagent.training.windowed import ImmutableWindowedBatchCache, WindowedSplitTensors, dataset_to_windowed_tensors
 
@@ -7971,6 +7972,7 @@ def _write_fold_complete_marker(
     fold_result: FoldResult,
     *,
     source: str,
+    inference_scope: Mapping[str, Any] | None = None,
 ) -> None:
     if not _distributed_should_write():
         return
@@ -8037,6 +8039,12 @@ def _write_fold_complete_marker(
         "deployment_date_end": deployment_coverage["date_end"],
         "written_at_unix_seconds": float(time.time()),
     }
+    if inference_scope is not None:
+        scope_path = fold_dir / "inference_scope.json"
+        marker["inference_scope"] = {
+            **dict(inference_scope), "receipt": scope_path.name,
+            "receipt_sha256": hashlib.sha256(scope_path.read_bytes()).hexdigest(),
+        }
     marker_path = _fold_complete_marker_path(fold_dir)
     marker_path.parent.mkdir(parents=True, exist_ok=True)
     with marker_path.open("w", encoding="utf-8") as handle:
@@ -8786,13 +8794,28 @@ def _windowed_prepare_device(split: WindowedSplitTensors, target_device: torch.d
     return split.features.device
 
 
+def _physical_source_elides_legacy_tape(execution_runtime) -> bool:
+    return (execution_runtime is not None
+        and execution_runtime.mode == "tw_day_trade"
+        and execution_runtime.day_trade_carry_source is not None
+        and os.environ.get("STOCKAGENT_DAY_TRADE_OMIT_LEGACY_TAPE", "0") == "1")
+
+
 def _move_windowed_batch_to_device(
     batch: Mapping[str, torch.Tensor],
     device: torch.device,
     non_blocking: bool,
+    *,
+    execution_runtime: _ExecutionRuntime | None = None,
 ) -> dict[str, torch.Tensor]:
+    omit_legacy_tape = _physical_source_elides_legacy_tape(execution_runtime)
     moved: dict[str, torch.Tensor] = {}
     for key, value in batch.items():
+        # The source-bound physical bridge unconditionally discards this old
+        # tape. Keep its source/coverage/checkpoint evidence on the CPU split,
+        # without copying or caching the duplicate on the device per replay.
+        if omit_legacy_tape and key == "overnight_log_returns":
+            continue
         if key in _WINDOWED_CONTROL_KEYS:
             moved[key] = value
         else:
@@ -9313,6 +9336,20 @@ def _capture_rng_state() -> dict[str, Any]:
         "torch_cuda_current": cuda_current_state,
         "torch_cuda_device_index": cuda_device_index,
     }
+
+
+def _reverse_fold_initialization_rng(folds, *, warm_start_from_previous_fold=False):
+    """New reverse schedules start each fresh group from the original rank RNG.
+
+    Keeping a later group's consumed RNG would otherwise make an earlier
+    initialization depend on how long the later group trained. Existing forward
+    and single-fold schedules retain their original initialization contract.
+    """
+    if len(folds) < 2 or folds[0].fold_id < folds[-1].fold_id:
+        return None
+    if warm_start_from_previous_fold:
+        raise ValueError("reverse folds cannot inherit later-group weights or RNG")
+    return _capture_rng_state()
 
 
 def _capture_checkpoint_rng_state() -> dict[str, Any]:
@@ -11533,6 +11570,7 @@ def _save_fold_output_artifacts(
     deployment_futures_account_context: object | None = None,
     write_model_checkpoint: bool = True,
     source_cache_snapshot: Mapping[str, Any] | None = None,
+    inference_scope: Mapping[str, Any] | None = None,
 ) -> tuple[dict[str, float | int | str], dict[str, float | str]]:
     if not _distributed_should_write():
         return {"skipped_nonzero_rank": "1", "total_s": 0.0}, {"skipped_nonzero_rank": "1", "total_s": 0.0}
@@ -12063,6 +12101,8 @@ def _save_fold_output_artifacts(
         )
         artifact_contract["mode_details"] = details
     write_training_json(fold_dir / "mode_artifact_contract.json", artifact_contract)
+    if inference_scope is not None:
+        write_training_json(fold_dir / "inference_scope.json", dict(inference_scope))
     if source_cache_snapshot is not None:
         # Observability only: never include changing cache counters in source,
         # optimizer or report-semantics fingerprints. No hot-loop disk writes.
@@ -12072,6 +12112,7 @@ def _save_fold_output_artifacts(
             fold_dir, fold_result,
             source=("fold_output_artifacts" if write_model_checkpoint
                     else "checkpoint_inference_output_artifacts"),
+            **({"inference_scope": inference_scope} if inference_scope is not None else {}),
         )
     if print_report:
         # Console output is optional and must not invalidate completed model,
@@ -18564,6 +18605,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
         verify_futures_account_binding(split, dated_source)
         dated_source.verify_identity()
         dated_source.validate_training_split(split)
+    needs_legacy_execution_tape = (not use_prepared_futures_execution
+        and not _physical_source_elides_legacy_tape(execution_runtime))
     model_ranges = [(start, min(start + model_chunk_rows, total_rows)) for start in range(0, total_rows, model_chunk_rows)]
     if progress_label:
         _progress(
@@ -18648,7 +18691,8 @@ def _evaluate_windowed_tensor_batch_decoupled(
                 # do not stage a duplicate full execution buffer on device.
                 batch = dict(batch)
                 batch.pop("overnight_log_returns")
-            batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+            batch = _move_windowed_batch_to_device(batch, device, non_blocking,
+                execution_runtime=execution_runtime)
             if panel_forward_model is not None and not direct_panel_slab:
                 date_indices_chunk = batch["date_indices"]
             elif panel_forward_model is None:
@@ -18819,7 +18863,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     dtype=weights_chunk.dtype,
                 )
                 returns_all = torch.empty((total_rows, split.num_symbols), device=device, dtype=returns_chunk.dtype)
-                if not use_prepared_futures_execution:
+                if needs_legacy_execution_tape:
                     overnight_returns_all = torch.empty(
                         (total_rows, *tuple(overnight_returns_chunk.shape[1:])),
                         device=device,
@@ -18908,7 +18952,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
                     )
             weights_all[start:end].copy_(weights_chunk[:valid_rows])
             returns_all[start:end].copy_(returns_chunk_padded[:valid_rows])
-            if not use_prepared_futures_execution:
+            if needs_legacy_execution_tape:
                 overnight_returns_all[start:end].copy_(overnight_returns_chunk[:valid_rows])
             mask_all[start:end].copy_(mask_chunk_padded[:valid_rows])
             buy_mask_all[start:end].copy_(buy_mask_chunk_padded[:valid_rows])
@@ -18975,7 +19019,7 @@ def _evaluate_windowed_tensor_batch_decoupled(
         if (
             weights_all is None
             or returns_all is None
-            or (overnight_returns_all is None and not use_prepared_futures_execution)
+            or (overnight_returns_all is None and needs_legacy_execution_tape)
             or mask_all is None
             or buy_mask_all is None
             or sell_mask_all is None
@@ -19903,7 +19947,8 @@ def _replay_taiwan_stitched_deployment(
     )
     execution_dataset = CrossSectionalDataset(
         panel,
-        panel_rows if dated_source is not None else np.arange(panel.num_dates, dtype=np.int64),
+        panel_rows if dated_source is not None or getattr(panel, "inference_year", None) is not None
+        else np.arange(panel.num_dates, dtype=np.int64),
         lookback=1,
         allow_empty=True,
         include_volume_notional=(
@@ -20772,7 +20817,11 @@ def _load_completed_fold_result(
     if (
         _has_completed_fold_marker(fold_dir)
         and metrics_path.exists()
-        and model_path.exists()
+        and (model_path.exists() or (
+            (_read_fold_complete_marker(fold_dir) or {}).get("source")
+            == "checkpoint_inference_output_artifacts"
+            and _best_checkpoint_path(fold_dir).is_file()
+        ))
         and backtest_path.exists()
     ):
         if expected_manifest is not None:
@@ -20884,43 +20933,6 @@ def _wrap_distributed_data_parallel_model(
             name: (buffer, buffer._version) for name, buffer in wrapped.module.named_buffers()
         }
     return wrapped
-
-
-def _resolve_host_compilers() -> tuple[str | None, str | None]:
-    env_bin = Path(sys.executable).resolve().parent
-    cc_candidates = [
-        os.environ.get("CC"),
-        str(env_bin / "x86_64-conda-linux-gnu-gcc"),
-        str(env_bin / "gcc"),
-        str(env_bin / "cc"),
-        "cc",
-        "gcc",
-        "clang",
-        "x86_64-conda-linux-gnu-gcc",
-        "x86_64-conda-linux-gnu-cc",
-    ]
-    cxx_candidates = [
-        os.environ.get("CXX"),
-        str(env_bin / "x86_64-conda-linux-gnu-g++"),
-        str(env_bin / "g++"),
-        str(env_bin / "c++"),
-        "c++",
-        "g++",
-        "clang++",
-        "x86_64-conda-linux-gnu-g++",
-        "x86_64-conda-linux-gnu-c++",
-    ]
-
-    def _resolve(candidates: list[str | None]) -> str | None:
-        for candidate in candidates:
-            if not candidate:
-                continue
-            resolved = candidate if os.path.isabs(candidate) else shutil.which(candidate)
-            if resolved:
-                return resolved
-        return None
-
-    return _resolve(cc_candidates), _resolve(cxx_candidates)
 
 
 def _cuda_graph_capture_snapshot(config: ExperimentConfig) -> dict[str, Any]:
@@ -22574,7 +22586,8 @@ def _train_epoch_windowed_tensor(
             # causal candidate context and must not stage a second copy.
             batch = dict(batch)
             batch.pop("overnight_log_returns", None)
-        batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+        batch = _move_windowed_batch_to_device(batch, device, non_blocking,
+            execution_runtime=execution_runtime)
         timing.prepare_move_windowed_batch_s += time.perf_counter() - move_start
         if batch_x is not None:
             batch_x = batch["x"]
@@ -23711,7 +23724,8 @@ def _train_epoch_windowed_tensor_ddp(
             # collective metadata exchange.
             batch = dict(batch)
             batch.pop("overnight_log_returns", None)
-        batch = _move_windowed_batch_to_device(batch, device, non_blocking)
+        batch = _move_windowed_batch_to_device(batch, device, non_blocking,
+            execution_runtime=execution_runtime)
         if resident_batches is not None and not resident_hit:
             resident_batches.put(split, resident_key, batch)
         timing.prepare_move_windowed_batch_s += time.perf_counter() - move_start
@@ -23794,6 +23808,7 @@ def _train_epoch_windowed_tensor_ddp(
                         global_metadata,
                         device,
                         non_blocking,
+                        execution_runtime=execution_runtime,
                     )
                     if resident_batches is not None:
                         resident_batches.put(split, metadata_key, global_metadata)
@@ -24322,7 +24337,7 @@ def _train_epoch_windowed_tensor_ddp(
     if return_tape is not None:
         # All ranks check the complete replay before any optimizer can step.
         return_tape.finish()
-    if optimizer_step_per_trajectory and steps > 0 and not capture_only:
+    if optimizer_step_per_trajectory and (steps > 0 or episode_spans is not None) and not capture_only:
         if finite_guard is not None:
             finite_guard.require_finite(optimizer, distributed=True)
             _flush_trajectory_progress(progress_label, num_batches, deferred_progress)
@@ -25781,6 +25796,7 @@ def _run_inference_neural_models(
     config: ExperimentConfig,
     output_dir: str | Path,
     deployment_folds: Iterable[WalkForwardFold] | None = None,
+    inference_year: int | None = None,
 ) -> list[FoldResult]:
     _configure_backtest_runtime_from_config(config)
     if getattr(config.training, "inference_backtest_autotune", None) is not None:
@@ -25812,6 +25828,25 @@ def _run_inference_neural_models(
 
     print(f"[inference] model={config.training.model_name} folds={len(fold_list)} device={device}")
     for fold in _progress_bar(fold_list, desc="Inference folds", unit="fold"):
+        scope_receipt = None
+        retained_validation = None
+        if inference_year is not None:
+            from stockagent.data.inference_scope import require_complete_year_split
+            year_scope = require_complete_year_split(
+                panel.dates, inference_year, fold.test_indices, fold.test_years,
+            )
+            retained_validation = _load_completed_fold_result(output_path, fold.fold_id)
+            if (retained_validation is None or retained_validation.fold_id != fold.fold_id
+                    or retained_validation.train_years != fold.train_years
+                    or retained_validation.val_years != fold.val_years):
+                raise ValueError("year-only inference needs the original completed validation evidence")
+            scope_receipt = {**year_scope,
+                "validation_recomputed": False, "validation_years_retained": list(fold.val_years),
+                "validation_metrics_source": str(_metrics_path(_fold_dir(output_path, fold.fold_id))),
+                "validation_metrics_source_sha256": hashlib.sha256(
+                    _metrics_path(_fold_dir(output_path, fold.fold_id)).read_bytes()).hexdigest()}
+            print(f"[inference scope] year={inference_year} test_rows={len(fold.test_indices)} "
+                  f"validation=retained_not_recomputed years={fold.val_years}", flush=True)
         fold_dir = _fold_dir(output_path, fold.fold_id)
         model_file = _model_path(fold_dir)
         best_checkpoint_file = _best_checkpoint_path(fold_dir)
@@ -25907,8 +25942,9 @@ def _run_inference_neural_models(
 
         val_ds = CrossSectionalDataset(
             fold_panel,
-            fold.val_indices,
+            fold.val_indices if inference_year is None else np.empty(0, dtype=np.int64),
             config.training.lookback,
+            allow_empty=inference_year is not None,
             include_volume_notional=include_volume_notional,
             execution_mode=config.trading.execution_mode,
             futures_account_source=fold_execution_runtime.futures_account_source,
@@ -25945,139 +25981,149 @@ def _run_inference_neural_models(
             lookback_context=config.walk_forward.lookback_context,
         )
 
-        val_windowed = _prepare_windowed_split(
-            dataset_to_windowed_tensors(val_ds),
-            device,
-            non_blocking,
-            name=f"inference fold {fold.fold_id} validation windowed tensors",
-        )
-        val_chunk_rows = _resolve_inference_model_chunk_rows(config, len(val_windowed))
-        val_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(
-            config,
-            val_chunk_rows,
-            len(val_windowed),
-        )
-        print(
-            f"[Fold {fold.fold_id}] inference val chunks: "
-            f"rows={len(val_windowed)} model_chunk_rows={val_chunk_rows} "
-            f"backtest_chunk_rows={val_backtest_chunk_rows}"
-        )
-
-        val_bt_t, val_ic, _ = _evaluate_windowed_tensor_batch(
-            model,
-            panel_slab_model,
-            val_windowed,
-            device,
-            amp_dtype,
-            non_blocking,
-            config.trading.long_only,
-            config.trading.buy_fee_rate,
-            config.trading.sell_fee_rate,
-            config.trading.max_turnover_ratio,
-            1.0,
-            config.trading.min_trade_weight,
-            portfolio_activation=config.trading.portfolio_activation,
-            chunk_rows=val_chunk_rows,
-            backtest_chunk_rows=val_backtest_chunk_rows,
-            max_volume_participation=config.trading.max_volume_participation,
-            volume_participation_equity=config.trading.volume_participation_equity,
-            execution_runtime=fold_execution_runtime,
-        )
-
-        val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _windowed_targets_to_tensors(
-            val_windowed,
-            device=device,
-            non_blocking=non_blocking,
-        )
-        val_rule_idx = val_windowed.valid_indices.to(
-            device=val_windowed.force_exit_mask.device,
-            dtype=torch.long,
-        )
-        val_short_open_masks = val_windowed.can_short_open_mask[val_rule_idx].to(
-            device=device,
-            non_blocking=non_blocking,
-        )
-        val_force_cover_masks = val_windowed.force_short_cover_mask[val_rule_idx].to(
-            device=device,
-            non_blocking=non_blocking,
-        )
-        val_force_exit_masks = val_windowed.force_exit_mask[val_rule_idx].to(
-            device=device,
-            non_blocking=non_blocking,
-        )
-        val_volume_notional = (
-            None
-            if val_windowed.volume_notional is None
-            else val_windowed.volume_notional[val_rule_idx].to(device=device, non_blocking=non_blocking)
-        )
-        if not np.isfinite(best_val_loss):
-            best_val_loss = float(
-                _evaluated_backtest_loss(
-                    val_bt_t,
-                    val_returns,
-                    None,
-                    val_masks,
-                    val_buy_masks,
-                    val_sell_masks,
-                    val_short_open_masks,
-                    val_force_cover_masks,
-                    val_force_exit_masks,
-                    val_bench,
-                    val_volume_notional,
-                    config,
-                    loss_objective,
-                    execution_runtime=fold_execution_runtime,
-                    state_advance_mask=val_windowed.session_advance_mask[val_rule_idx],
-                    session_month_ids=val_windowed.session_month_ids[val_rule_idx],
-                    commission_rebate_payment_eligible_mask=(
-                        val_windowed.commission_rebate_payment_eligible_mask[
-                            val_rule_idx
-                        ]
-                    ),
-                    day_trade_eligible_mask=(
-                        None
-                        if val_windowed.day_trade_eligible_mask is None
-                        else val_windowed.day_trade_eligible_mask[val_rule_idx]
-                    ),
-                    day_trade_can_buy_open_mask=(
-                        None
-                        if val_windowed.day_trade_can_buy_open_mask is None
-                        else val_windowed.day_trade_can_buy_open_mask[val_rule_idx]
-                    ),
-                    day_trade_can_sell_open_mask=(
-                        None
-                        if val_windowed.day_trade_can_sell_open_mask is None
-                        else val_windowed.day_trade_can_sell_open_mask[val_rule_idx]
-                    ),
-                    unresolved_corporate_action_mask=(
-                        None
-                        if val_windowed.unresolved_corporate_action_mask is None
-                        else val_windowed.unresolved_corporate_action_mask[
-                            val_rule_idx
-                        ]
-                    ),
-                    cash_dividend_yield=(
-                        None
-                        if val_windowed.cash_dividend_yield is None
-                        else val_windowed.cash_dividend_yield[val_rule_idx]
-                    ),
-                    cash_dividend_payment_delay_sessions=(
-                        None
-                        if val_windowed.cash_dividend_payment_delay_sessions is None
-                        else val_windowed.cash_dividend_payment_delay_sessions[
-                            val_rule_idx
-                        ]
-                    ),
-                    symbol_indices=val_windowed.symbol_indices,
-                ).detach().cpu()
+        if inference_year is None:
+            val_windowed = _prepare_windowed_split(
+                dataset_to_windowed_tensors(val_ds),
+                device,
+                non_blocking,
+                name=f"inference fold {fold.fold_id} validation windowed tensors",
+            )
+            val_chunk_rows = _resolve_inference_model_chunk_rows(config, len(val_windowed))
+            val_backtest_chunk_rows = _resolve_inference_backtest_chunk_rows(
+                config,
+                val_chunk_rows,
+                len(val_windowed),
+            )
+            print(
+                f"[Fold {fold.fold_id}] inference val chunks: "
+                f"rows={len(val_windowed)} model_chunk_rows={val_chunk_rows} "
+                f"backtest_chunk_rows={val_backtest_chunk_rows}"
             )
 
-        val_met = _compute_metrics_from_tensors(
-            val_bt_t.strategy_returns,
-            val_bt_t.benchmark_returns,
-            val_bt_t.turnovers,
-            periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
-        )
+            val_bt_t, val_ic, _ = _evaluate_windowed_tensor_batch(
+                model,
+                panel_slab_model,
+                val_windowed,
+                device,
+                amp_dtype,
+                non_blocking,
+                config.trading.long_only,
+                config.trading.buy_fee_rate,
+                config.trading.sell_fee_rate,
+                config.trading.max_turnover_ratio,
+                1.0,
+                config.trading.min_trade_weight,
+                portfolio_activation=config.trading.portfolio_activation,
+                chunk_rows=val_chunk_rows,
+                backtest_chunk_rows=val_backtest_chunk_rows,
+                max_volume_participation=config.trading.max_volume_participation,
+                volume_participation_equity=config.trading.volume_participation_equity,
+                execution_runtime=fold_execution_runtime,
+            )
+
+            val_returns, val_masks, val_buy_masks, val_sell_masks, val_bench = _windowed_targets_to_tensors(
+                val_windowed,
+                device=device,
+                non_blocking=non_blocking,
+            )
+            val_rule_idx = val_windowed.valid_indices.to(
+                device=val_windowed.force_exit_mask.device,
+                dtype=torch.long,
+            )
+            val_short_open_masks = val_windowed.can_short_open_mask[val_rule_idx].to(
+                device=device,
+                non_blocking=non_blocking,
+            )
+            val_force_cover_masks = val_windowed.force_short_cover_mask[val_rule_idx].to(
+                device=device,
+                non_blocking=non_blocking,
+            )
+            val_force_exit_masks = val_windowed.force_exit_mask[val_rule_idx].to(
+                device=device,
+                non_blocking=non_blocking,
+            )
+            val_volume_notional = (
+                None
+                if val_windowed.volume_notional is None
+                else val_windowed.volume_notional[val_rule_idx].to(device=device, non_blocking=non_blocking)
+            )
+            if not np.isfinite(best_val_loss):
+                best_val_loss = float(
+                    _evaluated_backtest_loss(
+                        val_bt_t,
+                        val_returns,
+                        None,
+                        val_masks,
+                        val_buy_masks,
+                        val_sell_masks,
+                        val_short_open_masks,
+                        val_force_cover_masks,
+                        val_force_exit_masks,
+                        val_bench,
+                        val_volume_notional,
+                        config,
+                        loss_objective,
+                        execution_runtime=fold_execution_runtime,
+                        state_advance_mask=val_windowed.session_advance_mask[val_rule_idx],
+                        session_month_ids=val_windowed.session_month_ids[val_rule_idx],
+                        commission_rebate_payment_eligible_mask=(
+                            val_windowed.commission_rebate_payment_eligible_mask[
+                                val_rule_idx
+                            ]
+                        ),
+                        day_trade_eligible_mask=(
+                            None
+                            if val_windowed.day_trade_eligible_mask is None
+                            else val_windowed.day_trade_eligible_mask[val_rule_idx]
+                        ),
+                        day_trade_can_buy_open_mask=(
+                            None
+                            if val_windowed.day_trade_can_buy_open_mask is None
+                            else val_windowed.day_trade_can_buy_open_mask[val_rule_idx]
+                        ),
+                        day_trade_can_sell_open_mask=(
+                            None
+                            if val_windowed.day_trade_can_sell_open_mask is None
+                            else val_windowed.day_trade_can_sell_open_mask[val_rule_idx]
+                        ),
+                        unresolved_corporate_action_mask=(
+                            None
+                            if val_windowed.unresolved_corporate_action_mask is None
+                            else val_windowed.unresolved_corporate_action_mask[
+                                val_rule_idx
+                            ]
+                        ),
+                        cash_dividend_yield=(
+                            None
+                            if val_windowed.cash_dividend_yield is None
+                            else val_windowed.cash_dividend_yield[val_rule_idx]
+                        ),
+                        cash_dividend_payment_delay_sessions=(
+                            None
+                            if val_windowed.cash_dividend_payment_delay_sessions is None
+                            else val_windowed.cash_dividend_payment_delay_sessions[
+                                val_rule_idx
+                            ]
+                        ),
+                        symbol_indices=val_windowed.symbol_indices,
+                    ).detach().cpu()
+                )
+
+            val_met = _compute_metrics_from_tensors(
+                val_bt_t.strategy_returns,
+                val_bt_t.benchmark_returns,
+                val_bt_t.turnovers,
+                periods_per_year=config.evaluation.eval_log_utility_periods_per_year,
+            )
+
+        else:
+            # Validation was already completed under this checkpoint. Rebuild
+            # only the explicitly owned test year; do not relabel it as val.
+            if retained_validation is None or not np.isfinite(best_val_loss):
+                raise ValueError("year-only inference requires finite checkpoint validation evidence")
+            val_windowed = None
+            val_ic = retained_validation.val_ic
+            val_met = dict(retained_validation.val_metrics)
 
         test_windowed = _prepare_windowed_split(
             dataset_to_windowed_tensors(test_ds),
@@ -26316,6 +26362,7 @@ def _run_inference_neural_models(
                 initial_nav=float(config.trading.volume_participation_equity),
             ),
             source_cache_snapshot=_physical_source_cache_snapshot(fold_execution_runtime),
+            **({"inference_scope": scope_receipt} if scope_receipt is not None else {}),
         )
 
     if results_by_fold:
@@ -26336,7 +26383,15 @@ def run_inference(
     config: ExperimentConfig,
     output_dir: str | Path,
     deployment_folds: Iterable[WalkForwardFold] | None = None,
+    inference_year: int | None = None,
 ) -> list[FoldResult]:
+    if inference_year is not None:
+        if (config.trading.execution_mode != "tw_day_trade"
+                or not config.trading.tw_day_trade_unlimited_margin_conversion
+                or _is_tree_model_name(config.training.model_name)
+                or str(config.training.model_name).strip().lower() == "classical"):
+            raise ValueError("year-only inference requires the physical neural day-trade executor")
+        panel = replace(panel, inference_year=inference_year)
     if str(config.training.model_name).strip().lower() == "classical":
         from stockagent.training.classical import run_classical
         return run_classical(panel, folds, config, output_dir,
@@ -26356,6 +26411,7 @@ def run_inference(
         config,
         output_dir,
         deployment_folds=deployment_folds,
+        **({"inference_year": inference_year} if inference_year is not None else {}),
     )
 
 
@@ -26983,6 +27039,8 @@ def _run_training_impl(
     os.environ["STOCKAGENT_TW_COMPILE_SYMBOL_MAX"] = str(dynamic_loss_symbol_max)
 
     grouped_fold_items = list(grouped_folds.items())
+    independent_group_rng = _reverse_fold_initialization_rng(fold_list,
+        warm_start_from_previous_fold=config.training.warm_start_from_previous_fold)
     for group_index, (train_years_key, group_folds) in enumerate(
         _progress_bar(grouped_fold_items, desc="Train groups", unit="group"),
         start=1,
@@ -27070,6 +27128,11 @@ def _run_training_impl(
             "loss_contract_metadata",
             loss_contract_error,
         )
+
+        if independent_group_rng is not None:
+            if not _restore_rng_state(independent_group_rng, rank_local=True):
+                raise RuntimeError("reverse-fold independent initialization RNG is incomplete")
+            print(f"[Train {train_years}] reset fresh-group RNG; later-fold state is excluded")
 
         # Ensure each train-group starts from a clean CUDA allocator state.
         if device.type == "cuda":

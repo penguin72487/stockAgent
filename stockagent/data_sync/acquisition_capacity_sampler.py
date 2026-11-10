@@ -20,7 +20,10 @@ def capacity_retry_delay_seconds(sample: dict) -> int:
     stale physical probe needs a short retry because its completed value has a
     bounded lifetime measured from the start of that probe.
     """
-    return 5 if sample.get('reason') in {'capacity_sample_pending', 'capacity_sample_expired'} else 60
+    reason = sample.get('reason')
+    return 5 if (reason in {'capacity_sample_pending', 'capacity_sample_expired'}
+                 or (reason in {'physical_backing_headroom_unconfirmed', 'capacity_probe_failed'}
+                     and sample.get('probe_inflight') is True)) else 60
 
 
 class AcquisitionCapacitySampler:
@@ -96,3 +99,11 @@ class AcquisitionCapacitySampler:
             self._done.wait(timeout_seconds)
             value = self.sample()
         return value
+
+    def wait_for_refresh(self, timeout_seconds: float = 29) -> dict:
+        """Wait for an already-running probe, then return the same guarded sample."""
+        with self._lock:
+            inflight = self._inflight
+        if inflight:
+            self._done.wait(timeout_seconds)
+        return self.sample()

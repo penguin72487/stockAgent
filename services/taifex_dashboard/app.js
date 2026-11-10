@@ -816,6 +816,21 @@ function render(snapshot, {forceHeavy = false} = {}) {
   snapshot.history = cachedHistory;
   lastSnapshot = snapshot;
   renderHeader(snapshot); renderMetrics(snapshot); renderParity(snapshot); renderCycle(snapshot);
+  const settlement = snapshot.settlement_reference || {};
+  const points = (value) => value == null || !Number.isFinite(Number(value)) ? "—" : `${Number(value).toLocaleString("zh-TW", {maximumFractionDigits: 2})} 點`;
+  setText("settlement-index", points(settlement.index_price));
+  setText("settlement-index-time", settlement.index_observed_at ? `來源時間 ${localTime(settlement.index_observed_at)} · ${settlement.index_state === "fresh" ? "即時" : "已過期"}` : "等待現貨資料");
+  setText("settlement-average", points(settlement.partial_average_price));
+  setText("settlement-estimate", points(settlement.partial_estimate_price));
+  setText("settlement-samples", settlement.closing_index_included
+    ? `盤中 ${settlement.sample_count} 筆 + 收盤 1 筆；合計 ${settlement.average_sample_count} 筆`
+    : `已觀測 ${settlement.sample_count || 0} 筆${settlement.observation_source === "retained_partial_summary" ? "（重啟前摘要）" : ""}；尚未包含收盤指數`);
+  setText("settlement-closing", points(settlement.closing_index_price));
+  setText("settlement-closing-status", settlement.closing_index_included
+    ? `證交所收盤 ${localTime(settlement.closing_index_at)} · 已納入平均`
+    : "等待證交所盤後資料；可能含延緩收盤");
+  setText("settlement-official", points(settlement.official?.official_price));
+  setText("settlement-official-date", settlement.official ? `${settlement.official.date} · ${settlement.official.series}` : "等待官方資料");
   renderPerformanceSummary(snapshot.portfolio_summary);
   const compatibilityCatalog = snapshot.strategy_catalog || snapshot.strategies.map((row) => ({
     strategy_id: row.strategy_id,
@@ -1047,4 +1062,5 @@ function refreshMinuteSnapshot() {
 }
 
 syncTimeRangeControl();
+Dashboard.scheduleRefresh(refresh, {intervalMs: 5000});
 Dashboard.scheduleRefresh(refreshMinuteSnapshot, {intervalMs: PRICE_REFRESH_MS});

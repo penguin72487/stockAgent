@@ -93,6 +93,19 @@ def test_first_download_admits_existing_parent_without_creating_output(tmp_path,
     assert list(tmp_path.iterdir()) == []
 
 
+def test_missing_registered_provider_path_does_not_fall_back_to_checkout(tmp_path, monkeypatch, capsys):
+    from stockagent.data_sync import provider_workspace as placement
+    monkeypatch.setattr(placement, 'ROOT', tmp_path)
+    fence = tmp_path/'migration-fence'; fence.write_text('in progress')
+    monkeypatch.setattr(placement, 'MIGRATION_FENCE', fence)
+    monkeypatch.setattr(placement, 'load', lambda: {'providers': {'tej': {'state': 'copying'}}})
+    monkeypatch.setattr(dispatch, 'acquisition_dispatch_status', lambda *_: pytest.fail('must not fall back to C'))
+    target = tmp_path/'data_tej/api_trial_v1'
+    assert dispatch.check_dispatch(target) == 75
+    assert json.loads(capsys.readouterr().out)['reason'] == 'provider_workspace_unavailable'
+    assert not target.exists()
+
+
 @pytest.mark.parametrize("dangling,expected", [(False, 75), (True, 2)])
 def test_redirected_or_dangling_workspace_does_not_admit_writes(
     tmp_path, backing_refusal, dangling, expected,

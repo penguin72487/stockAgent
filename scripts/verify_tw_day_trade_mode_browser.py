@@ -19,10 +19,14 @@ from scripts.probe_browser_runtime import browser_profile_launch_options
 from scripts.promote_tw_day_trade_replay import _atomic_json
 
 
-def _signal_url(base_url, *, market, day):
+def _signal_url(base_url, *, market, day, revision_scope="all"):
     # urljoin discards an empty query suffix; add '?' after resolving the path.
-    return urljoin(base_url, "api/signals") + "?" + urlencode(
-        {"mode": market, "date": day, "offset": 0, "limit": 1})
+    if revision_scope not in {"all", "latest"}:
+        raise ValueError("unsupported signal revision scope")
+    query = {"mode": market, "date": day, "offset": 0, "limit": 1}
+    if revision_scope != "all":
+        query["revision_scope"] = revision_scope
+    return urljoin(base_url, "api/signals") + "?" + urlencode(query)
 
 
 def _is_cloudflare_beacon(url):
@@ -70,13 +74,15 @@ def _expected_challenge_csp_denial(message, inline_scripts):
     return False
 
 
-def _verify_signal_boundary(payload, *, market, day, private_features=False):
+def _verify_signal_boundary(payload, *, market, day, private_features=False, revision_scope=None):
     rows = payload.get("rows") or []
     if (payload.get("simulation_only") is not True
             or payload.get("production_order_possible") is not False
             or int(payload.get("total") or 0) <= 0 or not rows
             or any(row.get("market") != market or row.get("session_date") != day for row in rows)):
         raise ValueError("public signal boundary does not match the requested mode/session")
+    if revision_scope is not None and payload.get("revision_scope") != revision_scope:
+        raise ValueError("public signal boundary does not match the requested revision scope")
     research_notice_required = False
     if private_features:
         records = payload.get("feature_drivers_by_signal") or {}
@@ -90,6 +96,7 @@ def _verify_signal_boundary(payload, *, market, day, private_features=False):
             research_notice_required |= (record.get("research_only") is True
                                          and record.get("historical_point_in_time_proven") is False)
     return {"session_date": day, "total": payload["total"], "returned": len(rows),
+            "revision_scope": revision_scope,
             "private_feature_policy_verified": private_features,
             "research_notice_required": research_notice_required}
 
@@ -141,6 +148,8 @@ def main():
     parser.add_argument("--expected-market", action="append", required=True)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument("--signal-revision-scope", choices=("all", "latest"), default="all",
+                        help="Explicit signal scope to verify; latest does not certify the full revision archive.")
     parser.add_argument("--expect-private-features", action="store_true")
     parser.add_argument("--browser-profile", choices=("default", "cpu-2d"), default="default")
     parser.add_argument("--output-dir", type=Path, required=True,
@@ -149,6 +158,7 @@ def main():
     output = _prepare_output_dir(args.output_dir)
     receipt = {"schema_version": 1, "observed_at_utc": datetime.now(UTC).isoformat(),
                "url": args.url, "market": args.market, "status": "running",
+               "signal_revision_scope": args.signal_revision_scope,
                "browser_profile": args.browser_profile,
                "gpu_webgl_verified": False,
                "broker_execution_verified": False, "viewports": []}
@@ -214,11 +224,13 @@ def main():
                         boundaries = []
                         for day in dict.fromkeys((args.start_date, args.end_date)):
                             response = context.request.get(
-                                _signal_url(args.url, market=args.market, day=day), timeout=60_000)
+                                _signal_url(args.url, market=args.market, day=day,
+                                            revision_scope=args.signal_revision_scope), timeout=60_000)
                             if not response.ok:
                                 raise ValueError(f"public signal boundary HTTP {response.status}")
                             boundaries.append(_verify_signal_boundary(response.json(), market=args.market,
-                                day=day, private_features=args.expect_private_features))
+                                day=day, private_features=args.expect_private_features,
+                                revision_scope=args.signal_revision_scope))
                         stage = "navigation"
                         page.goto(args.url, wait_until="domcontentloaded", timeout=60_000)
                         page.locator(f'#mode-filter option[value="{args.market}"]').wait_for(state="attached", timeout=60_000)

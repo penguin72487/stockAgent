@@ -299,6 +299,11 @@ def bootstrap(root: Path, repo: Path, windows_session_id: int, *, config: dict) 
         retire_expired_worker(root)
     except (OSError, ValueError, KeyError, TypeError):
         pass  # Ambiguous claims cannot be cleared by bootstrapping a UI.
+    try:
+        from downloader.tej_rebooted_discovery import quarantine
+        quarantine(root)
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+        pass  # Unknown metadata outcomes remain blocked unless both boots are proven.
     with closing(connect(root)) as con:
         if con.execute("SELECT 1 FROM tasks WHERE state='running' LIMIT 1").fetchone():
             return {'state': 'waiting_existing_worker'}

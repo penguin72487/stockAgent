@@ -150,7 +150,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--apply-raw-retirement requires --retire-closed-raw")
     if args.adopt_closed_release and args.retire_closed_raw:
         parser.error("adopt and verify the closed release before its separate retirement")
-    root = Path(args.output_dir).expanduser().resolve()
+    from stockagent.data_sync import workspace_source_handoff
+    root = Path(args.output_dir).expanduser().absolute()
+    workspace_source_handoff.guard_path(root)
+    root = root.resolve()
     root.mkdir(parents=True, exist_ok=True)
     # Direct and scheduled invocations borrow/acquire the same original lock.
     # Keep it through the complete transaction, including ordinary downloads.
@@ -159,6 +162,7 @@ def main(argv: list[str] | None = None) -> int:
              "source_coordination_lock_scope": "source_parent",
              "source_coordination_lock": root.name + "/state/collector.lock"}
     with _source_coordination_lock(entry, inherited_fd=args.source_lock_fd) as owner:
+        workspace_source_handoff.guard_path(root)
         return _collect(root, args, owner)
 
 

@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume enrolled E source staging after interruption
+
+[Timer]
+OnBootSec=45
+OnUnitInactiveSec=60
+AccuracySec=1
+Unit=stockagent-workspace-source-staging.service
+
+[Install]
+WantedBy=timers.target

@@ -24,8 +24,11 @@ def acknowledge(root: Path, code: str, result: dict, output: Path) -> None:
     """A successfully returned response is not evidence that the missing data exists."""
     if result['status'] == 'changed_during_check':
         return
+    from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+    guard_path(root)
     with (root / '.quality_priority.lock').open('a') as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
+        guard_locked_path(root, lock, lock_name='.quality_priority.lock')
         plan = load_plan(root)
         for row in plan['requests']:
             if row['code'] != code or row['state'] != 'source_checked_not_fill_proof':

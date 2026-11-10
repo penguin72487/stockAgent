@@ -1,6 +1,7 @@
 {
   "contract": "stockagent.pack_compute_spool.v1",
   "enabled": false,
+  "pressure_recovery_enabled": false,
   "cold_root": "/srv/stockagent-packed/.local-state/private-history",
   "dataset": "local-tw-index-futures",
   "installed_since_utc": "2026-11-01T02:56:00+00:00",

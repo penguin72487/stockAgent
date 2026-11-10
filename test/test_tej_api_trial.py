@@ -12,7 +12,8 @@ import pytest
 from downloader.http_transport import HttpResponse, HttpStatusError, sanitized_url
 from downloader.tej_api import TejAPIError, TejTrialAPI, connect, sanitize_account
 from downloader.tej_api_catalog import HEADERS, collect_catalog, publish_catalog
-from downloader.download_tej_api import _advance, run_queue, seed_queue, status, publish_financial_reference_fields
+from downloader.download_tej_api import (_advance, run_queue, seed_queue, status,
+    publish_financial_reference_fields, requeue_rejected_pages_once)
 from downloader.tej_api_ownership import FIELD_PAIRS, remaining_rectangles, record_price_coverage, EXPECTED_UNITS
 
 NOW = datetime(2026, 10, 4, 2, tzinfo=UTC)
@@ -67,6 +68,45 @@ def test_trial_caps_cannot_be_expanded_by_paid_response():
     clean = sanitize_account(account(rowsDayLimit=3_000_000, reqDayLimit=2000), now=NOW)
     assert clean["quota"]["rows_per_day"] == 50_000
     assert clean["quota"]["calls_per_day"] == 500
+
+
+def test_cli_defers_before_credentials_or_queue_writes(tmp_path, monkeypatch):
+    from downloader import download_tej_api as cli
+    from scripts import check_acquisition_capacity as admission
+    monkeypatch.setattr(admission, 'check_dispatch', lambda *_a, **_k: 75)
+    monkeypatch.setattr(cli.TejTrialAPI, 'from_env', lambda *_a, **_k: pytest.fail('credentials must not be read'))
+    root = tmp_path/'api'
+    assert cli.main(['run', '--root', str(root), '--env', str(tmp_path/'env')]) == 75
+    assert not root.exists()
+
+
+def test_cli_holds_original_api_lock_during_initialization(tmp_path, monkeypatch):
+    import fcntl
+    from types import SimpleNamespace
+    from downloader import download_tej_api as cli
+    from scripts import check_acquisition_capacity as admission
+    monkeypatch.setattr(admission, 'check_dispatch', lambda *_a, **_k: 0)
+    root = tmp_path/'api'
+    def initialized(path, env):
+        with (path/'.api.lock').open('a+') as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return SimpleNamespace(root=path.resolve())
+    monkeypatch.setattr(cli.TejTrialAPI, 'from_env', initialized)
+    monkeypatch.setattr(cli, 'status', lambda _api: {'state': 'read'})
+    assert cli.main(['status', '--root', str(root), '--env', str(tmp_path/'env')]) == 0
+
+
+def test_status_keeps_working_under_ordinary_low_space(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from downloader import download_tej_api as cli
+    from scripts import check_acquisition_capacity as admission
+    from stockagent.data_sync import provider_workspace as placement
+    monkeypatch.setattr(placement, 'check_path', lambda *_: None)
+    monkeypatch.setattr(admission, 'check_dispatch', lambda *_a, **_k: pytest.fail('status should not require growth'))
+    monkeypatch.setattr(cli.TejTrialAPI, 'from_env', lambda path, env: SimpleNamespace(root=path.resolve()))
+    monkeypatch.setattr(cli, 'status', lambda _api: {'state': 'read'})
+    assert cli.main(['status', '--root', str(tmp_path/'api'), '--env', str(tmp_path/'env')]) == 0
 
 
 @pytest.mark.parametrize("value", [True, -1, "500", None, 1.5])
@@ -197,6 +237,51 @@ def test_api_key_in_path_and_echo_are_redacted():
     err = HttpStatusError(403, url, ("credential=" + KEY).encode())
     assert KEY not in str(err) and KEY.encode() not in err.body
     assert "[REDACTED]" in sanitized_url(url)
+
+
+def test_http_rejection_keeps_private_diagnostic_without_key_or_cursor(tmp_path):
+    cursor = 'test-private-cursor'
+    api = client(tmp_path, HttpResponse(400, f'cursor expired {cursor}; key={KEY}'.encode(), {}, 1))
+    with pytest.raises(TejAPIError, match='query_rejected'):
+        api.page('TRAIL/TAPRCD', {'opts.cursor_id': cursor}, wanted_rows=1)
+    path, = (api.root / 'diagnostics').glob('*.http-error.json')
+    raw = path.read_text()
+    assert KEY not in raw and cursor not in raw
+    proof = json.loads(raw)
+    assert proof['http_status'] == 400 and 'expired' in proof['body_preview']
+    assert proof['credential_redaction'] == 'request_query_values_and_known_api_key'
+
+
+def test_rejected_cursor_recheck_is_once_only_and_retains_prior_pages(tmp_path):
+    api = client(tmp_path)
+    task_id, request_id = 'a' * 32, 'b' * 32
+    with closing(connect(api.root)) as con, con:
+        con.execute("INSERT INTO tasks(id,table_id,params_json,priority,state,cursor,query_rows,actual_rows,"
+                    "active_request_id,page_size,error_code) VALUES(?,?,?,?,'blocked',?,7,7,?,10,'query_rejected')",
+                    (task_id, 'TRAIL/TAPRCD', '{}', 3, 'old-cursor', request_id))
+        con.execute("INSERT INTO requests VALUES(?,?,?,?,?,?)",
+                    (request_id, api._account_id, NOW.timestamp(), 10, 0, 'http_400'))
+    intent = api.root / 'requests' / (request_id + '.intent.json')
+    intent.parent.mkdir(exist_ok=True)
+    intent.write_text(json.dumps({'request_id': request_id, 'task_id': task_id}))
+    original = intent.read_bytes()
+    result = requeue_rejected_pages_once(api, [task_id])
+    assert result['queued'] == [task_id] and result['provider_requests_sent'] == 0
+    assert requeue_rejected_pages_once(api, [task_id])['already_queued'] == [task_id]
+    with closing(connect(api.root)) as con:
+        task = dict(con.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
+        old = con.execute('SELECT state,actual_rows FROM requests WHERE id=?', (request_id,)).fetchone()
+    assert (task['state'], task['cursor'], task['query_rows'], task['actual_rows'], task['priority']) == (
+        'retry', 'old-cursor', 7, 7, 3)
+    assert tuple(old) == ('http_400', 0) and intent.read_bytes() == original
+
+
+def test_rejected_cursor_recheck_rejects_unknown_tasks_atomically(tmp_path):
+    api = client(tmp_path)
+    with pytest.raises(ValueError, match='missing'):
+        requeue_rejected_pages_once(api, ['a' * 32])
+    with closing(connect(api.root)) as con:
+        assert not con.execute('SELECT 1 FROM tasks').fetchone()
 
 
 def test_empty_page_stays_observed_empty_not_full_history(tmp_path):

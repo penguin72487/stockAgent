@@ -8,7 +8,7 @@
   <title>TAIFEX 全策略模擬交易即時面板</title>
   <link rel="stylesheet" href="styles.css?v=15">
   <link rel="stylesheet" href="../dashboard-core.css?v=7">
-  <link rel="stylesheet" href="../dashboard-responsive.css?v=11">
+  <link rel="stylesheet" href="../dashboard-responsive.css?v=12">
 </head>
 <body class="taifex-dashboard">
   <a class="skip-link" href="#main-content">跳到主要內容</a>
@@ -33,6 +33,7 @@
 
     <nav class="jump-nav" aria-label="本頁快速導覽">
       <a href="#overview">狀態總覽</a>
+      <a href="#settlement">選擇權結算</a>
       <a href="#parity">Parity 套利</a>
       <a href="#performance">績效趨勢</a>
       <a href="#strategies">策略比較</a>
@@ -56,6 +57,18 @@
       <article class="metric"><span>模擬委託</span><strong id="broker-status">—</strong><small id="broker-detail">—</small></article>
       <article class="metric"><span>狀態延遲</span><strong id="source-age">—</strong><small>超過 15 秒即標示 stale</small></article>
       <article class="metric"><span>安全邊界</span><strong id="safety-state">—</strong><small>正式下單必須永遠不可用</small></article>
+    </section>
+
+    <section id="settlement" class="panel parity-panel" aria-labelledby="settlement-title">
+      <div class="panel-head"><div><h2 id="settlement-title">臺指選擇權最後結算參考</h2><p>到期日現貨加權指數 13:00（不含）至 13:25（含）的每次揭示，加計收盤指數，取算術平均並四捨五入至整數點。</p></div></div>
+      <div class="parity-grid">
+        <div><span>現貨加權指數</span><strong id="settlement-index">—</strong><small id="settlement-index-time">等待即時來源</small></div>
+        <div><span>已觀測樣本平均</span><strong id="settlement-average">—</strong><small id="settlement-samples">等待 13:00 後揭示</small></div>
+        <div><span>目前樣本估算整數點</span><strong id="settlement-estimate">—</strong><small>僅已收到的樣本，並非正式結算價</small></div>
+        <div><span>最後一筆收盤指數</span><strong id="settlement-closing">—</strong><small id="settlement-closing-status">等待證交所盤後資料</small></div>
+        <div><span>最近官方最後結算價</span><strong id="settlement-official">—</strong><small id="settlement-official-date">—</small></div>
+      </div>
+      <p class="chart-note">估算只適用當日到期的臺指選擇權；缺少揭示、延遲、重啟或尚未收盤均可能造成差異。來源超過 15 秒會標示過期。夜盤無現貨即時結算。每日結算價是另一項由期交所依日盤成交訂定的資料。公開頁依行情顯示授權規則可能隱藏數值，私人檢視不受此限制。</p>
     </section>
 
     <section id="parity" class="panel parity-panel" aria-labelledby="parity-title">
@@ -288,8 +301,8 @@
       </div>
     </section>
   </main>
-  <script src="../dashboard-core.js?v=15" defer></script>
+  <script src="../dashboard-core.js?v=20" defer></script>
   <script src="../time-axis.js?v=4" defer></script>
-  <script src="app.js?v=29" defer></script>
+  <script src="app.js?v=31" defer></script>
 </body>
 </html>

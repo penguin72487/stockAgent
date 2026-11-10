@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the enrolled C handoff payload repack and retirement
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Unit=stockagent-handoff-source-repack.service
+
+[Install]
+WantedBy=timers.target

@@ -19,7 +19,7 @@ import subprocess
 import sys
 import time
 from dataclasses import replace
-from datetime import date, datetime, time as wall_time, timezone
+from datetime import date, datetime, time as wall_time, timedelta, timezone
 from pathlib import Path
 from types import ModuleType
 from typing import Any
@@ -52,6 +52,28 @@ PRIORITY_SOURCE_RETRY_WAKEUP_SECONDS = 60
 # formal inference and 10 min for cache/control overhead. Interactive callers
 # retain their configured ordinary completed-session timeout.
 FACTORIZED_SOURCE_RECOVERY_SECONDS = 80 * 60
+CAPACITY_WAIT_CONTRACT = "artifact_history_capacity_backoff_v1"
+CAPACITY_WAIT_MAX_SECONDS = 15 * 60
+CAPACITY_HINT_TIMEOUT_SECONDS = 8
+CURRENT_YEAR_HISTORY_CONTRACT = "tw_current_year_formal_history_v1"
+_CAPACITY_HINT_CHILD = r'''
+import json, sys
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+from stockagent.data_sync.cache_capacity import _admit_backing_volume
+from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+try:
+    result = _admit_backing_volume(Path(sys.argv[1]), int(sys.argv[2]))
+except CapacityDeferred as error:
+    state = "blocked" if error.details.get("reason") == "physical_backing_reserve" else "unknown"
+    print(json.dumps({"state": state, "free": None}))
+except Exception:
+    print(json.dumps({"state": "unknown", "free": None}))
+else:
+    free = result.get("physical_free_bytes") if isinstance(result, dict) else None
+    state = "available" if type(free) is int and free >= int(sys.argv[2]) else "unknown"
+    print(json.dumps({"state": state, "free": free if state == "available" else None}))
+'''
 
 
 def _preopen_source_priority_window(observed: datetime) -> bool:
@@ -87,6 +109,52 @@ def _load_discord_bot() -> ModuleType:
     return discord_bot
 
 
+def _current_history_year(*, now: datetime | None = None) -> int | None:
+    """Read the bounded result-scope policy shared by the worker and launcher."""
+    configured = os.environ.get("STOCKAGENT_FORMAL_HISTORY_SCOPE_POLICY")
+    path = Path(configured) if configured else ROOT / "configs/deployments/tw_day_trade_formal_history_scope.json"
+    if not path.is_absolute():
+        path = ROOT / path
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(8193)
+    except FileNotFoundError:
+        return None
+    if len(raw) > 8192:
+        raise ValueError("formal-history scope policy exceeds its bounded reader")
+    policy = json.loads(raw)
+    if (not isinstance(policy, dict)
+            or set(policy) != {"contract", "enabled", "calendar_year"}
+            or policy.get("contract") != CURRENT_YEAR_HISTORY_CONTRACT
+            or type(policy.get("enabled")) is not bool):
+        raise ValueError("invalid formal-history year scope policy")
+    if not policy["enabled"]:
+        return None
+    observed = now or datetime.now(ZoneInfo("Asia/Taipei"))
+    if observed.tzinfo is None:
+        raise ValueError("formal-history scope requires an aware observation clock")
+    current = observed.astimezone(ZoneInfo("Asia/Taipei")).year
+    selected = policy["calendar_year"]
+    if selected == "current":
+        return current
+    if type(selected) is not int or selected != current:
+        raise ValueError("formal-history policy must select the current calendar year")
+    return selected
+
+
+
+def _year_scope_requires_new_owner(markets: list[str], bot: ModuleType) -> int | None:
+    year = _current_history_year()
+    if year is None:
+        return None
+    if not any(bool(getattr(bot._resolve_market(market), "day_trade_simulation_enabled", False))
+               for market in markets):
+        return None
+    if getattr(bot, "FORMAL_HISTORY_SCOPE_CONTRACT", None) == CURRENT_YEAR_HISTORY_CONTRACT:
+        return None
+    return year
+
+
 def _read_retry_json(path: Path) -> dict:
     try:
         with path.open("rb") as handle:
@@ -99,6 +167,172 @@ def _read_retry_json(path: Path) -> dict:
     if not isinstance(result, dict):
         raise ValueError("artifact retry receipt must be a JSON object")
     return result
+
+
+def _backing_capacity_hint(required: int) -> tuple[str, int | None]:
+    """Observe workspace backing capacity; this is never a write reservation.
+
+    The actual writer must still recheck its own filesystem, root, leases and
+    byte budget. Unknown probes cannot trigger an early retry.
+    """
+    if type(required) is not int or not 0 < required < 2**63:
+        return "unknown", None
+    # WSL interop discovery can otherwise exceed the controller's 30-second
+    # service timeout. Isolate this advisory probe and bound the entire process
+    # group; never leave a blocked helper holding up the trading guardian.
+    try:
+        process = subprocess.Popen(
+            [sys.executable, "-c", _CAPACITY_HINT_CHILD, str(ROOT), str(required)],
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, start_new_session=True,
+        )
+    except OSError:
+        return "unknown", None
+    try:
+        output, _ = process.communicate(timeout=CAPACITY_HINT_TIMEOUT_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except OSError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+        try:
+            process.communicate(timeout=1)
+        except subprocess.TimeoutExpired:
+            # A descendant that escaped the new group is not ours to signal;
+            # close our pipe and leave the sample unknown.
+            if process.stdout is not None:
+                process.stdout.close()
+        return "unknown", None
+    if process.returncode != 0 or len(output) > 1024:
+        return "unknown", None
+    try:
+        result = json.loads(output)
+    except (TypeError, ValueError):
+        return "unknown", None
+    if not isinstance(result, dict):
+        return "unknown", None
+    state, free = result.get("state"), result.get("free")
+    if state == "blocked" and free is None:
+        return "blocked", None
+    if state == "available" and type(free) is int and free >= required:
+        return "available", free
+    return "unknown", None
+
+
+def _capacity_wait_signature(job: dict) -> tuple:
+    details = job.get("error_details")
+    return (job.get("key"), job.get("status"), job.get("error_type"),
+            job.get("run_id"), job.get("attempt"), job.get("completed_at"), job.get("next_retry_at"),
+            job.get("capacity_wait_contract"), job.get("capacity_workspace_was_blocked"),
+            job.get("capacity_source_hint"),
+            details.get("reason") if isinstance(details, dict) else None,
+            details.get("required_bytes_including_reserve") if isinstance(details, dict) else None)
+
+
+def _capacity_source_hint() -> str | None:
+    markets_dir = Path(os.environ.get("STOCKAGENT_MARKETS_DIR", str(ROOT / "services/discord_bot/markets")))
+    if not markets_dir.is_absolute():
+        markets_dir = ROOT / markets_dir
+    try:
+        return _retry_wakeup_fingerprint({}, markets_dir)
+    except (OSError, ValueError):
+        # A failed hint must not turn a recoverable capacity wait into a
+        # maintenance failure. The normal bounded deadline remains active.
+        return None
+
+
+def _capacity_recovered_jobs(jobs: dict, *, observed: datetime) -> dict[str, tuple]:
+    """Return advisory early-retry hints, with one physical probe per pass."""
+    candidates = []
+    for key, job in jobs.items():
+        if not isinstance(job, dict) or job.get("status") != "waiting_source":
+            continue
+        details = job.get("error_details")
+        required = details.get("required_bytes_including_reserve") if isinstance(details, dict) else None
+        if (not isinstance(details, dict)
+                or job.get("capacity_wait_contract") != CAPACITY_WAIT_CONTRACT
+                or job.get("error_type") != "CapacityDeferred"
+                or details.get("reason") != "physical_backing_reserve"):
+            continue
+        try:
+            deadline = datetime.fromisoformat(job["next_retry_at"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if deadline.tzinfo is None or deadline <= observed:
+            continue
+        candidates.append((key, job, required))
+    if not candidates:
+        return {}
+    # A changed source/configuration can make an existing cache usable without
+    # allocation. Wake the canonical owner, which still performs its checks.
+    source_hint = _capacity_source_hint()
+    recovered = {key: _capacity_wait_signature(job) for key, job, _ in candidates
+                 if source_hint is not None and isinstance(job.get("capacity_source_hint"), str)
+                 and job["capacity_source_hint"] != source_hint}
+    candidates = [(key, job, need) for key, job, need in candidates
+                  if key not in recovered and job.get("capacity_workspace_was_blocked") is True
+                  and type(need) is int and 0 < need < 2**63]
+    if not candidates:
+        return recovered
+    # One fresh physical observation is only a wakeup hint. It is not a
+    # reservation, and may concern a different filesystem from the child.
+    state, free = _backing_capacity_hint(min(item[2] for item in candidates))
+    if state != "available" or free is None:
+        return recovered
+    recovered.update((key, _capacity_wait_signature(job)) for key, job, need in candidates if need <= free)
+    return recovered
+
+
+def _previous_capacity_wait(key: str) -> dict:
+    with discord_bot._artifact_backfill_status_guard():
+        job = (discord_bot._load_artifact_backfill_status().get("jobs") or {}).get(key)
+    return dict(job) if isinstance(job, dict) else {}
+
+
+def _schedule_capacity_wait(key: str, waiting: dict, previous: dict) -> dict:
+    """Bound repeated full preparations without modifying the writer's gate."""
+    details = waiting.get("error_details")
+    if (not isinstance(details, dict) or details.get("reason") != "physical_backing_reserve"
+            or waiting.get("status") != "waiting_source"):
+        return waiting
+    required = details.get("required_bytes_including_reserve")
+    source_hint = _capacity_source_hint()
+    old_details = previous.get("error_details")
+    consecutive = (previous.get("status") == "waiting_source"
+                   and isinstance(old_details, dict)
+                   and old_details.get("reason") == "physical_backing_reserve"
+                   and previous.get("capacity_wait_contract") == CAPACITY_WAIT_CONTRACT
+                   and previous.get("capacity_source_hint") == source_hint)
+    old_count = previous.get("capacity_wait_attempt", 0)
+    count = min(16, old_count + 1) if consecutive and type(old_count) is int and old_count >= 0 else 1
+    delay = min(CAPACITY_WAIT_MAX_SECONDS, 60 * (2 ** min(count - 1, 4)))
+    # If this particular workspace was observed below the recorded threshold,
+    # the cheap controller may later request an early retry when it rises above
+    # it. The child might have used another filesystem: this is never admission.
+    workspace_blocked = _backing_capacity_hint(required)[0] == "blocked"
+    with discord_bot._artifact_backfill_status_guard():
+        payload = discord_bot._load_artifact_backfill_status()
+        job = (payload.get("jobs") or {}).get(key)
+        if not isinstance(job, dict) or _capacity_wait_signature(job) != _capacity_wait_signature(waiting):
+            return waiting
+        completed = datetime.fromisoformat(job["completed_at"])
+        job.update(capacity_wait_contract=CAPACITY_WAIT_CONTRACT,
+                   capacity_wait_attempt=count, capacity_workspace_was_blocked=workspace_blocked,
+                   capacity_source_hint=source_hint,
+                   retry_delay_seconds=float(delay),
+                   next_retry_at=(completed + timedelta(seconds=delay)).isoformat(timespec="seconds"))
+        payload["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+        discord_bot._write_artifact_backfill_status(payload)
+        return dict(job)
+
+
+def _capacity_hint_is_current(key: str, signature: tuple) -> bool:
+    job = _previous_capacity_wait(key)
+    return (job.get("status") == "waiting_source"
+            and job.get("capacity_wait_contract") == CAPACITY_WAIT_CONTRACT
+            and _capacity_wait_signature(job) == signature)
 
 
 def _retry_wakeup_fingerprint(jobs: dict, markets_dir: Path) -> str:
@@ -362,6 +596,9 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
             continue
         if market not in latest or key > latest[market][0]:
             latest[market] = key, job
+    capacity_recovered = _capacity_recovered_jobs(
+        {key: job for key, job in latest.values()}, observed=observed,
+    )
     candidates = []
     for market, (key, job) in latest.items():
         if job.get("status") == "running":
@@ -375,7 +612,7 @@ def retry_probe(*, observed: datetime | None = None) -> dict:
             deadline = datetime.fromisoformat(retry_at)
             if deadline.tzinfo is None:
                 raise ValueError("artifact retry deadline must be timezone-aware")
-            if deadline <= observed:
+            if deadline <= observed or key in capacity_recovered:
                 candidates.append((key, market))
     warming = _deferred_factorized_source_request() or _stale_factorized_projection_request()
     if not candidates and warming is None:
@@ -996,6 +1233,20 @@ def run_once(*, signal_cache_only: bool = False) -> int:
         record_worker = (_record_signal_cache_maintenance_run if signal_cache_only
                          else discord_bot._record_artifact_maintenance_run)
         record_worker("running")
+        if not signal_cache_only:
+            # An older immutable Gateway must not silently ignore a new year
+            # boundary. Keep caches in their independent owner and preserve all
+            # prior job/failure receipts while the compatible owner is admitted.
+            year = _year_scope_requires_new_owner(
+                discord_bot._artifact_maintenance_markets(), discord_bot)
+            if year is not None:
+                reason = "current_year_inference_owner_required"
+                record_worker("waiting_source", reason=reason, attempted=0, deferred=1)
+                _emit(status="waiting_source", reason=reason, calendar_year=year,
+                      result_start=f"{year}-01-01", result_end=f"{year}-12-31",
+                      inference_started=False, raw_data_deleted=False,
+                      signal_cache_owner="stockagent-discord-postclose-cache.service")
+                return 0
         if discord_bot._opening_critical_work_pending():
             record_worker(
                 "deferred", reason="opening_critical_work_pending"
@@ -1084,6 +1335,9 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 attempted=cache_attempted, failures=cache_failures, deferred=cache_deferred,
             )
 
+        with discord_bot._artifact_backfill_status_guard():
+            prior_jobs = dict(discord_bot._load_artifact_backfill_status().get("jobs") or {})
+        capacity_recovered = _capacity_recovered_jobs(prior_jobs, observed=datetime.now(timezone.utc))
         attempted = 0
         failures = 0
         deferred = 0
@@ -1132,7 +1386,9 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 )
                 if recovered:
                     continue
-                if not discord_bot._artifact_backfill_retry_allowed(key):
+                if (not discord_bot._artifact_backfill_retry_allowed(key)
+                        and not (key in capacity_recovered
+                                 and _capacity_hint_is_current(key, capacity_recovered[key]))):
                     # Skipping a failed job during backoff does not prove its
                     # artifacts are current. Preserve its per-market receipt
                     # and make the worker's unfinished work visible as well.
@@ -1181,6 +1437,7 @@ def run_once(*, signal_cache_only: bool = False) -> int:
 
             _verify_maintenance_gateway_generation()
             attempted += 1
+            previous_wait = _previous_capacity_wait(key)
             discord_bot._begin_artifact_backfill(key, market)
             try:
                 result = discord_bot._run_artifact_backfill_sync(cfg)
@@ -1191,6 +1448,8 @@ def run_once(*, signal_cache_only: bool = False) -> int:
                 waiting = discord_bot._finish_artifact_backfill(
                     key, market, status="waiting_source", exc=exc,
                 )
+                if isinstance(exc, CapacityDeferred):
+                    waiting = _schedule_capacity_wait(key, waiting, previous_wait)
                 _emit(
                     status="waiting_source", market=market, key=key,
                     attempt=waiting.get("attempt"),

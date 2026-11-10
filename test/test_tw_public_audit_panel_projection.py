@@ -1,7 +1,7 @@
 """Audit projection must not change the canonical panel's complete ABI."""
 from __future__ import annotations
 
-from dataclasses import asdict, fields
+from dataclasses import asdict, fields, replace
 from datetime import date
 import hashlib
 import json
@@ -146,6 +146,63 @@ def test_audit_cache_miss_builds_the_original_canonical_key(tmp_path, monkeypatc
     actual, source = audit._load_or_build_panel(cfg, stocks, external, build_if_missing=True, panel_cache_root=root)
     assert actual is sentinel and source == "built"
     assert observed == [{**_panel_kwargs(cfg, external, resolve_projection=False), "panel_cache_root": root}]
+
+
+def test_audit_explicitly_reports_an_uncached_capacity_deferred_build(tmp_path, monkeypatch):
+    stocks, external, cfg = _fixture(tmp_path)
+    sentinel = object()
+    monkeypatch.setattr(audit, "load_cached_panel", lambda *a, **kw: None)
+    def build(*args, **kwargs):
+        assert kwargs['allow_cache_write_deferred'] is True
+        kwargs['on_cache_write_deferred']({'reason': 'physical_backing_reserve'})
+        return sentinel
+    monkeypatch.setattr(audit, 'build_panel', build)
+    actual, origin = audit._load_or_build_panel(cfg, stocks, external,
+        build_if_missing=True, allow_uncached_panel_on_capacity=True)
+    assert actual is sentinel and origin == 'built_uncached_physical_reserve'
+
+
+def test_preopen_audit_keeps_strict_checks_with_optional_capacity_cache(tmp_path):
+    from scripts.run_tw_public_0830_check import _audit_command
+    command = _audit_command(config=tmp_path/'config', live_root=tmp_path/'live', output_dir=tmp_path/'audit')
+    assert '--allow-uncached-panel-on-capacity' in command
+    assert '--build-panel' in command and '--strict' in command
+    assert '--require-live-selected-features' in command
+
+
+def test_optional_cache_deferral_keeps_every_panel_value_and_reserve(tmp_path, monkeypatch):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+    stocks, external, cfg = _fixture(tmp_path)
+    cfg.data.feature_include, cfg.data.feature_exclude = ["twpub_keep"], []
+    kwargs = _panel_kwargs(cfg, external, resolve_projection=False)
+    expected = build_panel(stocks, panel_cache_root=tmp_path/'baseline', **kwargs)
+    def deferred(*_args, **_kwargs):
+        raise CapacityDeferred('physical_backing_reserve')
+    monkeypatch.setattr(panel_module, '_save_panel_cache', deferred)
+    notices = []
+    actual = build_panel(stocks, panel_cache_root=tmp_path/'uncached', **kwargs,
+        allow_cache_write_deferred=True, on_cache_write_deferred=notices.append)
+    # An in-memory panel has no immutable cache generation and must not claim
+    # the cache's persisted fingerprint receipt; its data arrays are identical.
+    assert expected.content_fingerprints is not None and actual.content_fingerprints is None
+    _assert_panel_bits(replace(expected, content_fingerprints=None), actual)
+    assert len(notices) == 1 and notices[0]['allocation_admitted'] is False
+    assert notices[0]['reason'] == 'physical_backing_reserve'
+    with pytest.raises(CapacityDeferred):
+        build_panel(stocks, panel_cache_root=tmp_path/'required', **kwargs)
+
+
+def test_optional_cache_does_not_hide_untrusted_namespace_or_other_errors(tmp_path, monkeypatch):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+    stocks, external, cfg = _fixture(tmp_path)
+    cfg.data.feature_include, cfg.data.feature_exclude = ["twpub_keep"], []
+    kwargs = _panel_kwargs(cfg, external, resolve_projection=False)
+    def rejected(*_args, **_kwargs):
+        raise CapacityDeferred('untrusted_namespace')
+    monkeypatch.setattr(panel_module, '_save_panel_cache', rejected)
+    with pytest.raises(CapacityDeferred, match='untrusted_namespace'):
+        build_panel(stocks, panel_cache_root=tmp_path/'untrusted', **kwargs,
+                    allow_cache_write_deferred=True)
 
 
 @pytest.mark.parametrize("tail", [False, True])

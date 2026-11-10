@@ -26,12 +26,11 @@ function harness({overnight = false, latestOnly = true} = {}) {
   function $(id) { return byId(id); }
   vm.runInContext(app.slice(app.indexOf("let snapshot = null;"), app.indexOf("try {\n  const storedHiddenSeries")), context);
   vm.runInContext(app.slice(app.indexOf("function measureRevisionPaint("), app.indexOf("function renderPositions()")), context);
-  vm.runInContext(app.match(/^const DEFAULT_PERFORMANCE_START_DATE = .*;$/m)[0], context);
   if (latestOnly) vm.runInContext("followLatestSession = true; followPerformanceRange = false", context);
   if (latestOnly === false) vm.runInContext("followLatestSession = false; followPerformanceRange = true", context);
   vm.runInContext(app.slice(app.indexOf("function selectedMode()"), app.indexOf("function chartWindowLabel()")), context);
   vm.runInContext(app.slice(app.indexOf("function validateDetailPage"), app.indexOf("function healthPresentation")), context);
-  vm.runInContext(app.slice(app.indexOf("function syncFilters(data)"), app.indexOf("function renderModes(data)")), context);
+  vm.runInContext(app.slice(app.indexOf("function performanceYear(data)"), app.indexOf("function renderModes(data)")), context);
   const run = (code) => vm.runInContext(code, context);
   const data = (day) => ({session_date: day, available_session_dates: [day, "2026-09-08"], modes: []});
   return {context, run, byId, timers, data};
@@ -40,6 +39,23 @@ function harness({overnight = false, latestOnly = true} = {}) {
 test("initial accessible button state agrees with the latest-session default before data arrives", () => {
   assert.match(html, /id="performance-range"[^>]*aria-pressed="false"/);
   assert.match(html, /id="follow-latest-session"[^>]*aria-pressed="true"/);
+});
+
+test("day-trade page consumes the latest version once per minute without revision-triggered full reloads", () => {
+  const source = app.slice(app.indexOf("Dashboard.scheduleRefresh(updateClock"), app.indexOf("installTwPublicMonitorActivation();"));
+  function observe(overnight) {
+    const intervals = [], streams = [];
+    const context = vm.createContext({IS_OVERNIGHT: overnight, PRICE_REFRESH_MS: 60000,
+      TW_PUBLIC_STATUS_REFRESH_MS: 60000, SERVICE_REVISION_REFRESH_MS: 1000,
+      Dashboard: {scheduleRefresh: (_fn, options) => intervals.push(options.intervalMs),
+        subscribeRevisions: (...args) => streams.push(args[0])},
+      updateClock() {}, refresh() {}, loadTwPublicMonitor() {}, acceptServiceRevision() {},
+      refreshServiceRevision() {}, acceptServiceStatus() {}});
+    vm.runInContext(source, context);
+    return {intervals, streams};
+  }
+  assert.deepEqual(observe(false), {intervals: [1000, 60000], streams: []});
+  assert.deepEqual(observe(true), {intervals: [1000, 60000, 60000], streams: ["api/updates"]});
 });
 
 test("new visits default to the latest session in both dashboards without loading all history", () => {
@@ -55,6 +71,20 @@ test("new visits default to the latest session in both dashboards without loadin
     assert.equal(byId("detail-start-date").value, "2026-10-21");
     assert.equal(byId("detail-end-date").value, "2026-10-21");
   }
+});
+
+test("signal revision selection is scoped and never changes positions or overnight semantics", () => {
+  const {run, byId} = harness();
+  const initialSignals = run("detailSelectionKey('signals')");
+  const initialPositions = run("detailSelectionKey('positions')");
+  assert.equal(run("selectedSignalRevisionScope()"), "latest");
+  byId("signal-revision-filter").value = "all";
+  assert.equal(run("selectedSignalRevisionScope()"), "all");
+  assert.notEqual(run("detailSelectionKey('signals')"), initialSignals);
+  assert.equal(run("detailSelectionKey('positions')"), initialPositions);
+  const overnight = harness({overnight: true});
+  overnight.byId("signal-revision-filter").value = "latest";
+  assert.equal(overnight.run("selectedSignalRevisionScope()"), "all");
 });
 
 test("optional year-to-date starts at 2026-01-01 and follows new sessions without fabricating earlier data", () => {
@@ -76,6 +106,69 @@ test("optional year-to-date starts at 2026-01-01 and follows new sessions withou
     assert.equal(byId("detail-start-date").value, "2026-09-08");
     assert.equal(byId("detail-end-date").value, "2026-10-16");
   }
+});
+
+test("current-year filters use the server's Taipei year and cannot select an old session", () => {
+  for (const overnight of [false, true]) {
+    for (const latestOnly of [true, false]) {
+      const {context, run, byId} = harness({overnight, latestOnly});
+      // Still 2026 UTC, already 2027 in Taiwan; no 2027 session exists yet.
+      context.data = {session_date: "2026-12-31", available_session_dates: ["2026-12-31", "2025-12-31"],
+        generated_at_utc: "2026-12-31T16:00:00Z", modes: []};
+      run("syncFilters(data)");
+      assert.equal(byId("detail-start-date").min, "2027-01-01");
+      assert.equal(byId("detail-start-date").value, "2027-01-01");
+      assert.equal(byId("detail-end-date").value, "2027-01-01");
+      assert.equal(byId("performance-range").textContent, "2027 年至今");
+      assert.equal(run("selectedDate()"), "2027-01-01");
+      // The full list remains available for determining whether an unbounded
+      // response would accidentally include an earlier year.
+      assert.equal(run("availableDetailDates.at(-1)"), "2025-12-31");
+
+      context.data = {session_date: "2027-01-04", available_session_dates: ["2027-01-04", "2026-12-31"],
+        generated_at_utc: "2027-01-04T01:00:00Z", modes: []};
+      run("syncFilters(data)");
+      assert.equal(byId("detail-start-date").value, latestOnly ? "2027-01-04" : "2027-01-01");
+      assert.equal(byId("detail-end-date").value, "2027-01-04");
+      assert.equal(run("selectedDate()"), latestOnly ? "" : "2027-01-04");
+      run("followLatestSession = false; followPerformanceRange = false");
+      byId("detail-start-date").value = "2025-12-31";
+      byId("detail-end-date").value = "2026-12-31";
+      run("syncFilters(data)");
+      assert.equal(byId("detail-start-date").value, "2027-01-01");
+      assert.equal(byId("detail-end-date").value, "2027-01-01");
+    }
+  }
+});
+
+test("a missing full status displays only the verified live projection, not fabricated history", () => {
+  const {context, run} = harness();
+  let html = "";
+  context.setHtml = (id, value) => { if (id === "mode-cards") html = value; };
+  context.summaryMoney = value => value == null ? "—" : `NT$ ${value}`;
+  context.number = value => value == null ? "—" : String(value);
+  context.engineStatusLabel = value => value || "未知";
+  context.window.StockAgentTwLivePaper = {getSnapshot: () => ({error: "更新失敗，保留上次已確認快照",
+    data: {as_of: "2026-11-09T09:22:00+08:00", modes: [{market: "m", label: "模型",
+      engine_status: "active", total_equity_twd: 2010000, open_position_count: 2,
+      entry_filled_shares: 1000, entry_unfilled_shares: 2000}]}})};
+  run("renderLiveModeFallback()");
+  assert.match(html, /模型/);
+  assert.match(html, /已提交快照/);
+  assert.match(html, /完整面板、歷史與曲線尚未取得/);
+  assert.match(html, /更新失敗，保留上次已確認快照/);
+  assert.match(html, /NT\$ 2010000/);
+  assert.doesNotMatch(html, /期間報酬/);
+  class NextYear extends Date {
+    constructor(...args) { super(...(args.length ? args : ["2026-12-31T16:00:00Z"])); }
+  }
+  context.Date = NextYear;
+  run("renderLiveModeFallback()");
+  assert.match(html, /今年尚無已確認快照/);
+  assert.doesNotMatch(html, /2010000/);
+  run("snapshot = {modes: []}");
+  context.window.StockAgentTwLivePaper.getSnapshot = () => { throw new Error("must preserve full snapshot"); };
+  assert.doesNotThrow(() => run("renderLiveModeFallback()"));
 });
 
 test("overnight performance keeps the server-clock rollover observer", () => {
@@ -123,6 +216,30 @@ test("year-to-date reuses full history but preserves requested boundaries and ob
   context.$("detail-start-date").value = "2026-10-01";
   await run("loadChartHistory()");
   assert.equal(new URL(requested.at(-1), "https://example.test/").searchParams.get("start_date"), "2026-10-01");
+});
+
+test("year-to-date never reuses an unbounded response containing an earlier year", async () => {
+  const {context, run, data} = harness({latestOnly: false});
+  context.data = {...data("2026-10-16"), available_session_dates: ["2026-10-16", "2025-12-31"]};
+  run("syncFilters(data)");
+  const requested = [];
+  const payload = {history_encoding: "minute_columns_v2", start_date: "2026-01-01", end_date: "2026-10-16",
+    minute_axis: ["2026-10-16T09:01:00+08:00"], history: [], range_summary: [], returned_points: 1,
+    minute_series: [{series_id: "mode", minute_indexes: [0], return_pct: [0],
+      cumulative_return_pct: [12], quality_flags: [0]}]};
+  Object.assign(context, {HISTORY_CLIENT_CACHE_MAX_ENTRIES: 3, URLSearchParams,
+    renderChart: () => {}, chartRequestKey: () => run("detailRangeKey()"),
+    chartHistoryMatchesSelection: () => false,
+    fetchMinuteHistory: async (url) => { requested.push(url); return {ok: true}; },
+    Dashboard: {readJsonResponse: async () => payload}, decodeChartHistory: (value) => value,
+    applyChartHistory: (value) => { context.observed = value; }});
+  run(app.slice(app.indexOf("function validateMinuteHistory("), app.indexOf("function applyChartHistory(")));
+  run(app.slice(app.indexOf("async function loadChartHistory({"), app.indexOf("function renderPriceSources(")));
+  await run("loadChartHistory()");
+  const query = new URL(requested[0], "https://example.test/").searchParams;
+  assert.equal(query.get("start_date"), "2026-01-01");
+  assert.equal(query.get("end_date"), "2026-10-16");
+  assert.equal(context.observed.start_date, "2026-01-01");
 });
 
 test("automatic day follows status, manual history stays pinned", () => {
@@ -230,6 +347,61 @@ test("a failed first status recovers without a new source revision or page reloa
     assert.equal(run("statusRecoveryAttempts"), 0);
     assert.equal(run("statusRecoveryTimer"), null);
     assert.equal(timers.size, 0);
+  }
+});
+
+test("range changes still load details from the newer verified snapshot when a status cache has an older same-content commit", async () => {
+  for (const overnight of [false, true]) {
+    const {context, run, data, byId} = harness({overnight});
+    const sync = {engine_generation:"engine", revision_token:"financial:history:quotes", state_revision:7, content_revision:3};
+    context.trusted = {...data("2026-09-09"), service_sync:sync, marker:"newer-verified"};
+    const stale = {...data("2026-09-09"), service_sync:{...sync,state_revision:6}, marker:"older-cache"};
+    const started = [];
+    Object.assign(context, {
+      fetchWithTimeout:async () => ({}), Dashboard:{readJsonResponse:async () => stale},
+      revisionOf:() => "same-content", render:() => {},
+      loadSignals:() => started.push("signals"), loadPositions:() => started.push("positions"),
+      loadEvents:() => started.push("events"), loadChartHistory:() => started.push("history"),
+    });
+    run("snapshot=trusted; appliedStatusRevision={...trusted.service_sync}; followLatestSession=false; followPerformanceRange=false");
+    byId("detail-start-date").value="2026-01-01";
+    byId("detail-end-date").value="2026-09-09";
+    run("clearDateScopedViews()");
+    run(app.slice(app.indexOf("async function refresh({"), app.indexOf("function activateTwPublicMonitor()")));
+    await run("refresh()");
+    assert.deepEqual(started,["signals","positions","history"]);
+    assert.equal(run("snapshot.marker"),"newer-verified");
+    assert.equal(run("appliedStatusRevision.state_revision"),7);
+    assert.equal(byId("detail-start-date").value,"2026-01-01");
+  }
+});
+
+test("retained-snapshot range recovery never crosses a changed financial, quote, owner or session scope", async () => {
+  for (const defect of ["content","quotes","owner","session","requested-date"]) {
+    const {context, run, data, byId, timers} = harness();
+    const sync={engine_generation:"engine",revision_token:"financial:history:quotes",state_revision:7,content_revision:3};
+    context.trusted={...data("2026-09-09"),service_sync:sync};
+    const stale={...data("2026-09-09"),service_sync:{...sync,state_revision:6}};
+    if(defect==="content") stale.service_sync.content_revision=2;
+    if(defect==="quotes") stale.service_sync.revision_token="financial:history:older-quotes";
+    if(defect==="owner") stale.service_sync.engine_generation="old-engine";
+    if(defect==="session") stale.session_date="2026-09-08";
+    let builds=0;
+    Object.assign(context, {
+      fetchWithTimeout:async () => ({}),Dashboard:{readJsonResponse:async () => stale},
+      revisionOf:() => "same",render:() => {builds++;},
+      loadSignals:() => {builds++;},loadPositions:() => {builds++;},
+      loadEvents:() => {builds++;},loadChartHistory:() => {builds++;},
+    });
+    run("snapshot=trusted; appliedStatusRevision={...trusted.service_sync}; latestServiceNotice={...trusted.service_sync}; followLatestSession=false; followPerformanceRange=false");
+    byId("detail-start-date").value=defect==="requested-date" ? "2026-09-08" : "2026-01-01";
+    byId("detail-end-date").value=defect==="requested-date" ? "2026-09-08" : "2026-09-09";
+    run(app.slice(app.indexOf("async function refresh({"), app.indexOf("function activateTwPublicMonitor()")));
+    await run("refresh()");
+    assert.equal(builds,0,defect);
+    assert.equal(run("snapshot===trusted"),true,defect);
+    assert.equal(run("appliedStatusRevision.state_revision"),7,defect);
+    assert.equal(timers.size,1,defect);
   }
 });
 
@@ -359,7 +531,7 @@ test("signal and event pages keep prior rows when an incomplete page arrives", a
     context.initial = {...data("2026-09-16"), service_sync: {content_revision: 2}};
     run("snapshot = initial; syncFilters(snapshot); signalRows = [{symbol: 'old'}]; eventRows = [{symbol: 'old'}]");
     let page = {start_date: "2026-09-16", end_date: "2026-09-16", offset: 0,
-      returned: 0, total: 0, has_more: false, rows: []};
+      returned: 0, total: 0, has_more: false, rows: [], revision_scope: overnight ? "all" : "latest"};
     Object.assign(context, {
       SIGNAL_PAGE_SIZE: 100, EVENT_PAGE_SIZE: 100, URLSearchParams,
       fetchWithTimeout: async () => ({}),
@@ -390,6 +562,29 @@ test("signal and event pages keep prior rows when an incomplete page arrives", a
     await run("loadEvents({force: true})");
     assert.equal(run("eventRows.length"), 0);
     assert.equal(run("eventRecordRevision === detailDataRevision('events')"), true);
+  }
+});
+
+test("signal range has a longer cold-read deadline without slowing the latest-day deadline", async () => {
+  for (const latestOnly of [true, false]) {
+    const {context, run, data} = harness({latestOnly});
+    context.initial = {...data("2026-10-16"), service_sync: {content_revision: 2}};
+    run("snapshot = initial; syncFilters(snapshot)");
+    const start = latestOnly ? "2026-10-16" : "2026-01-01";
+    const page = {start_date: start, end_date: "2026-10-16", offset: 0,
+      returned: 0, total: 0, has_more: false, rows: [], revision_scope: "latest"};
+    const timeouts = [];
+    Object.assign(context, {
+      SIGNAL_PAGE_SIZE: 100, URLSearchParams,
+      fetchWithTimeout: async (_url, options) => { timeouts.push(options.timeoutMs); return {}; },
+      Dashboard: {readJsonResponse: async () => page},
+      beginSilentTableUpdate: () => {}, compareByAbsoluteWeight: () => 0,
+      syncFeaturePanelSelection: () => {}, renderSignals: () => {}, renderSignalFeaturePanel: () => {},
+    });
+    run(app.slice(app.indexOf("async function loadSignals({"), app.indexOf("async function loadPositions({")));
+    await run("loadSignals({force: true})");
+    assert.deepEqual(timeouts, [latestOnly ? 15000 : 30000]);
+    assert.equal(run("signalLoadError"), "");
   }
 });
 

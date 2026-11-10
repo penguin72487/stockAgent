@@ -12,6 +12,7 @@ import subprocess
 import sys
 import tarfile
 import time
+from types import SimpleNamespace
 import zipfile
 
 import numpy as np
@@ -81,7 +82,13 @@ def rescue(tmp_path, monkeypatch):
     policy = load_policy(REPO / "configs/training_rescue.json")
     policy.update(state_root=str(tmp_path / "state"), cold_root=str(tmp_path / "cold"))
     r = Rescue(policy)
+    fake_sync = tmp_path/'packed'
+    (fake_sync/'.local-state/locks').mkdir(parents=True)
+    (fake_sync/'.local-state/locks/publish-retention-global.lock').touch()
     monkeypatch.setattr(r, "guard", lambda: r.cold.mkdir(parents=True, exist_ok=True))
+    monkeypatch.setattr(r, "_retention_protection_config", lambda: SimpleNamespace(
+        state_dir=tmp_path/'retention', sync_root=fake_sync))
+    monkeypatch.setattr(r, "_protect_packed_sources", lambda spec: list(spec.get("data_sources", [])))
     return r
 
 

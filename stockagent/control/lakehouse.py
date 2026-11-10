@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from pathlib import Path
 import shutil
 import subprocess
@@ -23,6 +24,48 @@ class CatalogOwnerBusy(BlockingIOError):
 
 class CatalogColdCapacity(OSError):
     """The guarded D lake has no writable bytes; retain its committed catalog."""
+
+
+class CatalogTradingPriority(CatalogOwnerBusy):
+    """Defer migration-time cold catalog work during Taiwan trading."""
+
+
+def _migration_pause_requested(state: Path) -> bool:
+    pause = state / 'source-replication-migration-pause.json'
+    if not os.path.lexists(pause):
+        return False
+    descriptor = os.open(pause, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    with os.fdopen(descriptor, 'rb') as stream:
+        info = os.fstat(stream.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_size > 4096 or info.st_nlink != 1):
+            raise ValueError('source replication migration pause is not a private local file')
+        request = json.loads(stream.read(4097))
+    if (not isinstance(request, dict)
+            or request.get('contract') != 'stockagent.source_replication_migration_pause.v1'
+            or request.get('paused') is not True):
+        raise ValueError('source replication migration pause identity differs')
+    return True
+
+
+def _trading_priority_window(*, now=None) -> bool:
+    """Use the same verified, cached session window as the storage timers."""
+    from datetime import time as wall_time
+    from scripts.check_outside_tw_opening_resource_window import TAIPEI, evaluate
+    from scripts.storage_priority_cache import evaluate_cached
+    observed = now or datetime.now(TAIPEI)
+    calendar = Path('data_tw_public').absolute()
+    result = evaluate_cached(observed, calendar, lambda: evaluate(
+        observed, minimum_runway_minutes=120, protected_until=wall_time(13, 30),
+        official_calendar_root=calendar))
+    return result['protected'] is True
+
+
+def _migration_catalog_trading_deferred(c: dict, *, now=None) -> bool:
+    """Do not start a D-wide migration catalog while day trading has priority."""
+    return (bool(c.get('cold_root')) and Path(c['cold_root']) == Path('/srv/stockagent-packed')
+            and _migration_pause_requested(Path(c['state_root']))
+            and _trading_priority_window(now=now))
 
 
 def configuration(path=Path("/etc/stockagent/lakehouse-control.json")) -> dict:
@@ -75,13 +118,34 @@ def _query_rows(connection, batch_rows=16):
         yield from rows
 
 
-def _metadata_rows(connection, *, maximum_bytes=64*1024**2, maximum_rows=2048):
-    """Bound each full-payload sort; preserve the original full-row SQL order.
+def _metadata_sort_fits_memory(content_bytes, row_count, sql_limit, available):
+    """Choose an algorithm from current headroom, without changing limits."""
+    if (any(type(value) is not int or value < 0 for value in (content_bytes, row_count, available))
+            or not isinstance(sql_limit, str)):
+        return False
+    match = re.fullmatch(r'([0-9]{1,20})(?:\.([0-9]{1,4}))?\s*([A-Za-z]+)', sql_limit)
+    units = {'B': 1, **{prefix + 'B': 1000**power for power, prefix in enumerate('KMGTPE', 1)},
+             **{prefix + 'iB': 1024**power for power, prefix in enumerate('KMGTPE', 1)}}
+    if match is None or match[3] not in units:
+        return False
+    unit, fraction = units[match[3]], match[2] or '0'
+    sql_bytes = int(match[1])*unit + int(fraction)*unit//10**len(fraction)
+    # Native 3.91-GB full-key sorting peaked at 8.51 GB RSS. Keep generous
+    # room for DuckDB buffers, Python rows, concurrent services and uncertainty.
+    required = content_bytes*8 + row_count*1024 + 64*1024**2
+    return sql_bytes >= required and available >= required + 8*1024**3
+
+
+def _metadata_rows(connection, *, maximum_bytes=64*1024**2, maximum_rows=2048, single_pass=False):
+    """Preserve full-row order with an admitted single pass or bounded pages.
 
     Keys are small and unique under the canonical append-only ingestion. If an
     older/invalid registry has duplicate, NULL or invalid keys, retain its exact
     ORDER BY ALL behavior, not a deduplicated or partially observed digest.
-    Callers retain the catalog publication lock across all pages; a restored
+    With measured SQL/host/cgroup headroom, unique leading keys allow one
+    narrow-key sort followed by the same complete row stream. Otherwise each
+    page retains its original full-payload sort. Callers retain the publication
+    lock across the complete stream; a restored
     private registry has no writer. This does not relax snapshot ownership.
     """
     if maximum_bytes <= 0 or maximum_rows <= 0:
@@ -91,13 +155,35 @@ def _metadata_rows(connection, *, maximum_bytes=64*1024**2, maximum_rows=2048):
     if columns[:2] != ['relative', 'sha256'] or 'bytes' not in columns:
         yield from _query_rows(connection.execute('SELECT * FROM lake.source_metadata ORDER BY ALL'))
         return
-    keys = connection.execute('SELECT relative,sha256,bytes FROM lake.source_metadata '
+    keys = connection.execute('SELECT relative,sha256,bytes,'
+                              'dense_rank() OVER (ORDER BY relative,sha256) AS ordering_rank '
+                              'FROM lake.source_metadata '
                               'ORDER BY relative,sha256,bytes').fetchall()
     if (any(not isinstance(r[0], str) or not isinstance(r[1], str)
             or type(r[2]) is not int or r[2] < 0 for r in keys)
-            or len({r[:2] for r in keys}) != len(keys)):
+            or len({r[:2] for r in keys}) != len(keys)
+            or keys and keys[-1][3] != len(keys)):
         yield from _query_rows(connection.execute('SELECT * FROM lake.source_metadata ORDER BY ALL'))
         return
+    if single_pass:
+        try:
+            from stockagent.remote_build import observe_node
+            available = observe_node(Path.cwd(), Path.cwd())['limits']['memory_headroom_bytes']
+            sql_limit = connection.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+            fits = _metadata_sort_fits_memory(sum(row[2] for row in keys), len(keys), sql_limit, available)
+        except (ImportError, OSError, ValueError, KeyError, TypeError):
+            fits = False  # Unknown headroom keeps the original bounded algorithm.
+        if fits:
+            # The leading two fields are non-null and unique, so their order
+            # determines precisely the full ORDER BY ALL order. Sort the small
+            # keys once; never repeatedly scan wide payloads for every page.
+            observed = 0
+            for row in _query_rows(connection.execute('SELECT * FROM lake.source_metadata ORDER BY relative,sha256')):
+                observed += 1
+                yield row
+            if observed != len(keys):
+                raise ValueError('metadata membership changed during single-pass digest')
+            return
     index = 0
     while index < len(keys):
         end, size = index, 0
@@ -125,7 +211,7 @@ def _metadata_rows(connection, *, maximum_bytes=64*1024**2, maximum_rows=2048):
 def _registered_table_digest(connection, table):
     if table not in {'dataset_releases', 'source_objects', 'catalog_captures', 'source_metadata'}:
         raise ValueError('unexpected lakehouse registry table')
-    rows = (_metadata_rows(connection) if table == 'source_metadata' else
+    rows = (_metadata_rows(connection, single_pass=True) if table == 'source_metadata' else
             _query_rows(connection.execute('SELECT * FROM lake.' + table + ' ORDER BY ALL')))
     return _canonical_row_digest(rows)[1]
 
@@ -330,6 +416,8 @@ def _source_metadata_signature(paths, include_orphans):
 
 
 def register(c: dict) -> dict:
+    if _migration_catalog_trading_deferred(c):
+        raise CatalogTradingPriority('catalog census waits until the TW trading priority window ends')
     from stockagent.data_sync.backup_stream import _catalog_metadata_workers, capture_catalog
     import pyarrow as pa
     started = time.perf_counter()
@@ -490,12 +578,24 @@ def _previous_catalog_export(c: dict, expected_snapshot: int):
     return None
 
 
-def export(c: dict, expected_snapshot: int) -> dict:
+def export(c: dict, expected_snapshot: int, *, on_owner_busy=None) -> dict:
     guard(c)
     state = Path(c["state_root"])
     journal = state / ("export-" + str(expected_snapshot) + ".json")
     with (state / "catalog-owner.lock").open("a") as owner:
-        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        waited = False
+        while True:
+            try:
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError as error:
+                if on_owner_busy is None or on_owner_busy() is not True:
+                    raise CatalogOwnerBusy('canonical catalog owner is busy') from error
+                waited = True
+        if waited:
+            # A workspace or mount may change while another activity owns
+            # the catalog. Revalidate before reading or publishing anything.
+            guard(c)
         if journal.exists():
             result = json.loads(journal.read_bytes())
             if result["state"] == "published":
@@ -819,12 +919,21 @@ def stage_source_wave(c: dict) -> dict:
     No source/transport removal. Archive membership is counted only from exact
     paired NAS independent-restore receipts, not from transfer completion.
     """
+    state = Path(c["state_root"])
+    if _migration_pause_requested(state):
+        status_path = state / 'source-replication-status.json'
+        previous = json.loads(status_path.read_bytes()) if status_path.exists() else {}
+        result = {**previous, 'state': 'paused_for_user_migration',
+                  'observed_at_utc': datetime.now(timezone.utc).isoformat(),
+                  'reason': 'user_requested_no_backup_during_migration',
+                  'source_deletion_enabled': False}
+        atomic_write_json(status_path, result)
+        return result
     from stockagent.data_sync.immutable_replication import safe
     from stockagent.data_sync.nas_coverage import read_ledger, restic_keys
     from stockagent.data_sync.immutable_transport_cache import PHYSICAL_TRANSPORT_ROOT, retirement_summary
     policy = source_wave_policy(c)
     guard(c)
-    state = Path(c["state_root"])
     refresh_error = None
     if policy['refresh_source_catalog']:
         checkpoint = state / 'source-catalog-refresh.json'

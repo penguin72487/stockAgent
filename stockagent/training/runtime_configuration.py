@@ -7,6 +7,7 @@ does not import trainer orchestration.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -65,6 +66,34 @@ def _configure_compile_cache_paths(
             os.environ[env_name] = str(path)
 
 
+def _resolve_host_compilers() -> tuple[str | None, str | None]:
+    env_bin = Path(sys.executable).resolve().parent
+    cc_candidates = [
+        os.environ.get("CC"),
+        str(env_bin / "x86_64-conda-linux-gnu-gcc"),
+        str(env_bin / "gcc"),
+        str(env_bin / "cc"),
+        "cc", "gcc", "clang", "x86_64-conda-linux-gnu-gcc", "x86_64-conda-linux-gnu-cc",
+    ]
+    cxx_candidates = [
+        os.environ.get("CXX"),
+        str(env_bin / "x86_64-conda-linux-gnu-g++"),
+        str(env_bin / "g++"),
+        str(env_bin / "c++"),
+        "c++", "g++", "clang++", "x86_64-conda-linux-gnu-g++", "x86_64-conda-linux-gnu-c++",
+    ]
+
+    def resolve(candidates: list[str | None]) -> str | None:
+        for candidate in candidates:
+            # Also validate absolute paths; a Conda-built Python can run in
+            # a venv without Conda's compiler executables.
+            if candidate and (resolved := shutil.which(candidate)):
+                return resolved
+        return None
+
+    return resolve(cc_candidates), resolve(cxx_candidates)
+
+
 def _prepend_compile_toolchain_paths() -> None:
     _configure_compile_cache_paths()
     normalize_cuda_env()
@@ -76,12 +105,6 @@ def _prepend_compile_toolchain_paths() -> None:
     if ptxas_path.exists():
         os.environ.setdefault("TRITON_PTXAS_PATH", str(ptxas_path))
         os.environ.setdefault("TRITON_PTXAS_BLACKWELL_PATH", str(ptxas_path))
-    cc_path = env_bin / "x86_64-conda-linux-gnu-gcc"
-    cxx_path = env_bin / "x86_64-conda-linux-gnu-g++"
-    if cc_path.exists():
-        os.environ.setdefault("CC", str(cc_path))
-    if cxx_path.exists():
-        os.environ.setdefault("CXX", str(cxx_path))
     entries.append(str(env_bin))
     conda_prefix = os.environ.get("CONDA_PREFIX")
     if conda_prefix:
@@ -103,6 +126,13 @@ def _prepend_compile_toolchain_paths() -> None:
     ]
     if prepend:
         os.environ["PATH"] = os.pathsep.join([*prepend, existing])
+    # Financial kernels compile even when model compilation is disabled.
+    # Select the same validated toolchain at their shared runtime entrypoint.
+    cc, cxx = _resolve_host_compilers()
+    if cc:
+        os.environ["CC"] = cc
+    if cxx:
+        os.environ["CXX"] = cxx
 
 
 def _configure_torch_compile_runtime() -> None:

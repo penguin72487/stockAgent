@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 import hashlib
 import json
 from pathlib import Path
@@ -1304,6 +1304,41 @@ def test_intraday_bar_loader_preserves_right_label_and_observed_vwap(
     ]
 
 
+def test_requested_minute_preserves_full_session_source_selection(tmp_path: Path) -> None:
+    primary = tmp_path / "primary" / "trade_date=2026-02-25" / "data.parquet"
+    secondary = tmp_path / "secondary" / "trade_date=2026-02-25" / "data.parquet"
+    primary.parent.mkdir(parents=True)
+    secondary.parent.mkdir(parents=True)
+    stamps = [datetime(2026, 2, 25, 9, 1) + timedelta(minutes=i) for i in range(270)]
+    symbols = ["2330"] * 270 + ["2454"] * 269
+    primary_stamps = stamps + stamps[:-1]
+    pl.DataFrame({
+        "symbol": symbols, "ts": primary_stamps,
+        **{name: [100.0] * len(symbols) for name in ("Open", "High", "Low", "Close")},
+        "volume_shares": [1000.0] * len(symbols),
+    }).write_parquet(primary)
+    pl.DataFrame({
+        "symbol": ["2454"], "ts": [stamps[-1]],
+        **{name: [101.0] for name in ("Open", "High", "Low", "Close")},
+        "volume_shares": [1000.0],
+    }).write_parquet(secondary)
+    args = ((primary.parent.parent, secondary.parent.parent),)
+    kwargs = {"trading_date": date(2026, 2, 25), "symbols": {"2330", "2454"}}
+
+    full, full_receipt = replay._minute_bar_rows(*args, **kwargs)
+    terminal, terminal_receipt = replay._minute_bar_rows(
+        *args, **kwargs, requested_minutes=frozenset({time(13, 30)})
+    )
+
+    key = "2026-02-25T13:30+08:00"
+    assert len(full["2330"]) == 270
+    assert terminal == {"2330": {key: full["2330"][key]}}
+    assert terminal_receipt["missing_symbols"] == ["2454"]
+    assert terminal_receipt["source_files"] == full_receipt["source_files"]
+    assert terminal_receipt["source_counts"] == full_receipt["source_counts"]
+    assert all(item["path"] != str(secondary) for item in terminal_receipt["source_files"])
+
+
 @pytest.mark.parametrize("layout", ["partition", "chunk"])
 @pytest.mark.parametrize("redirected", [False, True])
 def test_minute_provenance_resolution_is_per_file_with_redirect_fence(tmp_path, monkeypatch, layout, redirected):
@@ -2293,6 +2328,73 @@ def _write_official_aggregate_fixtures(tmp_path: Path) -> tuple[Path, Path]:
         }
     ).write_parquet(tpex_path)
     return twse_path, tpex_path
+
+
+def test_official_daily_batch_keeps_exact_session_values_and_missingness(
+    tmp_path: Path,
+) -> None:
+    twse, tpex = _write_official_aggregate_fixtures(tmp_path)
+    pl.DataFrame({
+        "date": ["2026-08-20", "2026-08-21", "2026-08-21"],
+        "證券代號": [" 2330 ", "2330", " 1234 "],
+        "開盤價": ["1,200.00", "--", "25.0"],
+        "最高價": ["1,215.00", "--", "26.0"],
+        "最低價": ["1,190.00", "--", "24.0"],
+        "收盤價": ["1,210.00", "1,210.00", "25.0"],
+        "成交股數": ["2,000", "0", "1,000"],
+    }).write_parquet(twse)
+    first, second, absent = (date(2026, 8, day) for day in (20, 21, 24))
+
+    actual = replay._official_aggregate_daily_rows_batch(
+        twse, tpex, (first, second, absent, first)
+    )
+
+    assert actual[first]["2330"] == {
+        "date": first, "open": 1200.0, "max": 1215.0, "min": 1190.0,
+        "close": 1210.0, "volume_shares": 2000.0,
+        "_official_source": "twse_daily_ohlcv",
+    }
+    assert actual[first]["6488"]["volume_shares"] is None
+    assert actual[second]["2330"]["open"] is None
+    assert actual[second]["2330"]["volume_shares"] == 0.0
+    assert actual[second]["2330"]["close"] == 1210.0
+    assert actual[second]["1234"]["open"] == 25.0
+    assert actual[absent] == {}
+    assert replay._official_aggregate_daily_rows(twse, tpex, second) == actual[second]
+    assert replay._official_aggregate_daily_rows_batch(twse, tpex, ()) == {}
+
+
+def test_official_daily_batch_rejects_duplicate_symbol_within_session(
+    tmp_path: Path,
+) -> None:
+    twse, tpex = _write_official_aggregate_fixtures(tmp_path)
+    pl.DataFrame({
+        "date": ["2026-08-20"], "代號": ["2330"], "開盤": ["1"],
+        "最高": ["1"], "最低": ["1"], "收盤": ["1"],
+    }).write_parquet(tpex)
+
+    with pytest.raises(ValueError, match="duplicate official aggregate daily row for 2330 on 2026-08-20"):
+        replay._official_aggregate_daily_rows_batch(twse, tpex, (date(2026, 8, 20),))
+
+
+def test_prior_session_index_matches_per_day_reference_and_never_uses_future(
+    tmp_path: Path,
+) -> None:
+    twse = tmp_path / "twse.parquet"
+    tpex = tmp_path / "tpex.parquet"
+    pl.DataFrame({"date": ["2014-12-;1", "2025-12-31", "2026-01-02", "2026-01-06"]}).write_parquet(twse)
+    pl.DataFrame({"date": ["2025-12-31", "2026-01-05", "2026-01-06"]}).write_parquet(tpex)
+    sessions = signal_backfill._official_session_index(twse, tpex)
+
+    assert sessions == tuple(date.fromisoformat(day) for day in (
+        "2025-12-31", "2026-01-02", "2026-01-05", "2026-01-06"
+    ))
+    for day in (date(2026, 1, 2), date(2026, 1, 5), date(2026, 1, 7)):
+        assert signal_backfill._previous_indexed_official_session_date(sessions, day) == (
+            signal_backfill._previous_official_session_date(twse, tpex, day)
+        )
+    with pytest.raises(ValueError, match="no completed session"):
+        signal_backfill._previous_indexed_official_session_date(sessions, date(2025, 12, 31))
 
 
 def test_official_daily_row_falls_back_to_fresh_venue_aggregate(

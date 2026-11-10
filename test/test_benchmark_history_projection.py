@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 from stockagent.live.benchmark_history_projection import (
+    adopt_benchmark_projection,
     load_benchmark_projection,
     projection_delta_path,
     projection_head_path,
@@ -31,6 +32,61 @@ def _benchmark_mark(session_date: str, minute: str, equity: float) -> dict[str, 
 
 def _source_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def test_adoption_rebinds_large_source_without_relaxing_snapshot_limit(tmp_path, monkeypatch):
+    from stockagent.live import paper_mode_snapshot
+    old, target = tmp_path / "derived", tmp_path / "candidate"
+    old.mkdir()
+    target.mkdir()
+    marks = [_benchmark_mark("2026-08-13", "09:00", 101.),
+             _benchmark_mark("2026-08-13", "13:30", 102.)]
+    original, copied = old / "benchmark_history.json", target / "benchmark_history.json"
+    original.write_text(json.dumps({"marks": marks, "full_provenance": "x" * 4096}))
+    copied.write_bytes(original.read_bytes())
+    os.utime(copied, ns=(1, 1))  # byte equality is not a file-generation match.
+    digest = _source_sha256(original)
+    write_benchmark_projection(state_dir=old, source_path=original, source_sha256=digest,
+        origins={"benchmark_0050": {"entry_price": 100.}}, marks=marks, created_at="first")
+    monkeypatch.setattr(paper_mode_snapshot, "MAX_SNAPSHOT_BYTES", 1024)
+    with pytest.raises(ValueError, match="bounded"):
+        paper_mode_snapshot.read_paper_state(copied)
+    receipt = adopt_benchmark_projection(state_dir=target, source_state_dir=old,
+        expected_source_sha256=digest, created_at="adopted")
+    assert receipt["projection_sessions"] == 1
+    current = load_benchmark_projection(state_dir=target, source_path=copied)
+    source = load_benchmark_projection(state_dir=old, source_path=original)
+    assert current.session_entries == source.session_entries
+    assert current.marks == source.marks
+    assert current.source_modified_ns != source.source_modified_ns
+    stable_delta = projection_delta_path(target).read_bytes()
+    adopt_benchmark_projection(state_dir=target, source_state_dir=old,
+        expected_source_sha256=digest, created_at="retried")
+    assert projection_delta_path(target).read_bytes() == stable_delta
+    copied.write_text("{}")
+    with pytest.raises(ValueError, match="content differs"):
+        adopt_benchmark_projection(state_dir=target, source_state_dir=old,
+            expected_source_sha256=digest, created_at="tampered")
+
+
+def test_adoption_rejects_corrupt_shards_and_keeps_legacy_absence(tmp_path):
+    old, target = tmp_path / "derived", tmp_path / "candidate"
+    old.mkdir()
+    target.mkdir()
+    original, copied = old / "benchmark_history.json", target / "benchmark_history.json"
+    marks = [_benchmark_mark("2026-08-13", "09:00", 101.)]
+    original.write_text(json.dumps({"marks": marks}))
+    copied.write_bytes(original.read_bytes())
+    digest = _source_sha256(original)
+    assert adopt_benchmark_projection(state_dir=target, source_state_dir=old,
+        expected_source_sha256=digest, created_at="legacy") is None
+    write_benchmark_projection(state_dir=old, source_path=original, source_sha256=digest,
+        origins={}, marks=marks, created_at="first")
+    head = json.loads(projection_head_path(old).read_bytes())
+    (old / "benchmark_history_projection/v1" / head["sessions"]["2026-08-13"]["path"]).write_bytes(b"bad")
+    with pytest.raises(ValueError, match="invalid or stale"):
+        adopt_benchmark_projection(state_dir=target, source_state_dir=old,
+            expected_source_sha256=digest, created_at="corrupt")
 
 
 def test_benchmark_validator_uses_hash_matched_projection_and_falls_back_on_corruption(

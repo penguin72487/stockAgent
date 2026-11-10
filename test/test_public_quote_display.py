@@ -284,6 +284,42 @@ def test_signal_price_requires_matching_recorded_position_not_signal_clock_alone
         assert policy.transaction_report_price(invalid, "execution_price", invalid["execution_price"], record_kind="paper_signal", now=NOW) is None
 
 
+def test_assumed_open_discloses_actual_replay_creation_not_assumed_0901_as_recorded_time():
+    position = paper_position(session_date="2026-10-12", entry_at="2026-10-12T09:01:00+08:00",
+        historical_open_fallback_fill=True,
+        recorded_at_basis="counterfactual_effective_clock_not_original_publication",
+        replay_generated_at="2026-10-12T14:31:00+08:00")
+    row = {"symbol": "2330", "market": "tw_day_trade", "session_date": "2026-10-12",
+           "filled_shares": 1000, "execution_price": position["entry_price"],
+           "historical_open_fallback_fill": True, "position": position}
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    _, proof = policy.transaction_report_price(row, "execution_price", row["execution_price"],
+                                                record_kind="paper_signal", now=NOW)
+    assert proof["evidence_kind"] == "paper_assumption"
+    assert proof["effective_at"] == "2026-10-12T09:01:00+08:00"
+    assert proof["recorded_at"] == "2026-10-12T14:31:00+08:00"
+    assert proof["opening_trade_time_verified"] is False
+    missing_clock = {**row, "position": position | {"replay_generated_at": None}}
+    assert policy.transaction_report_price(missing_clock, "execution_price", row["execution_price"],
+                                           record_kind="paper_signal", now=NOW) is None
+    mismatched = row | {"historical_open_fallback_fill": False}
+    assert policy.transaction_report_price(mismatched, "execution_price", row["execution_price"],
+                                           record_kind="paper_signal", now=NOW) is None
+
+
+def test_assumed_open_event_is_not_a_real_fill_or_0901_recording():
+    policy = quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True)
+    row = {"symbol": "2330", "event_kind": "fill", "simulation_only": True, "status": "filled",
+           "quantity": 1000, "price": 112.0, "purpose": "entry",
+           "fill_at": "2026-10-12T09:01:00+08:00", "historical_open_fallback_fill": True,
+           "recorded_at_basis": "counterfactual_effective_clock_not_original_publication",
+           "replay_generated_at": "2026-10-12T14:31:00+08:00"}
+    _, proof = policy.transaction_report_price(row, "price", row["price"], record_kind="paper_event", now=NOW)
+    assert proof["evidence_kind"] == "paper_assumption"
+    assert proof["recorded_at"] == row["replay_generated_at"]
+    assert proof["effective_at"] == row["fill_at"]
+
+
 def test_order_prices_cannot_become_own_fills_and_fill_event_keeps_its_original_clock(monkeypatch):
     monkeypatch.setattr(public, "public_quote_display_policy", lambda: quotes.PublicQuoteDisplayPolicy(paper_transaction_reports=True))
     row = {"symbol": "2330", "event_kind": "fill", "simulation_only": True, "status": "filled",

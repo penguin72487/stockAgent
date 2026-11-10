@@ -11,6 +11,17 @@ NOW = datetime(2026, 9, 30, 10, tzinfo=UTC)
 TASK = Task('TaiwanStockPriceAdj', '', '2026-09-30', 'day', 0, 'pending')
 
 
+def test_next_check_tolerates_database_created_before_observation_schema(tmp_path):
+    with sqlite3.connect(tmp_path / updates.DB_NAME):
+        pass  # Another publication has opened the file but not created tables.
+    updates.set_next_check(tmp_path, TASK, NOW.isoformat())
+    record(tmp_path, response([{'date': '2026-09-30', 'close': 1}]))
+    due = (NOW + timedelta(hours=1)).isoformat()
+    updates.set_next_check(tmp_path, TASK, due)
+    with sqlite3.connect(tmp_path / updates.DB_NAME) as conn:
+        assert conn.execute('SELECT next_check_at_utc FROM streams').fetchone()[0] == due
+
+
 def response(rows, now=NOW, request_id='first'):
     return updates.ResponseRows(rows, observation={
         'request_id': request_id, 'request_started_at_utc': (now - timedelta(seconds=2)).isoformat(),

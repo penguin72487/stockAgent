@@ -35,6 +35,8 @@ PUBLIC_STATUS_FALLBACK_POINTS_PER_SERIES: Final[int] = 2
 _TW_PUBLIC_POSITION_FIELDS: Final[set[str]] = {
     "closing_auction_limit_price", "closing_auction_order_status", "closing_auction_order_submitted_at",
     "counterfactual_open_replay", "counterfactual_0901_price_fill",
+    "historical_open_fallback_fill",
+    "recorded_at_basis", "replay_generated_at",
     "entry_at", "entry_exchange_at", "entry_fee_twd", "entry_price",
     "entry_price_source", "entry_completion_broker_fill",
     "entry_completion_contract", "entry_completion_recorded_at",
@@ -51,9 +53,13 @@ _TW_PUBLIC_POSITION_FIELDS: Final[set[str]] = {
     "realized_net_pnl_twd", "reconciled_total_net_pnl_twd", "requested_shares",
     "session_date", "security_type", "side", "signed_shares", "simulation_replay",
     "source_signal_at", "status", "stop_order_status", "stop_trigger_price",
+    "price_limit_band_kind", "paper_bracket_full_cross_assumed",
     "symbol", "take_profit_price", "target_weight", "target_unsubmitted_shares",
     "temporary_day_trade_model_adapter", "total_net_pnl_twd",
     "unrealized_net_pnl_twd", "valuation_stale", "public_price_display",
+    "nontrade_settlement_contract", "nontrade_settlement_shares", "nontrade_accounting_at",
+    "nontrade_reference_observed_at", "nontrade_reference_before_entry", "nontrade_reference_time_unknown", "nontrade_assumed_exit_fee_twd",
+    "nontrade_settlement_net_pnl_twd", "execution_realized_net_pnl_twd",
     PROTECTED_OBSERVATIONS_KEY,
 }
 _TAIFEX_HISTORY_ROW_FIELDS: Final[tuple[str, ...]] = (
@@ -148,6 +154,26 @@ def _public_replay_signal_origin(row: Mapping[str, Any]) -> str | None:
 
 def _public_projected_row(row: Mapping[str, Any], allowed_fields: set[str]) -> dict[str, Any]:
     output = {str(field): value for field, value in row.items() if str(field) in allowed_fields}
+    if "price_limit_band_kind" in allowed_fields:
+        output.pop("price_limit_band_kind", None)
+        try:
+            lower, upper = float(row.get("lower_limit")), float(row.get("upper_limit"))
+        except (TypeError, ValueError):
+            pass
+        else:
+            # The recorded exchange system band is not a daily fluctuation
+            # limit. Publish only the categorical interpretation, not a
+            # provider quote or inferred substitute price.
+            if math.isclose(lower, 0.01, abs_tol=1e-12, rel_tol=0.0) and math.isclose(upper, 9999.95, abs_tol=1e-9, rel_tol=0.0):
+                output["price_limit_band_kind"] = "recorded_system_band_without_daily_price_limit"
+    if "paper_bracket_full_cross_assumed" in allowed_fields:
+        output.pop("paper_bracket_full_cross_assumed", None)
+        evidence = row.get("bracket_cross_evidence")
+        if (isinstance(evidence, Mapping)
+                and evidence.get("contract") == "historical_bracket_full_on_strict_observed_cross_paper_assumption_v1"
+                and evidence.get("simulation_only") is True
+                and evidence.get("broker_fill") is False and evidence.get("exchange_fill") is False):
+            output["paper_bracket_full_cross_assumed"] = True
     trace = public_paper_signal_key(row)
     if trace is not None:
         output["public_signal_key"] = trace
@@ -455,6 +481,9 @@ def sanitize_tw_status(
         allowed_fields={
             "counterfactual_open_replay",
             "counterfactual_0901_price_fill",
+            "historical_open_fallback_fill",
+            "recorded_at_basis",
+            "replay_generated_at",
             "counterfactual_overnight_replay",
             "closing_auction_limit_price",
             "closing_auction_order_status",
@@ -492,6 +521,15 @@ def sanitize_tw_status(
             "opening_exit_order_status",
             "opening_exit_submitted_at",
             "realized_net_pnl_twd",
+            "nontrade_settlement_contract",
+            "nontrade_settlement_shares",
+            "nontrade_accounting_at",
+            "nontrade_reference_observed_at",
+            "nontrade_reference_before_entry",
+            "nontrade_reference_time_unknown",
+            "nontrade_assumed_exit_fee_twd",
+            "nontrade_settlement_net_pnl_twd",
+            "execution_realized_net_pnl_twd",
             "reconciled_total_net_pnl_twd",
             "requested_shares",
             "session_date",
@@ -503,6 +541,8 @@ def sanitize_tw_status(
             "status",
             "stop_order_status",
             "stop_trigger_price",
+            "price_limit_band_kind",
+            "paper_bracket_full_cross_assumed",
             "symbol",
             "take_profit_price",
             "target_weight",
@@ -611,6 +651,7 @@ def sanitize_tw_history(payload: Mapping[str, Any], *, private_prices: bool = Fa
         "period_return_basis",
         "range_summary",
         "historical_minute_replay_points",
+        "historical_delayed_auction_event_points",
         "historical_minute_carried_price_points",
         "historical_minute_missing_price_points",
         "historical_minute_min_fresh_trade_notional_coverage_ratio",
@@ -817,6 +858,8 @@ def sanitize_tw_signals(
         "scan_limit",
         "scan_limit_reached",
         "record_count",
+        "record_count_pending",
+        "revision_scope",
         "direction_summary_scope",
         "direction_summary",
         "opening_execution_audit_scope",
@@ -838,6 +881,9 @@ def sanitize_tw_signals(
             "bid",
             "counterfactual_open_replay",
             "counterfactual_0901_price_fill",
+            "historical_open_fallback_fill",
+            "recorded_at_basis",
+            "replay_generated_at",
             "counterfactual_overnight_replay",
             "day_trade_eligible",
             "execution_price",
@@ -985,6 +1031,9 @@ def sanitize_tw_events(
             "fill_at",
             "exchange_match_at",
             "fill_contract",
+            "historical_open_fallback_fill",
+            "recorded_at_basis",
+            "replay_generated_at",
             "market",
             "order_type",
             "price",

@@ -922,6 +922,10 @@ class NewsQueue:
         except BlockingIOError:
             self.owner_lock.close()
             raise RuntimeError("news_fulltext_owner_already_running") from None
+        # The original owner lock also fences the reviewed bodies handoff.
+        # Refuse a C placeholder if the workspace mount has not recovered.
+        from stockagent.data_sync.workspace_source_handoff import guard_path
+        guard_path(root / 'bodies')
         self.owner = uuid.uuid4().hex
         self.lifecycle = lifecycle
         if lifecycle is not None:

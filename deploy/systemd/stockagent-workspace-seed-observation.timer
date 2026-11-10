@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh enrolled E seed progress once per minute
+
+[Timer]
+OnBootSec=60s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Unit=stockagent-workspace-seed-observation.service
+
+[Install]
+WantedBy=timers.target

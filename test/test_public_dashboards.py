@@ -521,6 +521,21 @@ def test_tw_signal_embedded_valuation_uses_public_position_boundary() -> None:
                         }}
 
 
+def test_official_open_assumption_flag_survives_public_projection_without_private_proof() -> None:
+    public = sanitize_tw_signals({"simulation_only": True, "production_order_possible": False,
+        "rows": [{"symbol": "5291", "filled_shares": 8000,
+                  "historical_open_fallback_fill": True,
+                  "historical_open_fallback_evidence": {"source_path": "/private/source"},
+                  "position": {"symbol": "5291", "filled_shares": 8000,
+                               "historical_open_fallback_fill": True,
+                               "historical_open_fallback_evidence": {"source_path": "/private/source"}}}]})
+    row = public["rows"][0]
+    assert row["historical_open_fallback_fill"] is True
+    assert row["position"]["historical_open_fallback_fill"] is True
+    assert "historical_open_fallback_evidence" not in row
+    assert "historical_open_fallback_evidence" not in row["position"]
+
+
 def test_tw_signal_nested_scrub_keeps_security_rules_after_key_cache_hits() -> None:
     long_private_key = "x" * 129 + "_path"
     payload = {
@@ -771,6 +786,14 @@ def test_signal_display_filter_is_strict_and_not_a_position_filter() -> None:
             PublicDashboardHandler._signal_query(invalid, allow_hide_zero_targets=True)
     with pytest.raises(InvalidPublicRequest):
         PublicDashboardHandler._signal_query(query)
+    for scope in ("all", "latest"):
+        assert f"revision_scope={scope}" in PublicDashboardHandler._signal_query(
+            query + f"&revision_scope={scope}", allow_hide_zero_targets=True)
+    for invalid in ("revision_scope=old", "revision_scope=", "revision_scope=all&revision_scope=latest"):
+        with pytest.raises(InvalidPublicRequest):
+            PublicDashboardHandler._signal_query(invalid, allow_hide_zero_targets=True)
+    with pytest.raises(InvalidPublicRequest):
+        PublicDashboardHandler._signal_query("revision_scope=latest")
 
 
 @pytest.mark.parametrize("product", ["tw-day-trade", "tw-overnight"])
@@ -793,13 +816,16 @@ def test_both_public_signal_routes_forward_zero_target_display_filter(monkeypatc
         assert calls[-1]["hide_zero_targets"] is (value == "1")
     handler._api_response(f"/{product}/api/signals", "")
     assert calls[-1]["hide_zero_targets"] is False
+    assert calls[-1]["revision_scope"] == "all"
+    handler._api_response(f"/{product}/api/signals", "revision_scope=latest")
+    assert calls[-1]["revision_scope"] == "latest"
 
 
 def test_public_landing_exposes_live_safe_status_without_remote_assets() -> None:
     root = Path(__file__).resolve().parents[1] / "services" / "public_dashboards"
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "public.js").read_text(encoding="utf-8")
-    assert 'src="dashboard-core.js?v=15"' in html
+    assert 'src="dashboard-core.js?v=20"' in html
     assert 'src="public.js?v=17"' in html
     assert 'id="taifex-health"' in html
     assert 'id="tw-health"' in html
@@ -1151,9 +1177,9 @@ def test_public_pages_share_visual_tokens() -> None:
         html = (root / relative).read_text(encoding="utf-8")
         core_version = 7 if "quote-display-notice" in html else 6
         assert f"dashboard-core.css?v={core_version}" in html
-        assert "dashboard-responsive.css?v=11" in html
+        assert "dashboard-responsive.css?v=12" in html
         assert f'data-dashboard-nav="{dashboard_id}"' in html
-        script_version = 19 if relative == "tw_day_trade_dashboard/index.html" else 15
+        script_version = 20
         assert f'dashboard-core.js?v={script_version}" defer' in html
         assert html.index(f"dashboard-core.js?v={script_version}") < html.index(
             "app.js" if relative != "public_dashboards/index.html" else "public.js"
@@ -1168,7 +1194,7 @@ def test_public_pages_share_visual_tokens() -> None:
         assert f'src="../time-axis.js?v={version}"' in html
     tw_html = (root / "tw_day_trade_dashboard/index.html").read_text(encoding="utf-8")
     assert 'src="../vendor/uplot/uPlot.iife.min.js?v=1.6.32"' in tw_html
-    assert 'src="chart-renderer.js?v=6"' in tw_html
+    assert 'src="chart-renderer.js?v=8"' in tw_html
     assert "https://" not in tw_html and "http://" not in tw_html
 
     shared_javascript = (root / "public_dashboards" / "dashboard-core.js").read_text(
@@ -1218,7 +1244,7 @@ def test_public_pages_share_visual_tokens() -> None:
     assert 'id="browser-page-filter"' in traffic_html
     assert "不上傳" in traffic_html
     assert 'href="performance.css?v=4"' in traffic_html
-    assert 'src="app.js?v=12"' in traffic_html
+    assert 'src="app.js?v=13"' in traffic_html
     assert 'id="history-range"' in traffic_html
     assert 'id="history-phase-rows"' in traffic_html
     assert 'id="history-route-rows"' in traffic_html
@@ -1334,6 +1360,75 @@ def _test_server(*, audience: str = "owner") -> PublicDashboardServer:
         tw_upstream="http://127.0.0.1:1",
         audience=audience,
     )
+
+
+def test_paper_read_retry_waits_for_commit_metadata_without_building_a_payload(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from scripts import serve_public_dashboards as module
+
+    clock = [0.0]
+    attempts = []
+
+    @contextmanager
+    def guard(root):
+        assert root == tmp_path
+        attempts.append(clock[0])
+        if len(attempts) < 4:
+            raise module.PaperReadChanged("writer has not published its marker")
+        yield
+
+    monkeypatch.setattr(module, "committed_paper_read_guard", guard)
+    monkeypatch.setattr(module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+    assert PublicDashboardServer._wait_for_paper_commit(tmp_path)
+    assert attempts == pytest.approx([0.0, 0.02, 0.04, 0.06])
+
+
+def test_paper_read_retry_exhaustion_is_bounded_and_not_a_commit_acceptance(monkeypatch, tmp_path):
+    from contextlib import contextmanager
+    from types import SimpleNamespace
+    from scripts import serve_public_dashboards as module
+
+    clock = [0.0]
+    @contextmanager
+    def guard(_root):
+        raise module.PaperReadChanged("inconsistent marker")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(module, "committed_paper_read_guard", guard)
+    monkeypatch.setattr(module, "time", SimpleNamespace(
+        monotonic=lambda: clock[0], sleep=lambda seconds: clock.__setitem__(0, clock[0] + seconds)))
+    assert not PublicDashboardServer._wait_for_paper_commit(tmp_path)
+    assert clock[0] == pytest.approx(0.75)
+
+
+def test_paper_detail_retry_rebuilds_only_after_a_stable_fence(monkeypatch):
+    from contextlib import contextmanager
+    from scripts import serve_public_dashboards as module
+
+    server = _test_server()
+    guards, waits, builds = [], [], []
+    @contextmanager
+    def guard(_root):
+        guards.append(1)
+        if len(guards) == 1:
+            raise module.PaperReadChanged("commit pending")
+        yield
+
+    monkeypatch.setattr(module, "committed_paper_read_guard", guard)
+    monkeypatch.setattr(server, "content_token", lambda *args, **kwargs: "one-source")
+    monkeypatch.setattr(server, "_wait_for_paper_commit", lambda root: waits.append(root))
+    def builder():
+        builds.append(1)
+        return {"rows": [], "verified": True}
+    try:
+        response = server.cached_paper_json("tw", source_token="one-source", builder=builder,
+            cache_key="scope:one-source", ttl_seconds=1, cache_control="no-store")
+        assert json.loads(response.body)["verified"] is True
+        assert len(guards) == 2 and len(waits) == 1 and len(builds) == 1
+    finally:
+        server.server_close()
 
 
 def _stub_overview_sources(server, monkeypatch, *, failed=None, blocked=None):
@@ -2282,6 +2377,114 @@ def test_data_monitor_storage_operations_are_sanitized_background_receipts(tmp_p
         server.server_close()
 
 
+def test_storage_long_operation_list_is_lazy_and_remains_accessible(protocol_server):
+    from playwright.sync_api import expect, sync_playwright
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+    from stockagent.data_sync import storage_monitor
+
+    payload = storage_monitor.public_status({})
+    now = datetime.now(UTC).isoformat()
+    rows = [{'id': f'task-{i}', 'kind': 'retirement', 'label': f'工作 {i}', 'state': 'waiting',
+             'phase_label': '等待執行', 'scope': '固定版本', 'observed_at_utc': now,
+             'complete_evidence': False, 'progress': {}, 'eta': {'state': 'unknown'}, 'metrics': {}}
+            for i in range(250)]
+    payload['operations'] = {'contract': 'stockagent.storage_operations.v1', 'read_only': True,
+        'state': 'available', 'observed_at_utc': now, 'summary': {}, 'tasks': rows,
+        'overall_eta': {'state': 'unknown'}, 'flow': [], 'schedules': []}
+    with sync_playwright() as runtime:
+        browser = runtime.chromium.launch(**browser_profile_launch_options('cpu-2d'))
+        try:
+            page = browser.new_page(viewport={'width': 1200, 'height': 900})
+            errors = []
+            page.on('pageerror', lambda error: errors.append(str(error)))
+            page.route('**/data-monitor/api/**', lambda route: route.fulfill(content_type='application/json',
+                body=json.dumps({'summary': {}, 'groups': [], 'sources': [], 'provider_summaries': []})))
+            page.route('**/data-monitor/api/storage', lambda route: route.fulfill(content_type='application/json',
+                body=json.dumps(payload)))
+            page.goto(f'http://127.0.0.1:{protocol_server.port}/data-monitor/', wait_until='domcontentloaded')
+            expect(page.locator('#storage-operation-tasks > article')).to_have_count(6)
+            expect(page.locator('#storage-operation-other-tasks > article')).to_have_count(0)
+            page.locator('#acq-storage > summary').click()
+            page.locator('#storage-operations-more > summary').click()
+            expect(page.locator('#storage-operation-other-tasks > article')).to_have_count(100)
+            page.locator('#storage-operation-other-tasks > button').click()
+            expect(page.locator('#storage-operation-other-tasks > article')).to_have_count(200)
+            first = page.locator('#storage-operation-other-tasks [data-operation-detail]').first
+            first.locator('summary').click()
+            assert first.evaluate('(node) => node.open')
+            rows[6]['phase_label'] = '已更新的工作狀態'
+            page.evaluate("document.dispatchEvent(new Event('visibilitychange'))")
+            expect(page.locator('#storage-operation-other-tasks > article').first).to_contain_text('已更新的工作狀態')
+            expect(page.locator('#storage-operation-other-tasks > article')).to_have_count(200)
+            expect(first).to_have_attribute('open', '')
+            page.locator('#storage-operations-more > summary').click()
+            expect(page.locator('#storage-operation-other-tasks > article')).to_have_count(0)
+            assert errors == []
+        finally:
+            browser.close()
+
+
+def test_storage_stage_timeline_is_visible_scoped_and_expires_on_desktop_and_mobile(protocol_server):
+    from playwright.sync_api import expect, sync_playwright
+    from scripts.probe_browser_runtime import browser_profile_launch_options
+    from stockagent.data_sync import storage_monitor
+
+    payload = storage_monitor.public_status({})
+    flow = [
+        {'id': 'e_copy', 'label': 'E 複製讀回', 'state': 'completed'},
+        {'id': 'publish', 'label': 'D 來源封存', 'state': 'running',
+         'known_current_step_completion_at_utc': '2026-11-05T10:30:00Z'},
+        {'id': 'e_handoff', 'label': '來源交接', 'state': 'running', 'unassessed_source_count': 24,
+         'known_current_step_completion_at_utc': '2026-11-05T10:32:00Z'},
+        {'id': 'nas', 'label': 'NAS 讀回', 'state': 'blocked',
+         'next_check_at_utc': '2026-11-05T10:31:00Z'},
+    ]
+    payload['operations'] = {'contract': 'stockagent.storage_operations.v1', 'read_only': True, 'state': 'available',
+        'observed_at_utc': datetime.now(UTC).isoformat(), 'summary': {}, 'tasks': [],
+        'overall_eta': {'state': 'unknown'}, 'flow': flow, 'schedules': []}
+    with sync_playwright() as runtime:
+        browser = runtime.chromium.launch(**browser_profile_launch_options('cpu-2d'))
+        try:
+            for width in (1440, 390):
+                payload['operations']['state'] = 'available'
+                page = browser.new_page(viewport={'width': width, 'height': 900})
+                errors = []
+                page.on('pageerror', lambda error: errors.append(str(error)))
+                page.route('**/data-monitor/api/**', lambda route: route.fulfill(content_type='application/json',
+                    body=json.dumps({'summary': {}, 'groups': [], 'sources': [], 'provider_summaries': []})))
+                page.route('**/data-monitor/api/storage', lambda route: route.fulfill(content_type='application/json',
+                    body=json.dumps(payload)))
+                page.goto(f'http://127.0.0.1:{protocol_server.port}/data-monitor/', wait_until='domcontentloaded')
+                timeline = page.locator('#storage-phase-timeline')
+                expect(timeline.locator('tr')).to_have_count(4)
+                page.locator('#acq-storage > summary').click()
+                timeline.scroll_into_view_if_needed()
+                expect(timeline).to_be_visible()
+                assert page.locator('.storage-phase-table').evaluate('(node) => getComputedStyle(node).display') == 'table'
+                assert timeline.evaluate('(node) => getComputedStyle(node).display') == 'table-row-group'
+                assert timeline.locator('tr').first.evaluate('(node) => getComputedStyle(node).display') == 'table-row'
+                expect(page.locator('.storage-phase-table thead')).to_be_visible()
+                first_row = timeline.locator('tr').first
+                assert first_row.locator('td').last.bounding_box()['width'] > first_row.locator('th').bounding_box()['width']
+                assert not page.locator('#storage-operation-schedules').evaluate('(node) => node.open')
+                expect(timeline.locator('tr').nth(1)).to_contain_text('18:30')
+                expect(timeline.locator('tr').nth(1)).to_contain_text('整階段及後續步驟待估')
+                expect(timeline.locator('tr').nth(2)).to_contain_text('24 個來源待確認交接')
+                expect(timeline.locator('tr').nth(2)).to_contain_text('18:32')
+                expect(timeline.locator('tr').nth(2)).to_contain_text('整階段待估')
+                expect(timeline.locator('tr').nth(3)).to_contain_text('不是完成時間')
+                payload['operations']['state'] = 'stale'
+                page.evaluate('document.dispatchEvent(new Event("visibilitychange"))')
+                expect(timeline.locator('tr').nth(1)).to_contain_text('觀測已過期，暫停估算')
+                assert '18:30' not in timeline.inner_text()
+                assert '18:32' not in timeline.inner_text()
+                assert page.evaluate('document.documentElement.scrollWidth <= window.innerWidth')
+                assert not errors
+                page.close()
+        finally:
+            browser.close()
+
+
 def test_data_monitor_features_reads_separate_read_only_snapshot(tmp_path: Path) -> None:
     server = _test_server()
     server.repo_root = tmp_path
@@ -2647,6 +2850,56 @@ def test_status_revision_is_bound_to_the_actual_committed_snapshot(monkeypatch, 
         prefix = "tw-status:" if product == "tw" else "overnight-status:"
         keys = [key for key in server._cache if key.startswith(prefix)]
         assert keys and all("2:history:quotes" in key for key in keys)
+    finally:
+        server.server_close()
+
+
+def test_only_newer_engine_commit_requires_every_independent_identity():
+    from scripts.serve_public_dashboards import PublicDashboardServer
+    before = {"engine_generation": "run", "history_revision": "history", "public_quote_revision": "quotes",
+              "enabled_markets": ["a", "b"], "session_clock": {"display_session_date": "2026-11-09"},
+              "content_revision": 10, "state_revision": 20, "engine_revision_token": "10:readiness:date"}
+    after = before | {"content_revision": 11, "state_revision": 21, "engine_revision_token": "11:readiness:date"}
+    assert PublicDashboardServer._only_newer_engine_commit(before, after)
+    for changes in ({"engine_generation": "different"}, {"history_revision": "different"},
+                    {"public_quote_revision": "different"}, {"enabled_markets": ["a"]},
+                    {"session_clock": {"display_session_date": "2026-11-10"}},
+                    {"content_revision": 9}, {"state_revision": 19}, {"state_revision": 20},
+                    {"engine_revision_token": "11:changed-readiness:date"},
+                    {"engine_revision_token": "100:readiness:date"}, {"state_revision": True}):
+        assert not PublicDashboardServer._only_newer_engine_commit(before, after | changes)
+    assert not PublicDashboardServer._only_newer_engine_commit(before, {"content_revision": 11})
+
+
+def test_status_admits_only_proven_captured_as_of_snapshot_after_newer_commit():
+    server = _test_server()
+    before = {"engine_generation": "run", "history_revision": "history", "public_quote_revision": "quotes",
+              "enabled_markets": ["a"], "session_clock": {"display_session_date": "2026-11-09"},
+              "content_revision": 10, "state_revision": 20, "engine_revision_token": "10:readiness:date",
+              "revision_token": "10:readiness:date:history:quotes"}
+    after = before | {"content_revision": 11, "state_revision": 21,
+                      "engine_revision_token": "11:readiness:date",
+                      "revision_token": "11:readiness:date:history:quotes"}
+    sequence = iter([before, after])
+
+    def reader():
+        value = next(sequence)
+        return server.cached_local_json(cache_key=f"revision-{value['state_revision']}", ttl_seconds=0,
+            cache_control="no-store", builder=lambda: value)
+
+    def builder():
+        return {"_verified_captured_commit": True, "modes": [], "service_sync": {
+            "revision_token": before["engine_revision_token"], "engine_generation": "run",
+            "state_revision": 20, "content_revision": 10}}
+
+    try:
+        result = json.loads(server._committed_status_response(revision_reader=reader,
+            cache_key=lambda r: "captured:" + r["revision_token"], builder=builder).body)
+        assert "_verified_captured_commit" not in result
+        assert result["service_sync"]["snapshot_as_of_superseded"] is True
+        assert result["service_sync"]["state_revision"] == 20
+        assert result["service_sync"]["content_revision"] == 10
+        assert result["service_sync"]["revision_token"] == before["revision_token"]
     finally:
         server.server_close()
 
@@ -3837,11 +4090,13 @@ def test_overview_prewarms_before_large_history_scans() -> None:
     tw_history_call = method.index("                self.tw_history(")
     history_call = method.index("            taifex_history_builder()")
     full_history_call = method.index("            self.tw_history(\n                \"all\",")
+    signal_call = method.index("                build_dashboard_signal_page(")
     detail_pool = method.index("        builders: tuple[Callable[[], object], ...] = (")
     assert (
         overview_call
         < tw_status_call
         < tw_history_call
+        < signal_call
         < history_call
         < full_history_call
         < detail_pool
@@ -3849,6 +4104,9 @@ def test_overview_prewarms_before_large_history_scans() -> None:
     assert "start_date=current_tw_session_date" in method
     assert 'history_encoding="minute_columns_v2"' in method
     assert "end_date=current_tw_session_date" in method
+    assert 'hide_zero_targets=True' in method
+    assert 'offset=0, limit=100' in method
+    assert method.split("\nclass PublicDashboardHandler", 1)[0].count("build_dashboard_signal_page(") == 1
 
 
 def test_token_bucket_rate_limiter_refills_and_caps_client_table() -> None:
@@ -4044,6 +4302,176 @@ def test_public_performance_history_compacts_old_minutes_without_losing_counts(
         assert len(rows) == 1
         assert rows[0]["aggregate"]["requests"] == 2
         assert restored.status()["loaded_rows"] == 2
+    finally:
+        restored.close()
+
+
+def test_background_history_restore_is_nonblocking_and_merges_new_minutes_once(tmp_path, monkeypatch):
+    minute = int(time.time()) // 60 * 60 - 60
+    aggregate = TrafficAggregate()
+    aggregate.record(latency_ms=4.0, response_body_bytes=50, status=200, route_kind="api")
+
+    def row(epoch, key):
+        return {"schema_version": 1, "minute_epoch": epoch, "process_key": key,
+                "aggregate": aggregate.to_payload(), "routes": {}, "cache": {}}
+
+    seed = PublicPerformanceHistoryStore(tmp_path)
+    assert seed.enqueue(row(minute, "0123456789abcdef"))
+    seed.close()
+    started, release = threading.Event(), threading.Event()
+    original = PublicPerformanceHistoryStore._restore_in_background
+
+    def blocked_restore(self, sources):
+        started.set()
+        assert release.wait(10)
+        original(self, sources)
+
+    monkeypatch.setattr(PublicPerformanceHistoryStore, "_restore_in_background", blocked_restore)
+    restored = PublicPerformanceHistoryStore(tmp_path, background_restore=True)
+    try:
+        assert started.wait(2)
+        assert restored.status()["health"] == "warming"
+        assert restored.status()["history_restore_in_progress"] is True
+        assert restored.enqueue(row(minute, "fedcba9876543210"))
+        old_minute = (minute - 3 * 86_400) // 3_600 * 3_600
+        assert restored.enqueue(row(old_minute, "1111111111111111"))
+        restored._queue.join()  # Both new rows are durable before the fenced prefix is read.
+        assert len(restored.rows_since(minute)) == 1
+        release.set()
+        restored._restore_thread.join(timeout=10)
+        assert not restored._restore_thread.is_alive()
+        assert restored.status()["health"] == "ready"
+        assert restored.status()["loaded_rows"] == 1
+        rows = restored.rows_since(old_minute)
+        assert sum(item["aggregate"]["requests"] for item in rows) == 3
+    finally:
+        release.set()
+        restored.close()
+    complete = PublicPerformanceHistoryStore(tmp_path)
+    try:
+        assert sum(item["aggregate"]["requests"] for item in complete.rows_since(old_minute)) == 3
+    finally:
+        complete.close()
+
+
+def test_background_history_restore_reports_replaced_source_as_degraded(tmp_path, monkeypatch):
+    minute = int(time.time()) // 60 * 60 - 60
+    aggregate = TrafficAggregate()
+    aggregate.record(latency_ms=4.0, response_body_bytes=50, status=200, route_kind="api")
+    seed = PublicPerformanceHistoryStore(tmp_path)
+    assert seed.enqueue({"schema_version": 1, "minute_epoch": minute, "process_key": "0123456789abcdef",
+                         "aggregate": aggregate.to_payload(), "routes": {}, "cache": {}})
+    seed.close()
+    source = next(tmp_path.glob("*.jsonl"))
+    started, release = threading.Event(), threading.Event()
+    original = PublicPerformanceHistoryStore._restore_in_background
+
+    def blocked_restore(self, sources):
+        started.set()
+        assert release.wait(10)
+        original(self, sources)
+
+    monkeypatch.setattr(PublicPerformanceHistoryStore, "_restore_in_background", blocked_restore)
+    restored = PublicPerformanceHistoryStore(tmp_path, background_restore=True)
+    try:
+        assert started.wait(2)
+        source.replace(tmp_path / "preserved-original")
+        source.write_text("{}\n")
+        release.set()
+        restored._restore_thread.join(timeout=10)
+        assert restored.status()["health"] == "degraded"
+        assert restored.status()["loaded_rows"] == 0
+        assert (tmp_path / "preserved-original").is_file()
+    finally:
+        release.set()
+        restored.close()
+
+
+def test_background_history_snapshot_never_reports_partial_swap_as_ready(tmp_path, monkeypatch):
+    minute = int(time.time()) // 60 * 60 - 60
+    aggregate = TrafficAggregate()
+    aggregate.record(latency_ms=4.0, response_body_bytes=50, status=200, route_kind="api")
+    seed = PublicPerformanceHistoryStore(tmp_path)
+    assert seed.enqueue({"schema_version": 1, "minute_epoch": minute, "process_key": "0123456789abcdef",
+                         "aggregate": aggregate.to_payload(), "routes": {}, "cache": {}})
+    seed.close()
+    started, release = threading.Event(), threading.Event()
+    original_restore = PublicPerformanceHistoryStore._restore_in_background
+
+    def blocked_restore(self, sources):
+        started.set()
+        assert release.wait(10)
+        original_restore(self, sources)
+
+    monkeypatch.setattr(PublicPerformanceHistoryStore, "_restore_in_background", blocked_restore)
+    observer = PublicTrafficObserver(history_root=tmp_path, background_history_restore=True)
+    try:
+        assert started.wait(2)
+        store = observer._history_store
+        original_rows = store.rows_since_readonly
+
+        def rows_before_atomic_swap(since):
+            rows = original_rows(since)
+            release.set()
+            store._restore_thread.join(timeout=10)
+            assert not store._restore_thread.is_alive()
+            return rows
+
+        monkeypatch.setattr(store, "rows_since_readonly", rows_before_atomic_swap)
+        partial = observer.history_snapshot("24h")
+        assert partial["summary"]["requests"] == 0
+        assert partial["history_storage"]["health"] == "warming"
+        assert partial["history_storage"]["history_restore_in_progress"] is True
+        assert store.status()["health"] == "ready"
+        monkeypatch.setattr(store, "rows_since_readonly", original_rows)
+        complete = observer.history_snapshot("24h")
+        assert complete["summary"]["requests"] == 1
+        assert complete["history_storage"]["health"] == "ready"
+        assert complete["history_storage"]["history_restore_in_progress"] is False
+    finally:
+        release.set()
+        observer.close()
+
+
+def test_background_history_thread_start_failure_keeps_writer_available(tmp_path, monkeypatch):
+    original = threading.Thread.start
+
+    def start(thread):
+        if thread.name == "public-performance-history-restore":
+            raise RuntimeError("thread unavailable")
+        return original(thread)
+
+    monkeypatch.setattr(threading.Thread, "start", start)
+    store = PublicPerformanceHistoryStore(tmp_path, background_restore=True)
+    try:
+        assert store.status()["health"] == "degraded"
+        assert store.status()["enabled"] is True
+        assert store.status()["history_restore_in_progress"] is False
+        aggregate = TrafficAggregate()
+        aggregate.record(latency_ms=4.0, response_body_bytes=50, status=200, route_kind="api")
+        assert store.enqueue({"schema_version": 1, "minute_epoch": int(time.time()) // 60 * 60,
+                              "process_key": "0123456789abcdef", "aggregate": aggregate.to_payload(),
+                              "routes": {}, "cache": {}})
+        store._queue.join()
+        assert len(list(tmp_path.glob("*.jsonl"))) == 1
+    finally:
+        store.close()
+
+
+def test_background_history_keeps_the_existing_unicode_line_limit(tmp_path):
+    minute = int(time.time()) // 60 * 60 - 60
+    aggregate = TrafficAggregate()
+    aggregate.record(latency_ms=4.0, response_body_bytes=50, status=200, route_kind="api")
+    row = {"schema_version": 1, "minute_epoch": minute, "process_key": "0123456789abcdef",
+           "aggregate": aggregate.to_payload(), "routes": {}, "cache": {}, "unused": "測" * 400_000}
+    day = datetime.fromtimestamp(minute, UTC).date().isoformat()
+    (tmp_path / f"{day}.jsonl").write_text(json.dumps(row, ensure_ascii=False) + "\n")
+    restored = PublicPerformanceHistoryStore(tmp_path, background_restore=True)
+    try:
+        restored._restore_thread.join(timeout=10)
+        assert restored.status()["loaded_rows"] == 1
+        assert restored.status()["invalid_rows"] == 0
+        assert restored.status()["health"] == "ready"
     finally:
         restored.close()
 

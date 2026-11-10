@@ -23,6 +23,46 @@ from stockagent.control._schema import SCHEMA_VERSION
 from stockagent.data_sync.storage_automation import bounded_receipt, systemd_observations, lakehouse_readiness
 
 
+# The existing finite-priority scheduler replaces these continuous provider
+# lanes when they are explicitly disabled. Observing that selection must not
+# start a duplicate downloader merely to satisfy a boot audit. Trading, gateway
+# and storage owners remain required even if their enablement was changed.
+OPTIONAL_DISABLED_PROVIDER_LANES = frozenset({
+    'stockagent-finmind-free.service', 'stockagent-finmind-sponsor.service',
+    'stockagent-finmind-complement.service',
+})
+
+
+def prepare_windows_observer_environment() -> dict:
+    """Select a verified bridge for this single-threaded audit process.
+
+    A leftover /run/WSL/1_interop socket can exist but fail native queries.
+    Selection is only transport admission: the real holder/readiness probes
+    below still have to succeed, and no service environment is changed.
+    """
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    from stockagent.data_sync.windows_cold_io import _windows_process_environment
+    try:
+        environment = _windows_process_environment()
+    except (OSError, SnapshotError, subprocess.SubprocessError) as error:
+        return {'state': 'unavailable', 'error_type': type(error).__name__}
+    if environment is None:
+        return {'state': 'not_applicable'}
+    bridge = environment.get('WSL_INTEROP')
+    if not isinstance(bridge, str) or not bridge:
+        return {'state': 'unavailable', 'error_type': 'MissingVerifiedBridge'}
+    os.environ['WSL_INTEROP'] = bridge
+    return {'state': 'verified'}
+
+
+def inactive_disabled_provider_lanes(units: dict) -> list[str]:
+    return [name for name in PROFILES if name in OPTIONAL_DISABLED_PROVIDER_LANES
+            and units[name].get('LoadState') == 'loaded'
+            and units[name].get('UnitFileState') == 'disabled'
+            and units[name].get('ActiveState') == 'inactive'
+            and units[name].get('Result') == 'success']
+
+
 def control_verification_readiness(
     timers: dict, *,
     policy: Path = Path('/etc/stockagent/control-release-verification.json'),
@@ -89,9 +129,12 @@ def main() -> None:
     parser.add_argument('--state-root', type=Path, default=Path('/var/lib/stockagent/boot-recovery'))
     args = parser.parse_args()
     args.state_root.mkdir(parents=True, mode=0o700, exist_ok=True)
+    observer_environment = prepare_windows_observer_environment()
     report = build_report(sample_seconds=1)
     units = snapshot()
-    unavailable = [name for name in PROFILES if units[name].get('ActiveState') != 'active']
+    disabled_provider_lanes = inactive_disabled_provider_lanes(units)
+    unavailable = [name for name in PROFILES if units[name].get('ActiveState') != 'active'
+                   and name not in disabled_provider_lanes]
     guards = {}
     for name in ('mount_packed_d_cold.sh', 'mount_backup_transport.sh'):
         result = subprocess.run(['bash', str(ROOT / 'scripts' / name), '--check'],
@@ -118,7 +161,9 @@ def main() -> None:
                    and control_verification['ready'] and lakehouse['ready'])
     report['boot_recovery'] = {
         'local_infrastructure_ready': local_ready,
+        'windows_observer_transport': observer_environment,
         'unavailable_critical_owners': unavailable,
+        'inactive_disabled_provider_lanes': disabled_provider_lanes,
         'inactive_enabled_timers': inactive_timers,
         'mount_guards': guards,
         'postgres_contract_read_verified': database_ready,

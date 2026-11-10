@@ -52,6 +52,9 @@
     }
 
     function liquidation(row, signedShares) {
+      if (row.nontrade_settlement_contract || row.status === "nontrade_book_settled") {
+        return {fields: null, label: row.nontrade_reference_time_unknown ? "官方日報收盤價（非成交、時間未知）" : "最後觀測（非成交）", at: row.nontrade_reference_observed_at};
+      }
       const closed = row.status === "closed" || (Number(row.filled_shares) > 0 && signedShares === 0);
       return {fields: closed ? ["exit_price", "last_exit_price"] : "last_mark_price",
         label: closed ? "清算（已平倉）" : "清算",
@@ -143,7 +146,8 @@
         const sortedDates = [...dates].sort();
         const sortedClocks = [...clocks].sort((a, b) => Date.parse(a) - Date.parse(b));
         const range = values => values.length ? `${values[0]}${values.length > 1 && values[0] !== values.at(-1) ? ` ～ ${values.at(-1)}` : ""}` : "—";
-        const basis = proof.publication_basis === "owner_paper_transaction_report_v1" ? "模擬帳本成交 · 非券商成交"
+        const basis = proof.evidence_kind === "paper_assumption" ? "開盤價假設進場 · 首筆時間與成交量未確認"
+          : proof.publication_basis === "owner_paper_transaction_report_v1" ? "模擬帳本成交 · 非券商成交"
           : proof.publication_basis === "owner_paper_strategy_report_v1" ? "策略設定 · 非行情／非成交"
           : proof.publication_basis === "owner_private_view" ? "本人私人檢視 · 原始觀測／帳本價格"
           : proof.grain === "daily" ? "官方日資料 · 非分鐘／即時行情" : "已驗證可公開行情";
@@ -164,6 +168,12 @@
     function positionRow(row) {
       const {signedShares, realized:realizedNet, unrealized:unrealizedNet, total:totalNet} = resolvedPositionPnl(row);
       const mark = liquidation(row, signedShares);
+      const nontrade = Boolean(row.nontrade_settlement_contract || row.status === "nontrade_book_settled");
+      const bracketNotes = `${row.price_limit_band_kind === "recorded_system_band_without_daily_price_limit"
+        ? "<small>無每日漲跌幅限制；TP／SL 依系統委託邊界推導，並非一般漲跌停。</small>" : ""}${row.paper_bracket_full_cross_assumed
+        ? "<small>穿價後全數出場為模擬假設，非交易所或券商成交。</small>" : ""}`;
+      const exitReason = row.exit_reason === "13_33_delayed_close_paper_settlement"
+        ? "13:33 延後收盤模擬沖銷（非券商成交）" : (row.exit_reason || row.status || "—");
       if (product === "tw_overnight") {
         const openStatus = row.opening_exit_order_status || "尚未送出";
         return `<tr data-public-signal-key="${esc(row.public_signal_key || "")}">
@@ -177,22 +187,24 @@
       }
       return `<tr data-public-signal-key="${esc(row.public_signal_key || "")}">
         <td><strong>${esc(strategyLabel(row))}</strong> ${badge(row.side === "long" ? "多" : "空", row.side === "long" ? "good" : "bad")}<small>${esc(row.session_date)} · ${esc(row.symbol)} ${esc(row.name || "")}</small></td>
-        <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>未平倉 ${number(Math.abs(signedShares))} 股${Number(row.target_unsubmitted_shares || 0) > 0 ? ` · 目標缺口 ${number(row.target_unsubmitted_shares)} 股` : ""}</small></td>
-        <td><strong>進 ${quoteText(row, "entry_price")}</strong><small>${esc(row.counterfactual_open_replay ? replayTimingText(row, row.entry_at) : shortTime(row.entry_at))}</small><small>${mark.label} ${quoteText(row, mark.fields)} · ${shortTime(mark.at)}</small>${priceDistanceText(row, mark.fields)}</td>
-        <td><strong>TP ${quoteText(row, "take_profit_price", sourceNumber)} · SL ${quoteText(row, "stop_trigger_price", sourceNumber)}</strong><small>${esc(row.stop_order_status)}</small><small>13:20 ${quoteText(row, "eod_limit_price", sourceNumber)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small><small>13:25 ${quoteText(row, "closing_auction_limit_price", sourceNumber)} · ${esc(row.closing_auction_order_status || "未到")}</small></td>
-        <td><strong>${row.exit_price != null && !withheld(row, "exit_price") ? quoteText(row, "exit_price") : row.last_exit_price != null && !withheld(row, "last_exit_price") ? `${row.status === "closed" || signedShares === 0 ? "" : "部分 "}${quoteText(row, "last_exit_price")}` : withheld(row, "exit_price") || withheld(row, "last_exit_price") ? `${row.status === "closed" || signedShares === 0 ? "已平倉・" : "部分出場・"}${pendingQuoteText(row, ["exit_price", "last_exit_price"])}` : "持倉中"}</strong>${priceDistanceText(row, ["exit_price", "last_exit_price"])}<small>${esc(row.exit_reason || row.status || "—")}</small><small>${shortTime(row.exit_at || row.last_exit_at)}</small></td>
-        <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">已實現 ${money(realizedNet)}</small><small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small></td>
+        <td><strong>${pct(row.target_weight)}</strong><small>成交 ${number(row.filled_shares)}／預計 ${number(row.requested_shares)} 股</small><small>${nontrade ? "帳面剩餘" : "未平倉"} ${number(Math.abs(signedShares))} 股${Number(row.target_unsubmitted_shares || 0) > 0 ? ` · 目標缺口 ${number(row.target_unsubmitted_shares)} 股` : ""}</small></td>
+        <td><strong>進 ${quoteText(row, "entry_price")}</strong><small>${esc(row.counterfactual_open_replay ? replayTimingText(row, row.entry_at) : shortTime(row.entry_at))}</small>${row.historical_open_fallback_fill ? "<small>09:01 開盤價假設進場；首筆時間及成交量未確認</small>" : ""}<small>${mark.label} ${mark.fields ? quoteText(row, mark.fields) : "—"} · ${shortTime(mark.at)}</small>${mark.fields ? priceDistanceText(row, mark.fields) : ""}</td>
+        <td><strong>TP ${quoteText(row, "take_profit_price", sourceNumber)} · SL ${quoteText(row, "stop_trigger_price", sourceNumber)}</strong>${bracketNotes}<small>${esc(row.stop_order_status)}</small><small>13:20 ${quoteText(row, "eod_limit_price", sourceNumber)} · ${esc(row.eod_limit_order_status || "未到")} · ${shortTime(row.eod_limit_submitted_at)}</small><small>13:25 ${quoteText(row, "closing_auction_limit_price", sourceNumber)} · ${nontrade ? "未成交・假設帳面結算" : esc(row.closing_auction_order_status || "未到")}</small></td>
+        <td>${nontrade ? `<strong>假設帳面結算（非成交）</strong><small>${number(row.nontrade_settlement_shares)} 股 · ${row.nontrade_reference_time_unknown ? "官方日報收盤價，成交時間未知" : `最後觀測 ${shortTime(row.nontrade_reference_observed_at)}`}</small>${row.nontrade_reference_before_entry ? "<small>參考成交早於回放進場時間</small>" : ""}${row.last_exit_at ? `<small>先前部分模擬出場 ${shortTime(row.last_exit_at)}</small>` : ""}` : `<strong>${row.exit_price != null && !withheld(row, "exit_price") ? quoteText(row, "exit_price") : row.last_exit_price != null && !withheld(row, "last_exit_price") ? `${row.status === "closed" || signedShares === 0 ? "" : "部分 "}${quoteText(row, "last_exit_price")}` : withheld(row, "exit_price") || withheld(row, "last_exit_price") ? `${row.status === "closed" || signedShares === 0 ? "已平倉・" : "部分出場・"}${pendingQuoteText(row, ["exit_price", "last_exit_price"])}` : "持倉中"}</strong>${priceDistanceText(row, ["exit_price", "last_exit_price"])}<small>${esc(exitReason)}</small><small>${shortTime(row.exit_at || row.last_exit_at)}</small>`}</td>
+        <td><strong class="${pnlClass(totalNet)}">總 ${money(totalNet)}</strong><small class="${pnlClass(realizedNet)}">${nontrade ? "帳面損益（含假設結算）" : "已實現"} ${money(realizedNet)}</small>${nontrade ? `<small>模擬成交已實現 ${money(row.execution_realized_net_pnl_twd)} · 假設出場成本 ${money(row.nontrade_assumed_exit_fee_twd)}</small>` : `<small class="${pnlClass(unrealizedNet)}">未實現 ${money(unrealizedNet)} · ${row.valuation_stale ? badge("延用", "warn") : badge("新鮮", "good")}</small>`}</td>
       </tr>`;
 
     }
 
     function signalRow(row, {position, mode, sessionDate, selectedKey = ""} = {}) {
       position = row.position || position;
+      const sideLabel = row.side === "long" ? "多" : row.side === "short" ? "空" : row.side;
       const positionPnl = position ? resolvedPositionPnl(position) : null;
       const hasFill = product === "tw_overnight"
         ? Number(row.filled_shares || position?.filled_shares || 0) > 0
         : Number(row.filled_shares || 0) > 0;
       const hasPosition = Boolean(position && Number(position.filled_shares || 0) > 0);
+      const nontrade = Boolean(position?.nontrade_settlement_contract || position?.status === "nontrade_book_settled");
       const isOpen = hasPosition && positionPnl.signedShares !== 0;
       const indicative = String(position?.last_mark_quote_source || "").includes("stock_snapshot");
       const openingPrice = row.sizing_open_price ?? (row.counterfactual_open_replay ? row.execution_price : null);
@@ -203,7 +215,9 @@
         ? Math.abs(Number(row.filled_shares || 0)) * Number(executionPrice) : null;
       const minuteReplay = row.counterfactual_0901_price_fill === true
         || String(row.entry_fill_policy || "").startsWith("official_open_signal_0900_execute_0901");
-      const fillLabel = minuteReplay ? "09:01 首分鐘價反事實模擬" : "因果報價紙上模擬";
+      const openFallback = row.historical_open_fallback_fill === true || position?.historical_open_fallback_fill === true;
+      const fillLabel = openFallback ? "09:01 假設進場（官方當日開盤價；首筆時間、成交量未確認）"
+        : minuteReplay ? "09:01 首分鐘價反事實模擬" : "因果報價紙上模擬";
       const targetGap = Math.max(0, Number(row.requested_shares || 0) - Number(row.filled_shares || 0));
       const inventory = row.current_target_inventory;
       const inventoryHtml = inventory
@@ -218,20 +232,20 @@
         : hasTarget ? "完整模型訊號已保留 · 0 股紙上成交" : "不需開盤計價";
       const entryCounters = inventory
         ? `本版增倉委託 ${number(row.requested_shares)}／增倉成交 ${number(row.filled_shares)}／尚未成交 ${number(targetGap)} 股 · 減倉委託 ${number(row.reduction_requested_shares)}／減倉成交 ${number(row.reduction_filled_shares)} 股`
-        : `${hasTarget && !hasFill ? `${esc(signalReasonLabel(row.reason || row.status))} · ` : ""}模型目標 ${number(row.requested_shares)}／紙上成交 ${number(row.filled_shares)}／${minuteReplay ? "容量限制未建立委託" : "尚未成交"} ${number(targetGap)} 股${minuteReplay ? ` · 09:01 容量 ${number(row.minute_kbar_capacity_shares)}` : ` · L1 ${number(row.top_book_capacity_shares)}`}`;
+        : `${hasTarget && !hasFill ? `${esc(signalReasonLabel(row.reason || row.status))} · ` : ""}模型目標 ${number(row.requested_shares)}／紙上成交 ${number(row.filled_shares)}／${minuteReplay ? "容量限制未建立委託" : "尚未成交"} ${number(targetGap)} 股${openFallback ? " · 數量為假設，非券商或交易所成交" : minuteReplay ? ` · 09:01 容量 ${number(row.minute_kbar_capacity_shares)}` : ` · L1 ${number(row.top_book_capacity_shares)}`}`;
       const modeTotalEquity = row.session_date === sessionDate ? Number(mode?.total_equity_twd) : NaN;
       const equityImpactPct = hasPosition && positionPnl.total != null && Number.isFinite(modeTotalEquity) && Math.abs(modeTotalEquity) > .01
         ? Number(positionPnl.total) / modeTotalEquity * 100
         : null;
       const currentPrice = isOpen ? position.last_mark_price : position?.exit_price ?? position?.last_exit_price;
-      const currentLabel = isOpen ? (indicative ? "參考快照估值（非成交證據）" : "現在可清算價") : hasPosition ? "已平倉價" : hasFill ? "紙上已成交・估值未取得" : inventory ? "本版無新增持倉" : "未成交";
+      const currentLabel = nontrade ? "假設帳面結算（非成交）" : isOpen ? (indicative ? "參考快照估值（非成交證據）" : "現在可清算價") : hasPosition ? "已平倉價" : hasFill ? "紙上已成交・估值未取得" : inventory ? "本版無新增持倉" : "未成交";
       const missingPnlLabel = hasFill ? "估值資料未取得" : inventory ? "請見原成交生命週期" : "不計盈虧";
-      const currentAt = isOpen ? position.last_quote_at : position?.exit_at ?? position?.last_exit_at;
+      const currentAt = nontrade ? position?.nontrade_reference_observed_at : isOpen ? position.last_quote_at : position?.exit_at ?? position?.last_exit_at;
       const reasonText = signalReasonLabel(row.reason || row.status);
       const eligibility = row.day_trade_eligible
         ? badge(row.sell_first_allowed ? "可雙向" : "僅買先", row.sell_first_allowed ? "good" : "warn")
         : badge("不可當沖", "bad");
-      const result = badge(row.status, row.status === "ready" ? "good" : row.status === "partial_depth" ? "warn" : row.status === "hold" ? "" : "bad");
+      const result = openFallback ? badge("假設進場", "warn") : badge(row.status, row.status === "ready" ? "good" : row.status === "partial_depth" ? "warn" : row.status === "hold" ? "" : "bad");
       const selected = signalRowKey(row) === selectedKey ? " is-selected" : "";
       if (product === "tw_overnight") {
         const historical = row.counterfactual_overnight_replay === true;
@@ -249,7 +263,7 @@
           : null;
         return `<tr data-signal-key="${esc(signalRowKey(row))}" data-public-signal-key="${esc(row.public_signal_key || "")}" class="signal-row${selected}">
           <td><strong>${esc(strategyLabel(row))}</strong><small>${shortTime(row.signal_at)}</small></td>
-          <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
+          <td><strong>${esc(row.symbol)}</strong> ${badge(sideLabel, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
           <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small><small>${esc(signalReasonLabel(row.reason || row.status))}</small></td>
           <td><strong>${sizingLabel} ${quoteText(row, ["sizing_price_at_decision", "sizing_price_at_13_25", "sizing_open_price"])}</strong><small>${row.side === "long" ? "漲停買進" : row.side === "short" ? "跌停賣空" : "零權重"} · ${quoteText(row, "order_limit_price")}</small><small>目標 ${number(row.requested_shares)} 股 · ${row.simtrade === true ? "目前為試撮" : "等待／已見正式行情"}</small></td>
           <td><strong>${hasFill ? `${historical ? "官方收盤反事實" : "收盤成交"} ${position ? quoteText(position, "entry_price") : quoteText(row, "execution_price")}` : historical ? "歷史反事實未成交" : "尚無實際收盤成交"}</strong><small>${hasPosition ? `${isOpen ? (historical ? "期末估值" : "可清算") : (historical ? "官方開盤反事實沖銷" : "開盤沖銷")} ${quoteText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"])} · ${shortTime(currentAt)}` : hasFill ? "紙上已成交；對應持倉估值未取得" : historical ? "不補造歷史成交" : `訊號時 bid／ask ${quoteText(row, "bid", sourceNumber)}／${quoteText(row, "ask", sourceNumber)}`}</small>${hasPosition ? priceDistanceText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"]) : ""}<small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : missingPnlLabel}</small></td>
@@ -258,17 +272,19 @@
       }
       return `<tr data-signal-key="${esc(signalRowKey(row))}" data-public-signal-key="${esc(row.public_signal_key || "")}" class="signal-row${selected}">
         <td><strong>${esc(strategyLabel(row))}</strong><small>${esc(signalTimingText(row))}</small></td>
-        <td><strong>${esc(row.symbol)}</strong> ${badge(row.side, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
+        <td><strong>${esc(row.symbol)}</strong> ${badge(sideLabel, row.side === "long" ? "good" : row.side === "short" ? "bad" : "")}<small>${esc(row.name || "")}</small><small>${eligibility} ${result}</small>${futuresBadge(row.stock_futures)}</td>
         <td><strong>${sourceNumber(row.raw_score ?? row.score)}</strong><small>持倉目標 ${pct(row.target_weight)}</small>${inventoryHtml}<small>${esc(reasonText)}</small></td>
         <td>${entryHeading}<small>${entryDescription}</small><small>${entryCounters}</small></td>
-        <td><strong>${currentLabel} ${hasPosition ? quoteText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"]) : "—"}</strong><small>${hasPosition ? shortTime(currentAt) : `訊號時 bid／ask ${quoteText(row, "bid", sourceNumber)}／${quoteText(row, "ask", sourceNumber)}`}</small>${hasPosition ? priceDistanceText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"]) : ""}<small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : missingPnlLabel}</small></td>
-        <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : hasFill ? "已成交；待取得對應持倉估值" : inventory ? "庫存盈虧歸屬原成交，不重複歸入本版" : "未成交不納入"}</small></td>
+        <td><strong>${currentLabel} ${hasPosition && !nontrade ? quoteText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"]) : "—"}</strong><small>${hasPosition ? `${nontrade ? "最後觀測 " : ""}${shortTime(currentAt)}` : `訊號時 bid／ask ${quoteText(row, "bid", sourceNumber)}／${quoteText(row, "ask", sourceNumber)}`}</small>${hasPosition && !nontrade ? priceDistanceText(position, isOpen ? "last_mark_price" : ["exit_price", "last_exit_price"]) : ""}<small class="${pnlClass(positionPnl?.total)}">該檔盈虧 ${hasPosition ? money(positionPnl.total) : missingPnlLabel}</small></td>
+        <td><strong class="${pnlClass(positionPnl?.total)}">佔該模式總權益 ${equityImpactPct == null ? "—" : `${equityImpactPct >= 0 ? "+" : ""}${displayPct(equityImpactPct)}`}</strong><small>模式總權益 ${Number.isFinite(modeTotalEquity) ? summaryMoney(modeTotalEquity) : "—"}</small><small>${hasPosition ? (nontrade ? badge("非成交帳面估算", "warn") : position.valuation_stale ? badge("估值延用", "warn") : badge("估值新鮮", "good")) : hasFill ? "已成交；待取得對應持倉估值" : inventory ? "庫存盈虧歸屬原成交，不重複歸入本版" : "未成交不納入"}</small></td>
       </tr>`;
 
     }
 
     function eventRow(row) {
-      return `<tr><td>${esc(row.session_date)}<small>${shortTime(row.fill_at || row.recorded_at)}</small></td><td>${esc(strategyLabel(row))}<small>${esc(row.symbol)}</small></td><td>${esc(row.purpose)}</td><td>${esc(row.order_type || row.event_kind)}</td><td>${quoteText(row, "price", sourceNumber)} × ${number(row.quantity)}</td><td>${esc(row.status || row.event_kind)}</td></tr>`;
+      const nontrade = row.purpose === "nontrade_last_observed_accounting_settlement";
+      const assumed = row.historical_open_fallback_fill === true;
+      return `<tr><td>${esc(row.session_date)}<small>${shortTime(row.fill_at || row.recorded_at)}</small></td><td>${esc(strategyLabel(row))}<small>${esc(row.symbol)}</small></td><td>${nontrade ? "假設帳面結算" : assumed ? "開盤價假設進場" : esc(row.purpose)}</td><td>${nontrade ? "帳務事件" : assumed ? "紙上假設" : esc(row.order_type || row.event_kind)}</td><td>${nontrade ? "—" : quoteText(row, "price", sourceNumber)} × ${number(row.quantity)}</td><td>${nontrade ? "非成交" : assumed ? "非實際成交" : esc(row.status || row.event_kind)}</td></tr>`;
     }
 
     // These projections are explicitly narrower than the ledger pages. In

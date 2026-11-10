@@ -1,0 +1,36 @@
+{
+  "contract": "stockagent.fast_latest_generation_migration.v1",
+  "datasets": ["binance", "bybit", "okx", "yahoo-market", "legacy-parquet", "free-public-context", "forex-pepperstone"],
+  "allow_uncompared_historical_values": true,
+  "generations": {
+    "binance": {
+      "public_manifest_sha256": "f3ac25eb6c4210b61c1078119ebe8dfd75a25f9412c989837bdcbc5512e2e1e0",
+      "private_manifest_sha256": "84b5a9c501a6e458051219ce5f3530401d095e87345bf7f2347f063ce5c53f62"
+    },
+    "bybit": {
+      "public_manifest_sha256": "e4275d1b3fa9a20d5c26edb50df69c1bb8f2eda00cae27cd45f347bcd559d3e4",
+      "private_manifest_sha256": "7befd66dba0a0f77e954d55383642248d08f99599ad28c0b353c5f48a87d9f5d"
+    },
+    "okx": {
+      "public_manifest_sha256": "26f6b974358cd91c0234d56fc07393c0c1a661405cda78b0124457b8f06a334e",
+      "private_manifest_sha256": "32a1e2fb602e0abb81ee9c1b6a67b03540bd57e30830de9592d61653d8c8ee46"
+    },
+    "yahoo-market": {
+      "public_manifest_sha256": "422ce67108826c2e26a64d2bb906b715898808c157d2e28f8cf6d629845de527",
+      "private_manifest_sha256": "c1bffb4c5c3f15f66bab0648b986888616d1c51f151056a4ec756ddc05f05525"
+    },
+    "legacy-parquet": {
+      "public_manifest_sha256": "243ae7b7084dc02619f56c7ab53a3ed94326f3229c63deac734b59664f50b317",
+      "private_manifest_sha256": "87bf514b3e5d5430f0d67e9ed1df0b3e4ce75202e52e0ee8ee39c4c866f7cb5c"
+    },
+    "free-public-context": {
+      "public_manifest_sha256": "23c56ebce2e29fe36e185bf281d2f6c08cff3bc3457a5c541e97c8d3e5549f48",
+      "private_manifest_sha256": "39d24ec31a098854a18ab038e2e012ab984ce76ed2500c2c214c00e957a57143"
+    },
+    "forex-pepperstone": {
+      "public_manifest_sha256": "8bf817c6d106fea1781594a7cfb59227e2803b23c6c2d4e3bbd2313617472466",
+      "private_manifest_sha256": "b97656037dc6e785286ca2375a66a51787bf40540da3bde0866ad1d5bf522bbd"
+    }
+  },
+  "reason": "User requested the fixed newer source to be packed and old backup versions retired before additional restore or row-level verification; missing historical values must remain visible for later backfill."
+}

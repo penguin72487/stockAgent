@@ -3852,6 +3852,7 @@ def _load_or_build_panel(
     *,
     build_if_missing: bool,
     panel_cache_root: Path | None = None,
+    allow_uncached_panel_on_capacity: bool = False,
 ):
     if panel_cache_root is None and config.data.panel_cache_root:
         panel_cache_root = Path(config.data.panel_cache_root)
@@ -3871,7 +3872,13 @@ def _load_or_build_panel(
         raise RuntimeError(
             "No valid panel cache exists for this exact data/config fingerprint; pass --build-panel."
         )
-    return build_panel(parquet_root, panel_cache_root=panel_cache_root, **original_kwargs), "built"
+    deferred: list[dict[str, Any]] = []
+    optional_cache = ({"allow_cache_write_deferred": True,
+                       "on_cache_write_deferred": deferred.append}
+                      if allow_uncached_panel_on_capacity else {})
+    panel = build_panel(parquet_root, panel_cache_root=panel_cache_root,
+                        **optional_cache, **original_kwargs)
+    return panel, "built_uncached_physical_reserve" if deferred else "built"
 
 
 def _empty_panel_accumulator(years: np.ndarray, feature_count: int) -> dict[str, np.ndarray]:
@@ -4402,6 +4409,10 @@ def parse_args() -> argparse.Namespace:
         help="Writable panel cache outside an immutable --public-dir; requires --build-panel.",
     )
     parser.add_argument("--build-panel", action="store_true")
+    parser.add_argument(
+        "--allow-uncached-panel-on-capacity", action="store_true",
+        help="After a full panel build, allow strict auditing in memory when the optional cache is deferred by physical reserve.",
+    )
     parser.add_argument("--strict", action="store_true")
     parser.add_argument(
         "--require-live-selected-features",
@@ -4570,6 +4581,7 @@ def main() -> None:
         public_feature_path,
         build_if_missing=bool(args.build_panel),
         panel_cache_root=panel_cache_root,
+        allow_uncached_panel_on_capacity=bool(args.allow_uncached_panel_on_capacity),
     )
     checkpoint("panel_load_or_build")
     findings.extend(audit_panel_feature_schema(panel, config))

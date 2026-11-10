@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume private E-to-D handoff publication and E stage retirement
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Unit=stockagent-handoff-private-d.service
+
+[Install]
+WantedBy=timers.target

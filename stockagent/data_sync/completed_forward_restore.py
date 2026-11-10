@@ -9,6 +9,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from contextlib import contextmanager
 import fcntl
+import json
 import os
 from pathlib import Path
 import stat
@@ -67,6 +68,60 @@ class ForwardColdBinding:
             raise SnapshotError("completed-forward storage configuration changed")
 
 
+class _ForwardCatalogView:
+    """Expose one family to the original catalog validator without a file write."""
+
+    def __init__(self, entry: dict[str, Any]):
+        self._text = json.dumps({"schema_version": 1, "datasets": [], "publication_families": [entry]})
+
+    def read_text(self, encoding: str = "utf-8") -> str:
+        if encoding != "utf-8":
+            raise ValueError("completed-forward catalog view requires UTF-8")
+        return self._text
+
+
+def _forward_family_from_catalog(catalog: Path) -> dict[str, Any]:
+    """Validate this reader's family without interpreting unrelated formats.
+
+    A newer unrelated dataset can use a reader contract unknown to an older
+    frozen inference owner. The whole document's identity and unique names
+    still bind this operation; the selected family is then validated by the
+    same original publisher validator as before.
+    """
+    from scripts.publish_data_releases import _load_catalog
+
+    try:
+        document = json.loads(catalog.read_text(encoding="utf-8"))
+        valid_version = isinstance(document, dict) and int(document.get("schema_version", -1)) == 1
+    except (OSError, ValueError, TypeError) as exc:
+        raise SnapshotError("cannot read completed-forward catalog") from exc
+    if not valid_version:
+        raise SnapshotError("unsupported completed-forward catalog")
+    datasets, families = document.get("datasets"), document.get("publication_families", [])
+    if not isinstance(datasets, list) or not isinstance(families, list):
+        raise SnapshotError("completed-forward catalog sections must be lists")
+    seen = set()
+    for index, raw in enumerate([*datasets, *families]):
+        if not isinstance(raw, dict):
+            raise SnapshotError("catalog dataset entry must be an object")
+        name = str(raw.get("dataset", ""))
+        if not name or name in seen:
+            raise SnapshotError("catalog dataset name is missing or duplicated")
+        if (index >= len(datasets)) != ("publication_family" in raw):
+            raise SnapshotError("catalog publication families must be separate")
+        seen.add(name)
+    selected = [entry for entry in families if entry.get("publication_family") == FAMILY]
+    if len(selected) != 1:
+        raise SnapshotError("canonical completed-forward catalog family is missing or duplicated")
+    entry = selected[0]
+    if "file_chunk_bytes" in entry and entry.get("reader_contract") != "packed-v2-chunks":
+        raise SnapshotError("completed-forward family requires its supported chunk reader")
+    validated = _load_catalog(_ForwardCatalogView(entry), include_families=True)
+    if len(validated) != 1:
+        raise SnapshotError("completed-forward family validation differs")
+    return validated[0]
+
+
 def production_binding(root: Path) -> ForwardColdBinding | None:
     """Enroll only the original canonical root, never an offline override.
 
@@ -76,17 +131,14 @@ def production_binding(root: Path) -> ForwardColdBinding | None:
     root = canonical_service_path(root, root=REPO_ROOT)
     if root != canonical_service_path(REPO_ROOT / CANONICAL_CACHE, root=REPO_ROOT):
         return None
-    from scripts.publish_data_releases import _load_catalog
     from stockagent.data_sync.packed_retention import RetentionConfig
 
     catalog = REPO_ROOT / "configs/data_sync/packed_datasets.json"
     retention = REPO_ROOT / "configs/data_sync/packed_retention.json"
     generations = tuple((path, _configuration(path)) for path in (catalog, retention))
-    entries = [entry for entry in _load_catalog(catalog, include_families=True)
-               if entry.get("publication_family") == FAMILY]
-    if len(entries) != 1 or entries[0].get("publish") is not True:
+    entry = _forward_family_from_catalog(catalog)
+    if entry.get("publish") is not True:
         raise SnapshotError("canonical completed-forward catalog family is missing or disabled")
-    entry = entries[0]
     source = Path(entry["source"])
     if canonical_service_path(source if source.is_absolute() else REPO_ROOT / source,
                               root=REPO_ROOT) != root:

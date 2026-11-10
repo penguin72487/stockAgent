@@ -247,6 +247,31 @@ def recover_complete_local_response(root: Path) -> bool:
     return recovered
 
 
+def desktop_reconciliation_transport_ready(root: Path, *, now: datetime | None = None) -> bool:
+    """Admit a no-query inspection of the exact desktop that needs recovery.
+
+    A modal notice makes the desktop unsuitable for a new query, but waiting
+    for a query-ready desktop before inspecting that same notice deadlocks.
+    This gate authorizes only the existing retained-response inspector. Its
+    bridge still verifies the pinned process/window and original query stage.
+    """
+    from downloader.tej_startup import CONTRACT as STARTUP_CONTRACT, _read, interactive_transport, valid_session
+    try:
+        status = _read(root / 'desktop_startup_status.json')
+        session = _read(root / 'desktop_session.json')
+        observed = datetime.fromisoformat(status['observed_at_utc'])
+        age = ((now or datetime.now(UTC)) - observed).total_seconds()
+        if (status.get('contract') != STARTUP_CONTRACT
+                or status.get('state') != 'owned_query_needs_reconciliation'
+                or observed.tzinfo is None or not -5 <= age <= 180
+                or not valid_session(session)):
+            return False
+        interactive_transport(root)
+        return True
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def recover_retained_desktop_response(root: Path, bridge, config: dict, *, before_authorized_replay: bool = False) -> bool:
     """Read the exact late response, never repeat a source query or selection.
 
@@ -336,6 +361,17 @@ def recover_retained_desktop_response(root: Path, bridge, config: dict, *, befor
             controls=notices[0].get('controls',[])
             texts=[x.get('name','') for x in controls if x.get('class')=='Static' and x.get('name')]
             buttons=[x.get('name','') for x in controls if x.get('class')=='Button']
+            if (texts == ['ERROR TEJD:GetFullDbId : 查無此DB(wscap)(wscap)\r\n']
+                    and buttons == ['OK']):
+                # The exact owned window says this source database cannot be
+                # found. Preserve the original unknown attempt and notice; it
+                # is neither an empty dataset nor permission to send again.
+                status.update(state='vendor_source_database_unavailable',
+                    source_error_code='vendor_database_wscap_unavailable',
+                    notice_evidence_sha256=hashlib.sha256(readback.read_bytes()).hexdigest(),
+                    observed_at_utc=datetime.now(UTC).isoformat())
+                atomic_write_json(status_path,status)
+                return False
             if (len(texts)!=1 or not re.fullmatch(r'ERROR1:No data !!\([a-zA-Z0-9_]{1,32}\)',texts[0])
                     or buttons!=['OK']):
                 raise ValueError('Unreviewed notice retained, not an empty response')
@@ -708,7 +744,8 @@ def watch_queue(root: Path, bridge, config: dict, *, stop: Event | None = None,
                         # relay authorizes an attempt, whose native bridge
                         # independently verifies window/Excel/scope again.
                         ready = not startup_enabled or check_desktop_ready()
-                        if barrier == 'inflight_requires_recovery' and ready:
+                        inspect_ready = ready or (startup_enabled and desktop_reconciliation_transport_ready(root))
+                        if barrier == 'inflight_requires_recovery' and inspect_ready:
                             publish('recovering_response')
                             recover_retained_desktop_response(root,bridge,config)
                             barrier=local_barrier()

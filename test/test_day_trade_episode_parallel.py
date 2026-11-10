@@ -106,19 +106,24 @@ def test_shifted_ownership_uses_configured_periods_including_january_context():
     assert accounts == {2023: (0, 1), 2024: (1, 3), 2025: (3, 5)}
 
 
-def _worker(rank, rendezvous, results, shifted):
+def _worker(rank, rendezvous, results, shifted, backend="gloo"):
     torch.set_num_threads(1)
-    dist.init_process_group("gloo", init_method=f"file://{rendezvous}", rank=rank,
+    device = torch.device("cuda", rank) if backend == "nccl" else torch.device("cpu")
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
+    dist.init_process_group(backend, init_method=f"file://{rendezvous}", rank=rank,
                             world_size=2, timeout=timedelta(seconds=40))
     try:
-        split, runtime, loss_fn = shifted_fixture() if shifted else annual_fixture()
+        split, runtime, loss_fn = shifted_fixture() if shifted is True else annual_fixture()
+        if shifted in {"single", "single_mgda"}:
+            split = replace(split, valid_indices=split.valid_indices[:2])
         split = trainer._pad_windowed_training_split(split, 6)
-        policy = PolicyWithUnused()
+        policy = PolicyWithUnused().to(device)
         config = SimpleNamespace(training=TrainingConfig(non_blocking_transfer=False,
             ddp_broadcast_buffers=False, ddp_trajectory_gradient_sync="trajectory",
             day_trade_annual_episode_sharding=True))
         model = trainer._wrap_distributed_data_parallel_model(policy, config=config,
-            device=torch.device("cpu"))
+            device=device)
         optimizer, scheduler = CountingSGD(model.parameters()), Scheduler()
         def forbidden(*args, **kwargs):
             raise AssertionError("local episode actions or metadata invoked a collective")
@@ -127,7 +132,7 @@ def _worker(rank, rendezvous, results, shifted):
         # Different accounts need different numbers of forwards. Calling DDP
         # forward here would reintroduce hidden buffer/parameter rendezvous.
         model.forward = forbidden
-        options = dict(_LOSS_OPTIONS, batch_size=6, device=torch.device("cpu"),
+        options = dict(_LOSS_OPTIONS, batch_size=6, device=device,
             amp_dtype=None, non_blocking=False, grad_clip_norm=.05,
             execution_runtime=runtime, max_volume_participation=.5,
             volume_participation_equity=10_000_000., optimizer_step_per_trajectory=True,
@@ -136,16 +141,35 @@ def _worker(rank, rendezvous, results, shifted):
         with pytest.raises(ValueError, match="world size differs"):
             trainer._train_epoch_windowed_tensor_ddp(model, loss_fn, split, optimizer,
                 GradScaler("cpu", enabled=False), day_trade_annual_episode_world_size=4, **options)
-        value, timing = trainer._train_epoch_windowed_tensor_ddp(model, loss_fn, split,
-            optimizer, GradScaler("cpu", enabled=False), **options)
+        if shifted == "single_mgda":
+            from stockagent.training.return_adjoint import ReturnAdjointTape, task_return_gradients
+            from stockagent.training.multiobjective import ParameterGradientBank
+            record = ReturnAdjointTape.create(2, device)
+            trainer._train_epoch_windowed_tensor_ddp(model, loss_fn, split, optimizer,
+                GradScaler("cpu", enabled=False), **options, return_tape=record, capture_only=True)
+            _, gradients = task_return_gradients(record.values, (0, 2))
+            bank = ParameterGradientBank(model.parameters())
+            for index, row in enumerate(gradients):
+                replay = ReturnAdjointTape.create(2, device, expected=record.values)
+                value, timing = trainer._train_epoch_windowed_tensor_ddp(model, loss_fn, split,
+                    optimizer, GradScaler("cpu", enabled=False), **options,
+                    log_return_weights=row * (-2/252), return_tape=replay,
+                    gradient_only=index != 3,
+                    gradient_transform=(lambda: bank.combine("mgda_l2", seed=42, step=1)) if index == 3 else None)
+                assert replay.maximum_replay_error == 0
+                if index != 3:
+                    bank.record()
+        else:
+            value, timing = trainer._train_epoch_windowed_tensor_ddp(model, loss_fn, split,
+                optimizer, GradScaler("cpu", enabled=False), **options)
         assert timing.optimizer_steps == optimizer.calls == scheduler.calls == 1
         assert policy.unused.grad is None and policy.unused.item() == pytest.approx(.123)
         assert timing.gradient_norm_observations == 1 and timing.gradient_norm_zero_batches == 0
         # Independent accounts can use a parameter on one rank only. Verify
         # zero contribution without activating global unused weight decay.
-        partial = torch.nn.ParameterList([torch.nn.Parameter(torch.tensor(0.)) for _ in range(3)])
-        partial[0].grad = torch.tensor(float(2 + rank))
-        partial[1].grad = torch.tensor(4.) if rank == 0 else None
+        partial = torch.nn.ParameterList([torch.nn.Parameter(torch.tensor(0., device=device)) for _ in range(3)])
+        partial[0].grad = torch.tensor(float(2 + rank), device=device)
+        partial[1].grad = torch.tensor(4., device=device) if rank == 0 else None
         trainer._synchronize_trajectory_gradients(partial, allow_partial_presence=True)
         assert partial[0].grad.item() == 2.5 and partial[1].grad.item() == 2.
         assert partial[2].grad is None
@@ -159,21 +183,52 @@ def _worker(rank, rendezvous, results, shifted):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("shifted", [False, True])
-def test_two_ranks_match_independent_account_gradient_clip_and_single_update(tmp_path, monkeypatch, shifted):
-    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
-    split, runtime, loss_fn = shifted_fixture() if shifted else annual_fixture()
+@pytest.mark.parametrize("backend", ["gloo", "nccl"])
+@pytest.mark.parametrize("shifted", [False, True, "single", "single_mgda"])
+def test_two_ranks_match_independent_account_gradient_clip_and_single_update(tmp_path, monkeypatch, shifted, backend):
+    if backend == "nccl" and (not torch.cuda.is_available() or torch.cuda.device_count() < 2):
+        pytest.skip("requires two CUDA devices")
+    if backend == "gloo":
+        monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "")
+    split, runtime, loss_fn = shifted_fixture() if shifted is True else annual_fixture()
+    if shifted in {"single", "single_mgda"}:
+        split = replace(split, valid_indices=split.valid_indices[:2])
     reference = PolicyWithUnused()
     optimizer = CountingSGD(reference.parameters())
-    expected = (independent_shifted_reference(split, runtime, loss_fn, reference, torch.device("cpu"))
-                if shifted else independent_year_reference(split, runtime, loss_fn, reference))
-    expected.backward()
+    if shifted == "single_mgda":
+        import stockagent.training.loss as loss_module
+        from stockagent.training.return_adjoint import task_return_gradients
+        from stockagent.training.multiobjective import ParameterGradientBank
+        captured = []
+        original = loss_module.run_backtest_torch
+        def capture(*args, **kwargs):
+            result = original(*args, **kwargs)
+            captured.append(result.strategy_returns)
+            return result
+        monkeypatch.setattr(loss_module, "run_backtest_torch", capture)
+        independent_year_reference(split, runtime, loss_fn, reference, spans=[(0, len(split))])
+        returns = torch.cat(captured)
+        _, weights = task_return_gradients(returns.detach(), (0, 2))
+        bank = ParameterGradientBank(reference.parameters())
+        for index, weight in enumerate(weights):
+            reference.action.grad = torch.autograd.grad(returns, reference.action,
+                grad_outputs=weight.to(returns), retain_graph=True)[0]
+            if index == 3:
+                bank.combine("mgda_l2", seed=42, step=1)
+            else:
+                bank.record()
+        expected = None
+    else:
+        expected = (independent_shifted_reference(split, runtime, loss_fn, reference, torch.device("cpu"))
+                    if shifted is True else independent_year_reference(split, runtime, loss_fn, reference,
+                        spans=[(0, len(split))] if shifted == "single" else None))
+        expected.backward()
     norm = torch.nn.utils.clip_grad_norm_(reference.parameters(), .05).item()
     gradient = reference.action.grad.detach().clone()
     optimizer.step()
     context = mp.get_context("spawn")
     results = context.Queue()
-    workers = [context.Process(target=_worker, args=(rank, str(tmp_path / "init"), results, shifted))
+    workers = [context.Process(target=_worker, args=(rank, str(tmp_path / "init"), results, shifted, backend))
                for rank in range(2)]
     for worker in workers:
         worker.start()
@@ -185,12 +240,15 @@ def test_two_ranks_match_independent_account_gradient_clip_and_single_update(tmp
         assert worker.exitcode == 0
     for _, result in observed:
         assert isinstance(result, dict), result
-        assert result["loss"] == pytest.approx(expected.item(), rel=2e-6, abs=1e-7)
+        if expected is not None:
+            assert result["loss"] == pytest.approx(expected.item(), rel=2e-6, abs=1e-7)
         torch.testing.assert_close(torch.tensor(result["gradient"]), gradient, rtol=2e-5, atol=1e-7)
         torch.testing.assert_close(torch.tensor(result["parameter"]), reference.action.detach(), rtol=2e-6, atol=1e-7)
         assert result["norm"] == pytest.approx(norm, rel=2e-5, abs=1e-7)
-    if shifted:
+    if shifted is True:
         assert sorted(result["batches"] for _, result in observed) == [1, 2]
+    if shifted in {"single", "single_mgda"}:
+        assert sorted(result["batches"] for _, result in observed) == [0, 1]
 
 
 def test_disabled_flag_preserves_legacy_fingerprint_and_enabled_mode_changes_it():

@@ -513,12 +513,15 @@ def execute(root: Path, specs: list[CatalogSpec], credentials: dict[str, str], *
     # normalization still need headroom in the service's 512 MiB cgroup.
     effective_workers = min(workers, max(1, len(specs)), max(1, max_requests),
                             max(1, (32 * 1024**2) // maximum_bytes))
+    from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+    guard_path(root)
     root.mkdir(parents=True, exist_ok=True)
     budget = RequestBudget(max_requests)
     started = _now()
     secrets = tuple(value for value in credentials.values() if value)
     with (root / ".download.lock").open("a") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        guard_locked_path(root, lock)
         def capture(spec: CatalogSpec) -> dict:
             work_started = time.monotonic()
             checked = _now()

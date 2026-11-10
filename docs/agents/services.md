@@ -170,6 +170,12 @@ Use the section for the service being changed. Operational acceptance requires f
   reloads retain the configured release, including an engine-only reload's
   comparison against its unchanged Discord owner. Actual pinned-source drift
   still fails closed. See [the recurrence repair](../tw_opening_latency_stages_2026-10-14.md#loadedimplementationchanged-根因與目錄級版本隔離2026-10-20).
+- Developer-side Python inspection of a sealed source release must use `-B` or
+  `PYTHONDONTWRITEBYTECODE=1`: a service's read-only mount and environment do
+  not protect an external root shell. Unexpected bytecode is not part of the
+  manifest and must not be ignored by release verification. The 2026-11-09
+  quarantine and verified readback are recorded in the
+  [200 萬候選報告](../tw_day_trade_unit_mgda_2m_candidate_2026-11-04.md#1109-晚間正式上架前的交接與來源續修).
 - To prepare an isolated performance change from that compatible production
   base, use `scripts/freeze_discord_code_release.py --base-release <receipt>`
   with explicit `--include-source` members. If a selected module also contains

@@ -152,6 +152,41 @@ def test_remote_metrics_share_one_capacity_request_and_preserve_source_units(mon
     assert storage.REMOTE_CAPACITY.count("print(") == 1
 
 
+@pytest.mark.parametrize('files, expected, scope', [
+    ({'/sys/fs/cgroup/memory.max': '260', '/sys/fs/cgroup/memory.current': '187'},
+     (187, 260), 'cgroup_v2_including_cache'),
+    ({'/sys/fs/cgroup/memory.max': 'max', '/proc/meminfo':
+      'MemTotal: 100 kB\nMemAvailable: 80 kB\n'},
+     (20*1024, 100*1024), 'host_memavailable'),
+    ({'/sys/fs/cgroup/memory.max': '100', '/sys/fs/cgroup/memory.current': '101'},
+     (None, None), None),
+    ({'/sys/fs/cgroup/memory.max': '100'}, (None, None), None),
+])
+def test_remote_memory_uses_one_labeled_scope_not_mixed_portal_numbers(monkeypatch, files, expected, scope):
+    import urllib.request
+    # These deliberately inconsistent portal numbers must never be used as a pair.
+    payload = {'ram': {'total': 100, 'used': 187}, 'cpu': {}, 'gpu': {}}
+    monkeypatch.setattr(urllib.request, 'urlopen', lambda *a, **k: io.BytesIO(json.dumps(payload).encode()))
+    monkeypatch.setattr(fleet.subprocess, 'run', lambda *a, **k: SimpleNamespace(stdout=''))
+    def fake_open(path, *args, **kwargs):
+        if str(path) not in files:
+            raise FileNotFoundError(str(path))
+        return io.StringIO(files[str(path)])
+    namespace = {'datetime': __import__('datetime'), 'json': json, 'open': fake_open}
+    exec(fleet.REMOTE_RUNTIME, namespace)
+    raw = namespace['runtime']
+    assert (raw['metrics'].get('memory_used_bytes'), raw['metrics'].get('memory_total_bytes')) == expected
+    assert raw.get('memory_scope') == scope
+    raw['observed_at_utc'] = fleet.iso(NOW)
+    remote = view({'vastai1T': raw})['nodes'][2]
+    if scope == 'cgroup_v2_including_cache':
+        assert 'cgroup' in remote['scope'] and '快取' in remote['scope']
+    elif scope == 'host_memavailable':
+        assert '主機' in remote['scope']
+    else:
+        assert remote['metrics']['memory_used_bytes'] is None
+
+
 def test_bad_runtime_does_not_hide_valid_capacity_or_trigger_http_probes(monkeypatch):
     monkeypatch.setattr(fleet.subprocess, "run", lambda *a, **k: pytest.fail("public read launched a probe"))
     data = storage.public_status({"contract": storage.CONTRACT, "runtime": {"contract": "bad"}})
@@ -176,7 +211,9 @@ def test_receiver_observer_bundle_imports_without_the_penguin_checkout(tmp_path)
         target = tmp_path / relative
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(repo / relative, target)
-    result = subprocess.run([sys.executable, "-I", str(tmp_path / "scripts/lab203_storage_monitor.py"), "--help"],
+    # -S excludes installed site-packages as well as the Penguin checkout: the
+    # receiver's read-only observer has a standard-library-only bootstrap.
+    result = subprocess.run([sys.executable, "-I", "-S", str(tmp_path / "scripts/lab203_storage_monitor.py"), "--help"],
                             cwd=tmp_path, capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stderr
     assert "usage:" in result.stdout

@@ -17,16 +17,12 @@ ensure_enrolled_wsl_identity "$REPO_ROOT"
 
 RUN_ROOT="${SHIOAJI_MINUTE_RUN_ROOT:-artifacts/data_repair/shioaji_minute_full}"
 LOG_FILE="$RUN_ROOT/run.log"
-LOCK_FILE="$RUN_ROOT/runner.lock"
 TARGET_FILE="$RUN_ROOT/target_end_date.txt"
 SOURCE_GAP_RETRY_MARKER="$RUN_ROOT/source_gap_retry_v1.completed"
 mkdir -p "$RUN_ROOT"
-exec 9>"$LOCK_FILE"
-if ! flock -n 9; then
-  echo "[shioaji-minute-runner] another runner holds $LOCK_FILE" >&2
-  exit 3
-fi
-exec > >(tee -a "$LOG_FILE") 2>&1
+source scripts/shioaji_minute_locking.sh
+minute_runner_acquire_locks "$RUN_ROOT"
+exec > >(tee -a "$LOG_FILE" 8>&- 9>&-) 2>&1
 
 resolve_backfill_end_date() {
   if [[ -n "${SHIOAJI_MINUTE_END_DATE:-}" ]]; then
@@ -225,6 +221,14 @@ PY
 echo "[shioaji-minute-runner] started_at=$(TZ=Asia/Taipei date --iso-8601=seconds) rolling_target=true"
 
 while true; do
+  # A boot or completed C-to-E handoff may have changed the raw alias while
+  # this runner released its source lock for an idle sleep. Refuse a C
+  # placeholder if the enrolled E mount has not been restored.
+  run_fintech_python - <<'PY'
+from pathlib import Path
+from stockagent.data_sync.workspace_source_handoff import guard_path
+guard_path(Path('data_tw_minute/shioaji_1m').absolute())
+PY
   BACKFILL_END_DATE="$(resolve_backfill_end_date)"
   publish_target "$BACKFILL_END_DATE"
   echo "[shioaji-minute-runner] target_end_date=$BACKFILL_END_DATE boundary=latest_completed_tw_stock_session"
@@ -236,7 +240,7 @@ while true; do
   read -r top200_delay top200_reason <<< "$(top200_priority_state)"
   if (( top200_delay > 0 )); then
     echo "[shioaji-minute-runner] waiting_seconds=$top200_delay reason=$top200_reason"
-    sleep "$top200_delay"
+    minute_runner_sleep_unlocked "$top200_delay"
     continue
   fi
   echo "[shioaji-minute-runner] priority_gate=$top200_reason"
@@ -244,7 +248,7 @@ while true; do
   market_delay="$(seconds_until_after_close)"
   if (( market_delay > 0 )); then
     echo "[shioaji-minute-runner] waiting_seconds=$market_delay reason=taiwan_market_hours"
-    sleep "$market_delay"
+    minute_runner_sleep_unlocked "$market_delay"
     # The target may advance while sleeping across the close. Never download
     # yesterday's already-complete frontier in the new day's 14:31 slot.
     continue
@@ -255,7 +259,7 @@ while true; do
     capacity_delay=60
     if (( reserved_fop >= 3 )); then capacity_delay="$(connection_retry_seconds)"; fi
     echo "[shioaji-minute-runner] waiting_seconds=$capacity_delay reason=shioaji_connection_capacity fop_workers=$fop_workers reserved_fop=$reserved_fop history_workers=$history_workers reserved_history=$reserved_history reserved_stock_quotes=$quote_clients account_limit=5"
-    sleep "$capacity_delay"
+    minute_runner_sleep_unlocked "$capacity_delay"
     continue
   fi
 
@@ -378,7 +382,7 @@ PY
       --end-date "$BACKFILL_END_DATE" \
       --require-classified; then
       echo "[shioaji-minute-runner] source_history_audit=incomplete reason=unclassified_or_pending_history"
-      sleep 300
+      minute_runner_sleep_unlocked 300
       continue
     fi
     # A count-only shortcut is unsafe: a corrected K-bar can retain the same
@@ -491,5 +495,5 @@ PY
     next_delay=300
     echo "[shioaji-minute-runner] waiting_seconds=$next_delay reason=retry_incomplete_run"
   fi
-  sleep "$next_delay"
+  minute_runner_sleep_unlocked "$next_delay"
 done

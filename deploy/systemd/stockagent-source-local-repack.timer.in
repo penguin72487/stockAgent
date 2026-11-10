@@ -1,0 +1,11 @@
+[Unit]
+Description=Continue enrolled dataset-local E to D repacks
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=30s
+AccuracySec=1s
+Unit=stockagent-source-local-repack.service
+
+[Install]
+WantedBy=timers.target

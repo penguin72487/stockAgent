@@ -354,10 +354,27 @@ def bootstrap_ci(values: np.ndarray, rng: np.random.Generator) -> tuple[float, f
     return tuple(np.quantile(draws, [0.025, 0.975]))
 
 
+def _admitted_interval(calendar: dict, name: str, fold_id: int, split: str):
+    case = calendar.get("cases", {}).get(name, {})
+    if not case or fold_id not in case.get("fold_ids", []):
+        raise ValueError(f"calendar receipt does not own {name}/fold_{fold_id}")
+    intervals = case.get("actual_intervals")
+    if isinstance(intervals, list):
+        selected = [item for item in intervals if item.get("fold_id") == fold_id]
+        if len(selected) != 1:
+            raise ValueError(f"calendar receipt has ambiguous {name}/fold_{fold_id}")
+        item = selected[0][split]
+        return {"sessions": item["rows"], "first": item["start"], "last": item["end"],
+                "date_identity": item.get("dates_sha256") or "admitted_interval:" + hashlib.sha256(
+                    json.dumps(item, sort_keys=True).encode()).hexdigest()}
+    item = case["actual_intervals"][split]
+    return {**item, "date_identity": case["period_contract"]["panel_calendar_sha256"]}
+
+
 def _absolute_records(root: Path, split: str, calendar_receipt: Path | None):
     """Read completed observations; date ownership stays with saved receipts."""
     calendar = json.loads(calendar_receipt.read_text()) if calendar_receipt else {}
-    if calendar and calendar.get("state") != "accepted_calendar_context":
+    if calendar and calendar.get("state") != "accepted_calendar_context" and calendar.get("accepted") is not True:
         raise ValueError("absolute plots require an accepted calendar receipt")
     records, series = [], {}
     for name, rows in load(root, split, require_baseline=False).items():
@@ -371,15 +388,13 @@ def _absolute_records(root: Path, split: str, calendar_receipt: Path | None):
             marker = json.loads(marker_path.read_text())
             if marker.get("status") != "complete" or marker.get("fold_id") != fold_id:
                 raise ValueError(f"invalid completed fold identity: {marker_path}")
-            case = calendar.get("cases", {}).get(name, {})
-            if calendar and fold_id not in case.get("fold_ids", []):
-                raise ValueError(f"calendar receipt does not own {name}/fold_{fold_id}")
+            interval = _admitted_interval(calendar, name, fold_id,
+                                          "val" if split == "val" else "test") if calendar else None
             if split == "val":
-                if not case:
+                if interval is None:
                     raise ValueError("absolute validation plots require --calendar-receipt")
-                interval = case["actual_intervals"]["val"]
                 count, first, last = interval["sessions"], interval["first"], interval["last"]
-                dates_sha = case["period_contract"]["panel_calendar_sha256"]
+                dates_sha = interval["date_identity"]
                 returns_sha = "summary_only"
             else:
                 filename = "deployment_test_backtest.npz" if split == "deployment" else "test_backtest.npz"
@@ -395,8 +410,7 @@ def _absolute_records(root: Path, split: str, calendar_receipt: Path | None):
                 if (count, first, last) != (marker[f"{stem}_rows"], marker[f"{stem}_date_start"],
                                             marker[f"{stem}_date_end"]):
                     raise ValueError(f"backtest/complete receipt coverage differs: {marker_path}")
-                if case:
-                    interval = case["actual_intervals"]["test"]
+                if interval is not None:
                     if (count, first, last) != (interval["sessions"], interval["first"], interval["last"]):
                         raise ValueError(f"calendar/backtest coverage differs: {name}")
                 dates_sha = hashlib.sha256(dates.astype("<i8").tobytes()).hexdigest()
@@ -406,6 +420,7 @@ def _absolute_records(root: Path, split: str, calendar_receipt: Path | None):
                       count, first, last, dates_sha)
             cohort_id = hashlib.sha256(json.dumps(period).encode()).hexdigest()[:8]
             record = {"variant": name, "fold_id": fold_id, "cohort_id": cohort_id,
+                      "test_year": int(row["test_years"][0]),
                       "train_years": "-".join(map(str, row["train_years"])),
                       "val_years": "-".join(map(str, row["val_years"])),
                       "test_years": "-".join(map(str, row["test_years"])),
@@ -598,6 +613,435 @@ def _write_absolute_plots(root: Path, output: Path, split: str, prefix: str,
     return status
 
 
+RISK_RETURN_RENDER_CONTRACT = "canonical_ablation_risk_return_v1"
+
+
+def _risk_return_limits(records: list[dict], metric_name: str):
+    """Use the same numeric ranges for every period and its connected view."""
+    def padded(values, low, high, reference=None):
+        finite = np.asarray(values, dtype=np.float64)
+        finite = finite[np.isfinite(finite)]
+        if not finite.size:
+            raise ValueError("cannot plot a metric without finite observations")
+        span = max(float(np.ptp(finite)), 1e-6)
+        lower, upper = float(finite.min() - low * span), float(finite.max() + high * span)
+        if reference is not None:
+            lower, upper = min(lower, reference), max(upper, reference)
+        return lower, upper
+
+    reference = (0. if metric_name in {"cagr", "sharpe", "sortino"} else
+                 .5 if metric_name == "daily_hit_rate" else None)
+    return (padded([row["max_drawdown"] for row in records], .055, .09),
+            padded([row[metric_name] for row in records], .075, .09, reference), reference)
+
+
+def _annotate_risk_return_names(ax, points, y_limits, labels):
+    """Keep the original full-name side columns and leader-line placement."""
+    blue, ink = "#2864A8", "#252A34"
+    ordered = sorted(points, key=lambda name: points[name][0])
+    split = (len(ordered) + 1) // 2
+    for names, label_x, alignment in ((ordered[:split], -.035, "right"),
+                                       (ordered[split:], 1.035, "left")):
+        names = sorted(names, key=lambda name: points[name][1])
+        if not names:
+            continue
+        positions = np.clip([(points[name][1] - y_limits[0]) /
+                              (y_limits[1] - y_limits[0]) for name in names], .035, .965)
+        gap = min(.052, (.965 - .035) / max(len(names) - 1, 1))
+        for index in range(1, len(positions)):
+            positions[index] = max(positions[index], positions[index - 1] + gap)
+        if positions[-1] > .965:
+            positions -= positions[-1] - .965
+        for index in range(len(positions) - 2, -1, -1):
+            positions[index] = min(positions[index], positions[index + 1] - gap)
+        if positions[0] < .035:
+            positions += .035 - positions[0]
+        for name, position in zip(names, positions, strict=True):
+            color = ink if name == "baseline" else blue
+            ax.annotate(labels[name], xy=points[name], xycoords="data",
+                        xytext=(label_x, position), textcoords="axes fraction",
+                        ha=alignment, va="center", fontsize=8.,
+                        fontweight="bold" if name == "baseline" else "normal", color=color,
+                        annotation_clip=False, arrowprops={"arrowstyle": "-", "color": color,
+                            "alpha": .58, "linewidth": .7, "shrinkA": 2, "shrinkB": 4}, zorder=2)
+
+
+def _risk_return_figure(records: list[dict], metric_name: str, metric_label: str, *,
+                        scope_label: str, period_key: str = "fold_id",
+                        period_name: str = "Fold", period_id: int | None = None,
+                        periods: list[int] | None = None,
+                        variant_order: list[str] | None = None,
+                        show_fold_ids: bool = False):
+    """One canonical renderer for legacy folds and test-year-aligned reports."""
+    blue, ink, grid = "#2864A8", "#252A34", "#D9DEE7"
+    periods = sorted(set(periods if periods is not None else [int(row[period_key]) for row in records]))
+    colors = _fold_color_map(periods)
+    sizes = dict(zip(periods, np.linspace(34., 92., len(periods)), strict=True))
+    names = variant_order or sorted({row["variant"] for row in records},
+                                     key=lambda name: (name != "baseline", name))
+    x_limits, y_limits, reference = _risk_return_limits(records, metric_name)
+    usable = [row for row in records if math.isfinite(row["max_drawdown"]) and
+              math.isfinite(row[metric_name])]
+    by_key = {(row["variant"], int(row[period_key])): row for row in usable}
+    if len(by_key) != len(usable):
+        raise ValueError("duplicate experiment/period in risk-return chart")
+    connected = period_id is None
+    fig, ax = plt.subplots(figsize=(17, 9.2) if connected else (16, 8.6))
+    points, labels = {}, {}
+    for name in names:
+        owned = [value for value in periods if (name, value) in by_key]
+        if not owned or (not connected and (name, period_id) not in by_key):
+            continue
+        if connected:
+            xs = [by_key[name, value]["max_drawdown"] if (name, value) in by_key else np.nan for value in periods]
+            ys = [by_key[name, value][metric_name] if (name, value) in by_key else np.nan for value in periods]
+            ax.plot(xs, ys, color=ink if name == "baseline" else blue,
+                    linewidth=1.45 if name == "baseline" else .75,
+                    alpha=.72 if name == "baseline" else .24, zorder=1)
+            plotted_periods = owned
+        else:
+            plotted_periods = [period_id]
+        for value in plotted_periods:
+            row = by_key[name, value]
+            size = sizes[value] * (1.18 if name == "baseline" else 1.) if connected else (
+                104 if name == "baseline" else 74)
+            ax.scatter(row["max_drawdown"], row[metric_name], s=size,
+                       marker="D" if name == "baseline" else "o", color=colors[value],
+                       edgecolor=ink if name == "baseline" else "white",
+                       linewidth=(1.45 if name == "baseline" else .55) if connected else (
+                           1.5 if name == "baseline" else .8), zorder=3)
+        last = owned[-1] if connected else period_id
+        row = by_key[name, last]
+        points[name] = row["max_drawdown"], row[metric_name]
+        suffix = f" [F{row['fold_id']}]" if show_fold_ids else ""
+        if connected and last != periods[-1]:
+            suffix += f" ({period_name} {last})"
+        labels[name] = display_label(name) + suffix
+    ax.set_xlim(*x_limits)
+    ax.set_ylim(*y_limits)
+    _annotate_risk_return_names(ax, points, y_limits, labels)
+    if reference is not None:
+        ax.axhline(reference, color=ink, lw=.8)
+    period_text = f"Per-{period_name.lower()}" if connected else f"{period_name} {period_id}"
+    ax.set_xlabel(f"{period_text} {scope_label} max drawdown (less negative is better)")
+    ax.text(.012, .982, f"{period_text} {scope_label} {metric_label}", transform=ax.transAxes,
+            ha="left", va="top", fontsize=10, color=ink,
+            bbox={"facecolor": "white", "edgecolor": "none", "alpha": .84}, zorder=5)
+    ax.grid(color=grid, lw=.7)
+    for spine in ("top", "right"):
+        ax.spines[spine].set_visible(False)
+    if connected:
+        fig.suptitle(f"{period_name} trajectories: {scope_label} max drawdown vs {metric_label}",
+                     y=.988, fontweight="bold")
+        fig.text(.5, .955, f"Each line is one experiment; {period_name} {periods[-1]} is darkest and "
+                 "largest; labels mark latest available endpoints", ha="center", color="#596273")
+        cmap = ListedColormap([colors[value] for value in periods])
+        norm = BoundaryNorm(np.arange(len(periods) + 1) - .5, cmap.N)
+        bar = fig.colorbar(ScalarMappable(norm=norm, cmap=cmap), ax=ax, orientation="horizontal",
+                           fraction=.045, pad=.105, ticks=np.arange(len(periods)))
+        bar.ax.set_xticklabels([f"F{value}" if period_key == "fold_id" else str(value) for value in periods])
+        bar.set_label(f"Owned-test {period_name.lower()}: later periods are darker and larger")
+        fig.subplots_adjust(left=.22, right=.78, bottom=.18, top=.89)
+    else:
+        selected = [row for row in records if row[period_key] == period_id]
+        coverage = ""
+        if selected and all(row.get("sessions", row.get("calculation_rows")) for row in selected):
+            cohorts = {row.get("cohort_id") for row in selected}
+            first = selected[0]
+            start = first.get("test_start", first.get("calculation_date_start"))
+            end = first.get("test_end", first.get("calculation_date_end"))
+            count = first.get("sessions", first.get("calculation_rows"))
+            coverage = (f"{start} to {end}; {count} sessions; "
+                        if len(cohorts) == 1 else f"{len(cohorts)} date/benchmark cohorts (see CSV); ")
+        fig.suptitle(f"{period_text}: {scope_label} max drawdown vs {metric_label}", y=.985, fontweight="bold")
+        fig.text(.5, .95, f"{coverage}all {len(points)} completed experiments; x/y scales are shared across periods",
+                 ha="center", color="#596273")
+        fig.subplots_adjust(left=.23, right=.77, bottom=.11, top=.89)
+    return fig
+
+
+def _write_completed_fold_plots(root: Path, output: Path, split: str, prefix: str,
+                                 scope_label: str, calendar_receipt: Path | None) -> dict:
+    """Refresh every legacy risk/return path from all completed observations.
+
+    Validation/full-horizon test metrics retain their original calculation
+    windows. First test year aligns points without requiring equal fold IDs.
+    """
+    from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_text
+
+    records, _ = _absolute_records(root, split, calendar_receipt)
+    for row in records:
+        # Cohort identity follows the actual dates, not a strategy's fold number.
+        row["cohort_id"] = hashlib.sha256(json.dumps([row["calculation_rows"],
+            row["calculation_date_start"], row["calculation_date_end"], row["dates_sha256"]]).encode()).hexdigest()[:12]
+    clean = [{k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+              for k, v in row.items()} for row in records]
+    identity = dict(contract="completed_fold_risk_return_charts_v1", split=split,
+                    scope_label=scope_label, rendering_contract=RISK_RETURN_RENDER_CONTRACT,
+                    records=clean, renderer_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    directory = output / f"{prefix}_risk_return_by_fold"
+    directory.mkdir(parents=True, exist_ok=True)
+    status_path = directory / "plot_status.json"
+    previous = json.loads(status_path.read_text()) if status_path.is_file() else {}
+    if (previous.get("input_sha256") == digest and
+            all((directory / name).is_file() for name in previous.get("png_files", []))):
+        return previous
+    status = {**identity, "input_sha256": digest, "completed_observations": len(records),
+              "state": "charts_written" if records else "waiting_completed_runs",
+              "png_files": [], "period_input_sha256": {}, "fold_aliases": {},
+              "note": "Completed observations; compare matching test years. Validation and "
+                      "full-horizon test windows retain their original semantics; missing points are not zero."}
+    if not records:
+        atomic_write_json(status_path, status)
+        return status
+    table = io.StringIO()
+    writer = csv.DictWriter(table, fieldnames=list(records[0]))
+    writer.writeheader()
+    writer.writerows(records)
+    atomic_write_text(directory / "fold_metrics.csv", table.getvalue())
+    years = sorted({row["test_year"] for row in records})
+    periods = list(range(min(years), max(years) + 1))
+    fold_years = {}
+    for row in records:
+        fold_years.setdefault(row["fold_id"], set()).add(row["test_year"])
+    status["ambiguous_fold_aliases"] = sorted(fold for fold, owned in fold_years.items() if len(owned) != 1)
+
+    def save(fig, filename):
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", dpi=130, bbox_inches="tight")
+        target = directory / filename
+        target.parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(target, buffer.getvalue())
+        plt.close(fig)
+        status["png_files"].append(filename)
+
+    for metric_name, metric_label in RISK_SCATTER_Y_METRICS:
+        limits = _risk_return_limits(records, metric_name)
+        fig = _risk_return_figure(records, metric_name, metric_label,
+            scope_label=scope_label, period_key="test_year", period_name="Test year",
+            periods=periods, show_fold_ids=True)
+        save(fig, f"{metric_name}/all_folds_connected.png")
+        for year in years:
+            filename = f"{metric_name}/year_{year}.png"
+            comparable = [{k:v for k,v in row.items() if k != "summary_sha256"}
+                          for row in clean if row["test_year"] == year]
+            key = f"{metric_name}/{year}"
+            item_digest = hashlib.sha256(json.dumps(dict(records=comparable, periods=periods,
+                shared_limits=limits, renderer_sha256=identity["renderer_sha256"]),
+                sort_keys=True, allow_nan=False).encode()).hexdigest()
+            status["period_input_sha256"][key] = item_digest
+            if (previous.get("period_input_sha256", {}).get(key) == item_digest and
+                    (directory / filename).is_file()):
+                status["png_files"].append(filename)
+            else:
+                fig = _risk_return_figure(records, metric_name, metric_label,
+                    scope_label=scope_label, period_key="test_year", period_name="Test year",
+                    periods=periods, period_id=year, show_fold_ids=True)
+                save(fig, filename)
+            for fold, owned in fold_years.items():
+                if owned == {year}:
+                    alias = f"{metric_name}/fold_{fold:02d}.png"
+                    atomic_write_bytes(directory / alias, (directory / filename).read_bytes())
+                    status["png_files"].append(alias)
+                    status["fold_aliases"][str(fold)] = year
+    atomic_write_json(status_path, status)
+    return status
+
+
+def _test_year_records(root: Path, calendar_receipt: Path | None = None):
+    """Read each completed fold's first test year from its own reset account."""
+    from stockagent.backtest.report import compute_metrics
+    from stockagent.backtest.simulator import BacktestResult
+
+    calendar = json.loads(calendar_receipt.read_text()) if calendar_receipt else {}
+    if calendar and calendar.get("accepted") is not True:
+        raise ValueError("test-year charts require an accepted calendar admission")
+    records, series = [], {}
+    seen = set()
+    for name, rows in load(root, "test", require_baseline=False).items():
+        for row in rows:
+            fold_id = int(row["fold_id"])
+            fold = root / name / f"fold_{fold_id:02d}"
+            marker_path = fold / "fold_complete.json"
+            if not marker_path.is_file():
+                continue
+            marker = json.loads(marker_path.read_text())
+            if marker.get("status") != "complete" or marker.get("fold_id") != fold_id:
+                raise ValueError(f"invalid completed fold identity: {marker_path}")
+            test_years = [int(year) for year in row.get("test_years", [])]
+            val_years = [int(year) for year in row.get("val_years", [])]
+            if not test_years or not val_years:
+                raise ValueError(f"missing validation/test ownership: {fold}")
+            year = test_years[0]
+            if max(val_years) >= year:
+                # Experimental validation=test windows are not independent tests.
+                continue
+            if (name, year) in seen:
+                raise ValueError(f"duplicate independent first test year: {name}/{year}")
+            seen.add((name, year))
+            source = fold / "test_backtest.npz"
+            with np.load(source, allow_pickle=False) as archive:
+                dates = np.asarray(archive["dates"], dtype="datetime64[D]")
+                returns = np.asarray(archive["strategy_returns"], dtype=np.float64)
+                benchmark = np.asarray(archive["benchmark_returns"], dtype=np.float64)
+                turnover = np.asarray(archive["turnovers"], dtype=np.float64)
+            if (any(a.ndim != 1 for a in (dates, returns, benchmark, turnover)) or
+                not len(dates) or len({len(dates), len(returns), len(benchmark), len(turnover)}) != 1 or
+                np.isnat(dates).any() or np.any(dates[1:] <= dates[:-1]) or
+                any(np.isnan(a).any() or np.isposinf(a).any() for a in (returns, benchmark, turnover))):
+                raise ValueError(f"invalid observed test artifact: {source}")
+            coverage = (len(dates), str(dates[0]), str(dates[-1]))
+            if coverage != (marker["test_rows"], marker["test_date_start"], marker["test_date_end"]):
+                raise ValueError(f"test artifact and completion receipt differ: {source}")
+            if calendar:
+                case = calendar.get("cases", {}).get(name, {})
+                intervals = [item for item in case.get("actual_intervals", [])
+                             if item.get("fold_id") == fold_id]
+                if len(intervals) != 1:
+                    raise ValueError(f"calendar does not own {name}/fold_{fold_id:02d}")
+                expected = intervals[0]["test"]
+                if coverage != (expected["rows"], expected["start"], expected["end"]):
+                    raise ValueError(f"test artifact and admitted calendar differ: {source}")
+            mask = dates.astype("datetime64[Y]").astype(int) + 1970 == year
+            if not mask.any() or not mask[0]:
+                raise ValueError(f"first test year does not match observed dates: {source}")
+            dates, returns, benchmark, turnover = (a[mask] for a in (dates, returns, benchmark, turnover))
+            result = BacktestResult(strategy_returns=returns, benchmark_returns=benchmark,
+                                    turnovers=turnover, weights_history=np.empty((len(dates), 0)))
+            metrics = compute_metrics(result)
+            digest = lambda a: hashlib.sha256(a.tobytes()).hexdigest()
+            dates_hash = digest(dates.astype("<i8"))
+            benchmark_hash = digest(benchmark.astype("<f8"))
+            record = dict(variant=name, test_year=year, fold_id=fold_id,
+                          test_start=str(dates[0]), test_end=str(dates[-1]),
+                          sessions=len(dates), dates_sha256=dates_hash,
+                          benchmark_sha256=benchmark_hash,
+                          cohort_id=hashlib.sha256((dates_hash + benchmark_hash).encode()).hexdigest()[:12],
+                          returns_sha256=digest(returns.astype("<f8")),
+                          turnover_sha256=digest(turnover.astype("<f8")),
+                          train_years="-".join(map(str, row["train_years"])),
+                          val_years="-".join(map(str, val_years)))
+            record.update(metrics)
+            records.append(record)
+            series[name, year] = (dates, returns, benchmark)
+    records.sort(key=lambda row: (row["test_year"], row["variant"]))
+    return records, series
+
+
+def _write_test_year_plots(root: Path, output: Path, prefix: str,
+                           scope_label: str, calendar_receipt: Path | None) -> dict:
+    """Render inspectable first-test-year comparisons without joining accounts."""
+    from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_text
+    from stockagent.backtest.report import _safe_equity_for_plot
+
+    records, series = _test_year_records(root, calendar_receipt)
+    clean = [{k: (None if isinstance(v, float) and not math.isfinite(v) else v)
+              for k, v in row.items()} for row in records]
+    identity = dict(contract="first_test_year_ablation_charts_v2", records=clean,
+                    rendering_contract=RISK_RETURN_RENDER_CONTRACT,
+                    renderer_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                    scope_label=scope_label)
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
+    directory = output / f"{prefix}_by_test_year"
+    directory.mkdir(parents=True, exist_ok=True)
+    status_path = directory / "alignment_status.json"
+    previous = {}
+    if status_path.is_file():
+        previous = json.loads(status_path.read_text())
+        if previous.get("input_sha256") == digest and all((directory / p).is_file() for p in previous["png_files"]):
+            return previous
+    status = {**identity, "input_sha256": digest,
+              "state": "charts_written" if records else "waiting_completed_runs",
+              "completed_observations": len(records), "png_files": [],
+              "year_input_sha256": {},
+              "note": "Each point uses its own independent reset account and first test year; "
+                      "lines connect annual risk/return points, not account equity. "
+                      "Different calendar/benchmark cohort IDs are not paired comparisons."}
+    if not records:
+        atomic_write_json(status_path, status)
+        return status
+    table = io.StringIO()
+    writer = csv.DictWriter(table, fieldnames=list(records[0]))
+    writer.writeheader()
+    writer.writerows(records)
+    atomic_write_text(directory / "test_year_fold_metrics.csv", table.getvalue())
+    names = sorted({row["variant"] for row in records})
+    years = sorted({row["test_year"] for row in records})
+    numbers = {name: index + 1 for index, name in enumerate(names)}
+    palette = ["#2864A8", "#D9782D", "#697B43", "#9E5885", "#AF8C37"]
+    styles = ["-", "--", ":", "-."]
+    styles_for = {name: (palette[i % len(palette)], styles[(i // len(palette)) % len(styles)])
+                  for i, name in enumerate(names)}
+    periods = list(range(min(years), max(years) + 1))
+    shared_limits = {metric_name: _risk_return_limits(records, metric_name)
+                     for metric_name, _ in RISK_SCATTER_Y_METRICS}
+
+    def save(fig, filename):
+        buffer = io.BytesIO()
+        fig.savefig(buffer, format="png", dpi=130, bbox_inches="tight")
+        (directory / filename).parent.mkdir(parents=True, exist_ok=True)
+        atomic_write_bytes(directory / filename, buffer.getvalue())
+        plt.close(fig)
+        status["png_files"].append(filename)
+
+    def save_alias(source, filename):
+        atomic_write_bytes(directory / filename, (directory / source).read_bytes())
+        status["png_files"].append(filename)
+
+    for metric_name, metric_label in RISK_SCATTER_Y_METRICS:
+        fig = _risk_return_figure(records, metric_name, metric_label,
+            scope_label="first-test-year account", period_key="test_year",
+            period_name="Test year", periods=periods, show_fold_ids=True)
+        save(fig, f"{metric_name}/all_folds_connected.png")
+    save_alias("cagr/all_folds_connected.png", "all_folds_connected.png")
+
+    for year in years:
+        rows = [row for row in records if row["test_year"] == year]
+        year_identity = {"year": year, "names": names,
+                         "records": [row for row in clean if row["test_year"] == year],
+                         "periods": periods, "shared_axis_limits": shared_limits,
+                         "renderer_sha256": identity["renderer_sha256"]}
+        year_digest = hashlib.sha256(json.dumps(year_identity, sort_keys=True, allow_nan=False).encode()).hexdigest()
+        status["year_input_sha256"][str(year)] = year_digest
+        filenames = [f"{metric_name}/year_{year}.png" for metric_name, _ in RISK_SCATTER_Y_METRICS]
+        filenames += [f"year_{year}.png", f"year_{year}_equity.png"]
+        if (previous.get("year_input_sha256", {}).get(str(year)) == year_digest and
+                all((directory / filename).is_file() for filename in filenames)):
+            status["png_files"].extend(filenames)
+            continue
+        cohorts = sorted({row["cohort_id"] for row in rows})
+        for metric_name, metric_label in RISK_SCATTER_Y_METRICS:
+            fig = _risk_return_figure(records, metric_name, metric_label,
+                scope_label="first-test-year account", period_key="test_year",
+                period_name="Test year", periods=periods, period_id=year, show_fold_ids=True)
+            save(fig, f"{metric_name}/year_{year}.png")
+        save_alias(f"cagr/year_{year}.png", f"year_{year}.png")
+        coverage = (f"{rows[0]['test_start']} to {rows[0]['test_end']} | {rows[0]['sessions']} sessions"
+                    if len(cohorts) == 1 else "Different calendars or benchmarks: see cohort IDs in CSV")
+
+        fig, ax = plt.subplots(figsize=(13, 8))
+        for row in rows:
+            name = row["variant"]
+            dates, returns, benchmark = series[name, year]
+            color, style = styles_for[name]
+            ax.plot(dates, _safe_equity_for_plot(returns), color=color, linestyle=style,
+                    label=f"{numbers[name]:02d} {display_label(name)} [fold {row['fold_id']}]")
+        if len(cohorts) == 1:
+            dates, _, benchmark = series[rows[0]["variant"], year]
+            ax.plot(dates, _safe_equity_for_plot(benchmark), color="#222222", linewidth=2,
+                    label="2330 buy and hold (total return)")
+        ax.set_title(f"Test year {year}: observed trading-session equity, reset account\n{coverage}")
+        ax.set_ylabel("Equity / initial equity")
+        ax.set_xlabel("Trading date")
+        ax.grid(color="#D9DEE7", alpha=.8)
+        ax.legend(loc="upper left", bbox_to_anchor=(1.02, 1), ncol=2, fontsize=8)
+        fig.tight_layout()
+        save(fig, f"year_{year}_equity.png")
+    atomic_write_json(status_path, status)
+    return status
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, required=True)
@@ -610,9 +1054,27 @@ def main() -> None:
     parser.add_argument("--prefix", default=None)
     parser.add_argument("--baseline-root", type=Path, default=None)
     parser.add_argument("--scope-label", default=None)
-    parser.add_argument("--comparison-mode", choices=("paired", "absolute"), default="paired")
+    parser.add_argument("--comparison-mode", choices=("paired", "absolute", "test_year", "completed"), default="paired")
     parser.add_argument("--calendar-receipt", type=Path, default=None)
     args = parser.parse_args()
+    if args.comparison_mode == "completed":
+        prefix = args.prefix or args.split
+        if not prefix or Path(prefix).name != prefix:
+            raise ValueError("invalid plot prefix")
+        status = _write_completed_fold_plots(args.root, args.output_dir, args.split, prefix,
+            args.scope_label or args.split, args.calendar_receipt)
+        print(json.dumps({key: status[key] for key in ("state", "completed_observations", "png_files")}))
+        return
+    if args.comparison_mode == "test_year":
+        if args.split != "test":
+            raise ValueError("test_year comparison requires the test split")
+        prefix = args.prefix or args.split
+        if not prefix or Path(prefix).name != prefix:
+            raise ValueError("invalid plot prefix")
+        status = _write_test_year_plots(args.root, args.output_dir, prefix,
+                                       args.scope_label or "test", args.calendar_receipt)
+        print(json.dumps({key: status[key] for key in ("state", "completed_observations", "png_files")}))
+        return
     if args.comparison_mode == "absolute":
         prefix = args.prefix or args.split
         if not prefix or Path(prefix).name != prefix:
@@ -989,323 +1451,29 @@ def main() -> None:
         output_path=args.output_dir / f"{prefix}_risk_return_medians.png",
     )
 
-    # Preserve fold-level movement instead of collapsing every experiment to a
-    # single median. Each metric gets comparable one-fold views plus one
-    # connected trajectory view. Fold color and marker size both progress in
-    # chronological order so the combined chart remains interpretable without
-    # relying on color alone.
+    # The legacy paired plots and incremental year reports share one renderer.
     fold_ids = [int(row["fold_id"]) for row in baseline_rows]
-    fold_colors = _fold_color_map(fold_ids)
-    fold_sizes = {
-        fold_id: float(size)
-        for fold_id, size in zip(
-            fold_ids,
-            np.linspace(34.0, 92.0, len(fold_ids)),
-            strict=True,
-        )
-    }
+    fold_records = []
+    for name in all_names:
+        for row in runs[name]:
+            record = dict(variant=name, fold_id=int(row["fold_id"]),
+                          **{key: float(row[f"{args.split}_metrics"][key]) for key in METRIC_NAMES})
+            count, first, last = _row_coverage(row, args.split)
+            if count != "":
+                record.update(sessions=count, test_start=first, test_end=last,
+                              cohort_id=f"{count}/{first}/{last}")
+            fold_records.append(record)
     fold_scatter_root = args.output_dir / f"{prefix}_risk_return_by_fold"
-
-    def padded_limits(
-        values: np.ndarray,
-        *,
-        lower_padding: float,
-        upper_padding: float,
-        reference: float | None = None,
-    ) -> tuple[float, float]:
-        finite = np.asarray(values, dtype=np.float64)
-        finite = finite[np.isfinite(finite)]
-        if not finite.size:
-            raise ValueError("cannot plot a metric without finite observations")
-        span = max(float(np.ptp(finite)), 1e-6)
-        lower = float(np.min(finite) - lower_padding * span)
-        upper = float(np.max(finite) + upper_padding * span)
-        if reference is not None:
-            lower = min(lower, reference)
-            upper = max(upper, reference)
-        return lower, upper
-
-    def annotate_experiment_names(
-        ax: plt.Axes,
-        point_values: dict[str, tuple[float, float]],
-        y_limits: tuple[float, float],
-    ) -> None:
-        x_ranked_names = sorted(
-            point_values,
-            key=lambda name: point_values[name][0],
-        )
-        split_at = (len(x_ranked_names) + 1) // 2
-        side_names = {
-            "left": x_ranked_names[:split_at],
-            "right": x_ranked_names[split_at:],
-        }
-        y_min, y_max = y_limits
-
-        def spread_label_positions(side: str) -> dict[str, float]:
-            side_order = sorted(
-                side_names[side],
-                key=lambda name: point_values[name][1],
-            )
-            if not side_order:
-                return {}
-            positions = np.asarray(
-                [
-                    (point_values[name][1] - y_min) / (y_max - y_min)
-                    for name in side_order
-                ],
-                dtype=np.float64,
-            )
-            low, high = .035, .965
-            positions = np.clip(positions, low, high)
-            minimum_gap = min(
-                .052,
-                (high - low) / max(len(side_order) - 1, 1),
-            )
-            for index in range(1, len(positions)):
-                positions[index] = max(
-                    positions[index],
-                    positions[index - 1] + minimum_gap,
-                )
-            if positions[-1] > high:
-                positions -= positions[-1] - high
-            for index in range(len(positions) - 2, -1, -1):
-                positions[index] = min(
-                    positions[index],
-                    positions[index + 1] - minimum_gap,
-                )
-            if positions[0] < low:
-                positions += low - positions[0]
-            return dict(zip(side_order, positions, strict=True))
-
-        for side, label_x, horizontal_alignment in (
-            ("left", -.035, "right"),
-            ("right", 1.035, "left"),
-        ):
-            positions = spread_label_positions(side)
-            for name in side_names[side]:
-                x_value, y_value = point_values[name]
-                color = ink if name == "baseline" else blue
-                ax.annotate(
-                    display_label(name),
-                    xy=(x_value, y_value),
-                    xycoords="data",
-                    xytext=(label_x, positions[name]),
-                    textcoords="axes fraction",
-                    ha=horizontal_alignment,
-                    va="center",
-                    fontsize=8.0,
-                    fontweight="bold" if name == "baseline" else "normal",
-                    color=color,
-                    annotation_clip=False,
-                    arrowprops={
-                        "arrowstyle": "-",
-                        "color": color,
-                        "alpha": .58,
-                        "linewidth": .7,
-                        "shrinkA": 2,
-                        "shrinkB": 4,
-                    },
-                    zorder=2,
-                )
-
-    drawdown_by_name = {
-        name: metric(runs[name], args.split, "max_drawdown")
-        for name in all_names
-    }
-    all_fold_drawdowns = np.concatenate(list(drawdown_by_name.values()))
-    fold_xlim = padded_limits(
-        all_fold_drawdowns,
-        lower_padding=.055,
-        upper_padding=.09,
-    )
-
     for y_metric, y_label in RISK_SCATTER_Y_METRICS:
-        y_by_name = {
-            name: metric(runs[name], args.split, y_metric)
-            for name in all_names
-        }
-        reference_value: float | None = None
-        if y_metric in {"cagr", "sharpe", "sortino"}:
-            reference_value = 0.0
-        elif y_metric == "daily_hit_rate":
-            reference_value = 0.5
-        fold_ylim = padded_limits(
-            np.concatenate(list(y_by_name.values())),
-            lower_padding=.075,
-            upper_padding=.09,
-            reference=reference_value,
-        )
         metric_dir = fold_scatter_root / y_metric
         metric_dir.mkdir(parents=True, exist_ok=True)
-
-        for fold_index, fold_id in enumerate(fold_ids):
-            point_values = {
-                name: (
-                    float(drawdown_by_name[name][fold_index]),
-                    float(y_by_name[name][fold_index]),
-                )
-                for name in all_names
-            }
-            fig, ax = plt.subplots(figsize=(16, 8.6))
-            fold_color = fold_colors[fold_id]
-            for name in all_names:
-                x_value, y_value = point_values[name]
-                ax.scatter(
-                    x_value,
-                    y_value,
-                    s=104 if name == "baseline" else 74,
-                    marker="D" if name == "baseline" else "o",
-                    color=fold_color,
-                    edgecolor=ink if name == "baseline" else "white",
-                    linewidth=1.5 if name == "baseline" else .8,
-                    zorder=3,
-                )
-            ax.set_xlim(*fold_xlim)
-            ax.set_ylim(*fold_ylim)
-            annotate_experiment_names(ax, point_values, fold_ylim)
-            if reference_value is not None:
-                ax.axhline(reference_value, color=ink, lw=.8)
-            ax.set_xlabel(
-                f"Fold {fold_id} {risk_axis_label} max drawdown "
-                "(less negative is better)"
-            )
-            ax.text(
-                .012,
-                .982,
-                f"Fold {fold_id} {risk_axis_label} {y_label}",
-                transform=ax.transAxes,
-                ha="left",
-                va="top",
-                fontsize=10,
-                color=ink,
-                bbox={"facecolor": "white", "edgecolor": "none", "alpha": .84},
-                zorder=5,
-            )
-            coverage = _row_coverage(baseline_rows[fold_index], args.split)
-            coverage_text = (
-                f"{coverage[1]} to {coverage[2]}; {coverage[0]} sessions; "
-                if coverage[0] != ""
-                else ""
-            )
-            fig.suptitle(
-                f"Fold {fold_id}: {risk_axis_label} max drawdown vs {y_label}",
-                y=.985,
-                fontweight="bold",
-            )
-            fig.text(
-                .5,
-                .95,
-                f"{coverage_text}all {len(all_names)} experiments; "
-                "x/y scales are shared across folds",
-                ha="center",
-                color="#596273",
-            )
-            ax.grid(color=grid, lw=.7)
-            for spine in ("top", "right"):
-                ax.spines[spine].set_visible(False)
-            fig.subplots_adjust(left=.23, right=.77, bottom=.11, top=.89)
-            fig.savefig(
-                metric_dir / f"fold_{fold_id:02d}.png",
-                dpi=180,
-                bbox_inches="tight",
-            )
+        for fold_id in [*fold_ids, None]:
+            fig = _risk_return_figure(fold_records, y_metric, y_label,
+                scope_label=risk_axis_label, periods=fold_ids,
+                period_id=fold_id, variant_order=all_names)
+            filename = "all_folds_connected.png" if fold_id is None else f"fold_{fold_id:02d}.png"
+            fig.savefig(metric_dir / filename, dpi=180, bbox_inches="tight")
             plt.close(fig)
-
-        # One connected path per experiment. The latest fold receives the
-        # darkest/largest point and the direct experiment-name label.
-        fig, ax = plt.subplots(figsize=(17, 9.2))
-        for name in all_names:
-            x_values = drawdown_by_name[name]
-            y_values = y_by_name[name]
-            ax.plot(
-                x_values,
-                y_values,
-                color=ink if name == "baseline" else blue,
-                linewidth=1.45 if name == "baseline" else .75,
-                alpha=.72 if name == "baseline" else .24,
-                zorder=1,
-            )
-            for fold_index, fold_id in enumerate(fold_ids):
-                ax.scatter(
-                    x_values[fold_index],
-                    y_values[fold_index],
-                    s=(
-                        fold_sizes[fold_id] * (1.18 if name == "baseline" else 1.0)
-                    ),
-                    marker="D" if name == "baseline" else "o",
-                    color=fold_colors[fold_id],
-                    edgecolor=ink if name == "baseline" else "white",
-                    linewidth=1.45 if name == "baseline" else .55,
-                    zorder=3,
-                )
-        ax.set_xlim(*fold_xlim)
-        ax.set_ylim(*fold_ylim)
-        latest_index = len(fold_ids) - 1
-        latest_points = {
-            name: (
-                float(drawdown_by_name[name][latest_index]),
-                float(y_by_name[name][latest_index]),
-            )
-            for name in all_names
-        }
-        annotate_experiment_names(ax, latest_points, fold_ylim)
-        if reference_value is not None:
-            ax.axhline(reference_value, color=ink, lw=.8)
-        ax.set_xlabel(
-            f"Per-fold {risk_axis_label} max drawdown "
-            "(less negative is better)"
-        )
-        ax.text(
-            .012,
-            .982,
-            f"Per-fold {risk_axis_label} {y_label}",
-            transform=ax.transAxes,
-            ha="left",
-            va="top",
-            fontsize=10,
-            color=ink,
-            bbox={"facecolor": "white", "edgecolor": "none", "alpha": .84},
-            zorder=5,
-        )
-        fig.suptitle(
-            f"Fold trajectories: {risk_axis_label} max drawdown vs {y_label}",
-            y=.988,
-            fontweight="bold",
-        )
-        fig.text(
-            .5,
-            .955,
-            f"Each line is one experiment; Fold {fold_ids[-1]} is darkest and "
-            "largest; labels mark latest endpoints",
-            ha="center",
-            color="#596273",
-        )
-        ordered_colors = [fold_colors[fold_id] for fold_id in fold_ids]
-        discrete_cmap = ListedColormap(ordered_colors)
-        discrete_norm = BoundaryNorm(
-            np.arange(len(fold_ids) + 1) - .5,
-            discrete_cmap.N,
-        )
-        colorbar = fig.colorbar(
-            ScalarMappable(norm=discrete_norm, cmap=discrete_cmap),
-            ax=ax,
-            orientation="horizontal",
-            fraction=.045,
-            pad=.105,
-            ticks=np.arange(len(fold_ids)),
-        )
-        colorbar.ax.set_xticklabels([f"F{fold_id}" for fold_id in fold_ids])
-        colorbar.set_label("Owned-test fold: later folds are darker and larger")
-        ax.grid(color=grid, lw=.7)
-        for spine in ("top", "right"):
-            ax.spines[spine].set_visible(False)
-        fig.subplots_adjust(left=.22, right=.78, bottom=.18, top=.89)
-        fig.savefig(
-            metric_dir / "all_folds_connected.png",
-            dpi=180,
-            bbox_inches="tight",
-        )
-        plt.close(fig)
 
     folds = np.asarray([row["fold_id"] for row in baseline_rows])
     baseline_sharpe = metric(baseline_rows, args.split, "sharpe")

@@ -77,8 +77,8 @@ def plan_annual_episode_ownership(split, source, *,
                 for start, stop in zip(cuts[:-1], cuts[1:], strict=True)]
     if len({period for period, _, _ in episodes}) != len(episodes):
         raise ValueError("an annual account appears in disjoint source intervals")
-    if len(episodes) < world_size:
-        raise ValueError("annual episode sharding needs at least one complete account per rank")
+    # A short expanding fold may contain fewer complete accounts than ranks.
+    # Idle ranks own no dates and contribute zero to the same global update.
     for period, start, _ in episodes:
         source_row = int(indices[start])
         if source_row > 0 and int(labels([source.day_at(source_row - 1)])[0]) == period:
@@ -124,7 +124,7 @@ def validate_annual_episode_receipt(receipt: Mapping[str, Any], *, train_rows: i
     counts, batches = [], []
     for rank in range(world_size):
         owned = receipt["accounts_by_rank"][rank]
-        if not owned or list(receipt["periods_by_rank"][rank]) != [a[0] for a in owned]:
+        if list(receipt["periods_by_rank"][rank]) != [a[0] for a in owned]:
             raise ValueError("annual ownership account labels mismatch")
         spans = [tuple(s) for s in receipt["spans_by_rank"][rank]]
         expected = []
@@ -141,7 +141,7 @@ def validate_annual_episode_receipt(receipt: Mapping[str, Any], *, train_rows: i
         counts.append(rows)
         batches.append(len(spans))
     accounts.sort(key=lambda a: a[1])
-    if (accounts[0][1] != 0 or accounts[-1][2] != train_rows
+    if (not accounts or accounts[0][1] != 0 or accounts[-1][2] != train_rows
             or any(a[2] != b[1] for a, b in zip(accounts, accounts[1:]))
             or len({a[0] for a in accounts}) != len(accounts)):
         raise ValueError("annual ownership duplicates or omits an account or physical date")

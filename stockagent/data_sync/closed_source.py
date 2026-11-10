@@ -166,6 +166,22 @@ def require_unbound_originals(source: Path) -> None:
 
 def _census(source: Path, files: dict) -> dict:
     allowed = set(files) | {BINDING, RETIREMENT_RECEIPT}
+    # The source handoff adds this empty coordination lock after the fixed
+    # release was recorded. It is never a member of that historical release.
+    # Admit it only for the active, exact E-bound CFTC source, and still check
+    # its type, ownership and generation alongside the regular census.
+    supplemental = source / '.download.lock'
+    has_supplemental = supplemental.exists() or supplemental.is_symlink()
+    if has_supplemental:
+        from stockagent.data_sync import workspace_source_handoff
+        active = workspace_source_handoff.guard_path(source)
+        if not active or active.get('source') != str(source) or active.get('state') != 'active':
+            raise SnapshotError('closed source supplemental lock has no active E handoff')
+        info = supplemental.lstat()
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_nlink != 1 or info.st_size != 0 or info.st_mode & 0o022):
+            raise SnapshotError('closed source supplemental lock identity differs')
+        allowed.add('.download.lock')
     result = {".": _signature(source.lstat())}
     for directory, subdirs, names in os.walk(source, followlinks=False):
         for name in subdirs + names:
@@ -178,7 +194,7 @@ def _census(source: Path, files: dict) -> dict:
             elif not stat.S_ISREG(info.st_mode) or relative not in allowed:
                 raise SnapshotError(f"unknown or redirected closed source member: {relative}")
             result[relative] = _signature(info)
-            if len(result) > 17:
+            if len(result) > 17 + int(has_supplemental):
                 raise SnapshotError("closed source exceeds its bounded workspace")
     missing = set(files) - set(result)
     if any(not _RAW.fullmatch(name) for name in missing):

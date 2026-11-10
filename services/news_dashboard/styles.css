@@ -25,6 +25,10 @@
 body.news-snapshot-unavailable #acq-overview{display:none}
 .news-provider-list>dl{margin-top:4px}
 .news-traffic-table td:last-child{white-space:pre-line}
+/* Provider cards can be narrower than the desktop viewport. Do not inherit
+   the unrelated API page's 620px minimum table width inside these cards. */
+.news-provider-list .table-scroll table{width:100%;min-width:0;table-layout:fixed}
+.news-provider-list .table-scroll th,.news-provider-list .table-scroll td{min-width:0;white-space:normal;overflow-wrap:anywhere}
 body[data-acquisition-page="news"] .table-scroll caption{text-align:left;font-size:12px;color:var(--muted);line-height:1.7;padding:10px 12px;overflow-wrap:anywhere}
 body[data-acquisition-page="news"] #backfill .progress-copy{grid-template-columns:minmax(0,1.6fr) minmax(0,1fr)}
 body[data-acquisition-page="news"] #download-progress-label{font-size:clamp(18px,2.3vw,28px)}

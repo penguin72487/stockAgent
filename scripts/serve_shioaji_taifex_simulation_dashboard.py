@@ -21,6 +21,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from downloader.artifact_io import atomic_write_bytes  # noqa: E402
+from stockagent.live.taifex_settlement_reference import SettlementReference  # noqa: E402
 from stockagent.live.taifex_volatility_dashboard import (  # noqa: E402
     DASHBOARD_SCHEMA_VERSION,
     DEFAULT_MARK_LIMIT_PER_STRATEGY,
@@ -144,6 +145,13 @@ class DashboardHTTPServer(ThreadingHTTPServer):
         self._history_build_lock = threading.Lock()
         self._history_refreshing: set[str] = set()
         self._prewarm_stop = threading.Event()
+        self.settlement_reference = SettlementReference(
+            REPO_ROOT / "data_tw_index_options_daily/txo_final_settlement_history.parquet",
+            partial_snapshot_path=(
+                self.history_cache_dir / "settlement-reference-partial.json"
+                if self.history_cache_dir is not None else None
+            ),
+        )
 
     def server_close(self) -> None:
         self._prewarm_stop.set()
@@ -292,6 +300,7 @@ class DashboardHTTPServer(ThreadingHTTPServer):
                 mark_limit_per_strategy=self.mark_limit_per_strategy,
                 include_history=False,
             )
+            snapshot["settlement_reference"] = self.settlement_reference.snapshot()
             self._snapshot_cache = (time.monotonic(), snapshot)
             return snapshot
 
@@ -606,6 +615,12 @@ def main(argv: list[str] | None = None) -> int:
         f"state_dir={args.state_dir}",
         flush=True,
     )
+    threading.Thread(
+        target=server.settlement_reference.run,
+        args=(server._prewarm_stop,),
+        name="taiex-settlement-reference",
+        daemon=True,
+    ).start()
     threading.Thread(
         target=server.prewarm_default_views_after_startup,
         name="taifex-default-views-prewarm",

@@ -236,6 +236,54 @@ def test_fill_inventory_and_all_minute_nav_reconcile(tmp_path):
     assert any("exit exceeds inventory" in e for e in result["errors"])
 
 
+def test_delayed_terminal_settlement_is_in_1330_endpoint_only_after_recording(tmp_path):
+    from stockagent.live.tw_day_trade_simulation import TERMINAL_CLOSE_UNLIMITED_CONTRACT
+
+    start = datetime.fromisoformat("2026-08-13T09:01:00+08:00")
+    close_at = "2026-08-13T13:30:00+08:00"
+    recorded = "2026-08-13T13:35:00+08:00"
+    receipt = {"contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT, "broker_fill": False,
+        "full_quantity_is_user_assumption": True, "effective_at": close_at, "recorded_at": recorded,
+        "source_evidence": {"session_date": "2026-08-13", "price": 10.1,
+                            "price_basis": "official_session_close"}}
+    entry = dict(market="a", position_id="p", symbol="2330", session_date="2026-08-13",
+        order_id="entry", recorded_at=start.isoformat(), fill_at=start.isoformat(),
+        purpose="entry", side="buy", quantity=1000, price=10.0)
+    exit = dict(market="a", position_id="p", symbol="2330", session_date="2026-08-13",
+        order_id="exit", recorded_at=recorded, fill_at=close_at, purpose="13_30_unlimited_close_paper_settlement",
+        side="sell", quantity=1000, requested_quantity=1000, remaining_quantity=0, price=10.1,
+        simulation_only=True, fill_contract=TERMINAL_CLOSE_UNLIMITED_CONTRACT,
+        terminal_close_receipt=receipt, quote_at=None, exchange_match_at=None,
+        gross_pnl_twd=100.0, entry_fee_allocated_twd=1.0, fee_and_tax_twd=1.0, net_pnl_twd=98.0)
+    marks = []
+    for index in range(270):
+        final = index == 269
+        minute = start + timedelta(minutes=index)
+        marks.append(dict(market="a", session_date="2026-08-13", minute=minute.isoformat(timespec="minutes"),
+            recorded_at="2026-08-13T13:36:00+08:00" if final else minute.isoformat(),
+            initial_capital_twd=10000.0, cumulative_realized_net_pnl_twd=98.0 if final else 0.0,
+            open_net_liquidation_pnl_twd=0.0, total_equity_twd=10098.0 if final else 10000.0,
+            open_position_count=0 if final else 1))
+    state = {"modes": {"a": {"session_date": "2026-08-13", "total_equity_twd": 10098.0,
+        "terminal_close_contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT,
+        "positions": {"p": {"position_id": "p", "signed_shares": 0}}}}}
+    rebuild = {"replay_contract": {"terminal_close_contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT},
+        "sessions": [{"session_date": "2026-08-13", "modes": [{"market": "a", "after_close": {
+            "terminal_close_contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT,
+            "terminal_flatten_count": 1, "open_position_rows": 0}}]}]}
+    (tmp_path / "state.json").write_text(json.dumps(state))
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps(rebuild))
+    (tmp_path / "orders.jsonl").write_text("".join(json.dumps(row) + "\n" for row in (entry, exit)))
+    (tmp_path / "fills.jsonl").write_text("".join(json.dumps({k: v for k, v in row.items() if k != "side"}) + "\n"
+        for row in (entry, exit)))
+    (tmp_path / "marks.jsonl").write_text("".join(json.dumps(row) + "\n" for row in marks))
+    assert audit(tmp_path, verify_sources=False, require_margin_carry=False)["passed"]
+    marks[-1]["recorded_at"] = close_at
+    (tmp_path / "marks.jsonl").write_text("".join(json.dumps(row) + "\n" for row in marks))
+    with pytest.raises(ValueError, match="predates"):
+        audit(tmp_path, verify_sources=False, require_margin_carry=False)
+
+
 def test_audit_disclosed_paper_entry_completion_is_inventory_not_exit(tmp_path):
     from scripts.complete_tw_day_trade_paper_entry import CONTRACT
 

@@ -7,6 +7,7 @@ or commit an enclosing worker transaction. Call queue helpers under worker.lock.
 from __future__ import annotations
 
 from contextlib import contextmanager
+from collections import OrderedDict
 from datetime import UTC, date, datetime, timedelta
 from functools import lru_cache
 import hashlib
@@ -14,6 +15,7 @@ import json
 from pathlib import Path
 import re
 import sqlite3
+import threading
 from typing import Any
 from uuid import uuid4
 
@@ -34,6 +36,9 @@ DERIVED_DATASETS = {'TaiwanStockInstitutionalInvestorsBuySell': 'TaiwanStockInst
 MAX_PLAN_BYTES = 4 * 1024**2
 MAX_RECEIPT_BYTES = 1024**2
 MAX_PROOF_BYTES = 512 * 1024**2
+_OPTION_PROOF_CACHE: OrderedDict[bytes, tuple[int, int] | None] = OrderedDict()
+_OPTION_PROOF_CACHE_LOCK = threading.Lock()
+_OPTION_PROOF_CACHE_MAX = 1024
 PERMANENT_ERRORS = frozenset({'invalid_token', 'not_entitled', 'invalid_request', 'provider_bad_request',
                               'TokenIllegal', 'ip_banned'})
 MUTABLE_STATES = frozenset({'complete', 'observed_empty', 'pending', 'failed'})
@@ -334,6 +339,59 @@ def _parquet_verified(path_text: str, signature: tuple[int, ...], digest: str, r
     return signature == (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
 
 
+def _file_signature(path: Path) -> tuple[int, ...]:
+    stat = path.stat()
+    return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
+
+
+def _option_contract_proof(prior: Path, prior_signature: tuple[int, ...], prior_sha256: str,
+                           current: Path, current_signature: tuple[int, ...],
+                           expected: list) -> tuple[int, int] | None:
+    """Memoize exact immutable generations, including an unchanged negative proof.
+
+    The cache stores only a digest and two counts, not Parquet frames or source
+    values. A changed inode, size, timestamps, requested keys, or expected SHA
+    forces the full verification again. Both files are restatted after lookup.
+    """
+    key = hashlib.sha256(_json([str(prior), prior_signature, prior_sha256, str(current),
+                               current_signature, expected]).encode()).digest()
+    with _OPTION_PROOF_CACHE_LOCK:
+        cached = key in _OPTION_PROOF_CACHE
+        proof = _OPTION_PROOF_CACHE.get(key)
+        if cached:
+            _OPTION_PROOF_CACHE.move_to_end(key)
+    if not cached:
+        if prior_signature[2] > MAX_PROOF_BYTES or _sha(prior) != prior_sha256:
+            proof = None
+        else:
+            names = ['option_id', 'contract_date', 'ExercisePrice', 'PutCall']
+            def distinct_keys(source: Path):
+                return (pl.scan_parquet(source).select(
+                    pl.col('option_id').str.strip_chars().str.to_uppercase(),
+                    vendor_option_series(pl.col('contract_date')).alias('contract_date'),
+                    pl.col('ExercisePrice').cast(pl.Float32),
+                    pl.col('PutCall').str.strip_chars().str.to_uppercase(),
+                ).unique().collect(engine='streaming'))
+            prior_keys = distinct_keys(prior)
+            current_keys = distinct_keys(current)
+            wanted = pl.DataFrame(expected, schema={
+                'option_id': pl.String, 'contract_date': pl.String,
+                'ExercisePrice': pl.Float32, 'PutCall': pl.String,
+            }, orient='row').unique()
+            proof = None if (wanted.join(current_keys, on=names, how='anti').height
+                             or prior_keys.join(current_keys, on=names, how='anti', nulls_equal=True).height
+                             ) else (wanted.height, prior_keys.height)
+    if _file_signature(prior) != prior_signature or _file_signature(current) != current_signature:
+        return None
+    if not cached:
+        with _OPTION_PROOF_CACHE_LOCK:
+            _OPTION_PROOF_CACHE[key] = proof
+            _OPTION_PROOF_CACHE.move_to_end(key)
+            while len(_OPTION_PROOF_CACHE) > _OPTION_PROOF_CACHE_MAX:
+                _OPTION_PROOF_CACHE.popitem(last=False)
+    return proof
+
+
 def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
                       owner: str, receipt: dict[str, Any]) -> dict[str, Any] | None:
     """Verify an affected receipt and any explicitly requested source keys."""
@@ -431,35 +489,12 @@ def _verified_receipt(root: Path, task: dict[str, Any], request: dict[str, Any],
             if (not isinstance(expected_contracts, list) or not 0 < len(expected_contracts) <= 50000
                     or any(not isinstance(key, list) or len(key) != 4 for key in expected_contracts)):
                 return None
-            names = ['option_id', 'contract_date', 'ExercisePrice', 'PutCall']
-            def distinct_keys(source: Path):
-                return (pl.scan_parquet(source).select(
-                    pl.col('option_id').str.strip_chars().str.to_uppercase(),
-                    vendor_option_series(pl.col('contract_date')).alias('contract_date'),
-                    pl.col('ExercisePrice').cast(pl.Float32),
-                    pl.col('PutCall').str.strip_chars().str.to_uppercase(),
-                ).unique().collect(engine='streaming'))
-
             prior = _local_path(root, request['original_parquet_path'])
-            prior_before = prior.stat()
-            prior_signature = (prior_before.st_dev, prior_before.st_ino, prior_before.st_size,
-                               prior_before.st_mtime_ns, prior_before.st_ctime_ns)
-            if (_sha(prior) != request['original_parquet_sha256'] or prior_before.st_size > MAX_PROOF_BYTES):
+            proof = _option_contract_proof(prior, _file_signature(prior), request['original_parquet_sha256'],
+                                           path, signature, expected_contracts)
+            if proof is None:
                 return None
-            prior_keys = distinct_keys(prior)
-            current_keys = distinct_keys(path)
-            wanted = pl.DataFrame(expected_contracts, schema={
-                'option_id': pl.String, 'contract_date': pl.String,
-                'ExercisePrice': pl.Float32, 'PutCall': pl.String,
-            }, orient='row').unique()
-            prior_after = prior.stat()
-            if (wanted.join(current_keys, on=names, how='anti').height
-                    or prior_keys.join(current_keys, on=names, how='anti', nulls_equal=True).height
-                    or prior_signature != (prior_after.st_dev, prior_after.st_ino, prior_after.st_size,
-                                           prior_after.st_mtime_ns, prior_after.st_ctime_ns)):
-                return None
-            evidence.update(verified_expected_contract_keys=wanted.height,
-                            verified_prior_contract_keys=prior_keys.height)
+            evidence.update(verified_expected_contract_keys=proof[0], verified_prior_contract_keys=proof[1])
         expected_futures = request.get('expected_source_futures_contracts')
         if expected_futures is not None:
             # Contract-day identity is necessary but does not prove complete

@@ -21,10 +21,12 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture
-def tiny_metadata_scratch_capacity(monkeypatch):
+def tiny_metadata_scratch_capacity(monkeypatch, tmp_path):
     # Forced one-row spills exercise SQLite/binding semantics with a handful
-    # of owned records, independently of a busy host's transient free space.
-    # Keep every production check; only its observed test capacity is fixed.
+    # of owned records, independently of the host's E enrollment and transient
+    # free space. Live E admission is covered by dedicated workspace tests.
+    from stockagent.data_sync import workspace_volume
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', tmp_path / 'no-e-enrollment')
     native_usage = migration.shutil.disk_usage
 
     def usage(path):
@@ -163,6 +165,36 @@ def test_private_preparation_keeps_old_c_binding_when_e_is_enrolled(setup, monke
     monkeypatch.setattr(workspace_volume, 'path', lambda *_a, **_k: pytest.fail('existing binding changed'))
     after = migration._private_preparation(entries[1], args, source, private, policy)
     assert after == before
+
+
+def test_prepared_sqlite_follows_exact_repack_without_backing_up_live_database_again(setup, tmp_path, monkeypatch):
+    from test_dataset_migration_freshness import _source_hashed_repack
+    repo, cold, entries, args, policy = setup
+    entry = entries[1]
+    source = Path(entry['source'])
+    database = source/'state.sqlite3'
+    with sqlite3.connect(database) as db:
+        db.execute('CREATE TABLE observations(value INTEGER)')
+        db.execute('INSERT INTO observations VALUES(7)')
+    private = migration.private_history_root(cold, policy)
+    initialize_packed_layout(private, node_id='test')
+    before = migration._private_preparation(entry, args, source, private, policy)
+    old = before['sqlite_states'][0]
+    fixed = migration.resolve_packed_snapshot_id(private, old['dataset'], old['snapshot_id'])
+    workspace = tmp_path/'repack-E'
+    result, _ = _source_hashed_repack(workspace, private, old['dataset'], fixed, monkeypatch, private=True)
+    fixed.manifest_path.unlink()
+    with sqlite3.connect(database) as db:
+        db.execute('INSERT INTO observations VALUES(99)')
+    monkeypatch.setattr(migration, '_repack_evidence_workspace', lambda: workspace)
+    monkeypatch.setattr(migration, '_snapshot_sqlite', lambda *_a, **_kw: pytest.fail('frozen database backed up again'))
+    after = migration._private_preparation(entry, args, source, private, policy)
+    new = after['sqlite_states'][0]
+    assert new['consistent_state'] == old['consistent_state']
+    assert new['retained_snapshot_staging'] == old['retained_snapshot_staging']
+    assert new['manifest_sha256'] == result['new_manifest_sha256']
+    assert new['physical_repack_rebindings'][0]['previous_manifest_sha256'] == old['manifest_sha256']
+    assert migration._private_preparation(entry, args, source, private, policy) == after
 
 
 def test_private_control_freeze_uses_observed_size_and_complete_original_bytes(tmp_path, monkeypatch):
@@ -367,6 +399,9 @@ def setup(tmp_path, monkeypatch):
     policy = json.loads((ROOT / "configs/columnar_storage.json").read_text())
     policy["source_versioning"]["roots"] = {}
     policy["dataset_version_lifecycle"]["pending_source_priority"] = []
+    # Generic lifecycle cases exercise rolling deadlines independently of
+    # Penguin's operator-selected calendar window. Calendar cases opt in.
+    policy["dataset_version_lifecycle"].pop('daily_merge_window', None)
     (repo / "configs/columnar_storage.json").write_text(json.dumps(policy))
     monkeypatch.setattr(publisher, "REPO_ROOT", repo)
     cold = tmp_path / "cold"
@@ -490,6 +525,21 @@ def test_futures_dependency_wait_has_no_failed_attempt_and_wakes_on_recovery(tmp
     assert 'dependency_wait' not in row and row['retry_at_unix'] == 0
 
 
+def test_futures_dependency_can_publish_only_under_explicit_recovery_pause(tmp_path):
+    entry = {'dataset': 'local-tw-futures', 'source': str(tmp_path)}
+    row = {'state': 'pending', 'attempts': 0}
+    target = {'state': 'recovery_deferred_user_migration', 'snapshot_id': 'fixed', 'manifest_sha256': 'a'*64}
+    datasets = {'local-tw-index-futures': target}
+    marker = tmp_path/'pause.json'
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    assert migration._source_precondition_wait(entry, row, datasets, retry_seconds=60)
+    assert not migration._source_precondition_wait(entry, row, datasets, retry_seconds=60, recovery_pause_path=marker)
+    assert 'dependency_wait' not in row
+    target['manifest_sha256'] = 'bad'
+    assert migration._source_precondition_wait(entry, row, datasets, retry_seconds=60, recovery_pause_path=marker)
+
+
 def test_committed_release_recovery_always_precedes_source_preconditions(tmp_path, monkeypatch):
     entry = {'dataset': 'local-tw-futures', 'source': str(tmp_path)}
     row = {'state': 'recovery', 'snapshot_id': 'fixed', 'blocked_source_link': {'path': 'bad'}}
@@ -512,6 +562,83 @@ def test_full_cold_volume_waits_without_spending_attempt_and_wakes_on_capacity(t
     assert not migration._source_precondition_wait(entry, row, {}, retry_seconds=60, cold=tmp_path)
     assert 'capacity_wait' not in row and row['retry_at_unix'] == 0
     assert row['attempts'] == 3
+
+
+def test_d_cold_floor_matches_native_writer_without_spending_attempt(tmp_path, monkeypatch):
+    entry = {'dataset': 'pending', 'source': str(tmp_path)}
+    row = {'state': 'pending', 'attempts': 0}
+    monkeypatch.setattr(migration.shutil, 'disk_usage', lambda _: SimpleNamespace(free=13 * 1024**3))
+    assert migration._source_precondition_wait(entry, row, {}, retry_seconds=60,
+                                                cold=Path('/srv/stockagent-packed'))
+    assert row['attempts'] == 0
+    assert row['capacity_wait']['minimum_write_headroom_bytes'] == 32 * 1024**3
+    monkeypatch.setattr(migration.shutil, 'disk_usage', lambda _: SimpleNamespace(free=32 * 1024**3))
+    assert not migration._source_precondition_wait(entry, row, {}, retry_seconds=60,
+                                                    cold=Path('/srv/stockagent-packed'))
+    assert row['attempts'] == 0 and 'capacity_wait' not in row
+
+
+def test_private_recovery_pause_rejects_unsafe_or_wrong_marker(tmp_path):
+    marker = tmp_path / 'pause.json'
+    assert not migration._recovery_paused(marker)
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    assert migration._recovery_paused(marker)
+    marker.chmod(0o644)
+    with pytest.raises(SnapshotError, match='private local file'):
+        migration._recovery_paused(marker)
+    marker.chmod(0o600)
+    marker.write_text(json.dumps({'contract': 'different', 'paused': True}))
+    with pytest.raises(SnapshotError, match='identity differs'):
+        migration._recovery_paused(marker)
+    marker.unlink()
+    marker.symlink_to(tmp_path / 'elsewhere')
+    with pytest.raises(OSError):
+        migration._recovery_paused(marker)
+
+
+def test_user_recovery_pause_retains_fixed_publication_and_resumes_without_republish(setup, monkeypatch):
+    repo, _, entries, args, _ = setup
+    entry = next(row for row in entries if row['publish'])
+    marker = args.migration_state.parent / 'pause.json'
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    args.recovery_pause_path = marker
+    native_recover = migration._recover
+    monkeypatch.setattr(migration, '_recover', lambda *a, **kw: pytest.fail('recovery was deferred'))
+    first = migration.migrate_catalog(repo, args, [entry])
+    fixed = first['datasets'][entry['dataset']]
+    assert fixed['state'] == 'recovery_deferred_user_migration'
+    assert first['state'] != 'verified' and fixed['recovery_deferred_by_user'] is True
+    assert fixed['snapshot_id'] and fixed['manifest_sha256']
+    assert (Path(entry['source']) / 'raw.txt').read_text() == 'public'
+    assert not (args.migration_state / 'recovery' / 'public.json').exists()
+    again = migration.migrate_catalog(repo, args, [entry])
+    assert again['datasets']['public']['snapshot_id'] == fixed['snapshot_id']
+    assert again['datasets']['public']['attempts'] == fixed['attempts']
+    marker.unlink()
+    monkeypatch.setattr(migration, '_recover', native_recover)
+    monkeypatch.setattr(publisher, '_publish_entry', lambda *a, **kw: pytest.fail('fixed version was republished'))
+    resumed = migration.migrate_catalog(repo, args, [entry])
+    assert resumed['state'] == 'verified'
+    assert resumed['datasets']['public']['snapshot_id'] == fixed['snapshot_id']
+    assert resumed['datasets']['public']['manifest_sha256'] == fixed['manifest_sha256']
+
+
+def test_recovery_pause_does_not_block_other_source_publications(setup, monkeypatch):
+    repo, _, entries, args, _ = setup
+    marker = args.migration_state.parent / 'pause.json'
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    args.recovery_pause_path = marker
+    args.maximum_attempted_sources = 1
+    monkeypatch.setattr(migration, '_recover', lambda *a, **kw: pytest.fail('recovery was deferred'))
+    first = migration.migrate_catalog(repo, args, entries)
+    assert first['datasets']['public']['state'] == 'recovery_deferred_user_migration'
+    second = migration.migrate_catalog(repo, args, entries)
+    assert second['datasets']['public']['state'] == 'recovery_deferred_user_migration'
+    assert second['datasets']['private']['state'] == 'recovery_deferred_user_migration'
+    assert second['verified_datasets'] == 0
 
 
 def test_full_cold_volume_recovers_a_committed_release_even_if_its_journal_was_interrupted(setup, monkeypatch):
@@ -675,6 +802,26 @@ def test_committed_catalog_reuse_never_admits_changed_scope_rights_or_gates(setu
     assert resolve_latest_packed(cold, entry['dataset']).manifest_sha256 == saved.manifest_sha256
 
 
+def test_content_alias_enrollment_preserves_exact_v2_source_scope_during_transition(setup, monkeypatch):
+    from types import SimpleNamespace
+    _, cold, entries, args, _ = setup
+    original = entries[0]
+    _, saved = publisher._publish_entry(original, args, cold)
+    v3_entry = {**original, 'reader_contract': 'packed-v3-content-alias'}
+    assert migration._committed_catalog_release(v3_entry, args, cold).manifest_sha256 == saved.manifest_sha256
+    manifest = {**saved.manifest, 'schema_version': 3,
+                'metadata': {**saved.manifest['metadata'],
+                             'physical_repack_original_manifest_sha256': saved.manifest_sha256}}
+    monkeypatch.setattr(migration, 'resolve_latest_packed',
+                        lambda *_a, **_kw: SimpleNamespace(manifest=manifest, manifest_sha256='a'*64))
+    assert migration._committed_catalog_release(v3_entry, args, cold).manifest['schema_version'] == 3
+    assert migration._committed_catalog_release(original, args, cold) is None
+    assert migration._committed_catalog_release({**v3_entry, 'role': 'changed'}, args, cold) is None
+    manifest['metadata'].pop('physical_repack_original_manifest_sha256')
+    with pytest.raises(SnapshotError, match='original physical release binding'):
+        migration._committed_catalog_release(v3_entry, args, cold)
+
+
 def test_unbound_legacy_catalog_release_gets_one_contract_upgrade_not_payload_duplication(setup):
     _, cold, entries, args, _ = setup
     entry = entries[0]
@@ -777,6 +924,65 @@ def test_futures_cross_root_interfaces_bind_fixed_versions_without_payload_copy(
     assert receipt["source_files_deleted"] == 0
 
 
+@pytest.mark.parametrize('with_sqlite', [False, True])
+def test_futures_interfaces_can_bind_a_deferred_fixed_target_without_claiming_recovery(setup, with_sqlite):
+    from stockagent.data_sync import private_source_links as links
+    from stockagent.data_sync import private_handoff_retirement as retirement
+    repo, cold, catalog, args, policy = _futures_interfaces(setup)
+    if with_sqlite:
+        database = repo/'data_tw_index_futures/preparation_sources/margin_repair_inputs/probe/observations.sqlite3'
+        database.parent.mkdir()
+        with sqlite3.connect(database) as connection:
+            connection.execute('CREATE TABLE observations(value REAL)')
+            connection.execute('INSERT INTO observations VALUES (-7)')
+    marker = repo/'recovery-pause.json'
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    args.recovery_pause_path = marker
+    args.maximum_attempted_sources = 1
+    first = migration.migrate_catalog(repo, args, catalog)
+    assert first['datasets']['local-tw-index-futures']['state'] == 'recovery_deferred_user_migration'
+    assert first['datasets']['local-tw-futures']['state'] == 'pending'
+    assert not (args.migration_state/'recovery/local-tw-index-futures.json').exists()
+    second = migration.migrate_catalog(repo, args, catalog)
+    assert second['datasets']['local-tw-futures']['state'] == 'recovery_deferred_user_migration', second
+    private = migration.private_history_root(cold, policy)
+    selected = resolve_latest_packed(private, 'local-tw-futures')
+    bindings = links.manifest_source_links(selected)
+    assert len(bindings) == 3 and all(x['dependency_recovery'] == 'deferred_by_user' for x in bindings)
+    assert not (args.migration_state/'recovery/local-tw-futures.json').exists()
+    census = retirement._manifest_census(private)
+    dependencies = list(links.source_link_dependencies(bindings))
+    for dependency in dependencies:
+        pins = retirement._source_link_protections(private, census, dependency['dataset'])
+        assert pins[dependency['snapshot_id']] == dependency['manifest_sha256']
+    if with_sqlite:
+        assert any(binding.get('sqlite_states') for binding in bindings)
+        assert len(dependencies) == 2
+        # The index release itself pins its SQLite side snapshot even if no
+        # separate futures source-link manifest remains.
+        futures_manifest = selected.manifest_path
+        saved = futures_manifest.with_suffix('.temporary-test')
+        futures_manifest.rename(saved)
+        try:
+            state = dependencies[1]
+            pins = retirement._source_link_protections(private, retirement._manifest_census(private), state['dataset'])
+            assert pins[state['snapshot_id']] == state['manifest_sha256']
+        finally:
+            saved.rename(futures_manifest)
+    target = private/'manifests'/dependencies[0]['dataset']/(dependencies[0]['snapshot_id']+'.json')
+    displaced = target.with_suffix('.temporary-test')
+    target.rename(displaced)
+    try:
+        with pytest.raises((FileNotFoundError, SnapshotError)):
+            links.guard_source_links(repo/'data_tw_futures', bindings, cold=private, recovery_pause_path=marker)
+    finally:
+        displaced.rename(target)
+    marker.unlink()
+    with pytest.raises(SnapshotError, match='active recovery pause'):
+        links.guard_source_links(repo/'data_tw_futures', bindings, cold=private, recovery_pause_path=marker)
+
+
 def test_futures_source_view_retains_original_consistent_sqlite_dependency(setup):
     from stockagent.data_sync import private_source_links as links
     repo, cold, catalog, args, policy = _futures_interfaces(setup)
@@ -847,6 +1053,47 @@ def test_futures_dependency_guard_rechecks_target_and_link_before_commit(setup, 
     result = migration.migrate_catalog(repo, args, catalog)
     assert result["datasets"]["local-tw-futures"]["state"] == "waiting_retry", result
     assert "dependency changed" in result["datasets"]["local-tw-futures"]["error"]
+
+
+def test_private_sqlite_dependency_is_rechecked_under_main_publication_lock(setup, monkeypatch):
+    repo, cold, entries, args, policy = setup
+    source = Path(entries[1]['source'])
+    with sqlite3.connect(source/'live.sqlite3') as database:
+        database.execute('CREATE TABLE observations(value REAL)')
+    native_publish = migration.publish_packed_snapshot
+    def remove_state_before_main_commit(root, dataset, original, **options):
+        if dataset != 'private':
+            return native_publish(root, dataset, original, **options)
+        preparation = json.loads((args.migration_state/'preparations/private.json').read_text())
+        state, = preparation['sqlite_states']
+        manifest = root/'manifests'/state['dataset']/(state['snapshot_id']+'.json')
+        displaced = manifest.with_suffix('.temporary-test')
+        manifest.rename(displaced)
+        try:
+            return native_publish(root, dataset, original, **options)
+        finally:
+            displaced.rename(manifest)
+    monkeypatch.setattr(migration, 'publish_packed_snapshot', remove_state_before_main_commit)
+    result = migration.migrate_catalog(repo, args, [entries[1]])
+    assert result['datasets']['private']['state'] == 'waiting_retry', result
+    private = migration.private_history_root(cold, policy)
+    assert not (private/'heads/private').exists()
+
+
+def test_sqlite_snapshot_reports_its_actual_stages_without_claiming_acceptance(tmp_path):
+    database = tmp_path/'original.sqlite3'
+    with sqlite3.connect(database) as connection:
+        connection.execute('CREATE TABLE observations(value BLOB)')
+        connection.execute('INSERT INTO observations VALUES (zeroblob(1024*1024))')
+    events = []
+    proof = migration._snapshot_sqlite(database, tmp_path/'owned', 'original.sqlite3', progress=events.append)
+    stages = [event['stage'] for event in events]
+    assert stages.index('snapshotting_sqlite_state') < stages.index('checking_sqlite_snapshot')
+    assert stages.index('checking_sqlite_snapshot') < stages.index('hashing_sqlite_snapshot')
+    assert events[-1]['logical_bytes_processed'] == events[-1]['logical_bytes_total'] == proof['snapshot_bytes']
+    assert all(event['acceptance'] is False for event in events)
+    with sqlite3.connect(tmp_path/'owned/snapshot.sqlite3') as connection:
+        assert connection.execute('SELECT length(value) FROM observations').fetchone() == (1024*1024,)
 
 
 def test_finmind_inflight_parquet_promotion_is_not_a_missing_observation(setup, monkeypatch):
@@ -1072,6 +1319,7 @@ def test_recursive_mutable_controls_do_not_restart_the_entire_baseline(setup, mo
     ('data_crypto_reference', ['state/providers/etherscan.json', 'state/datasets/supply.json']),
     ('data_finlab', ['receipts/prices.json', 'raw_receipts/after_market_fixed_price.json',
                      'attempts/prices.json',
+                     'intraday/priority_status_tw_minute.json', 'intraday/priority_status_tw_tick.json',
                      'intraday/attempts/tw_minute-0103/2026-09-21.json',
                      'intraday/receipts/tw_minute-0103/2026-09-21.json',
                      'intraday/derived_minute/receipts/tw_tick-0103/2026-09-21.json']),
@@ -1079,6 +1327,7 @@ def test_recursive_mutable_controls_do_not_restart_the_entire_baseline(setup, mo
                       'complement/receipts/TaiwanStockNews/all/2026-10-19.json',
                       'sponsor/receipts/TaiwanStockPrice/all/2026-10-19.json']),
     ('data_tej', ['progress/task-attempt.json.progress.json']),
+    ('data_tw_index_derivatives_ticks', ['shioaji_fop_captures/runtime/worker_00.json']),
 ])
 def test_named_provider_controls_stream_into_cold_without_millions_of_freeze_files(
         setup, monkeypatch, root, controls, memory_rows, tiny_metadata_scratch_capacity):
@@ -1140,6 +1389,20 @@ def test_provider_control_scope_does_not_admit_raw_receipts_by_basename(tmp_path
     (source / 'raw/receipts/2026-10-19.json').write_text('{"price":-7}')
     capture = migration._freeze_controls(source, tmp_path / 'private/capture', [])
     assert not capture
+
+
+@pytest.mark.parametrize('logical,expected', [
+    ('shioaji_fop_captures/runtime/worker_00.json', True),
+    ('shioaji_fop_captures/runtime/worker_99.json', True),
+    ('shioaji_fop_captures/runtime/worker_0.json', False),
+    ('shioaji_fop_captures/runtime/worker_00.json.tmp', False),
+    ('shioaji_fop_captures/ticks/worker_00.json', False),
+    ('raw/worker_00.json', False),
+])
+def test_derivatives_atomic_observation_only_covers_named_live_book_controls(tmp_path, logical, expected):
+    from stockagent.data_sync import packed_snapshots as packed
+    assert packed._is_atomic_json_control(tmp_path / 'data_tw_index_derivatives_ticks', logical) is expected
+    assert not packed._is_atomic_json_control(tmp_path / 'other', logical)
 
 
 @pytest.mark.parametrize('fault', ['none', 'atomic_replace', 'in_place_write', 'invalid_json', 'redirected'])
@@ -1371,6 +1634,11 @@ def test_v11_control_delta_keeps_old_capture_and_never_rewalks_payload(
      b'{"rows":7,"unit":"shares"}', b'{"rows":8}'),
     ('data_tw_public', 'features/tw_public_research_wide_2014_v1.parquet',
      b'closed original table', b'new closed table'),
+    ('data_tw_public', 'state/tpex_institutional_trades.json',
+     b'{"dataset":"tpex_institutional_trades","checked_through":"2026-11-04"}',
+     b'{"dataset":"tpex_institutional_trades","checked_through":"2026-11-05"}'),
+    ('data_tw_public', 'shioaji/daily/006204.parquet', b'closed original daily table', b'new daily table'),
+    ('data_tw_public', 'shioaji/daily/006204.summary.json', b'{"rows":7}', b'{"rows":8}'),
 ])
 def test_v11_producer_updates_roundtrip_complete_selected_original(
         setup, monkeypatch, source_name, logical, payload, changed):
@@ -1397,6 +1665,40 @@ def test_v11_producer_updates_roundtrip_complete_selected_original(
     preparation = json.loads((args.migration_state / 'preparations/private.json').read_bytes())
     assert preparation['controls'][logical]['sha256'] == hashlib.sha256(payload).hexdigest()
     assert preparation['control_scope'] == migration.CONTROL_SCOPE
+
+
+def test_v18_public_upgrade_captures_only_reviewed_atomic_outputs(tmp_path, monkeypatch):
+    source = tmp_path / 'data_tw_public'
+    source.mkdir()
+    (source / 'status.json').write_bytes(b'{"prior":true}')
+    stage = tmp_path / 'private/captures'
+    old = migration._freeze_controls(source, stage, [])
+    stage.with_suffix('.intent.json').write_text(json.dumps({
+        'contract': 'recursive_mutable_controls_v17', 'source': str(source), 'excluded': []}))
+    captures = {'state/tpex_institutional_trades.json': b'{"dataset":"tpex_institutional_trades"}',
+                'shioaji/daily/006204.parquet': b'closed table',
+                'shioaji/daily/006204.summary.json': b'{"rows":7}'}
+    for name, payload in captures.items():
+        path = source / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(payload)
+    unknown_state = source / 'state/unrelated.json'
+    unknown_state.write_bytes(b'{"raw":true}')
+    unknown_daily = source / 'shioaji/daily/unknown!.parquet'
+    unknown_daily.write_bytes(b'raw not in the symbol writer scope')
+    (source / 'status.json').write_bytes(b'{"prior":false}')
+    monkeypatch.setattr(migration.os, 'walk', lambda *_a, **_k: pytest.fail('raw census repeated'))
+    upgraded = migration._freeze_controls(source, stage, [], existing=old,
+                                         upgrade_from='recursive_mutable_controls_v17')
+    assert set(upgraded) == {'status.json', *captures}
+    assert Path(upgraded['status.json']['path']).read_bytes() == b'{"prior":true}'
+    for name, payload in captures.items():
+        replacement = (source / name).with_name('replacement.tmp')
+        replacement.write_bytes(b'{"new":true}')
+        replacement.replace(source / name)
+        assert Path(upgraded[name]['path']).read_bytes() == payload
+    assert unknown_state.read_bytes() == b'{"raw":true}'
+    assert unknown_daily.read_bytes() == b'raw not in the symbol writer scope'
 
 
 @pytest.mark.parametrize('source_name,logical', [
@@ -1897,11 +2199,48 @@ def test_v13_large_operational_log_has_bounded_memory_and_retains_first_capture(
         tracemalloc.stop()
     row = captured['logs/supervisor.log']
     assert row['bytes'] == 70 * 1024**2 and peak < 32 * 1024**2
-    assert row['capture_kind'] == 'stable_operational_log'
+    assert row['capture_kind'] == 'verified_operational_log_prefix'
     assert migration.sha256_file(path) == row['sha256']
     path.write_bytes(b'new log\n')
     # Recover an atomic installed capture after a crash before receipt save.
     assert migration._freeze_controls(source, stage, [], upgrade_from='recursive_mutable_controls_v12') == captured
+
+
+def test_openbb_supervisor_capture_accepts_verified_prefix_during_append(tmp_path, monkeypatch):
+    path = tmp_path/'data_openBB/logs/supervisor.log'
+    path.parent.mkdir(parents=True)
+    original = b'original complete observation\n'
+    path.write_bytes(original)
+    target = tmp_path/'captures/supervisor.log'
+    target.parent.mkdir()
+    native = migration._require_capture_headroom
+    def append_after_open(directory, length):
+        native(directory, length)
+        with path.open('ab') as output:
+            output.write(b'new later observation\n')
+    monkeypatch.setattr(migration, '_require_capture_headroom', append_after_open)
+    row = migration._freeze_streamed_observation(path, target, 'logs/supervisor.log',
+        capture_kind='verified_operational_log_prefix', allow_growing_log_prefix=True)
+    assert target.read_bytes() == original and path.read_bytes().startswith(original)
+    assert row['bytes'] == len(original) and row['capture_kind'] == 'verified_operational_log_prefix'
+    assert row['sha256'] == migration.sha256_file(target)
+
+
+def test_openbb_supervisor_capture_rejects_in_place_rewrite(tmp_path, monkeypatch):
+    path = tmp_path/'data_openBB/logs/supervisor.log'
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b'a'*128)
+    target = tmp_path/'captures/supervisor.log'
+    target.parent.mkdir()
+    native = migration._require_capture_headroom
+    def rewrite_after_open(directory, length):
+        native(directory, length)
+        path.write_bytes(b'b'*128 if path.read_bytes() == b'a'*128 else b'a'*128)
+    monkeypatch.setattr(migration, '_require_capture_headroom', rewrite_after_open)
+    with pytest.raises(SnapshotError, match='changed during capture'):
+        migration._freeze_streamed_observation(path, target, 'logs/supervisor.log',
+            capture_kind='verified_operational_log_prefix', allow_growing_log_prefix=True)
+    assert not target.exists() and not list(target.parent.glob('*.partial'))
 
 
 @pytest.mark.parametrize('logical', ['logs/supervisor.log', '_state/monitor_history.jsonl',
@@ -2717,7 +3056,7 @@ def test_inventory_benchmark_changes_only_inventory_io_and_keeps_complete_lifecy
         assert row['production_source_payloads_deleted'] == 0
 
 
-def test_object_path_index_benchmark_preserves_complete_spilled_lifecycle():
+def test_object_path_index_benchmark_preserves_complete_spilled_lifecycle(tiny_metadata_scratch_capacity):
     from scripts.benchmark_sealed_pack_recovery import object_path_trial
     reference = object_path_trial(32, False)
     candidate = object_path_trial(32, True)
@@ -2735,7 +3074,7 @@ def test_object_path_index_benchmark_preserves_complete_spilled_lifecycle():
         assert row['production_source_payloads_deleted'] == 0
 
 
-def test_metadata_update_benchmark_keeps_full_spilled_crash_and_old_version_recovery():
+def test_metadata_update_benchmark_keeps_full_spilled_crash_and_old_version_recovery(tiny_metadata_scratch_capacity):
     from scripts.benchmark_sealed_pack_recovery import metadata_update_trial
     reference = metadata_update_trial(32, False)
     candidate = metadata_update_trial(32, True)
@@ -3234,6 +3573,114 @@ def test_lock_mode_change_finishes_original_plan_before_new_catalog_cycle(setup,
     assert json.loads(current_path.read_bytes())['operation_directory'] != original['operation_directory']
 
 
+def test_paused_recovery_and_changed_contract_do_not_block_unchanged_source(setup, monkeypatch):
+    repo, cold, entries, args, _ = setup
+    changed = repo/'changed'
+    changed.mkdir()
+    (changed/'raw.txt').write_text('changed source')
+    entries.append({**entries[0], 'dataset': 'changed', 'source': str(changed)})
+    monkeypatch.setattr(publisher, '_load_catalog', lambda *_: entries)
+    configuration = {'cold_root': str(cold), 'state_root': str(args.migration_state.parent/'control')}
+    state = Path(configuration['state_root'])
+    state.mkdir(parents=True)
+    marker = state/'dataset-recovery-migration-pause.json'
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    first = migration.advance_catalog_versions(repo, configuration, now=100)
+    current_path = state/'dataset-versions/current.json'
+    original = json.loads(current_path.read_bytes())
+    progress_path = Path(original['operation_directory'])/'progress.json'
+    prior = json.loads(progress_path.read_bytes())['datasets']
+    assert prior['public']['state'] == 'recovery_deferred_user_migration'
+    assert prior['private']['state'] == prior['changed']['state'] == 'pending'
+    fixed = (prior['public']['snapshot_id'], prior['public']['manifest_sha256'])
+    entries[2] = {**entries[2], 'role': 'changed contract'}
+    second = migration.advance_catalog_versions(repo, configuration, now=200)
+    resumed = json.loads(current_path.read_bytes())
+    assert second['plan_sha256'] != first['plan_sha256']
+    assert resumed['operation_directory'] != original['operation_directory']
+    assert json.loads(progress_path.read_bytes())['datasets'] == prior
+    new_operation = Path(resumed['operation_directory'])
+    assert json.loads((new_operation/'previous-progress.json').read_bytes())['datasets'] == prior
+    after = json.loads((new_operation/'progress.json').read_bytes())['datasets']
+    assert after['public']['state'] == 'recovery_deferred_user_migration'
+    assert (after['public']['snapshot_id'], after['public']['manifest_sha256']) == fixed
+    assert after['private']['state'] == 'recovery_deferred_user_migration'
+    assert after['changed']['state'] == 'pending' and after['changed']['attempts'] == 0
+    third = migration.advance_catalog_versions(repo, configuration, now=300)
+    assert third['plan_sha256'] == second['plan_sha256']
+    after = json.loads((new_operation/'progress.json').read_bytes())['datasets']
+    assert after['changed']['state'] == 'recovery_deferred_user_migration'
+
+
+@pytest.mark.parametrize('missing', ['manifest', 'receipt'])
+def test_paused_transition_does_not_claim_an_unavailable_historical_release(setup, monkeypatch, missing):
+    repo, cold, entries, args, policy = setup
+    monkeypatch.setattr(publisher, '_load_catalog', lambda *_: entries)
+    configuration = {'cold_root': str(cold), 'state_root': str(args.migration_state.parent/'control')}
+    migration.advance_catalog_versions(repo, configuration, now=100)
+    state = Path(configuration['state_root'])
+    current_path = state/'dataset-versions/current.json'
+    original = json.loads(current_path.read_bytes())
+    operation = Path(original['operation_directory'])
+    public = json.loads((operation/'progress.json').read_bytes())['datasets']['public']
+    assert public['state'] == 'verified'
+    marker = state/'dataset-recovery-migration-pause.json'
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    migration.advance_catalog_versions(repo, configuration, now=200)
+    entries[1] = {**entries[1], 'role': 'new private contract'}
+    manifest = cold/'manifests/public'/(public['snapshot_id']+'.json')
+    target = manifest if missing == 'manifest' else Path(public['recovery_receipt'])
+    target.unlink()
+    root = state/'dataset-versions'
+    current = json.loads(current_path.read_bytes())
+    held = migration._catalog_contract_transition(repo, root, current, entries, policy, cold)
+    assert held['state'] == 'finish_original_committed_recovery'
+    if missing == 'receipt':
+        with pytest.raises(FileNotFoundError):
+            migration._catalog_contract_transition(repo, root, current, entries, policy, cold, allow_deferred=True)
+        return
+    transition = migration._catalog_contract_transition(repo, root, current, entries, policy, cold,
+                                                        allow_deferred=True)
+    new_operation = Path(transition['operation_directory'])
+    result = json.loads((new_operation/'progress.json').read_bytes())['datasets']
+    assert result['public']['state'] == 'pending'
+    assert result['public']['previous_contract_binding']['snapshot_id'] == public['snapshot_id']
+    assert result['public']['previous_contract_binding']['state'] == 'historically_verified_manifest_now_unavailable'
+    assert result['private']['state'] == 'pending'
+    assert result['private']['previous_contract_binding']['state'] == 'recovery_deferred_user_migration'
+    previous = json.loads((new_operation/'previous-progress.json').read_bytes())
+    assert previous['datasets']['public']['state'] == 'verified'
+
+
+def test_paused_transition_requeues_a_missing_deferred_manifest_without_losing_its_binding(setup, monkeypatch):
+    repo, cold, entries, args, policy = setup
+    monkeypatch.setattr(publisher, '_load_catalog', lambda *_: entries)
+    configuration = {'cold_root': str(cold), 'state_root': str(args.migration_state.parent/'control')}
+    state = Path(configuration['state_root'])
+    state.mkdir(parents=True)
+    marker = state/'dataset-recovery-migration-pause.json'
+    marker.write_text(json.dumps({'contract': migration.RECOVERY_PAUSE_CONTRACT, 'paused': True}))
+    marker.chmod(0o600)
+    migration.advance_catalog_versions(repo, configuration, now=100)
+    root = state/'dataset-versions'
+    current = json.loads((root/'current.json').read_bytes())
+    operation = Path(current['operation_directory'])
+    public = json.loads((operation/'progress.json').read_bytes())['datasets']['public']
+    assert public['state'] == 'recovery_deferred_user_migration'
+    (cold/'manifests/public'/(public['snapshot_id']+'.json')).unlink()
+    entries[1] = {**entries[1], 'role': 'new private contract'}
+    transition = migration._catalog_contract_transition(repo, root, current, entries, policy, cold,
+                                                        allow_deferred=True)
+    new_operation = Path(transition['operation_directory'])
+    new = json.loads((new_operation/'progress.json').read_bytes())['datasets']['public']
+    assert new['state'] == 'pending' and 'snapshot_id' not in new
+    assert new['previous_contract_binding']['snapshot_id'] == public['snapshot_id']
+    assert new['previous_contract_binding']['state'] == 'deferred_manifest_now_unavailable'
+    assert json.loads((new_operation/'previous-progress.json').read_bytes())['datasets']['public'] == public
+
+
 def test_completed_lock_only_change_defers_without_payload_or_recovery_io(setup, monkeypatch):
     repo, cold, entries, args, policy = setup
     entries[0] = {**entries[0], 'dataset': 'tw-public',
@@ -3399,7 +3846,8 @@ def test_public_to_private_reuse_shares_existing_bytes_but_never_shared_heads(se
 
 
 @pytest.mark.parametrize('limit', [2, 100])
-def test_private_bootstrap_streams_overlapping_donors_into_one_consumed_index(setup, monkeypatch, limit):
+def test_private_bootstrap_streams_overlapping_donors_into_one_consumed_index(
+        setup, monkeypatch, limit, tiny_metadata_scratch_capacity):
     from stockagent.data_sync.packed_metadata import MetadataRows
     from stockagent.data_sync import packed_snapshots as packed
     repo, cold, entries, _, policy = setup

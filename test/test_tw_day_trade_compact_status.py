@@ -163,6 +163,34 @@ def test_compact_status_skips_order_fill_reads_but_keeps_all_facts(
     assert compact["execution_records"]["executed_count"] == 1
 
 
+@pytest.mark.parametrize("session", SESSIONS)
+@pytest.mark.parametrize("include_ledger_dates", (False, True))
+def test_summary_skips_order_fill_rows_without_changing_visible_facts(
+    status_source: Path, session: str, include_ledger_dates: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    options = {"state_dir": status_source, "session_date": session, "now": NOW,
+               "include_ledger_session_dates": include_ledger_dates}
+    baseline = dashboard.build_dashboard_snapshot(
+        **options, maximum_signal_rows=0, maximum_event_rows=500,
+        maximum_mark_rows=4_000, include_position_rows=False,
+    )
+
+    def guard_reader(reader):
+        def guarded(path, *args, **kwargs):
+            assert path.name not in {"orders.jsonl", "fills.jsonl"}
+            return reader(path, *args, **kwargs)
+        return guarded
+
+    for name in ("_rows_for_sessions", "_latest_contiguous_session_rows",
+                 "_tail_for_session", "_tail"):
+        monkeypatch.setattr(dashboard, name, guard_reader(getattr(dashboard, name)))
+
+    summary = dashboard.build_dashboard_summary(**options)
+    assert summary
+    assert summary == {key: baseline.get(key) for key in summary}
+
+
 @pytest.mark.parametrize("requested_session", (None, " 2026-08-13 "))
 def test_gateway_tw_status_omits_only_order_fill_display_reads(
     tmp_path: Path, requested_session: str | None, monkeypatch: pytest.MonkeyPatch,
@@ -187,6 +215,10 @@ def test_gateway_tw_status_omits_only_order_fill_display_reads(
         tw_revision=lambda: SimpleNamespace(body=b'{"revision_token":"fixed"}'),
         cached_local_json=build_response,
         _revision_stale_or_build=build_response,
+    )
+    server._status_owner_prefix = gateway.PublicDashboardServer._status_owner_prefix
+    server._committed_status_response = lambda **kwargs: (
+        gateway.PublicDashboardServer._committed_status_response(server, **kwargs)
     )
     payload = gateway.PublicDashboardServer.tw_status(server, requested_session)
     assert payload["service_sync"]["revision_token"] == "fixed"

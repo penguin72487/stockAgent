@@ -3,12 +3,18 @@ set -euo pipefail
 
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 universe_only=false
+publication_only=false
 for option in "$@"; do
   case "$option" in
     --universe-only) universe_only=true ;;
-    *) echo "Usage: sudo bash scripts/install_tw_public_publication_services.sh [--universe-only]" >&2; exit 2 ;;
+    --publication-only) publication_only=true ;;
+    *) echo "Usage: sudo bash scripts/install_tw_public_publication_services.sh [--universe-only | --publication-only]" >&2; exit 2 ;;
   esac
 done
+if [[ "$universe_only" == true && "$publication_only" == true ]]; then
+  echo "[tw-public-publication] scoped install options are mutually exclusive" >&2
+  exit 2
+fi
 service_user="${TW_PUBLIC_SERVICE_USER:-}"
 if [[ -z "$service_user" ]]; then
   service_user="$(stat -c '%U' "$repo_root")"
@@ -45,11 +51,14 @@ units=(
   stockagent-tw-public-cold-publish.service
   stockagent-tw-public-cold-publish.timer
   stockagent-tw-public-cold-publish.path
+  stockagent-rate-limit-directory@.service
   stockagent-tw-trading-universe.service
   stockagent-tw-trading-universe.timer
 )
 if [[ "$universe_only" == true ]]; then
-  units=(stockagent-tw-trading-universe.service stockagent-tw-trading-universe.timer)
+  units=(stockagent-rate-limit-directory@.service stockagent-tw-trading-universe.service stockagent-tw-trading-universe.timer)
+elif [[ "$publication_only" == true ]]; then
+  units=(stockagent-tw-public-publication-sweep.service stockagent-tw-public-publication-sweep.timer)
 fi
 rendered_units=()
 for unit in "${units[@]}"; do
@@ -65,8 +74,15 @@ done
 
 systemd-analyze verify "${rendered_units[@]}"
 install -m 0644 "$temporary_dir"/* /etc/systemd/system/
+if [[ "$publication_only" == true ]]; then
+  systemctl daemon-reload
+  systemctl enable --now stockagent-tw-public-publication-sweep.timer
+  echo "[tw-public-publication] scoped_publication_install=true discord_restarted=false engine_restarted=false source_monitor_restarted=false"
+  exit 0
+fi
 install -d -o "$service_user" -g "$service_group" -m 0750 "$repo_root/artifacts/live/tw_trading_universe"
-install -d -o "$service_user" -g "$service_group" -m 0700 "/tmp/stockagent-rate-limits-$service_uid"
+source "$repo_root/scripts/runtime_env.sh"
+run_fintech_python "$repo_root/scripts/ensure_rate_limit_directory.py" --uid "$service_uid"
 if [[ "$universe_only" == true ]]; then
   systemctl daemon-reload
   systemctl enable --now stockagent-tw-trading-universe.timer

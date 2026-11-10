@@ -1,0 +1,28 @@
+{
+  "contract": "explicit-d-workflow-testing-copy-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "使用者明確同意刪除舊效能驗證資料；只處置 D 工作區固定的試驗指標副本，保留比較及驗收收據，不刪冷庫正本或 NAS。",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_0_baseline/reported_metrics.csv",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_1_candidate/reported_metrics.csv",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_3_candidate/reported_metrics.csv",
+      "kind": "file",
+      "reason": "benchmark"
+    }
+  ],
+  "identity_sha256": "6a9f1cbc7a27832e72a749d47842106aab5880d2da134d461f0e0ff5c5e54a45"
+}

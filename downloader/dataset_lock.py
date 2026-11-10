@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import errno
 import json
 import math
+import os
 from pathlib import Path
 import sys
 import time
@@ -23,6 +24,10 @@ DEFAULT_LOCK_TIMEOUT_SECONDS = 180.0
 
 class DatasetLockTimeout(TimeoutError):
     """The existing writer did not release its lock within the allowed wait."""
+
+
+class DatasetLockPathChanged(DatasetLockTimeout):
+    """The path was replaced while waiting; retry on the canonical inode."""
 
 
 @dataclass(frozen=True)
@@ -108,8 +113,19 @@ def exclusive_dataset_lock(
                 emit("waiting", "dataset_writer_lock_busy")
                 next_report = now + 30.0
             time.sleep(min(poll_interval_seconds, remaining))
-        waited = emit("acquired", "exclusive_dataset_lock_acquired")
         try:
+            # A namespace handoff can replace the path while this open file
+            # description waits on the old inode. Never treat that old lock as
+            # ownership of the new workspace.
+            try:
+                held, current = os.fstat(handle.fileno()), path.stat()
+            except OSError as error:
+                emit("error", "dataset_lock_path_changed")
+                raise DatasetLockPathChanged(f"{provider} lock path disappeared; retry on its owner") from error
+            if (held.st_dev, held.st_ino) != (current.st_dev, current.st_ino):
+                emit("error", "dataset_lock_path_changed")
+                raise DatasetLockPathChanged(f"{provider} lock path changed; retry on its owner")
+            waited = emit("acquired", "exclusive_dataset_lock_acquired")
             yield DatasetLockAcquisition(wait_seconds=waited)
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)

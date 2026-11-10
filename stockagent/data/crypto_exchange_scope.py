@@ -5,6 +5,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -138,12 +139,16 @@ def validate_crypto_exchange_scope(
         return resolved
 
     raw_panel = Path(str(get("parquet_root"))).expanduser()
-    panel_path = (raw_panel if raw_panel.is_absolute() else repo_root / raw_panel).resolve()
-    registered_view = (repo_root / BYBIT_REPAIR_VIEW).absolute()
-    if venue == "bybit" and panel_path == registered_view:
+    # Match the exact configured research-view alias before resolving it.
+    # The service layout may bind or symlink artifacts/cache elsewhere; the
+    # resolved payload still passes its full source-receipt gate at use time.
+    panel_alias = Path(os.path.abspath(raw_panel if raw_panel.is_absolute() else repo_root / raw_panel))
+    panel_path = panel_alias.resolve()
+    registered_view = Path(os.path.abspath(repo_root / BYBIT_REPAIR_VIEW))
+    if venue == "bybit" and panel_alias == registered_view:
         if check_schema:
             validate_bybit_repair_view(panel_path, venue_root=venue_root)
-    elif venue == "bybit" and panel_path == (repo_root / BYBIT_MIDNIGHT_VIEW).absolute():
+    elif venue == "bybit" and panel_alias == Path(os.path.abspath(repo_root / BYBIT_MIDNIGHT_VIEW)):
         if check_schema:
             validate_bybit_midnight_view(panel_path, venue_root=venue_root)
     else:

@@ -1,0 +1,7 @@
+{
+  "contract": "stockagent.edge_reader_activation_policy.v1",
+  "enabled": true,
+  "remote_reader_manifest_sha256": "cd1a491edfe6cedba4b3650401fd6cda0452cb4b08c19c62a6e773b19274e941",
+  "remote_wrapper_sha256": "0b11c8dcb1fcb342699e5498cc3c0da6aac9e56a28fcad0542ac774890d6b89d",
+  "probe_dataset": "tw-index-futures"
+}

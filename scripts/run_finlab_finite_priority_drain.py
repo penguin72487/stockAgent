@@ -65,7 +65,8 @@ def _digest(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _batch(kind: str = "tw_minute", *, futures_workspace_only: bool = False) -> tuple[int, dict | None]:
+def _batch(kind: str = "tw_minute", *, futures_workspace_only: bool = False,
+           preferred_futures_request_ids: tuple[str, ...] = ()) -> tuple[int, dict | None]:
     if kind not in {"tw_minute", "tw_tick"}:
         raise ValueError("unsupported finite priority family")
     limit = PER_PASS if kind == "tw_minute" else 1
@@ -75,6 +76,8 @@ def _batch(kind: str = "tw_minute", *, futures_workspace_only: bool = False) -> 
         if kind != "tw_minute":
             raise ValueError("futures workspace requires minute priority")
         command.append("--futures-workspace-only")
+    for request_id in preferred_futures_request_ids:
+        command.extend(["--preferred-futures-request-id", request_id])
     last = None
     with subprocess.Popen(command, cwd=ROOT, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True, bufsize=1) as child:
@@ -93,15 +96,19 @@ def _batch(kind: str = "tw_minute", *, futures_workspace_only: bool = False) -> 
 
 def drain(max_passes: int, *, kind: str = "tw_minute", run_batch=None, owner_digest=None,
           guard_digest=None, capacity_wait=None, busy_sleep=time.sleep,
-          futures_workspace_only: bool = False) -> tuple[int, dict]:
+          futures_workspace_only: bool = False,
+          preferred_futures_request_ids: tuple[str, ...] = ()) -> tuple[int, dict]:
     if type(max_passes) is not int or not 1 <= max_passes <= MAX_PASSES:
         raise ValueError("finite priority drain needs 1..32 passes")
     if kind not in {"tw_minute", "tw_tick"}:
         raise ValueError("unsupported finite priority family")
     if type(futures_workspace_only) is not bool or futures_workspace_only and kind != "tw_minute":
         raise ValueError("futures workspace requires minute priority")
+    if preferred_futures_request_ids and not futures_workspace_only:
+        raise ValueError("preferred request order requires futures workspace")
     limit = PER_PASS if kind == "tw_minute" else 1
-    run = run_batch or (lambda: _batch(kind, futures_workspace_only=futures_workspace_only))
+    run = run_batch or (lambda: _batch(kind, futures_workspace_only=futures_workspace_only,
+                                      preferred_futures_request_ids=preferred_futures_request_ids))
     digest = owner_digest or (lambda: _digest(OWNER))
     guard = guard_digest or (lambda: _digest(CAPACITY_GUARD))
     source = digest()
@@ -164,6 +171,24 @@ def drain(max_passes: int, *, kind: str = "tw_minute", run_batch=None, owner_dig
             print(json.dumps({"contract": "finlab_finite_priority_drain_v1",
                               "state": "waiting_owner_admission",
                               "owner_state": summary["state"],
+                              "admission_waits": result["admission_waits"]}), flush=True)
+            busy_sleep(ADMISSION_RETRY_SECONDS)
+            continue
+        if (code == 75 and capacity_wait is not None and isinstance(summary, dict)
+                and summary.get("contract") == "acquisition_dispatch_capacity_v1"
+                and summary.get("state") == "deferred"
+                and summary.get("reason") == "physical_backing_headroom_unconfirmed"
+                and summary.get("retryable") is True
+                and summary.get("allocation_admitted") is False):
+            # The parent may have just measured enough space while the child's
+            # independent Windows backing probe timed out. Unknown is still a
+            # denial, never an admission; release the lock, throttle, and ask
+            # the same bounded owner to remeasure before another dispatch.
+            result["passes"] -= 1
+            result["admission_waits"] += 1
+            print(json.dumps({"contract": "finlab_finite_priority_drain_v1",
+                              "state": "waiting_backing_measurement",
+                              "reason": summary["reason"],
                               "admission_waits": result["admission_waits"]}), flush=True)
             busy_sleep(ADMISSION_RETRY_SECONDS)
             continue

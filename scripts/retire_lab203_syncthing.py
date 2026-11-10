@@ -46,9 +46,9 @@ def _api() -> tuple[str, dict[str, str]]:
     return f"http://127.0.0.1:{port}", {"X-API-Key": key}
 
 
-def _get(base: str, headers: dict[str, str], path: str) -> dict:
+def _get(base: str, headers: dict[str, str], path: str, *, timeout: float = 20) -> dict:
     with urllib.request.urlopen(
-        urllib.request.Request(base + path, headers=headers), timeout=20
+        urllib.request.Request(base + path, headers=headers), timeout=timeout
     ) as response:
         return json.load(response)
 

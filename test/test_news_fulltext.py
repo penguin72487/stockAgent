@@ -415,6 +415,20 @@ def test_exclusive_owner_and_restart_lease(config, tmp_path):
         q.close()
 
 
+def test_body_handoff_guard_releases_queue_owner_before_any_database_write(config, tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_source_handoff as handoff
+    root = tmp_path / 'queue'
+    def unavailable(path):
+        assert path == root / 'bodies'
+        raise handoff.SnapshotError('workspace unavailable')
+    monkeypatch.setattr(handoff, 'guard_path', unavailable)
+    with pytest.raises(handoff.SnapshotError, match='workspace unavailable'):
+        NewsQueue(root, PolicyRegistry(config, base=tmp_path))
+    assert not (root / 'queue.sqlite3').exists()
+    with handoff.lock_file(root / 'owner.lock'):
+        pass
+
+
 def test_durable_receipt_recovers_crash_before_queue_commit(config, tmp_path, monkeypatch):
     registry = PolicyRegistry(config, base=tmp_path)
     q = NewsQueue(tmp_path, registry)

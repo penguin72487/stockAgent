@@ -20,7 +20,9 @@ import time
 from downloader.artifact_io import sha256_file
 from downloader.provider_priority import inspect
 from scripts.request_finmind_option_tick_product_checks import CONTRACT, DATASET
-from stockagent.data_sync.acquisition_capacity_sampler import capacity_retry_delay_seconds
+from stockagent.data_sync.acquisition_capacity_sampler import (
+    AcquisitionCapacitySampler, capacity_retry_delay_seconds,
+)
 
 
 REPO = Path(__file__).resolve().parents[1]
@@ -42,7 +44,11 @@ OWNERS = tuple(REPO / name for name in (
     'downloader/finmind_account.py', 'downloader/finmind_scheduling.py',
     'downloader/finmind_retry_cohorts.py', 'downloader/finmind_json_pipeline.py',
     'downloader/finmind_product_query_verification.py',
+    'downloader/paused_provider_owners.py',
     'stockagent/data_sync/acquisition_capacity_sampler.py',
+    'stockagent/data_sync/cache_capacity.py',
+    'stockagent/data_sync/provider_workspace.py',
+    'stockagent/data_sync/workspace_volume.py',
 ))
 TERMINAL = frozenset({'complete', 'observed_empty'})
 
@@ -55,10 +61,20 @@ def checked_inputs(path: Path, root: Path, request_id: str, now: datetime) -> tu
     rows = plan.get('checks')
     if not isinstance(rows, list) or not 0 < len(rows) <= 64:
         raise ValueError('source comparison needs 1 to 64 explicit product days')
-    for path, digest in plan.get('additional_evidence_pins', {}).items():
-        evidence = Path(path).resolve()
-        if not evidence.is_relative_to(root.parents[1]) or sha256_file(evidence) != digest:
+    commitments, additional_sources = {}, set()
+
+    def declare(source: Path, digest: str) -> None:
+        source = source.absolute()
+        if source in commitments and commitments[source] != digest:
+            raise ValueError('retained original has conflicting source commitments')
+        commitments[source] = digest
+
+    for source, digest in plan.get('additional_evidence_pins', {}).items():
+        evidence = Path(source).resolve()
+        if not evidence.is_relative_to(root.parents[1]):
             raise ValueError('additional source evidence changed')
+        declare(evidence, digest)
+        additional_sources.add(evidence.absolute())
     for row in rows:
         if row['dataset'] != dataset or not row['data_id'] or not row['audited_missing_contracts']:
             raise ValueError('invalid source comparison product key')
@@ -70,14 +86,27 @@ def checked_inputs(path: Path, root: Path, request_id: str, now: datetime) -> tu
         if 'baseline_parquet' in row:
             pins.append(('baseline_parquet', 'baseline_parquet_sha256'))
         for field, digest in pins:
-            if sha256_file(Path(row[field])) != row[digest]:
-                raise ValueError('retained original or conflict evidence changed')
+            declare(Path(row[field]), row[digest])
+    # Multiple products on the same day share the original all-market source
+    # and conflict plan. Verify each complete byte file once per readback,
+    # retaining a fresh before/after generation check across the whole check.
+    signature = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+    verified = {}
+    for source, digest in commitments.items():
+        before = signature(source.stat())
+        if sha256_file(source) != digest or signature(source.stat()) != before:
+            if source in additional_sources:
+                raise ValueError('additional source evidence changed')
+            raise ValueError('retained original or conflict evidence changed')
+        verified[source] = before
     status = inspect(root, request_id, now=now)
     expected = {(row['dataset'], row['data_id'], row['partition']) for row in rows}
     actual = {tuple(json.loads(row['key'])) for row in status['items']}
     if (status['provider'] != 'finmind' or status['expires_at_utc'] != plan['expires_at_utc']
             or len(expected) != len(rows) or len(actual) != len(status['items']) or actual != expected):
         raise ValueError('source and registered priority identities differ')
+    if any(signature(source.stat()) != before for source, before in verified.items()):
+        raise ValueError('retained original or conflict evidence changed during readback')
     return plan, status
 
 
@@ -184,31 +213,73 @@ def wait_for_priority_dispatch(root: Path, *, timeout_seconds: float = 300, poll
     return False
 
 
-def main() -> int:
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--source-plan', required=True, type=Path)
-    parser.add_argument('--request-id', required=True)
-    args = parser.parse_args()
-    path = args.source_plan.resolve()
+def run(path: Path, request_id: str, *, root: Path = ROOT, capacity=None,
+        clock=None, sleep=None) -> int:
+    """Wait without reopening the owner or hashing source payloads when blocked.
+
+    The initial and every dispatch/terminal readback verify the full source.
+    During an ordinary capacity or retry wait only the pinned implementation,
+    priority state and canonical capacity sampler are read. The owner retains
+    its independent, per-request capacity, source, quota and lock checks.
+    """
+    clock = clock or (lambda: datetime.now(UTC))
+    sleep = sleep or time.sleep
+    path = path.resolve()
     pins = {item: sha256_file(item) for item in (*OWNERS, path)}
+    try:
+        _, initial = checked_inputs(path, root, request_id, clock())
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        print(json.dumps({'state': 'source_evidence_changed_or_invalid', 'error': type(error).__name__,
+                          'provider_calls_by_waiter': 0}), flush=True)
+        return 75
+    expires = datetime.fromisoformat(initial['expires_at_utc'])
+    if expires.tzinfo is None:
+        raise ValueError('source comparison requires a timezone-aware expiry')
+    capacity = capacity or AcquisitionCapacitySampler(root)
+    previous_capacity = None
     while True:
         if any(sha256_file(item) != digest for item, digest in pins.items()):
             print(json.dumps({'state': 'owner_or_plan_changed', 'provider_calls_by_waiter': 0}), flush=True)
             return 75
+        now = clock()
+        current = inspect(root, request_id, now=now)
+        current_states = [row['state'] for row in current['items']]
+        terminal = all(state in TERMINAL for state in current_states)
+        if not terminal and current['priority_active'] and now < expires:
+            if any(state not in TERMINAL | {'pending', 'failed', 'inflight', 'running'}
+                   for state in current_states):
+                print(json.dumps({'state': 'native_task_blocked', 'states': current_states,
+                                  'provider_calls_by_waiter': 0}), flush=True)
+                return 75
+            if not ready_keys(current, now):
+                sleep(min(60, max(0, (expires - now).total_seconds())))
+                continue
+            sample = capacity.initial_sample()
+            if sample.get('state') not in {'admitted', 'not_enrolled'}:
+                marker = (sample.get('state'), sample.get('reason'))
+                if marker != previous_capacity:
+                    print(json.dumps({'state': 'waiting_capacity_before_owner',
+                                      'capacity': sample, 'provider_calls_by_waiter': 0,
+                                      'owner_started': False}), flush=True)
+                    previous_capacity = marker
+                sleep(min(capacity_retry_delay_seconds(sample),
+                          max(0, (expires - clock()).total_seconds())))
+                continue
+            previous_capacity = None
         try:
-            _, status = checked_inputs(path, ROOT, args.request_id, datetime.now(UTC))
+            _, status = checked_inputs(path, root, request_id, clock())
         except (OSError, ValueError, KeyError, TypeError) as error:
             print(json.dumps({'state': 'source_evidence_changed_or_invalid', 'error': type(error).__name__,
                               'provider_calls_by_waiter': 0}), flush=True)
             return 75
         states = [row['state'] for row in status['items']]
-        if all(state in TERMINAL for state in states) or not status['priority_active']:
+        if all(state in TERMINAL for state in states) or not status['priority_active'] or clock() >= expires:
             from downloader.artifact_io import atomic_write_json
             if json.loads(path.read_bytes())['contract'] == FUTURES_CONTRACT:
                 from scripts.audit_finmind_futures_tick_product_checks import audit
             else:
                 from scripts.audit_finmind_option_tick_product_checks import audit
-            result = audit(path, ROOT, args.request_id, datetime.now(UTC))
+            result = audit(path, root, request_id, clock())
             report = path.with_name(path.stem + '_readback.json')
             atomic_write_json(report, result)
             finished = all(state in TERMINAL for state in states)
@@ -219,16 +290,23 @@ def main() -> int:
         if any(state not in TERMINAL | {'pending', 'failed', 'inflight', 'running'} for state in states):
             print(json.dumps({'state': 'native_task_blocked', 'states': states, 'provider_calls_by_waiter': 0}), flush=True)
             return 75
-        keys = ready_keys(status, datetime.now(UTC))
+        keys = ready_keys(status, clock())
         if keys:
-            started = datetime.now(UTC)
-            child = subprocess.run(owner_command(ROOT, args.request_id, keys), cwd=REPO, text=True,
+            # A capacity probe or source readback can take time. Recheck code
+            # identity and expiry at the actual child-launch boundary.
+            if any(sha256_file(item) != digest for item, digest in pins.items()):
+                print(json.dumps({'state': 'owner_or_plan_changed', 'provider_calls_by_waiter': 0}), flush=True)
+                return 75
+            started = clock()
+            if started >= expires:
+                continue
+            child = subprocess.run(owner_command(root, request_id, keys), cwd=REPO, text=True,
                                    capture_output=True, timeout=1800)
             try:
                 owner_state = json.loads(child.stdout.strip().splitlines()[-1]).get('state')
             except (IndexError, json.JSONDecodeError, AttributeError):
                 owner_state = None
-            delay, capacity_reason = retry_delay(owner_state, ROOT, started)
+            delay, capacity_reason = retry_delay(owner_state, root, started)
             print(json.dumps({'state': 'owner_pass', 'owner_state': owner_state, 'exit_code': child.returncode,
                               'capacity_reason': capacity_reason, 'retry_delay_seconds': delay,
                               'stdout_tail': child.stdout[-1200:], 'stderr_tail': child.stderr[-300:],
@@ -236,18 +314,26 @@ def main() -> int:
             if child.returncode not in {0, 2} or owner_state in {'invalid_token', 'not_entitled', 'ip_banned'}:
                 return child.returncode or 75
             if child.returncode == 2 and 'FinMind complement worker already running' in child.stderr:
-                unlocked = wait_until_owner_unlock(ROOT)
+                unlocked = wait_until_owner_unlock(root)
                 print(json.dumps({'state': 'owner_unlock_observed' if unlocked else 'owner_unlock_unresolved',
                                   'provider_calls_by_waiter': 0}), flush=True)
                 continue
             if owner_state == 'incremental_reserve':
-                ready = wait_for_priority_dispatch(ROOT, timeout_seconds=delay)
+                ready = wait_for_priority_dispatch(root, timeout_seconds=delay)
                 print(json.dumps({'state': 'priority_dispatch_ready' if ready else 'priority_wait_elapsed',
                                   'provider_calls_by_waiter': 0}), flush=True)
             else:
-                time.sleep(delay)
+                sleep(min(delay, max(0, (expires - clock()).total_seconds())))
         else:
-            time.sleep(60)
+            sleep(min(60, max(0, (expires - clock()).total_seconds())))
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--source-plan', required=True, type=Path)
+    parser.add_argument('--request-id', required=True)
+    args = parser.parse_args()
+    return run(args.source_plan, args.request_id)
 
 
 if __name__ == '__main__':

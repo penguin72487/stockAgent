@@ -110,6 +110,8 @@ def test_exact_priority_yields_foreign_history_but_protects_due_release(tmp_path
                                                                        dated_release_due):
     from types import SimpleNamespace
     from downloader import finmind_integrity
+    from downloader import paused_provider_owners
+    monkeypatch.setattr(paused_provider_owners, 'explicitly_paused', lambda _: frozenset())
     selected = ('TaiwanStockDelisting', '', '2025')
     with worker._db(tmp_path / 'queue.sqlite3') as con:
         worker._add_tasks(con, [(*selected, 'year', 4), ('USStockPrice', 'AAPL', 'history', 'id_history', 0)])
@@ -385,6 +387,33 @@ def test_finlab_futures_priority_uses_existing_partition_index_and_native_receip
         register(root, plan('finlab', [item, 'price:close']), now=NOW)
     with pytest.raises(ValueError, match='future'):
         register(root, plan('finlab', [{**item, 'partition': '2027-01-01'}]), now=NOW)
+
+
+def test_exact_futures_request_preference_reorders_without_removing_other_intents(tmp_path):
+    from downloader.provider_priority import finlab_futures_candidates
+    from scripts.download_finlab_market_intraday import _open_index
+    root = tmp_path / 'finlab'
+    db = root / 'intraday/market_index.sqlite3'
+    db.parent.mkdir(parents=True)
+    with closing(_open_index(db)):
+        pass
+    old = {'dataset': 'tw_futures_minute:AAA_201611', 'partition': '2016-11-08'}
+    new = {'dataset': 'tw_futures_minute:ZZZ_202610', 'partition': '2026-10-02'}
+    first = register(root, plan('finlab', [old]), now=NOW)
+    second = register(root, plan('finlab', [new]), now=NOW)
+    with closing(_open_index(db)) as con:
+        before = finlab_futures_candidates(con, NOW)
+        assert before == [(old['dataset'], date.fromisoformat(old['partition'])),
+                          (new['dataset'], date.fromisoformat(new['partition']))]
+        after = finlab_futures_candidates(con, NOW, prefer_request_ids=(second['request_id'],))
+        assert after == [before[1], before[0]]
+        assert len(after) == len(before) and set(after) == set(before)
+        assert not finlab_futures_candidates(con, NOW + timedelta(hours=3),
+                                             prefer_request_ids=(second['request_id'],))
+        with pytest.raises(ValueError, match='unique exact request'):
+            finlab_futures_candidates(con, NOW, prefer_request_ids=('invalid',))
+    assert inspect(root, first['request_id'], now=NOW)['items'][0]['state'] == 'pending_existing_owner'
+    assert inspect(root, second['request_id'], now=NOW)['items'][0]['state'] == 'pending_existing_owner'
 
 
 def test_finlab_exact_stock_priorities_reuse_native_partition_receipts(tmp_path):

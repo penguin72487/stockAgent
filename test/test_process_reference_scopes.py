@@ -45,6 +45,41 @@ def test_selected_roots_ignore_sibling_writer_but_detect_selected_fd(tmp_path, m
     assert any("fd=2" in row for row in process_references_many([old]))
 
 
+def test_immutable_regular_reference_scan_resolves_shared_parent_once_and_detects_alias(tmp_path, monkeypatch):
+    process, old, _new = _proc_fixture(tmp_path, monkeypatch)
+    targets = [old/f'object-{index}' for index in range(80)]
+    for path in targets:
+        path.write_bytes(b'fixed')
+    alias = tmp_path/'other-hardlink-name'
+    os.link(targets[17], alias)
+    (process/'fd/2').symlink_to(alias)
+    original = Path.resolve
+    count = 0
+    def counted(path, *args, **kwargs):
+        nonlocal count
+        if path == old:
+            count += 1
+        return original(path, *args, **kwargs)
+    monkeypatch.setattr(Path, 'resolve', counted)
+    evidence = process_references_many(targets, immutable_regular_paths=True)
+    assert any('fd=2' in value for value in evidence)
+    assert count == 1
+
+
+def test_immutable_regular_reference_scan_rejects_redirected_leaves_and_parents(tmp_path):
+    directory = tmp_path/'real'
+    directory.mkdir()
+    (directory/'file').write_bytes(b'fixed')
+    leaf = directory/'leaf'
+    leaf.symlink_to(directory/'file')
+    with pytest.raises(SnapshotError, match='not a regular file'):
+        process_references_many([leaf], immutable_regular_paths=True)
+    parent = tmp_path/'redirected'
+    parent.symlink_to(directory, target_is_directory=True)
+    with pytest.raises(SnapshotError, match='parent is redirected'):
+        process_references_many([parent/'file'], immutable_regular_paths=True)
+
+
 def test_selected_maps_and_ancestor_orchestrator_remain_protected(tmp_path, monkeypatch):
     process, old, new = _proc_fixture(tmp_path, monkeypatch)
     (process / "maps").write_text(f"0-1 r--p 0 0 0 {old}/source\n")

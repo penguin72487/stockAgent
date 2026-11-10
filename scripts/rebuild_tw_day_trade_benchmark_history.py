@@ -913,11 +913,67 @@ def _required_stock_adjustment(
     return factor, actions
 
 
+def _retained_tx_prefix(
+    path: Path, *, expected_sha256: str, session_dates: list[date]
+) -> tuple[dict[str, Any], list[dict[str, Any]], dict[str, Any]]:
+    """Reuse a complete, pinned TX prefix only for same-contract extension.
+
+    Chart rows are not general execution checkpoints: they omit realized roll
+    bookkeeping.  The caller must therefore reject any new contract, rather
+    than manufacture state for a later roll.  Wealth, origin and collateral
+    inputs needed by the unchanged same-contract marker remain exact.
+    """
+    if len(expected_sha256) != 64 or _sha256(path) != expected_sha256:
+        raise ValueError("retained TX history source SHA differs")
+    payload = json.loads(path.read_bytes())
+    if payload.get("simulation_only") is not True or payload.get("production_order_possible") is not False:
+        raise ValueError("retained TX history is not explicitly simulation-only")
+    rows = [dict(row) for row in payload.get("marks") or ()
+            if isinstance(row, Mapping) and row.get("benchmark_id") == TX_CONTINUOUS_BENCHMARK_ID]
+    by_session: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        by_session.setdefault(str(row.get("session_date") or ""), []).append(row)
+    days = sorted(by_session)
+    if not days or days != [day.isoformat() for day in session_dates[:len(days)]]:
+        raise ValueError("retained TX history is not an exact requested session prefix")
+    for day in days:
+        start = datetime.combine(date.fromisoformat(day), time(8, 45), tzinfo=TAIPEI)
+        expected = {start + timedelta(minutes=i) for i in range(TX_SESSION_MINUTES)}
+        observed = [datetime.fromisoformat(str(row.get("minute") or "")) for row in by_session[day]]
+        if len(observed) != TX_SESSION_MINUTES or set(observed) != expected:
+            raise ValueError(f"retained TX history minute grid differs: {day}")
+    rows.sort(key=lambda row: str(row["minute"]))
+    seed = dict(rows[-1])
+    from stockagent.live.benchmark_accounting import current_roll_linked_wealth
+    for field in ("entry_price", "origin_entry_price", "initial_capital_twd",
+                  "settled_buy_hold_wealth_index", "buy_hold_wealth_index", "last_mark_price"):
+        value = _finite(seed.get(field))
+        if value is None or value <= 0:
+            raise ValueError(f"retained TX history has invalid continuation input: {field}")
+    wealth = current_roll_linked_wealth(seed["settled_buy_hold_wealth_index"],
+                                      seed["last_mark_price"], seed["entry_price"])
+    if (seed.get("benchmark_accounting_contract_version") != MARKET_BENCHMARK_ACCOUNTING_CONTRACT_VERSION
+            or seed.get("capital_basis") != TX_FULLY_COLLATERALIZED_CAPITAL_BASIS
+            or not str(seed.get("contract_code") or "")
+            or not math.isclose(float(seed["buy_hold_wealth_index"]), float(wealth), rel_tol=1e-12, abs_tol=1e-12)
+            or not math.isclose(float(seed["initial_capital_twd"]), float(seed["origin_entry_price"]) * TAIFEX_INDEX_FUTURES_MULTIPLIERS["TX"], rel_tol=1e-12)):
+        raise ValueError("retained TX history financial continuation contract differs")
+    seed["roll_history"] = list(payload.get("roll_history") or ())
+    if len(seed["roll_history"]) != int(seed.get("roll_count") or 0):
+        raise ValueError("retained TX history roll evidence is incomplete")
+    if _sha256(path) != expected_sha256:
+        raise ValueError("retained TX history changed during readback")
+    return seed, rows, dict(payload.get("provenance") or {})
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
+    parser.add_argument("--resume-history", type=Path,
+                        help="Pinned complete TX history prefix; only same-contract tail extension is supported.")
+    parser.add_argument("--resume-history-sha256")
     parser.add_argument(
         "--markets-dir", type=Path, default=Path("services/discord_bot/markets")
     )
@@ -984,6 +1040,8 @@ def main() -> None:
     end = date.fromisoformat(args.end_date)
     if start > end:
         raise ValueError("--start-date must not be after --end-date")
+    if bool(args.resume_history) != bool(args.resume_history_sha256):
+        raise ValueError("retained history path and SHA must be supplied together")
     state_path = state_dir / "state.json"
     from stockagent.live.paper_mode_snapshot import read_paper_state
     state = read_paper_state(state_path)
@@ -1318,15 +1376,30 @@ def main() -> None:
         raise FileNotFoundError(final_settlement_path)
     provenance["tx_final_settlement_path"] = str(final_settlement_path)
     provenance["tx_final_settlement_sha256"] = _sha256(final_settlement_path)
-    provenance["tx_capture_manifests"] = {}
-    provenance["tx_history_receipts"] = {}
-    tx_rows = 0
+    seed, retained_rows, retained_provenance = ({}, [], {})
+    if args.resume_history is not None:
+        seed, retained_rows, retained_provenance = _retained_tx_prefix(
+            args.resume_history.resolve(), expected_sha256=args.resume_history_sha256,
+            session_dates=session_dates)
+        provenance["retained_tx_prefix"] = {"path": str(args.resume_history.resolve()),
+            "sha256": args.resume_history_sha256, "rows": len(retained_rows),
+            "last_session_date": retained_rows[-1]["session_date"],
+            "scope": "verified same-contract continuation; no omitted-state roll"}
+    provenance["tx_capture_manifests"] = dict(retained_provenance.get("tx_capture_manifests") or {})
+    provenance["tx_history_receipts"] = dict(retained_provenance.get("tx_history_receipts") or {})
+    marks.extend(retained_rows)
+    retained_days = {row["session_date"] for row in retained_rows}
+    tx_rows = len(retained_rows)
     with tempfile.TemporaryDirectory(prefix="stockagent-tx-benchmark-replay-") as temp:
         tx_engine = TwDayTradeSimulationEngine(
             Path(temp),
             final_settlement_path=final_settlement_path,
         )
+        if seed:
+            tx_engine.state["benchmarks"][TX_CONTINUOUS_BENCHMARK_ID] = seed
         for trading_date in session_dates:
+            if trading_date.isoformat() in retained_days:
+                continue
             manifest_root = (
                 args.fop_capture_root
                 / "manifests"
@@ -1416,6 +1489,8 @@ def main() -> None:
                     epoch_utc=False,
                 )
                 quote_source = "receipt_backed_shioaji_txfr1_historical_tick_l1"
+            if seed and metadata["code"] != seed["contract_code"]:
+                raise RuntimeError("retained TX continuation crosses a roll; use a full canonical rebuild")
             for observed, book, fresh in minute_books:
                 quote = {
                     "bid": float(book["bid_price_1"]),

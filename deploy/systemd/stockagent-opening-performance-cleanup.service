@@ -1,0 +1,16 @@
+[Unit]
+Description=Retire reviewed performance test copies
+Requires=stockagent-e-workspace-mount.service
+After=stockagent-e-workspace-mount.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 120 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python -c "from stockagent.data_sync import workspace_volume; workspace_volume.check()"'
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/discard_local_testing_artifacts.py --policy configs/data_sync/testing_discard_opening_rounds_20261108.json --state /srv/stockagent-workspace/verify/testing-discard-opening-rounds-20261108-v1 --apply'
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/discard_local_testing_artifacts.py --policy configs/data_sync/testing_discard_opening_reviewed_20261108.json --state /srv/stockagent-workspace/verify/testing-discard-opening-reviewed-20261108-v1 --apply'
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/discard_local_testing_artifacts.py --policy configs/data_sync/testing_discard_monitor_images_20261108.json --state /srv/stockagent-workspace/verify/testing-discard-monitor-images-20261108-v1 --apply'
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=infinity

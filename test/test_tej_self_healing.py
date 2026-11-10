@@ -103,6 +103,23 @@ def test_auth_quota_and_unreviewed_notices_are_never_acknowledged(unknown,text,b
     assert bridge.calls==['inspect_notices']
 
 
+def test_missing_vendor_database_is_visible_without_acknowledging_or_fabricating_a_result(unknown):
+    root, task, attempt, prepared = active_unknown(unknown)
+    notices = [{'controls': [{'class': 'Static', 'name': 'ERROR TEJD:GetFullDbId : 查無此DB(wscap)(wscap)\r\n'},
+                             {'class': 'Button', 'name': 'OK'}]}]
+    bridge = RetainedBridge(notices=notices)
+    assert not recover_retained_desktop_response(root, bridge, CONFIG)
+    assert bridge.calls == ['inspect_notices']
+    status = json.loads((root / 'desktop_response_recovery.json').read_text())
+    assert status['state'] == 'vendor_source_database_unavailable'
+    assert status['source_error_code'] == 'vendor_database_wscap_unavailable'
+    assert status['data_query_repeated'] is False
+    with closing(connect(root)) as con:
+        row = con.execute('SELECT state,actual_rows,last_error_code FROM tasks WHERE task_id=?',
+                          (task['task_id'],)).fetchone()
+    assert tuple(row) == ('blocked', None, 'unknown_outcome_no_auto_retry')
+
+
 @pytest.mark.parametrize('gate',['disabled','missing_stage','wrong_stage','unfinished','running','other_unknown'])
 def test_ambiguous_submission_evidence_cannot_trigger_even_a_desktop_probe(unknown,gate):
     root,task,attempt,_=active_unknown(unknown); config=CONFIG; bridge=RetainedBridge()

@@ -1,0 +1,19 @@
+[Unit]
+Description=Place immutable service archives on E under original publication owners
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+ConditionPathExists=/etc/stockagent/packed-object-placement.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+Environment=STOCKAGENT_TRADING_PRIORITY_GUARD=1
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 10 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/run_bounded_storage_maintenance.py scripts/run_packed_object_placement.py --apply'
+SuccessExitStatus=75
+TimeoutStartSec=8h 1min
+TimeoutStopSec=30s
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

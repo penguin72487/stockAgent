@@ -22,6 +22,8 @@ from tqdm import tqdm
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+if str(SCRIPT_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR.parent))
 
 from common import (  # noqa: E402
     SharedRateLimiter,
@@ -35,6 +37,8 @@ from artifact_io import (  # noqa: E402
     sha256_bytes as _sha256_bytes,
     sha256_file as _sha256_path,
 )
+from downloader.dataset_lock import exclusive_dataset_lock  # noqa: E402
+from stockagent.data_sync.workspace_source_handoff import guard_path  # noqa: E402
 
 
 SCHEMA_VERSION = 1
@@ -1618,6 +1622,16 @@ def _capture_dataset(
 
 def main() -> None:
     args = parse_args()
+    output_dir = Path(args.output_dir)
+    # The original C inode and the E mount can exchange while a collector is
+    # waiting. Fence the whole capture and recheck the alias after locking.
+    guard_path(output_dir)
+    with exclusive_dataset_lock(output_dir / '.download.lock', provider='free_public_context'):
+        guard_path(output_dir)
+        _run(args)
+
+
+def _run(args: argparse.Namespace) -> None:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     selected_ids = set(args.datasets or [])

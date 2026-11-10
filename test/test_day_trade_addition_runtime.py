@@ -19,6 +19,7 @@ def test_addition_cutover_requires_loaded_paper_policy_and_checkpoint(monkeypatc
     mode = {"terminal_close_contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT, "margin_carry_contract": None,
             "checkpoint_fingerprint": short_file_fingerprint(checkpoint)}
     (tmp_path / "state.json").write_text(json.dumps({"modes": {"new": mode}}))
+    (tmp_path / "rebuild_receipt.json").write_text("{}")
     if change == "checkpoint_path":
         config[change] = None
     elif change:

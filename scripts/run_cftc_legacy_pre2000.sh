@@ -6,6 +6,7 @@ cd "$repo_root"
 source "$repo_root/scripts/runtime_env.sh"
 
 state_dir="$repo_root/data_cftc_legacy/state"
+run_fintech_python -c 'from pathlib import Path; import sys; from stockagent.data_sync.workspace_source_handoff import guard_path; guard_path(Path(sys.argv[1]))' "$repo_root/data_cftc_legacy"
 mkdir -p "$state_dir"
 exec 9<>"$state_dir/collector.lock"
 if ! flock -n 9; then

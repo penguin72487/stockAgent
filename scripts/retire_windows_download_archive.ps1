@@ -1,4 +1,4 @@
-# Move one explicitly pinned, inactive C: archive to a verified D: copy.
+# Move one explicitly pinned, inactive C: file to a verified D: or E: copy.
 # The source handle denies all sharing and is used for deletion, so the
 # pathname cannot be swapped between the readback and the retirement.
 [CmdletBinding()]
@@ -7,6 +7,7 @@ param(
     [Parameter(Mandatory=$true)][string]$DestinationDirectory,
     [Parameter(Mandatory=$true)][long]$ExpectedSize,
     [Parameter(Mandatory=$true)][string]$ExpectedLastWriteUtc,
+    [ValidateSet('D','E')][string]$DestinationDrive = 'D',
     [long]$DestinationReserveBytes = 68719476736
 )
 $ErrorActionPreference = 'Stop'
@@ -14,9 +15,11 @@ Set-StrictMode -Version Latest
 if ($ExpectedSize -le 0 -or $DestinationReserveBytes -lt 0) { throw 'Invalid size or destination reserve' }
 $sourcePath = [IO.Path]::GetFullPath($Source)
 $destinationPath = [IO.Path]::GetFullPath($DestinationDirectory)
+$destinationRoot = ('{0}:\' -f $DestinationDrive)
 if (-not $sourcePath.StartsWith('C:\', [StringComparison]::OrdinalIgnoreCase) -or
-    -not $destinationPath.StartsWith('D:\', [StringComparison]::OrdinalIgnoreCase)) {
-    throw 'This operation is restricted to explicit local C: to D: paths'
+    -not $destinationPath.StartsWith($destinationRoot, [StringComparison]::OrdinalIgnoreCase) -or
+    ($DestinationDrive -eq 'E' -and -not $destinationPath.StartsWith('E:\StockAgent\', [StringComparison]::OrdinalIgnoreCase))) {
+    throw 'This operation requires an explicit C: source and selected D: or E:\StockAgent destination'
 }
 function Assert-NoRedirectedAncestors([string]$Path) {
     $item = [IO.DirectoryInfo]::new($Path)
@@ -29,10 +32,10 @@ function Assert-NoRedirectedAncestors([string]$Path) {
 }
 Assert-NoRedirectedAncestors ([IO.Path]::GetDirectoryName($sourcePath))
 Assert-NoRedirectedAncestors $destinationPath
-$disk = [IO.DriveInfo]::new('D')
+$disk = [IO.DriveInfo]::new($DestinationDrive)
 if (-not $disk.IsReady -or $disk.DriveType -ne [IO.DriveType]::Fixed -or
     $disk.AvailableFreeSpace -lt ($ExpectedSize + $DestinationReserveBytes)) {
-    throw 'D: does not have the pinned copy size plus its reserve'
+    throw 'The selected destination does not have the pinned copy size plus its reserve'
 }
 $target = Join-Path $destinationPath ([IO.Path]::GetFileName($sourcePath))
 $pending = $target + '.retirement-pending.json'

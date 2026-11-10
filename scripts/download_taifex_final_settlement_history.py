@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 from datetime import date, datetime, timedelta, timezone
 import io
+import os
 from pathlib import Path
 import sys
 from typing import Final
@@ -135,6 +136,26 @@ def _parse_date(value: str) -> date:
         ) from exc
 
 
+def _receipt_directory(requested: Path) -> tuple[Path, Path]:
+    """Keep the live settlement receipt beside its C service projection."""
+    requested = Path(os.path.abspath(os.fspath(requested.expanduser())))
+    canonical = REPO_ROOT / "data_tw_index_options_daily"
+    output_dir = requested.resolve()
+    if requested == canonical or output_dir == canonical:
+        if (canonical.is_symlink() or canonical.resolve(strict=True) != canonical
+                or canonical.stat().st_dev != REPO_ROOT.stat().st_dev):
+            raise RuntimeError("live settlement source must remain on the C service filesystem")
+        directory = canonical / "service_raw" / "final_settlement"
+        ancestor = directory
+        while not ancestor.exists() and not ancestor.is_symlink():
+            ancestor = ancestor.parent
+        if (directory.resolve(strict=False) != directory
+                or ancestor.stat().st_dev != REPO_ROOT.stat().st_dev):
+            raise RuntimeError("live settlement receipt path is redirected from C")
+        return canonical, directory
+    return output_dir, output_dir / "raw" / "final_settlement"
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--start-date", type=_parse_date, default=date(2012, 11, 1))
@@ -161,25 +182,20 @@ def main() -> int:
         "end_month": f"{args.end_date.month:02d}",
     }
     source_url = f"{TAIFEX_FINAL_SETTLEMENT_PAGE}?{parse.urlencode(query)}"
-    output_dir = args.output_dir.expanduser().resolve()
-    raw_path = (
-        output_dir
-        / "raw"
-        / "final_settlement"
-        / (
-            f"{args.start_date.strftime('%Y-%m')}_{args.end_date.strftime('%Y-%m')}_TXO.html"
+    output_dir, receipt_dir = _receipt_directory(args.output_dir)
+    raw_path = receipt_dir / f"{args.start_date.strftime('%Y-%m')}_{args.end_date.strftime('%Y-%m')}_TXO.html"
+    from stockagent.data_sync.tw_option_raw_workspace_guard import writer_guard
+    with writer_guard(raw_path):
+        _download_html(source_url, raw_path, refresh=bool(args.refresh))
+        source_sha256 = sha256_path(raw_path)
+        frame = parse_taifex_txo_final_settlement_html(
+            raw_path.read_bytes(),
+            start_date=args.start_date,
+            end_date=args.end_date,
+            source_file=str(raw_path),
+            source_sha256=source_sha256,
+            source_url=source_url,
         )
-    )
-    _download_html(source_url, raw_path, refresh=bool(args.refresh))
-    source_sha256 = sha256_path(raw_path)
-    frame = parse_taifex_txo_final_settlement_html(
-        raw_path.read_bytes(),
-        start_date=args.start_date,
-        end_date=args.end_date,
-        source_file=str(raw_path),
-        source_sha256=source_sha256,
-        source_url=source_url,
-    )
     normalized_path = output_dir / "txo_final_settlement_history.parquet"
     atomic_write_parquet(normalized_path, frame, compression="zstd", durable=True)
     manifest = {

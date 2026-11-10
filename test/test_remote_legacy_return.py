@@ -154,6 +154,9 @@ def test_private_control_carries_packed_reader_with_archive_code():
     program = '''
 import stockagent.data_sync.packed_snapshots as old_reader
 import stockagent.data_sync.desync_snapshots as old_scanner
+import sys
+sys.modules['stockagent.storage_layout'] = None
+sys.modules['stockagent.service_layout'] = None
 old_error = old_scanner.SnapshotError
 del old_scanner._iter_lstat_bounded
 del old_scanner._raise_walk_error
@@ -162,7 +165,7 @@ del old_reader._verified_packed_inventory
 '''
     program += private_control_prefix()
     program += '''
-from stockagent.data_sync.legacy_artifact_archive import _verified_packed_inventory
+from stockagent.data_sync.legacy_artifact_archive import _verified_packed_inventory, REVIEWED_STAGE_POLICY
 from stockagent.data_sync.packed_snapshots import _verified_packed_inventory as reader
 from stockagent.data_sync.desync_snapshots import scan_tree, SnapshotError
 import hashlib
@@ -170,6 +173,8 @@ import tempfile
 from pathlib import Path
 assert _verified_packed_inventory is reader
 assert SnapshotError is old_error
+assert REVIEWED_STAGE_POLICY == Path('/root/stockAgent/configs/data_sync/legacy_stage_retirement.json')
+assert real(Path('/root/stockAgent/artifacts/benchmarks/control-test')) == Path('/root/stockAgent/artifacts/benchmarks/control-test')
 with tempfile.TemporaryDirectory() as dirname:
     Path(dirname, 'one').write_text('x')
     observed = scan_tree(Path(dirname), file_workers=4)
@@ -286,6 +291,76 @@ def test_transitive_training_config_sources_protect_code_even_without_output_ref
         assert any('active-config-unreadable' in r for r in refs)
     finally:
         child.terminate();child.wait(timeout=5)
+
+
+def test_active_configuration_uses_the_observed_training_python_if_control_lacks_a_module(tmp_path, monkeypatch):
+    import builtins
+    import sys
+    from stockagent.data_sync import remote_legacy_return as module
+
+    root = tmp_path/'frozen'; package = root/'stockagent'; package.mkdir(parents=True)
+    (package/'__init__.py').write_text('')
+    (package/'config.py').write_text('''
+from dataclasses import dataclass
+from pathlib import Path
+import json
+@dataclass
+class Config:
+    data: dict
+def _config_source_identity(path):
+    s=path.stat();return (s.st_ino,s.st_size,s.st_mtime_ns)
+def load_config(path,source_signatures=None):
+    p=Path(path);value=json.loads(p.read_text());base=Path(value['base_config'])
+    source_signatures[p]=_config_source_identity(p)
+    source_signatures[base]=_config_source_identity(base)
+    return Config(json.loads(base.read_text())['data'])
+''')
+    base = root/'base.json'; base.write_text('{"data":{"input":"/needed/old-probe"}}')
+    config = root/'config.json'; config.write_text(json.dumps({'base_config':str(base)}))
+    old_import = builtins.__import__
+    def missing_control(name, *args, **kwargs):
+        if name == 'stockagent.config':
+            raise ModuleNotFoundError('control has no pyarrow', name='pyarrow')
+        return old_import(name, *args, **kwargs)
+    monkeypatch.setattr(builtins, '__import__', missing_control)
+    process = Path('/proc')/str(os.getpid())
+    value, sources = module._active_configuration(config, root, [str(root/'train.py')],
+        process=process, process_environment=[f'VIRTUAL_ENV={sys.prefix}'])
+    assert value == {'data':{'input':'/needed/old-probe'}} and set(sources) == {config, base}
+    # Without a bound live process the missing control dependency stays a veto.
+    with pytest.raises(ModuleNotFoundError):
+        module._active_configuration(config, root, [str(root/'train.py')])
+
+
+def test_active_configuration_fails_closed_if_the_training_process_changes(tmp_path, monkeypatch):
+    import builtins
+    import sys
+    from stockagent.data_sync import remote_legacy_return as module
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+
+    root = tmp_path/'frozen'; package = root/'stockagent'; package.mkdir(parents=True)
+    (package/'__init__.py').write_text('')
+    (package/'config.py').write_text('''
+from dataclasses import dataclass
+@dataclass
+class Config: value: int = 1
+def load_config(path,source_signatures=None): return Config()
+def _config_source_identity(path): return ()
+''')
+    config=root/'config.json';config.write_text('{}')
+    original_import=builtins.__import__
+    def missing_control(name,*args,**kwargs):
+        if name=='stockagent.config': raise ModuleNotFoundError('missing',name='pyarrow')
+        return original_import(name,*args,**kwargs)
+    monkeypatch.setattr(builtins,'__import__',missing_control)
+    original_identity=module._training_process_identity;calls=[]
+    def changed(process):
+        result=original_identity(process);calls.append(True)
+        return result if len(calls)==1 else (*result[:-1],b'different-start-time')
+    monkeypatch.setattr(module,'_training_process_identity',changed)
+    with pytest.raises(SnapshotError,match='training process changed'):
+        module._active_configuration(config,root,[str(root/'train.py')],
+            process=Path('/proc')/str(os.getpid()),process_environment=[f'VIRTUAL_ENV={sys.prefix}'])
 
 
 def test_persistent_handoff_selects_only_the_exact_retained_cohort():

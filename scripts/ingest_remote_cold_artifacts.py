@@ -17,11 +17,13 @@ import fcntl
 import hashlib
 import json
 import inspect
+import math
 import os
 from pathlib import Path, PurePosixPath
 import re
 import shlex
 import shutil
+import stat
 import subprocess
 import sys
 import time
@@ -46,6 +48,7 @@ from stockagent.data_sync.cold_artifacts import (  # noqa: E402
 )
 from stockagent.data_sync.desync_snapshots import (  # noqa: E402
     SnapshotError,
+    _fsync_directory,
     _safe_relative_path,
     _utc_iso_from_ns,
     atomic_write_bytes,
@@ -62,9 +65,12 @@ from stockagent.data_sync.training_return import admitted, admit_workspace, load
 INGRESS_SCHEMA_VERSION = 1
 AUTOMATION_CONTRACT = "cold-return-v4-bounded-confirmations"
 MAX_PENDING_RETURNS = 32
+MAX_DEFERRED_RETURNS = 16384
 INGRESS_OWNER = Path('/run/lock/stockagent-remote-cold-artifact-ingress-cycle.lock')
 PUBLICATION_OWNER = Path('/run/lock/stockagent-remote-cold-artifact-ingress.lock')
 RETURN_PAYLOAD_SCRATCH = Path('/srv/stockagent-d-volume/stockagent-completed-offline-scratch/remote-return')
+E_RETURN_PAYLOAD_SCRATCH = Path('/srv/stockagent-workspace/restore/completed-return-staging')
+E_WORKSPACE_MOUNT = Path('/srv/stockagent-workspace')
 UNOBSERVABLE_CONSUMERS = "unobservable-consumers-preserve-source"
 _SSH_TARGET_RE = re.compile(r"^[A-Za-z0-9_.@:-]+$")
 _REMOTE_ABSOLUTE_RE = re.compile(r"^/[A-Za-z0-9_./-]+$")
@@ -225,6 +231,24 @@ def _remote_ancestor_reference_override() -> str:
     )
 
 
+def _run_readonly_ssh_discovery(command: list[str]):
+    """Retry only SSH transport failures for the read-only discovery probe.
+
+    Exit 255 can also originate remotely, so retries are bounded and the last
+    original exception (including private diagnostics) is preserved.  Do not
+    reuse this for transfers, publication or retirement, whose outcomes can be
+    ambiguous after a disconnect.
+    """
+    for attempt in range(3):
+        try:
+            return subprocess.run(command, check=True, capture_output=True,
+                                  text=True, timeout=300)
+        except subprocess.CalledProcessError as error:
+            if error.returncode != 255 or attempt == 2:
+                raise
+            time.sleep(attempt + 1)
+
+
 def discover_remote_artifacts(
     *,
     ssh_target: str,
@@ -265,13 +289,8 @@ def discover_remote_artifacts(
             ),
         ]
     )
-    completed = subprocess.run(
-        [*_ssh_base(identity_file, ssh_port), target, remote_command],
-        check=True,
-        capture_output=True,
-        text=True,
-        timeout=300,
-    )
+    completed = _run_readonly_ssh_discovery(
+        [*_ssh_base(identity_file, ssh_port), target, remote_command])
     return _decode_discovery(completed.stdout)
 
 
@@ -357,17 +376,18 @@ def _staging_artifact_root(
     node = re.sub(r"[^A-Za-z0-9_.-]", "-", origin_node_id).strip("-.")
     if not node:
         raise SnapshotError("origin node ID is empty")
-    root = (state_root.resolve() / "ingress-staging" / node / spec.dataset).resolve()
-    expected_parent = (state_root.resolve() / "ingress-staging" / node).resolve()
-    try:
-        root.relative_to(expected_parent)
-    except ValueError as exc:
-        raise SnapshotError(f"unsafe ingress staging root: {root}") from exc
+    base = state_root.resolve()
+    root = base / "ingress-staging" / node / spec.dataset
+    for path in (root, root.parent, root.parent.parent):
+        if path.is_symlink() or (path.exists() and not path.is_dir()):
+            raise SnapshotError("ingress staging root contains a redirected component")
+    if root.resolve(strict=False) != root:
+        raise SnapshotError("ingress staging root is redirected")
     return root / "artifacts"
 
 
 def return_staging_workspace(args, required_bytes: int) -> Path:
-    """Keep durable receipts on SSD, but admit payload scratch on guarded D.
+    """Keep receipts on SSD and admit payload scratch only on an enrolled volume.
 
     The explicit D namespace is private and excluded from replication. It is
     not an alternate cold authority and cannot silently fall back to C/WSL.
@@ -378,6 +398,23 @@ def return_staging_workspace(args, required_bytes: int) -> Path:
         args.state_root.mkdir(parents=True, exist_ok=True)
         admit_workspace(args.state_root, required_bytes)
         return args.state_root
+    if selected.absolute() == E_RETURN_PAYLOAD_SCRATCH:
+        from stockagent.data_sync import workspace_volume
+
+        if not getattr(args, "prestage_root", None) and not getattr(args, "policy", None):
+            raise SnapshotError("E scratch requires the completed-return policy or exact prestage")
+        expected = E_RETURN_PAYLOAD_SCRATCH
+        if any(path.is_symlink() for path in (expected, expected.parent, E_WORKSPACE_MOUNT)):
+            raise SnapshotError("completed return E workspace is redirected")
+        # admit() measures both the enrolled ext4 mount and the actual E
+        # backing volume, including its own reserved headroom.
+        workspace_volume.admit(required_bytes)
+        expected.mkdir(parents=True, mode=0o700, exist_ok=True)
+        info = expected.stat()
+        if (expected.resolve() != expected or info.st_dev != E_WORKSPACE_MOUNT.stat().st_dev
+                or info.st_uid != os.geteuid() or (info.st_mode & 0o777) != 0o700):
+            raise SnapshotError("completed return E workspace identity differs")
+        return expected
     from stockagent.data_sync.cold_primary import _check_d_primary_mount
 
     canonical = Path("/srv/stockagent-packed")
@@ -426,6 +463,7 @@ def _rsync_candidate(
     remote_artifact_root: str,
     destination_artifact_root: Path,
     compression: str = "none",
+    delete_extraneous: bool = True,
 ) -> None:
     if not isinstance(compression, str) or compression not in {"none", "zstd-1"}:
         raise SnapshotError("unsupported rsync transfer compression profile")
@@ -445,11 +483,12 @@ def _rsync_candidate(
         "--archive",
         "--partial",
         "--append-verify",
-        "--delete-delay",
         "--protect-args",
         "-e",
         ssh_command,
     ]
+    if delete_extraneous:
+        command.append("--delete-delay")
     if compression == "zstd-1":
         command.extend(("--compress", "--compress-choice=zstd", "--compress-level=1"))
     command.extend((source, str(destination) + "/"))
@@ -458,6 +497,179 @@ def _rsync_candidate(
         check=True,
         timeout=21_600,
     )
+
+
+# Identical byte-level proof on the remote and on the enrolled E workspace.
+# Reject links and changing files; names/sizes alone do not establish that an
+# unarchived staged checkpoint matches the source.
+_CONTENT_DIGEST_PROGRAM = r"""
+import hashlib, json, os, stat, sys
+root = os.path.abspath(sys.argv[1])
+if os.path.realpath(root) != root or not os.path.isdir(root):
+    raise ValueError('content digest root is absent or redirected')
+digest = hashlib.sha256()
+files = total = 0
+def fail(error):
+    raise error
+for current, dirs, names in os.walk(root, topdown=True, followlinks=False, onerror=fail):
+    dirs.sort()
+    names.sort()
+    for name in dirs:
+        if not stat.S_ISDIR(os.lstat(os.path.join(current, name)).st_mode):
+            raise ValueError('content digest rejects linked or special directory')
+    for name in names:
+        path = os.path.join(current, name)
+        before = os.lstat(path)
+        if not stat.S_ISREG(before.st_mode):
+            raise ValueError('content digest rejects linked or special file')
+        fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0))
+        try:
+            first = os.fstat(fd)
+            identity = lambda s: (s.st_dev, s.st_ino, s.st_mode, s.st_size, s.st_mtime_ns, s.st_ctime_ns)
+            if identity(first) != identity(before):
+                raise ValueError('file changed before content digest')
+            item = hashlib.sha256()
+            while True:
+                block = os.read(fd, 4 * 1024 * 1024)
+                if not block:
+                    break
+                item.update(block)
+            if identity(os.fstat(fd)) != identity(first) or identity(os.lstat(path)) != identity(first):
+                raise ValueError('file changed during content digest')
+        finally:
+            os.close(fd)
+        relative = os.path.relpath(path, root).encode('utf-8', 'surrogateescape')
+        digest.update(relative + b'\0' + str(first.st_size).encode('ascii') + b'\0' + item.digest() + b'\n')
+        files += 1
+        total += first.st_size
+print(json.dumps({'files': files, 'logical_bytes': total, 'sha256': digest.hexdigest()}, sort_keys=True))
+""".strip()
+
+
+def _content_digest(command: Sequence[str]) -> dict[str, Any]:
+    completed = subprocess.run(command, check=True, capture_output=True, text=True, timeout=21_600)
+    for line in reversed(completed.stdout.splitlines()):
+        try:
+            result = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if (isinstance(result, dict) and type(result.get("files")) is int
+                and type(result.get("logical_bytes")) is int
+                and re.fullmatch(r"[0-9a-f]{64}", str(result.get("sha256") or ""))):
+            return result
+    raise SnapshotError("content digest did not return valid evidence")
+
+
+def _fence_e_stage(stage: Path, identity: tuple[int, int], *, physical: bool) -> None:
+    from stockagent.data_sync import workspace_volume
+
+    if physical:
+        workspace_volume.admit(0)
+    else:
+        workspace_volume.check(physical=False)
+    info = stage.stat()
+    if stage.is_symlink() or (info.st_dev, info.st_ino) != identity:
+        raise SnapshotError("E return workspace changed during transfer")
+
+
+def _prestage_on_e(args, policy: Mapping[str, Any]) -> dict[str, Any]:
+    """Preserve one exact completed run on E without publishing or retiring it."""
+    selected = _safe_relative_path(args.prestage_root, "prestage root").as_posix()
+    if not admitted(selected, dict(policy)):
+        raise SnapshotError("prestage root is outside the completed-return policy")
+    if getattr(args, "staging_root", None) != E_RETURN_PAYLOAD_SCRATCH:
+        raise SnapshotError("prestage requires the enrolled E return workspace")
+    discovery = dict(ssh_target=args.ssh_target, ssh_port=args.ssh_port,
+        identity_file=args.identity_file, remote_repo_root=args.remote_repo_root,
+        remote_artifact_root=args.remote_artifact_root,
+        scope=PurePosixPath(selected).parts[0], relative_root=selected)
+    found = discover_remote_artifacts(**discovery)
+    eligible = eligible_candidates(found, include_roots=[selected],
+        stable_hours=float(policy["stable_hours"]), allow_unobservable_copy=True)
+    if len(eligible) != 1 or eligible[0].relative_root != selected:
+        raise SnapshotError("exact completed prestage source is not eligible")
+    candidate = eligible[0]
+    if candidate.files > policy["maximum_run_files"] or candidate.logical_bytes > policy["maximum_run_bytes"]:
+        raise SnapshotError("prestage source exceeds completed-return policy bounds")
+    spec = _spec(candidate, float(policy["stable_hours"]))
+    stage = return_staging_workspace(args, 2 * candidate.logical_bytes)
+    stage_stat = stage.stat()
+    stage_identity = (stage_stat.st_dev, stage_stat.st_ino)
+    generation = hashlib.sha256(json.dumps({"root": selected,
+        "files": candidate.files, "bytes": candidate.logical_bytes,
+        "portable": candidate.portable_fingerprint_sha256,
+        "newest_mtime_ns": candidate.newest_mtime_ns}, sort_keys=True).encode()).hexdigest()
+    generation_root = stage / generation
+    if generation_root.is_symlink():
+        raise SnapshotError("E prestage generation is redirected")
+    generation_root.mkdir(mode=0o700, exist_ok=True)
+    if generation_root.resolve() != generation_root or generation_root.stat().st_dev != stage.stat().st_dev:
+        raise SnapshotError("E prestage generation escaped its workspace")
+    node = re.sub(r"[^A-Za-z0-9_.-]", "-", args.origin_node_id).strip("-.")
+    lexical_root = generation_root / "ingress-staging" / node / spec.dataset / "artifacts"
+    for parent in (lexical_root, *lexical_root.parents):
+        if parent == generation_root:
+            break
+        if parent.is_symlink():
+            raise SnapshotError("E prestage artifact path contains a symlink")
+    artifact_root = _staging_artifact_root(generation_root, args.origin_node_id, spec)
+    if artifact_root != lexical_root or not artifact_root.is_relative_to(generation_root):
+        raise SnapshotError("E prestage artifact path is redirected")
+    cursor = artifact_root
+    for part in PurePosixPath(selected).parts:
+        cursor = cursor / part
+        if cursor.is_symlink() or (cursor.exists() and not cursor.is_dir()):
+            raise SnapshotError("E prestage source destination is redirected")
+    directory = args.state_root / "ingress-prestage-receipts"
+    directory.mkdir(parents=True, mode=0o700, exist_ok=True)
+    receipt_path = directory / f"{spec.dataset}-{generation}.json"
+    if directory.is_symlink() or receipt_path.is_symlink():
+        raise SnapshotError("prestage receipt path is redirected")
+    previous = json.loads(receipt_path.read_bytes()) if receipt_path.exists() else None
+    if previous is None:
+        cycle_progress(args, "prestage-e-transfer", candidate)
+        _rsync_candidate(candidate, ssh_target=args.ssh_target, ssh_port=args.ssh_port,
+            identity_file=args.identity_file, remote_artifact_root=args.remote_artifact_root,
+            destination_artifact_root=artifact_root, compression=args.transfer_compression,
+            delete_extraneous=False)
+    _fence_e_stage(stage, stage_identity, physical=True)
+    local = validate_cold_artifact_source(artifact_root, spec)
+    if not staging_observation_matches(local, candidate, d_payload_scratch=False):
+        raise SnapshotError("E staged lifecycle inventory differs from origin")
+    from stockagent.data_sync.packed_snapshots import _collect_entries
+    _, inventory = _collect_entries(Path(local["source"]))
+    if inventory["portable_fingerprint_sha256"] != candidate.portable_fingerprint_sha256:
+        raise SnapshotError("E staged names or sizes differ from origin")
+    cycle_progress(args, "prestage-e-content-proof", candidate)
+    remote_root = _validate_remote_absolute(args.remote_artifact_root, "remote artifact root")
+    source = str(PurePosixPath(remote_root).joinpath(*PurePosixPath(selected).parts))
+    remote_command = shlex.join(["python3", "-c", _CONTENT_DIGEST_PROGRAM, source])
+    remote_digest = _content_digest([*_ssh_base(args.identity_file, args.ssh_port),
+        _validate_ssh_target(args.ssh_target), remote_command])
+    local_digest = _content_digest([sys.executable, "-c", _CONTENT_DIGEST_PROGRAM, local["source"]])
+    if remote_digest != local_digest or local_digest["files"] != candidate.files or local_digest["logical_bytes"] != candidate.logical_bytes:
+        raise SnapshotError("E staged file SHA256 evidence differs from origin")
+    current = discover_remote_artifacts(**discovery)
+    if len(current) != 1 or current[0].observation() != candidate.observation() or current[0].portable_fingerprint_sha256 != candidate.portable_fingerprint_sha256 or (current[0].process_references and current[0].process_references != (UNOBSERVABLE_CONSUMERS,)):
+        raise SnapshotError("prestage source changed or became active during transfer")
+    _fence_e_stage(stage, stage_identity, physical=False)
+    receipt = {"schema_version": 1, "contract": "completed_training_e_prestage_v1",
+        "state": "staged_not_cold_published", "relative_root": selected,
+        "dataset": spec.dataset, "source_generation": generation,
+        "staged_artifact_root": str(artifact_root), "staged_source": local["source"],
+        "source_observation": {"files": candidate.files, "logical_bytes": candidate.logical_bytes,
+            "portable_fingerprint_sha256": candidate.portable_fingerprint_sha256,
+            "newest_mtime_ns": candidate.newest_mtime_ns},
+        "content_sha256_proof": local_digest, "recorded_at": _utc_iso_from_ns(time.time_ns()),
+        "cold_published": False, "source_retired": False, "simulation_promotion": False}
+    if previous is not None:
+        if not isinstance(previous, dict) or any(previous.get(key) != receipt.get(key)
+                for key in receipt if key != "recorded_at"):
+            raise SnapshotError("existing E prestage receipt disagrees with current source")
+        receipt = previous
+    else:
+        atomic_write_json(receipt_path, receipt)
+    return {**receipt, "receipt_path": str(receipt_path), "reused": previous is not None}
 
 
 def remote_retirement(args, ack: dict, policy: dict, *, apply: bool) -> dict:
@@ -567,6 +779,70 @@ def waiting_returns(state_root: Path, policy: dict) -> list[dict]:
     return [wave for _, wave in _waiting_entries(state_root, policy)]
 
 
+def _deferred_entries(state_root: Path, policy: dict) -> list[tuple[Path, dict]]:
+    """Keep converged but unrestored waves outside the transport backlog."""
+    directory = state_root / 'training-return-deferred'
+    if any(p.is_symlink() for p in (directory, *directory.parents)):
+        raise SnapshotError('deferred training return directory is redirected')
+    if not directory.exists():
+        return []
+    if not directory.is_dir():
+        raise SnapshotError('invalid deferred training return directory')
+    entries, roots = [], set()
+    for path in directory.iterdir():
+        if len(entries) >= MAX_DEFERRED_RETURNS or not re.fullmatch(r'[0-9a-f]{64}\.json', path.name):
+            raise SnapshotError('deferred training return queue exceeds its bound or identity')
+        wave = _read_waiting_marker(path, policy)
+        if path.name != _pending_name(wave) or wave['relative_root'] in roots:
+            raise SnapshotError('deferred training return marker identity conflicts')
+        roots.add(wave['relative_root'])
+        entries.append((path, wave))
+    return sorted(entries, key=lambda item: item[0].lstat().st_mtime_ns)
+
+
+def _move_waiting_marker(path: Path, wave: dict, policy: dict, destination: Path) -> Path:
+    """Durably move one fixed marker; interruption may leave two equal links."""
+    if _read_waiting_marker(path, policy) != wave:
+        raise SnapshotError('training return marker changed before queue handoff')
+    if any(p.is_symlink() for p in (destination, *destination.parents)):
+        raise SnapshotError('training return queue destination is redirected')
+    destination.mkdir(mode=0o700, parents=True, exist_ok=True)
+    info = destination.stat()
+    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or info.st_mode & 0o022:
+        raise SnapshotError('training return queue destination is not private')
+    target = destination / _pending_name(wave)
+    try:
+        os.link(path, target, follow_symlinks=False)
+    except FileExistsError:
+        if _read_waiting_marker(target, policy) != wave:
+            raise SnapshotError('training return queue target identity differs') from None
+    if _read_waiting_marker(target, policy) != wave or _read_waiting_marker(path, policy) != wave:
+        raise SnapshotError('training return marker changed during queue handoff')
+    _fsync_directory(destination)
+    path.unlink()
+    _fsync_directory(path.parent)
+    return target
+
+
+def _resume_deferred_returns(state_root: Path, policy: dict) -> None:
+    """Requeue preserved markers when the user permits restoration again."""
+    pending = _waiting_entries(state_root, policy)
+    for path, wave in _deferred_entries(state_root, policy):
+        existing = next(((old_path, old) for old_path, old in pending
+                         if old['relative_root'] == wave['relative_root']), None)
+        if existing is not None and existing[1] != wave:
+            raise SnapshotError('pending and deferred return generations conflict')
+        if existing is not None:
+            _fsync_directory(existing[0].parent)
+            path.unlink()
+            _fsync_directory(path.parent)
+            continue
+        if len(pending) >= MAX_PENDING_RETURNS:
+            break
+        target = _move_waiting_marker(path, wave, policy, state_root/'training-return-pending')
+        pending.append((target, wave))
+
+
 def waiting_return(state_root: Path, policy: dict) -> dict | None:
     """Compatibility projection: the oldest exact pending release, if any."""
     waves = waiting_returns(state_root, policy)
@@ -580,6 +856,9 @@ def _enroll_return(args, wave: dict, policy: dict) -> Path:
             if previous != wave:
                 raise SnapshotError("a different exact release for this training run is awaiting confirmation")
             return path
+    if any(previous['relative_root'] == wave['relative_root']
+           for _, previous in _deferred_entries(args.state_root, policy)):
+        raise SnapshotError('this training return is awaiting deferred recovery')
     if len(entries) >= MAX_PENDING_RETURNS:
         raise SnapshotError("training return confirmation queue is full")
     path = args.state_root / "training-return-pending" / _pending_name(wave)
@@ -592,6 +871,24 @@ def _clear_return(path: Path, wave: dict, policy: dict) -> None:
     if _read_waiting_marker(path, policy) != wave:
         raise SnapshotError("training return waiting wave changed during confirmation")
     path.unlink()
+
+
+def _resolve_waiting_release(args, wave):
+    """Use a retired wave's exact physical successor only with fixed evidence."""
+    try:
+        held = resolve_packed_snapshot_id(args.sync_root, wave['dataset'], wave['snapshot_id'])
+    except FileNotFoundError:
+        # Do not reinterpret a still-present but damaged release as a repack.
+        original = args.sync_root/'manifests'/wave['dataset']/(wave['snapshot_id']+'.json')
+        if os.path.lexists(original):
+            raise
+        from stockagent.data_sync import remote_return_repack, workspace_volume
+        workspace_volume.check()
+        held = remote_return_repack.resolve(args.sync_root, E_WORKSPACE_MOUNT, wave)
+        return held, True
+    if held.manifest_sha256 != wave['manifest_sha256']:
+        raise SnapshotError('waiting training release changed')
+    return held, False
 
 
 def retry_training_layout(args) -> dict:
@@ -631,7 +928,46 @@ def retry_training_layout(args) -> dict:
     return result
 
 
-def returned_source(args, candidate, resolved, policy, *, retire_source: bool = True) -> dict:
+def remote_cache_pressure(args) -> dict:
+    """Run only the fixed expendable-cache policy on the enrolled SSH peer."""
+    result = {'contract':'stockagent.remote_cache_pressure_observation.v1',
+              'state':'waiting', 'observed_at_epoch':time.time()}
+    script = REPO_ROOT/'scripts/reclaim_unused_vscode_servers.py'
+    try:
+        if script.is_symlink() or not script.is_file() or script.stat().st_size > 128*1024:
+            raise SnapshotError('remote cache policy source is not a bounded regular file')
+        program = ("scope={'__name__':'stockagent_remote_cache_policy'}\n"
+                   f"exec(compile({script.read_text()!r}, 'cache_policy', 'exec'), scope)\n"
+                   "import json\nprint(json.dumps(scope['reclaim_under_pressure'](), sort_keys=True))\n")
+        completed = subprocess.run([*_ssh_base(args.identity_file, args.ssh_port),
+            _validate_ssh_target(args.ssh_target), 'python3 -'], input=program,
+            capture_output=True, text=True, timeout=60, check=False)
+        if completed.returncode != 0:
+            return {**result, 'error_type':'remote_exit_nonzero'}
+        for line in reversed(completed.stdout.splitlines()):
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (isinstance(value, dict) and value.get('contract') == 'stockagent.remote_cache_pressure_reclaim.v1'
+                    and value.get('state') in {'checked','partial','not_needed'}
+                    and type(value.get('removed_allocated_bytes')) is int
+                    and value['removed_allocated_bytes'] >= 0
+                    and type(value.get('profile_issues', 0)) is int
+                    and 0 <= value.get('profile_issues', 0) <= 2):
+                return {**result, 'state':value['state'],
+                        'removed_allocated_bytes':value['removed_allocated_bytes'],
+                        'profile_issues':value.get('profile_issues', 0),
+                        'available_before_bytes':value.get('available_before_bytes'),
+                        'available_after_bytes':value.get('available_after_bytes'),
+                        'threshold_bytes':value.get('threshold_bytes')}
+    except (OSError, ValueError, SnapshotError, subprocess.SubprocessError) as error:
+        return {**result, 'error_type':type(error).__name__}
+    return {**result, 'error_type':'invalid_remote_receipt'}
+
+
+def returned_source(args, candidate, resolved, policy, *, retire_source: bool = True,
+                    pending_original: dict | None = None) -> dict:
     if policy is None:
         return {}
     from stockagent.data_sync.cold_primary import verify_cold_resilience
@@ -640,7 +976,20 @@ def returned_source(args, candidate, resolved, policy, *, retire_source: bool = 
         raise SnapshotError("returned artifact cold authority is not ready")
     wave = {"relative_root": candidate.relative_root, "dataset": resolved.manifest["dataset"],
             "snapshot_id": resolved.manifest["snapshot_id"], "manifest_sha256": resolved.manifest_sha256}
-    waiting_path = _enroll_return(args, wave, policy)
+    marker_wave = wave
+    if pending_original is None:
+        waiting_path = _enroll_return(args, wave, policy)
+    else:
+        fixed, repacked = _resolve_waiting_release(args, pending_original)
+        if (not repacked or fixed.manifest_sha256 != resolved.manifest_sha256
+                or fixed.manifest['snapshot_id'] != resolved.manifest['snapshot_id']
+                or pending_original['relative_root'] != candidate.relative_root):
+            raise SnapshotError('pending training repack binding changed before confirmation')
+        matches = [(path, old) for path, old in _waiting_entries(args.state_root, policy)
+                   if old == pending_original]
+        if len(matches) != 1:
+            raise SnapshotError('original pending training marker changed')
+        waiting_path, marker_wave = matches[0]
     from scripts.configure_artifact_ingress_syncthing import credentials
     from scripts.manage_packed_edge import _convergence
     base, key = credentials()
@@ -656,10 +1005,22 @@ def returned_source(args, candidate, resolved, policy, *, retire_source: bool = 
     retain_until = candidate.newest_mtime_ns / 1_000_000_000 + minimum_hours * 3600
     if retire_source and time.time() < retain_until:
         if args.apply:
-            _clear_return(waiting_path, wave, policy)
+            _clear_return(waiting_path, marker_wave, policy)
         return {"deleted": False, "state": "waiting-training-hot-retention",
                 "retain_until_epoch": retain_until, "minimum_hot_retention_hours": minimum_hours,
                 "cold_recovery_reused_or_claimed": False}
+    if os.environ.get('STOCKAGENT_DEFER_OPTIONAL_RETURN_RESTORE') == '1':
+        # The current user-requested migration prioritizes finishing the new
+        # layout over an additional decode/restore. Preserve the exact marker
+        # in the deferred queue; never manufacture a recovery or deletion ACK.
+        if args.apply:
+            deferred_dir = args.state_root/'training-return-deferred'
+            if (len(_deferred_entries(args.state_root, policy)) >= MAX_DEFERRED_RETURNS
+                    and not os.path.lexists(deferred_dir/_pending_name(marker_wave))):
+                raise SnapshotError('deferred training return queue is full')
+            _move_waiting_marker(waiting_path, marker_wave, policy, deferred_dir)
+        return {"deleted": False, "state": "recovery-deferred-user-migration",
+                "cold_recovery_completed": False}
     ack = make_ack(args.sync_root, resolved, relative_root=candidate.relative_root,
                    origin=args.origin_node_id)
     # Exact cold reconstruction may be slow. An earlier transport observation
@@ -697,7 +1058,7 @@ def returned_source(args, candidate, resolved, policy, *, retire_source: bool = 
                   "cold_return_verified": True}
     if args.apply:
         atomic_write_json(receipt, {"ack": ack, "retirement": result})
-        _clear_return(waiting_path, wave, policy)
+        _clear_return(waiting_path, marker_wave, policy)
     return result
 
 
@@ -716,8 +1077,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--identity-file",
         type=Path,
         default=(
-            Path(os.environ["COLD_ARTIFACT_INGRESS_IDENTITY_FILE"])
-            if os.environ.get("COLD_ARTIFACT_INGRESS_IDENTITY_FILE")
+            Path(os.environ.get("STOCKAGENT_REMOTE_INGRESS_IDENTITY_FILE")
+                 or os.environ["COLD_ARTIFACT_INGRESS_IDENTITY_FILE"])
+            if (os.environ.get("STOCKAGENT_REMOTE_INGRESS_IDENTITY_FILE")
+                or os.environ.get("COLD_ARTIFACT_INGRESS_IDENTITY_FILE"))
             else None
         ),
     )
@@ -740,6 +1103,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--scope", default="ablations")
     parser.add_argument("--include-root", action="append", default=[])
+    parser.add_argument("--prestage-root", help="Preserve one exact completed run on enrolled E without D publication or source retirement")
     parser.add_argument("--stable-hours", type=float, default=0.0)
     parser.add_argument("--max-publish", type=int, default=1)
     parser.add_argument("--transfer-compression", choices=("none", "zstd-1"),
@@ -760,11 +1124,54 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _last_completed_cycle(path: Path) -> dict | None:
+    """Keep bounded, non-identifying counts while the next cycle runs."""
+    try:
+        descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        with os.fdopen(descriptor, 'rb') as stream:
+            if not stat.S_ISREG(os.fstat(stream.fileno()).st_mode):
+                return None
+            raw = stream.read(1024 * 1024 + 1)
+        if len(raw) > 1024 * 1024:
+            return None
+        previous = json.loads(raw)
+    except (OSError, ValueError, TypeError):
+        return None
+    if not isinstance(previous, dict) or previous.get('automation_contract') != AUTOMATION_CONTRACT:
+        return None
+    if previous.get('state') == 'cycle-complete' and previous.get('apply') is True:
+        rows = previous.get('rows')
+        if not isinstance(rows, list) or not all(isinstance(row, dict) for row in rows):
+            return None
+        candidate = {key: previous.get(key) for key in
+                     ('observed_at_epoch', 'observed', 'eligible', 'published',
+                      'pending_return_count', 'pending_return_limit', 'deferred_return_count')}
+        candidate['deferred'] = sum(row.get('action') in {'return-cycle-limit', 'publish-limit'} for row in rows)
+    else:
+        candidate = previous.get('last_completed_summary')
+    if not isinstance(candidate, dict):
+        return None
+    stamp = candidate.get('observed_at_epoch')
+    if type(stamp) not in (int, float) or not math.isfinite(stamp) or stamp <= 0:
+        return None
+    required = ('observed', 'eligible', 'published', 'deferred')
+    if any(type(candidate.get(key)) is not int or not 0 <= candidate[key] <= 2**53-1 for key in required):
+        return None
+    result = {key: candidate[key] for key in ('observed_at_epoch', *required)}
+    for key in ('pending_return_count', 'pending_return_limit', 'deferred_return_count'):
+        value = candidate.get(key)
+        if type(value) is int and 0 <= value <= 2**53-1:
+            result[key] = value
+    return result
+
+
 def cycle_progress(args, phase: str, candidate=None) -> None:
     if args.apply and args.output:
         values = {"schema_version": INGRESS_SCHEMA_VERSION, "state": "cycle-running",
                   "phase": phase, "observed_at_epoch": time.time(),
                   "automation_contract": AUTOMATION_CONTRACT}
+        if summary := _last_completed_cycle(args.output):
+            values['last_completed_summary'] = summary
         if candidate is not None:
             values.update(current_root=candidate.relative_root, source_files=candidate.files,
                           source_logical_bytes=candidate.logical_bytes)
@@ -776,6 +1183,8 @@ def cycle_failure(args, error: Exception) -> dict:
     failure = {"state": "cycle_failed", "error_type": type(error).__name__,
                "observed_at_epoch": time.time(), "automation_contract": AUTOMATION_CONTRACT}
     if args.output and args.output.is_file():
+        if summary := _last_completed_cycle(args.output):
+            failure['last_completed_summary'] = summary
         try:
             prior = json.loads(args.output.read_text())
             if prior.get("automation_contract") == AUTOMATION_CONTRACT and prior.get("state") == "cycle-running":
@@ -800,6 +1209,20 @@ def _run_cycle(args, cycle_started: float) -> int:
         policy = load_policy(args.policy) if args.policy else None
         if policy and args.origin_node_id != policy["origin_node_id"]:
             raise SnapshotError("remote origin differs from completed return policy")
+        if args.prestage_root:
+            if not policy or not args.apply:
+                raise SnapshotError("E prestage requires the existing applied completed-return policy")
+            receipt = _prestage_on_e(args, policy)
+            result = {"schema_version": INGRESS_SCHEMA_VERSION, "state": "cycle-complete",
+                "scope": "exact completed training E prestage", "apply": True,
+                "observed_at_epoch": time.time(), "rows": [receipt],
+                "cold_published": False, "source_roots_retired": 0}
+            if args.output:
+                atomic_write_json(args.output, result)
+            print(json.dumps(result, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0
+        if args.apply and policy and os.environ.get('STOCKAGENT_REMOTE_CACHE_PRESSURE_GC') == '1':
+            atomic_write_json(args.state_root/'remote-cache-pressure.json', remote_cache_pressure(args))
         if args.apply:
             retry_training_layout(args)
         include_roots = list(args.include_root)
@@ -820,15 +1243,40 @@ def _run_cycle(args, cycle_started: float) -> int:
         )
         cycle_progress(args, "discovering-completed-runs")
         scopes = policy["scopes"] if policy else [args.scope]
+        defer_restore = os.environ.get('STOCKAGENT_DEFER_OPTIONAL_RETURN_RESTORE') == '1'
+        if policy and args.apply and not defer_restore:
+            _resume_deferred_returns(args.state_root, policy)
         pending = waiting_returns(args.state_root, policy) if policy else []
-        waiting = pending[0] if pending else None
+        deferred = [wave for _, wave in _deferred_entries(args.state_root, policy)] if policy else []
+        deferred_by_root = {wave['relative_root']: wave for wave in deferred}
+        if any(wave['relative_root'] in deferred_by_root and
+               deferred_by_root[wave['relative_root']] != wave for wave in pending):
+            raise SnapshotError('pending and deferred return generations conflict')
+        attempts_path = args.state_root / "training-return-attempts.json"
+        attempts = {}
+        if policy:
+            if attempts_path.is_symlink():
+                raise SnapshotError("training return attempt journal is redirected")
+            if attempts_path.exists():
+                attempts = json.loads(attempts_path.read_text())
+                if not isinstance(attempts, dict) or any(type(v) not in (int, float) for v in attempts.values()):
+                    raise SnapshotError("training return attempt journal is invalid")
+        ordered = sorted(pending, key=lambda wave: attempts.get(wave['relative_root'], 0))
+        # While restoration is explicitly deferred, move all already-synced
+        # fixed waves in this bounded queue through the same original gate.
+        # This needs neither source deletion nor an SSH scan for each wave.
+        waiting_batch = ordered if defer_restore else ordered[:1]
+        waiting = waiting_batch[0] if waiting_batch else None
         if len(pending) >= MAX_PENDING_RETURNS:
             # Capacity-bounded backpressure affects new preservation only
             # after the independent confirmation queue is actually full.
-            selected_scope = PurePosixPath(waiting["relative_root"]).parts[0]
-            observed = [row for row in discover_remote_artifacts(
-                **discovery_args, scope=selected_scope, relative_root=waiting["relative_root"]
-            ) if row.relative_root == waiting["relative_root"]]
+            if defer_restore:
+                observed = []  # No source may be deleted in this mode.
+            else:
+                selected_scope = PurePosixPath(waiting["relative_root"]).parts[0]
+                observed = [row for row in discover_remote_artifacts(
+                    **discovery_args, scope=selected_scope, relative_root=waiting["relative_root"]
+                ) if row.relative_root == waiting["relative_root"]]
         else:
             observed = [row for scope in scopes for row in discover_remote_artifacts(**discovery_args, scope=scope)]
         if policy:
@@ -839,6 +1287,8 @@ def _run_cycle(args, cycle_started: float) -> int:
             result = {"schema_version": 1, "state": "cycle-complete", "apply": args.apply,
                       "observed_at_epoch": time.time(), "automation_contract": AUTOMATION_CONTRACT,
                       "observed": len(observed), "eligible": 0, "published": 0, "rows": [],
+                      "pending_return_count": 0, "pending_return_limit": MAX_PENDING_RETURNS,
+                      "deferred_return_count": len(deferred),
                       "scope": "completed training returns"}
             if args.output:
                 atomic_write_json(args.output, result)
@@ -850,48 +1300,51 @@ def _run_cycle(args, cycle_started: float) -> int:
             stable_hours=policy["stable_hours"] if policy else args.stable_hours,
             allow_unobservable_copy=policy is not None,
         ) if include_roots else []
-        attempts_path = args.state_root / "training-return-attempts.json"
-        attempts = {}
         if policy:
-            if attempts_path.is_symlink():
-                raise SnapshotError("training return attempt journal is redirected")
-            if attempts_path.exists():
-                attempts = json.loads(attempts_path.read_text())
-                if not isinstance(attempts, dict) or any(type(v) not in (int, float) for v in attempts.values()):
-                    raise SnapshotError("training return attempt journal is invalid")
             eligible.sort(key=lambda r: (attempts.get(r.relative_root, 0), r.newest_mtime_ns, r.relative_root))
         pending_candidates = {row.relative_root: row for row in eligible}
-        if pending:
-            waiting = min(pending, key=lambda wave: attempts.get(wave["relative_root"], 0))
-        pending_roots = {wave["relative_root"] for wave in pending}
+        pending_roots = {wave["relative_root"] for wave in (*pending, *deferred)}
         eligible = [row for row in eligible if row.relative_root not in pending_roots]
         rows: list[dict[str, Any]] = []
         published = 0
         processed = 0
-        if waiting:
-            # One exact confirmation is independent of the new-publication
-            # budget. Busy shared transport cannot stall preservation of
-            # other completed runs; it still cannot authorize source unlink.
-            held = resolve_packed_snapshot_id(args.sync_root, waiting["dataset"], waiting["snapshot_id"])
-            if held.manifest_sha256 != waiting["manifest_sha256"]:
-                raise SnapshotError("waiting training release changed")
-            source = held.manifest["source"]
-            current = pending_candidates.get(waiting["relative_root"])
-            # A new source revision must never be retired against an older
-            # frozen return. Confirm that old wave without source mutation.
-            exact = current is not None and current.files == source["files"] and (
-                current.logical_bytes == source["logical_bytes"] and
-                current.portable_fingerprint_sha256 == source["portable_fingerprint_sha256"])
-            proxy = current if exact else RemoteCandidate(
-                waiting["relative_root"], source["files"], source["logical_bytes"],
-                source["portable_fingerprint_sha256"], 1, ())
+        for waiting in waiting_batch:
+            # Fixed-wave confirmation is independent of the new-publication
+            # budget. Busy shared transport cannot authorize source unlink.
             if args.apply:
                 attempts[waiting["relative_root"]] = time.time()
                 atomic_write_json(attempts_path, attempts)
-            cycle_progress(args, "verifying-held-cold-wave", proxy)
-            rows.append({"relative_root": proxy.relative_root, "action": "confirming-held-wave",
-                         "source_retirement": returned_source(
-                             args, proxy, held, policy, retire_source=bool(exact and not proxy.process_references))})
+            try:
+                held, repacked = _resolve_waiting_release(args, waiting)
+            except (OSError, ValueError, SnapshotError) as error:
+                # Preserve this marker and let other waves progress on future
+                # ticks; the UI still reports the unresolved fixed release.
+                rows.append({'relative_root':waiting['relative_root'], 'action':'waiting-fixed-release-unavailable',
+                             'error_type':type(error).__name__})
+            else:
+                source = held.manifest["source"]
+                current = pending_candidates.get(waiting["relative_root"])
+                # A new source revision must never be retired against an older
+                # frozen return. Confirm that old wave without source mutation.
+                exact = current is not None and current.files == source["files"] and (
+                    current.logical_bytes == source["logical_bytes"] and
+                    current.portable_fingerprint_sha256 == source["portable_fingerprint_sha256"])
+                proxy = current if exact else RemoteCandidate(
+                    waiting["relative_root"], source["files"], source["logical_bytes"],
+                    source["portable_fingerprint_sha256"], 1, ())
+                cycle_progress(args, "verifying-held-cold-wave", proxy)
+                options = {'retire_source':bool(exact and not proxy.process_references)}
+                if repacked:
+                    options['pending_original'] = waiting
+                try:
+                    returned = returned_source(args, proxy, held, policy, **options)
+                except (OSError, ValueError, SnapshotError) as error:
+                    # One stale fixed wave must not starve unrelated markers.
+                    rows.append({'relative_root': waiting['relative_root'], 'action': 'waiting-fixed-release-unavailable',
+                                 'error_type': type(error).__name__})
+                    continue
+                rows.append({"relative_root": proxy.relative_root, "action": "confirming-held-wave",
+                             "source_retirement": returned})
         for candidate in eligible:
             if policy:
                 if len(waiting_returns(args.state_root, policy)) >= MAX_PENDING_RETURNS:
@@ -956,7 +1409,13 @@ def _run_cycle(args, cycle_started: float) -> int:
                     rows.append({"relative_root": candidate.relative_root, "action": "waiting-local-capacity"})
                     continue
             elif getattr(args, "staging_root", None) is not None:
-                raise SnapshotError("D return scratch requires the bounded training return policy")
+                raise SnapshotError("return scratch requires the bounded training return policy")
+            use_e_scratch = staging_base.absolute() == E_RETURN_PAYLOAD_SCRATCH
+            e_identity = None
+            if use_e_scratch:
+                stage_stat = staging_base.stat()
+                e_identity = (stage_stat.st_dev, stage_stat.st_ino)
+                _fence_e_stage(staging_base, e_identity, physical=False)
             staging_artifact_root = _staging_artifact_root(
                 staging_base, args.origin_node_id, spec
             )
@@ -970,9 +1429,11 @@ def _run_cycle(args, cycle_started: float) -> int:
                 destination_artifact_root=staging_artifact_root,
                 compression=args.transfer_compression,
             )
+            if e_identity is not None:
+                _fence_e_stage(staging_base, e_identity, physical=True)
             local_status = validate_cold_artifact_source(staging_artifact_root, spec)
             if not staging_observation_matches(
-                    local_status, candidate, d_payload_scratch=getattr(args, "staging_root", None) is not None):
+                    local_status, candidate, d_payload_scratch=staging_base.absolute() == RETURN_PAYLOAD_SCRATCH):
                 raise SnapshotError(
                     f"remote artifact changed during ingress: {candidate.relative_root}"
                 )
@@ -993,6 +1454,8 @@ def _run_cycle(args, cycle_started: float) -> int:
                     f"{candidate.relative_root}"
                 )
             cycle_progress(args, "publishing-d-cold", candidate)
+            if e_identity is not None:
+                _fence_e_stage(staging_base, e_identity, physical=False)
             with ingress_owner(PUBLICATION_OWNER):
                 resolved = publish_cold_artifact(
                     args.sync_root,
@@ -1008,14 +1471,24 @@ def _run_cycle(args, cycle_started: float) -> int:
                         "ingress_transport_compression": args.transfer_compression,
                         "ingress_staging_clock_contract": (
                             "drvfs_rsync_whole_seconds_origin_nanoseconds_in_receipt"
-                            if getattr(args, "staging_root", None) is not None else "native_nanoseconds"),
+                            if staging_base.absolute() == RETURN_PAYLOAD_SCRATCH else "native_nanoseconds"),
                     },
                 )
-            proof = verify_packed_snapshot(
-                args.sync_root,
-                resolved,
-                materialized_path=Path(str(local_status["source"])),
-            )
+            if policy and defer_restore:
+                # The publisher hashes all staged source files and commits the
+                # fixed D generation. The user deferred an additional cold
+                # payload readback during migration; keep this explicitly
+                # distinct from an independent verification or restore ACK.
+                proof = {'state': 'source_hashed_publication_readback_deferred',
+                         'source_hashed_during_publication': True,
+                         'independent_cold_readback': False,
+                         'cold_reconstruction_verified': False}
+            else:
+                proof = verify_packed_snapshot(
+                    args.sync_root,
+                    resolved,
+                    materialized_path=Path(str(local_status["source"])),
+                )
             receipt = {
                 "schema_version": INGRESS_SCHEMA_VERSION,
                 "recorded_at": _utc_iso_from_ns(time.time_ns()),
@@ -1037,6 +1510,10 @@ def _run_cycle(args, cycle_started: float) -> int:
             receipt_path = receipt_dir / f"{spec.dataset}.json"
             atomic_write_json(receipt_path, receipt)
             staging_dataset_root = staging_artifact_root.parent
+            if e_identity is not None:
+                _fence_e_stage(staging_base, e_identity, physical=False)
+            if staging_dataset_root.is_symlink() or staging_dataset_root.resolve() != staging_dataset_root:
+                raise SnapshotError('return staging dataset root changed before cleanup')
             shutil.rmtree(staging_dataset_root)
             receipt["staging_removed"] = True
             atomic_write_json(receipt_path, receipt)
@@ -1072,6 +1549,7 @@ def _run_cycle(args, cycle_started: float) -> int:
                     "waiting_return": waiting_return(args.state_root, policy) if policy else None,
                     "pending_return_count": len(waiting_returns(args.state_root, policy)) if policy else 0,
                     "pending_return_limit": MAX_PENDING_RETURNS if policy else None,
+                    "deferred_return_count": len(_deferred_entries(args.state_root, policy)) if policy else 0,
                     "source_roots_retired": sum(bool(row.get("source_retirement", {}).get("deleted")) for row in rows),
                     "remote_reclaimed_bytes": sum(int(row.get("source_retirement", {}).get("reclaimed_allocated_bytes", 0)) for row in rows),
                     "deferred_sources": sum(row.get("source_retirement", {}).get("deleted") is False for row in rows if "source_retirement" in row),

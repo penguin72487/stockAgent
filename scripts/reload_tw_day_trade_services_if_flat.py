@@ -12,6 +12,7 @@ import argparse
 from contextlib import nullcontext
 from datetime import date, datetime, time as wall_time
 import json
+import math
 from pathlib import Path
 import subprocess
 import sys
@@ -43,6 +44,49 @@ PROTECTED_SERVICES = (
     "stockagent-public-dashboards.service", "stockagent-public-cloudflared.service",
 )
 
+READ_MODEL_MEMBERS = frozenset({"scripts/serve_tw_day_trade_dashboard.py",
+                                "stockagent/live/tw_day_trade_dashboard.py"})
+FINANCIAL_JOURNALS = ("events.jsonl", "orders.jsonl", "fills.jsonl")
+
+
+def engine_read_model_scope(previous: Path | None, candidate: Path, *, repo_root=REPO_ROOT) -> dict:
+    """Only a verified UI-only delta can use the narrower restart proof.
+
+    This never qualifies a model/executor/config/quote change or an unknown
+    original pin. Such reloads retain the existing full-journal byte proof.
+    """
+    result = {"contract": "verified_ui_only_restart_scope_v1", "eligible": False}
+    if previous is None or not Path(previous).is_file() or not Path(candidate).is_file():
+        return result
+    from stockagent.live.service_code_release import verify_frozen_source
+    verify_frozen_source(previous, repo_root)
+    verify_frozen_source(candidate, repo_root)
+    before = json.loads(Path(previous).read_bytes()).get("code", {}).get("files", {})
+    after = json.loads(Path(candidate).read_bytes()).get("code", {}).get("files", {})
+    changed = {name for name in before.keys() | after.keys() if before.get(name) != after.get(name)}
+    result["changed_members"] = sorted(changed)
+    if before and before.keys() == after.keys() and changed and changed <= READ_MODEL_MEMBERS:
+        result.update(eligible=True, previous_release=str(previous), candidate_release=str(candidate),
+                      all_signal_history_bytes_verified=False,
+                      financial_journals=list(FINANCIAL_JOURNALS),
+                      remaining_journals_proof="exact_file_and_immutable_head_generations_not_full_content_hash")
+    return result
+
+
+def journal_generation_fence(root: Path, names) -> dict:
+    """Capture exact local file identities AND the canonical immutable heads."""
+    from stockagent.live.paper_journal import layout_generations
+    files = {}
+    for name in names:
+        info = (root / name).stat()
+        files[name] = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+    return {"files": files, "immutable_layout": layout_generations(root, names=names)}
+
+
+def verify_journal_generation_fence(root: Path, expected: dict) -> None:
+    if journal_generation_fence(root, tuple(expected["files"])) != expected:
+        raise RuntimeError("UI-only reload changed a protected journal generation")
+
 
 def read_object(path):
     from stockagent.live.paper_mode_snapshot import read_paper_state
@@ -50,6 +94,63 @@ def read_object(path):
     if not isinstance(value, dict):
         raise ValueError(f"object receipt required: {path.name}")
     return value
+
+
+def verify_engine_release_mode_specs(release, *, expected_capitals, repo_root=REPO_ROOT):
+    """Load the real enabled configurations in the *candidate* code namespace.
+
+    Source-manifest verification alone cannot show that a runner and its config
+    schema are compatible. This isolated read-only probe starts no services and
+    opens no paper ledger. A failed import, missing mode, configuration error or
+    changed capital blocks the native restart before its drop-in is changed.
+    """
+    from stockagent.live.service_code_release import run_in_namespace
+
+    if (not isinstance(expected_capitals, dict) or not expected_capitals
+            or any(not isinstance(market, str) or not market
+                   or isinstance(capital, bool) or not isinstance(capital, (int, float))
+                   or not math.isfinite(capital) or capital <= 0
+                   for market, capital in expected_capitals.items())):
+        raise ValueError("candidate engine probe requires exact active market capitals")
+    code = '''\
+from pathlib import Path
+import inspect, json, sys
+from scripts.run_tw_day_trade_simulation import _mode_specs
+kwargs = ({"promoted_research_state_dir": Path(sys.argv[2])}
+          if "promoted_research_state_dir" in inspect.signature(_mode_specs).parameters else {})
+specs, _, errors = _mode_specs(Path(sys.argv[1]), **kwargs)
+rows = [{"market": spec.market, "capital": spec.initial_capital_twd} for spec in specs]
+print("STOCKAGENT_ENGINE_MODE_PROBE=" + json.dumps({"modes": rows, "errors": errors}, allow_nan=False))
+'''
+    result = run_in_namespace(Path(release), Path(repo_root),
+        ["-c", code, str(Path(repo_root) / "services/discord_bot/markets"), str(STATE_PATH.parent)], timeout=90)
+    prefix = "STOCKAGENT_ENGINE_MODE_PROBE="
+    lines = [line[len(prefix):] for line in result.stdout.splitlines() if line.startswith(prefix)]
+    if result.returncode != 0 or len(lines) != 1:
+        raise ValueError("candidate engine mode probe failed before restart: "
+                         + (result.stderr or result.stdout or f"exit {result.returncode}")[-1200:])
+    try:
+        payload = json.loads(lines[0])
+        rows, errors = payload["modes"], payload["errors"]
+        if not isinstance(rows, list) or not isinstance(errors, dict):
+            raise ValueError("invalid probe schema")
+        actual = {}
+        for row in rows:
+            market, capital = row["market"], row["capital"]
+            if (not isinstance(market, str) or not market or market in actual
+                    or isinstance(capital, bool) or not isinstance(capital, (int, float))
+                    or not math.isfinite(capital) or capital <= 0):
+                raise ValueError("invalid candidate market or capital")
+            actual[market] = float(capital)
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError("invalid candidate engine mode probe result") from exc
+    expected = {market: float(capital) for market, capital in expected_capitals.items()}
+    if errors or actual != expected:
+        raise ValueError(f"candidate engine cannot load the exact active modes and capitals: "
+                         f"errors={errors}, actual={actual}, expected={expected}")
+    return {"contract": "candidate_engine_real_mode_spec_probe_v1", "status": "passed",
+            "markets": actual, "services_started": 0, "ledger_opened": False,
+            "native_readiness_claimed": False}
 
 
 def fresh(receipt, field, now):
@@ -211,7 +312,7 @@ def terminal_exit_priority_cancellation(order, mode, *, market, symbol, now):
 
 
 def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
-                code_admission_only=False):
+                code_admission_only=False, events_path: Path | None = None):
     """Fail closed for unknown/malformed state; do not equate it to flat/idle."""
     if discord_only and engine_only:
         raise ValueError("select only one independent owner")
@@ -262,17 +363,39 @@ def reload_plan(state, bot, sync, *, now, discord_only=False, engine_only=False,
     for market, mode in modes.items():
         if not isinstance(mode, dict) or not isinstance(mode.get("positions"), dict):
             raise ValueError(f"malformed mode/positions: {market}")
-        if mode.get("entry_retry_pending_commit") or mode.get("ledger_state_divergence"):
+        if (mode.get("entry_retry_pending_commit") or mode.get("research_terminal_pending_commit") is not None
+                or mode.get("ledger_state_divergence")):
             raise ValueError(f"uncommitted or divergent ledger: {market}")
         for position in mode["positions"].values():
             if not isinstance(position, dict) or type(position.get("signed_shares")) is not int:
                 raise ValueError(f"unknown position quantity: {market}")
             nonflat += bool(position["signed_shares"])
+        # A prior completed session can retain cancelled quantities and
+        # unchanged targets for audit. Reuse the stricter replay-owner proof:
+        # flat inventory, complete settlement, zero pending counters, exact
+        # consumed signal identity and matching immutable cancellation events.
+        # A status label alone is never sufficient.
+        terminal_prior = False
+        if events_path is not None:
+            from scripts.repair_tw_day_trade_flat_opening import _previous_terminal_orders_proven
+            terminal_prior = _previous_terminal_orders_proven(
+                mode, now.astimezone(TAIPEI).date(), events_path,
+                completed_same_day_at=now, terminal_entry_validator=terminal_entry_price_rejection,
+            )
         for field in ("pending_entry_orders", "pending_reduction_orders"):
             orders = mode.get(field, {})
             if not isinstance(orders, dict):
                 raise ValueError(f"malformed pending orders: {market}")
+            if terminal_prior:
+                terminal += len(orders)
+                continue
             for symbol, order in orders.items():
+                if events_path is not None:
+                    # When the canonical journal is available, a label or a
+                    # single-row shortcut must not override a failed complete
+                    # settlement/cancellation proof for this mode.
+                    pending += 1
+                    continue
                 # The canonical engine retains filled entries for recovery.
                 # Do not delete them or confuse container length with work.
                 # Explicit completed fills and proven TP/SL rejections are
@@ -410,7 +533,8 @@ def main() -> int:
                 raise ValueError("native owner pair is not coherently acknowledged")
             plan = reload_plan(state, bot, sync,
                                now=datetime.now(TAIPEI), discord_only=args.discord_only,
-                               engine_only=args.engine_only, code_admission_only=args.code_admission_only)
+                               engine_only=args.engine_only, code_admission_only=args.code_admission_only,
+                               events_path=STATE_PATH.parent / "events.jsonl")
             protected = tuple(name for name in (SERVICES[0], *PROTECTED_SERVICES)
                               if name not in plan["services"])
             before = {name: owner(name) for name in protected}
@@ -435,6 +559,14 @@ def main() -> int:
                 receipt["engine_source_release"] = verify_frozen_source(engine_release, REPO_ROOT)
                 if not args.engine_only:
                     raise ValueError("pinned engine reload requires the independent --engine-only workflow")
+            if args.engine_source_release is not None:
+                expected_capitals = {market: (state.get("modes") or {}).get(market, {}).get("initial_capital_twd")
+                                     for market in plan["signal_ids"]}
+                receipt["candidate_engine_mode_probe"] = verify_engine_release_mode_specs(
+                    engine_release, expected_capitals=expected_capitals)
+            read_model = (engine_read_model_scope(configured_release(REPO_ROOT, role="engine"), engine_release)
+                          if args.engine_only and args.engine_source_release is not None else {"eligible": False})
+            receipt["engine_read_model_scope"] = read_model
             if args.apply:
                 selected_before = {name: owner(name) for name in plan["services"]}
                 from scripts.audit_tw_day_trade_restart import inventory, prefix_sha256, verify_prefix
@@ -484,18 +616,34 @@ def main() -> int:
                     # ledger prefixes. Keep the canonical control -> source
                     # lock order and all independent post-reload readbacks.
                     from stockagent.live.paper_journal import FILENAMES
-                    journals = FILENAMES if engine_release is not None else ("events.jsonl", "orders.jsonl", "fills.jsonl")
+                    if read_model["eligible"]:
+                        receipt["previous_engine_namespace"] = verify_owner_namespace(
+                            Path(read_model["previous_release"]), REPO_ROOT,
+                            native_owner_pid(REPO_ROOT, role="engine"), role="engine")
+                    journals = (FINANCIAL_JOURNALS if read_model["eligible"] else FILENAMES
+                                if engine_release is not None else FINANCIAL_JOURNALS)
+                    protected_journals = tuple(name for name in FILENAMES if name not in journals)
+                    generation_fence = (journal_generation_fence(STATE_PATH.parent, protected_journals)
+                                        if read_model["eligible"] else None)
                     inputs = {name: {"size_bytes": (STATE_PATH.parent / name).stat().st_size}
                               for name in journals}
                     for name, value in inputs.items():
                         value["sha256"] = prefix_sha256(STATE_PATH.parent / name, value["size_bytes"])
+                    if generation_fence is not None:
+                        verify_journal_generation_fence(STATE_PATH.parent, generation_fence)
                     current_state = read_object(STATE_PATH)
                     current_sync, current_bot, ack = read_fresh_ack_pair()
                     if ack.get("matched") is not True:
                         raise ValueError("native owner pair changed before reload")
                     plan = reload_plan(current_state, current_bot, current_sync,
                                        now=datetime.now(TAIPEI), discord_only=args.discord_only,
-                                       engine_only=args.engine_only, code_admission_only=args.code_admission_only)
+                                       engine_only=args.engine_only, code_admission_only=args.code_admission_only,
+                                       events_path=STATE_PATH.parent / "events.jsonl")
+                    if args.engine_source_release is not None:
+                        current_capitals = {market: (current_state.get("modes") or {}).get(market, {}).get("initial_capital_twd")
+                                            for market in plan["signal_ids"]}
+                        if verify_engine_release_mode_specs(engine_release, expected_capitals=current_capitals) != receipt["candidate_engine_mode_probe"]:
+                            raise RuntimeError("candidate engine mode probe changed before restart")
                     if (code_drift_warmup(current_bot, plan["signal_ids"])
                             and admitted_bot_code(current_bot, expected_code, entrypoint["sha256"])):
                         raise ValueError("reported code drift does not match the current admitted implementation")
@@ -506,6 +654,9 @@ def main() -> int:
                             current_bot, expected_code, entrypoint["sha256"]):
                         raise ValueError("unchanged Discord code admission differs; engine-only reload cannot adopt it")
                     before_inventory = inventory(read_object(STATE_PATH))
+                    if read_model["eligible"] and engine_read_model_scope(
+                            configured_release(REPO_ROOT, role="engine"), engine_release) != read_model:
+                        raise RuntimeError("UI-only source delta changed before restart")
                     if (not code_unchanged()
                             or not engine_code_unchanged()
                             or before != {name: owner(name) for name in protected}
@@ -567,6 +718,9 @@ def main() -> int:
                        for name, value in selected_after.items()):
                     raise RuntimeError("restarted service owner is not a new active invocation")
                 prefixes = verify_prefix(STATE_PATH.parent, {"inputs": inputs})
+                if generation_fence is not None:
+                    verify_journal_generation_fence(STATE_PATH.parent, generation_fence)
+                    receipt["protected_journal_generations"] = generation_fence
                 # Prefix verification may legitimately outlive heartbeat TTL.
                 # Re-observe the original coherent pair; never re-date the old
                 # snapshot or restart again just because readback was slow.
@@ -581,6 +735,8 @@ def main() -> int:
                     raise RuntimeError("native readiness, code or owner changed during final readback")
                 if not args.discord_only and inventory(read_object(STATE_PATH)) != before_inventory:
                     raise RuntimeError("engine reload changed persisted inventory, signals or accounting")
+                if generation_fence is not None:
+                    verify_journal_generation_fence(STATE_PATH.parent, generation_fence)
                 if release_path is not None:
                     receipt["native_code_namespace"] = verify_owner_namespace(
                         release_path, REPO_ROOT, int(bot["run_id"].split("-", 1)[0]))

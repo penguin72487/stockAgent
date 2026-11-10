@@ -4733,6 +4733,13 @@ def main() -> None:
     # so any single blocking call can't hang the process indefinitely.
     socket.setdefaulttimeout(30)
     args = parse_args()
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    # The root summary is written even when an explicit output-dir is used.
+    with yahoo_writer_guard(args.output_root, getattr(args, 'output_dir', None)):
+        _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args: argparse.Namespace) -> None:
     if args.request_interval is not None and args.request_interval < 0.0:
         raise ValueError("--request-interval must be >= 0")
     args.request_interval = resolve_request_interval(

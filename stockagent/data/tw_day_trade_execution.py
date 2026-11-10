@@ -362,6 +362,7 @@ def load_tw_day_trade_execution_tape(
     allow_daily_proxy: bool = True,
     daily_proxy_price_policy: str = DAILY_PROXY_PRICE_LEGACY,
     policy: str = DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED,
+    materialization_year: int | None = None,
 ) -> np.ndarray:
     """Align executor-only minute facts to the daily panel.
 
@@ -385,6 +386,8 @@ def load_tw_day_trade_execution_tape(
     partition_paths, first_minute_date = discover_day_trade_minute_execution_source(root_path)
 
     dates = np.asarray(panel_dates, dtype="datetime64[D]").reshape(-1)
+    from stockagent.data.inference_scope import year_decision_mask
+    requested_rows = year_decision_mask(dates, materialization_year)
     opens = np.asarray(official_open_prices, dtype=np.float64)
     normalized_policy = normalize_day_trade_minute_execution_policy(policy)
     proxy_price_policy = normalize_day_trade_daily_proxy_price_policy(daily_proxy_price_policy)
@@ -405,7 +408,7 @@ def load_tw_day_trade_execution_tape(
             raise ValueError("official_close_prices must align with panel [T,S]")
         if daily_volumes.shape != expected:
             raise ValueError("daily_volume_shares must align with panel [T,S]")
-    proxy_rows = dates < first_minute_date
+    proxy_rows = (dates < first_minute_date) & requested_rows
     proxy_prices = None
     if normalized_policy == DAY_TRADE_MINUTE_EXECUTION_POLICY_SCHEDULED and np.any(proxy_rows):
         # Validate even on a cache hit; float32 output hashes cannot certify a
@@ -417,6 +420,8 @@ def load_tw_day_trade_execution_tape(
     cache_path: Path | None = None
     if cache_dir is not None:
         digest = hashlib.sha256()
+        if materialization_year is not None:
+            digest.update(f"materialization_year={materialization_year}\0".encode())
         digest.update(
             f"contract={DAY_TRADE_MINUTE_EXECUTION_CONTRACT_VERSION}\0"
             f"policy={normalized_policy}\0"
@@ -465,7 +470,7 @@ def load_tw_day_trade_execution_tape(
                         "strict minute execution cache contains daily proxy rows: "
                         f"{cache_path}"
                     )
-                _require_executable_tape_coverage(cached, source=cache_path)
+                _require_executable_tape_coverage(cached[requested_rows], source=cache_path)
             return cached
     if normalized_policy == DAY_TRADE_MINUTE_EXECUTION_POLICY_FULL_VOLUME:
         return _load_full_session_volume_tape(
@@ -474,6 +479,7 @@ def load_tw_day_trade_execution_tape(
             panel_symbols=panel_symbols,
             opens=opens,
             cache_path=cache_path,
+            requested_rows=requested_rows,
         )
     assert closes is not None and daily_volumes is not None
     tape = np.full((*expected, DAY_TRADE_EXECUTION_FIELD_COUNT), np.nan, dtype=np.float32)
@@ -553,6 +559,8 @@ def load_tw_day_trade_execution_tape(
         "volume_shares",
     ]
     for date_idx, day in enumerate(dates):
+        if not requested_rows[date_idx]:
+            continue
         day_text = np.datetime_as_string(day, unit="D")
         path = root_path / f"trade_date={day_text}" / "data.parquet"
         if not path.is_file():
@@ -596,7 +604,8 @@ def load_tw_day_trade_execution_tape(
             elif minute == 270:
                 tape[date_idx, sym_idx, DayTradeExecutionField.AUCTION_PRICE_1330] = close
                 tape[date_idx, sym_idx, DayTradeExecutionField.AUCTION_VOLUME_1330] = max(volume, 0.0) if np.isfinite(volume) else 0.0
-    _require_executable_tape_coverage(tape, source=root_path)
+    tape[~requested_rows] = np.nan
+    _require_executable_tape_coverage(tape[requested_rows], source=root_path)
     if cache_path is not None:
         temporary = cache_path.with_name(
             f".{cache_path.name}.{os.getpid()}.tmp"
@@ -616,6 +625,7 @@ def _load_full_session_volume_tape(
     panel_symbols: list[str],
     opens: np.ndarray,
     cache_path: Path | None,
+    requested_rows: np.ndarray | None = None,
 ) -> np.ndarray:
     """Build the full right-labelled market-volume path without a RAM copy."""
 
@@ -678,6 +688,8 @@ def _load_full_session_volume_tape(
         "volume_shares",
     ]
     for date_idx, day in enumerate(dates):
+        if requested_rows is not None and not requested_rows[date_idx]:
+            continue
         day_text = np.datetime_as_string(day, unit="D")
         path = root_path / f"trade_date={day_text}" / "data.parquet"
         if not path.is_file():
@@ -727,6 +739,9 @@ def _load_full_session_volume_tape(
             FULL_SESSION_VOLUME_SHARES,
         ] = np.where(valid_volume, volumes, 0.0).astype(np.float32)
 
+    if requested_rows is not None:
+        # Unrequested history is unknown, not a source-proven zero-volume day.
+        tape[~requested_rows] = np.nan
     if temporary is None or cache_path is None:
         return tape
     tape.flush()

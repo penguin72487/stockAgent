@@ -30,6 +30,8 @@ from stockagent.data_sync.bulk_archive import (
     atomic_write_json, verify_retained_preservation, PreservationProofExpired,
 )
 from stockagent.data_sync.desync_snapshots import SnapshotError, sha256_file, atomic_write_bytes
+from stockagent.data_sync import (bulk_committed_landing_retirement, bulk_landing_alias_retirement,
+                                 bulk_original_carrier_retirement, workspace_volume)
 from stockagent.data_sync.windows_cold_io import metadata_path
 from stockagent.data_sync.packed_snapshots import resolve_packed_snapshot_id
 
@@ -53,6 +55,48 @@ def received_batches():
         return []
     return sorted(p for p in parent.iterdir()
                   if BATCH_NAME.fullmatch(p.name) and p.is_dir() and not p.is_symlink())
+
+
+def original_carrier_reclaim_summary():
+    """Bounded owner-receipt totals; they are not net disk free space."""
+    total = count = part_total = part_count = 0
+    incomplete = False
+    try:
+        batches = received_batches()
+    except (OSError, SnapshotError):
+        return {'original_carriers_reclaimed': 0, 'original_carrier_reclaimed_allocated_bytes': 0,
+                'landing_parts_reclaimed': 0, 'landing_parts_reclaimed_allocated_bytes': 0,
+                'original_carrier_summary_incomplete': True}
+    try:
+        workspace = Path(workspace_volume.configuration()['mount_point'])
+    except (OSError, ValueError, KeyError, TypeError, SnapshotError):
+        return {'original_carriers_reclaimed': 0, 'original_carrier_reclaimed_allocated_bytes': 0,
+                'landing_parts_reclaimed': 0, 'landing_parts_reclaimed_allocated_bytes': 0,
+                'original_carrier_summary_incomplete': True}
+    for batch in batches:
+        for scope in ('markets', 'ablations', 'cache'):
+            try:
+                amount = bulk_original_carrier_retirement.completed_reclamation(workspace, batch, scope)
+                if amount is not None:
+                    if total+amount > 2**53-1:
+                        raise ValueError('bulk carrier total exceeds display bound')
+                    count += 1
+                    total += amount
+            except (OSError, ValueError, TypeError, AttributeError, SnapshotError):
+                incomplete = True
+            try:
+                parts = bulk_committed_landing_retirement.completed_reclamation(workspace, batch, scope)
+                if parts is not None:
+                    files, size = parts
+                    if part_total+size > 2**53-1:
+                        raise ValueError('bulk landing total exceeds display bound')
+                    part_count += files
+                    part_total += size
+            except (OSError, ValueError, TypeError, AttributeError, SnapshotError):
+                incomplete = True
+    return {'original_carriers_reclaimed': count, 'original_carrier_reclaimed_allocated_bytes': total,
+            'landing_parts_reclaimed': part_count, 'landing_parts_reclaimed_allocated_bytes': part_total,
+            'original_carrier_summary_incomplete': incomplete}
 
 
 def _private_control_body():
@@ -109,6 +153,52 @@ def private_observe_roots(args, records):
 
 def verify_retained_proof(proof):
     return verify_retained_preservation(proof)
+
+
+def _retire_repacked_bulk(args, directory, receipt, implementation):
+    """Advance only inside the original bulk coordinator's lock."""
+    owner_fd = getattr(args, '_coordinator_fd', None)
+    if owner_fd is None:
+        return {'state': 'waiting_original_coordinator'}
+    from datetime import datetime
+    from scripts.check_outside_tw_opening_resource_window import TAIPEI
+    from scripts.run_bounded_storage_maintenance import allowed_seconds
+    from stockagent.data_sync.cold_primary import _check_d_primary_mount
+    if allowed_seconds(datetime.now(TAIPEI)) < 120:
+        return {'state': 'waiting_trading_priority_window'}
+    config = workspace_volume.configuration()
+    workspace = Path(config['mount_point'])
+    def guard():
+        if allowed_seconds(datetime.now(TAIPEI)) < 120:
+            raise SnapshotError('Taiwan day-trade priority window; maintenance deferred')
+        workspace_volume.check(c=config)
+        _check_d_primary_mount(SYNC_ROOT)
+    try:
+        options = dict(workspace=workspace, cold=SYNC_ROOT,
+            incoming=metadata_path(INCOMING), coordinator_fd=owner_fd, coordinator_lock=COORDINATOR_LOCK,
+            ingress_lock=Path('/run/lock/stockagent-remote-cold-artifact-ingress.lock'),
+            install_lock=workspace/'migration/cold-install-write-owner.lock',
+            extra_locks=(Path('/var/lib/stockagent/backup-stream/cycle.lock'),
+                         Path('/var/lib/stockagent/lakehouse-control/source-replication-owner.lock')),
+            guard=guard)
+        planned = implementation.retire(directory, receipt, apply=False, **options)
+        if planned.get('state') not in {'planned', 'removing'}:
+            return planned
+        return implementation.retire(directory, receipt, apply=True, **options)
+    except SnapshotError as error:
+        if 'owner busy' in str(error):
+            return {'state': 'waiting_original_owner'}
+        if 'day-trade priority window' in str(error):
+            return {'state': 'waiting_trading_priority_window'}
+        raise
+
+
+def retire_repacked_original_carrier(args, directory, receipt):
+    return _retire_repacked_bulk(args, directory, receipt, bulk_original_carrier_retirement)
+
+
+def retire_repacked_landing_parts(args, directory, receipt):
+    return _retire_repacked_bulk(args, directory, receipt, bulk_committed_landing_retirement)
 
 
 def retire_roots(args, directory, receipt, index, proof, state):
@@ -224,8 +314,28 @@ def organize(args, directory, receipt):
         state.update(row, observed_at_epoch=time.time())
         atomic_write_json(status_path, state)
         print(json.dumps({"scope": scope, "phase": state["state"], **row}), flush=True)
-    if (state.get("state") == "cold_preserved_retirement_audited"
-            and (not args.retire or state.get("all_sources_retired") is True)):
+    finished = (state.get("state") == "cold_preserved_retirement_audited"
+                and (not args.retire or state.get("all_sources_retired") is True))
+    if args.apply:
+        # A sealed E migration can retire the old landing names while the
+        # original D snapshot is being replaced. Do not reuse an old proof or
+        # infer remote retirement from that local transition.
+        if bulk_landing_alias_retirement.organizer_deferred(directory, receipt):
+            carrier = retire_repacked_original_carrier(args, directory, receipt)
+            parts = retire_repacked_landing_parts(args, directory, receipt)
+            state.update(observed_at_epoch=time.time(), independent_recovery_claimed=False, remote_delete_performed=False,
+                         original_carrier_last_attempt=carrier.get('state'), landing_parts_last_attempt=parts.get('state'))
+            if carrier.get('state') == 'completed' or state.get('original_carrier_state') != 'completed':
+                state.update(original_carrier_state=carrier.get('state'),
+                             original_carrier_reclaimed_allocated_bytes=carrier.get('estimated_allocated_bytes_reclaimed'))
+            if parts.get('state') == 'completed' or state.get('landing_parts_state') != 'completed':
+                state.update(landing_parts_state=parts.get('state'),
+                             landing_parts_reclaimed_allocated_bytes=parts.get('estimated_allocated_bytes_reclaimed'))
+            if not finished:
+                state['state'] = 'local_source_migration_reconciliation_pending'
+            atomic_write_json(status_path, state)
+            return bool(finished)
+    if finished:
         return True
     index_path = directory / (scope + ".original-index.json")
     if index_path.exists():
@@ -351,7 +461,7 @@ def run_batches(args):
                     pending = not ready or pending
                     if preserve_first and ready:
                         retirement_queue.append((directory, receipt))
-                except (SnapshotError, subprocess.TimeoutExpired) as error:
+                except (SnapshotError, OSError, subprocess.TimeoutExpired) as error:
                     atomic_write_json(directory / (scope + ".organization-error.json"),
                                       {"state": "source_preserved_organization_failed", "error": str(error),
                                        "observed_at_epoch": time.time()})
@@ -375,7 +485,7 @@ def run_batches(args):
                                   "remaining_remote_candidates": len(retirement_queue) - index - 1,
                                   "source_deleted_by_failed_request": False}), flush=True)
                 break
-            except (SnapshotError, subprocess.TimeoutExpired) as error:
+            except (SnapshotError, OSError, subprocess.TimeoutExpired) as error:
                 atomic_write_json(directory / (receipt["scope"] + ".organization-error.json"),
                                   {"state": "source_preserved_organization_failed", "error": str(error),
                                    "observed_at_epoch": time.time()})
@@ -417,9 +527,12 @@ def main():
         except BlockingIOError:
             print(json.dumps({"state": "existing_bulk_coordinator_busy"}), flush=True)
             return 75
+        args._coordinator_fd = owner.fileno()
         started = time.perf_counter()
         COORDINATOR_STATUS.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        atomic_write_json(COORDINATOR_STATUS, {"state": "checking_received_cohorts", "observed_at_epoch": time.time()})
+        prior_reclamation = original_carrier_reclaim_summary()
+        atomic_write_json(COORDINATOR_STATUS, {"state": "checking_received_cohorts", "observed_at_epoch": time.time(),
+                                               **prior_reclamation})
         try:
             # This owner writes its organization/index receipts on D before it
             # can preserve or retire anything. With a full D, repeatedly
@@ -432,7 +545,7 @@ def main():
                 atomic_write_json(COORDINATOR_STATUS, {'state': 'waiting_cold_physical_capacity',
                     'available_bytes': available, 'minimum_write_headroom_bytes': minimum,
                     'observed_at_epoch': time.time(), 'source_deleted': False,
-                    'full_history_verified': False})
+                    'full_history_verified': False, **prior_reclamation})
                 return 75
             code = run_batches(args)
             if args.capture_inactive_caches:
@@ -453,12 +566,13 @@ def main():
                         code = 75
         except BaseException:
             atomic_write_json(COORDINATOR_STATUS, {"state": "source_preserved_needs_audit", "observed_at_epoch": time.time(),
-                                                 "complete_workflow_seconds": time.perf_counter() - started})
+                                                 "complete_workflow_seconds": time.perf_counter() - started,
+                                                 **prior_reclamation})
             raise
         atomic_write_json(COORDINATOR_STATUS, {"state": "cohorts_checked" if code == 0 else "deferred" if code == 75 else "source_preserved_needs_audit",
                                              "exit_code": code, "observed_at_epoch": time.time(),
                                              "complete_workflow_seconds": time.perf_counter() - started,
-                                             "full_history_verified": False})
+                                             "full_history_verified": False, **original_carrier_reclaim_summary()})
         return code
 
 

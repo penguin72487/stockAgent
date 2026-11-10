@@ -9,10 +9,10 @@ fallback_marker=.stockagent-d-mount-required
 volume_marker="$volume/stockagent-cold-primary/volume.json"
 expected_volume_id=9ba6ab87-3889-40e7-90e4-9597dc88abaf
 
-usage() { printf 'usage: %s --check-volume|--check|--mount|--unmount\n' "$0" >&2; exit 2; }
+usage() { printf 'usage: %s --check-volume-identity|--check-volume|--check|--mount|--unmount\n' "$0" >&2; exit 2; }
 [[ $# -eq 1 ]] || usage
 case "$1" in
-  --check-volume|--check|--mount|--unmount) ;;
+  --check-volume-identity|--check-volume|--check|--mount|--unmount) ;;
   *) usage ;;
 esac
 
@@ -78,10 +78,24 @@ PY
 }
 
 check_canonical() {
-  [[ "$(findmnt -n -o TARGET -T "$canonical")" == "$canonical" &&
+  [[ ! -L "$canonical" && "$(findmnt -n -o TARGET -T "$canonical")" == "$canonical" &&
+     "$(findmnt -n -o SOURCE -T "$canonical")" == 'D:[/stockagent-cold-primary/packed]' &&
      "$(findmnt -n -o FSTYPE -T "$canonical")" == 9p &&
-     "$(stat -c '%d:%i' "$canonical")" == "$(stat -c '%d:%i' "$primary")" ]] || {
+     "$(stat -c '%i' "$canonical")" == "$(stat -c '%i' "$primary")" &&
+     -f "$canonical/.stockagent-d-primary" && ! -L "$canonical/.stockagent-d-primary" &&
+     -f "$canonical/.local-state/node-id" && ! -L "$canonical/.local-state/node-id" ]] || {
     printf 'canonical cold store is not bound to the D primary namespace\n' >&2; exit 2;
+  }
+  # WSL can recreate the D: root mount while an existing canonical bind
+  # remains mounted. Separate 9p mounts have different Linux st_dev values;
+  # the enrolled D: source, NTFS file ID and immutable markers identify the
+  # same directory. Both paths must still use the proven 8 KiB request size.
+  findmnt -n -o OPTIONS -T "$canonical" | tr ',' '\n' | rg -qx 'msize=8192' || {
+    printf 'canonical D: DrvFs request size is not 8192 bytes\n' >&2; exit 2;
+  }
+  cmp -s "$canonical/.stockagent-d-primary" "$primary/.stockagent-d-primary" &&
+    cmp -s "$canonical/.local-state/node-id" "$primary/.local-state/node-id" || {
+    printf 'canonical and D primary authority markers differ\n' >&2; exit 2;
   }
 }
 
@@ -99,6 +113,11 @@ if [[ "$1" == --unmount ]]; then
     check_volume_identity
     umount "$volume"
   fi
+  exit 0
+fi
+
+if [[ "$1" == --check-volume-identity ]]; then
+  check_volume_identity
   exit 0
 fi
 

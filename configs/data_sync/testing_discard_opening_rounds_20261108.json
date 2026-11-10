@@ -1,0 +1,136 @@
+{
+  "contract": "explicit-local-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "User authorized deletion of old performance-validation data; preserve the associated summary and failure receipts.",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round16/progressive_six_mode_v1.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round16/progressive_six_mode_v3.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round16/progressive_six_mode_v5.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round17/queued_refresh_a1_v10.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round17/queued_refresh_a2_v10.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round17/queued_refresh_b1_v10.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round17/queued_refresh_b2_v10.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round17/progressive_six_mode_v8.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round18/ledger_guard_a1.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round18/ledger_guard_a2.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round18/ledger_guard_b1.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round18/ledger_guard_b2.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round18/overlap_v11_profile.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round20/remaining_paths_a1.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round20/remaining_paths_a2.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round20/remaining_paths_b1.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round20/remaining_paths_b2.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round23/full_pipeline_trace_v13.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round23/full_pipeline_trace_v14.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round24/complete_pair_v1.control.json",
+      "kind": "file",
+      "reason": "benchmark"
+    },
+    {
+      "base": "artifact",
+      "relative": "operations/tw_opening_latest_standard_20261022/analysis_round24/complete_pair_v1.candidate.json",
+      "kind": "file",
+      "reason": "benchmark"
+    }
+  ],
+  "identity_sha256": "06050a3f40d7f2b5a62dcb459db88bdfceea97f079a45d410e213778e62e4288"
+}

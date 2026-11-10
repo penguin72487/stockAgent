@@ -1,0 +1,11 @@
+[Unit]
+Description=Continue bounded service-archive placement without manual commands
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=20s
+AccuracySec=1s
+Unit=stockagent-packed-object-placement.service
+
+[Install]
+WantedBy=timers.target

@@ -1,0 +1,14 @@
+[Unit]
+Description=Observe and recover the pinned Vast packed-data reader
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+Wants=network-online.target
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+Environment=STOCKAGENT_TRADING_PRIORITY_GUARD=1
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_authority_storage_operation.sh scripts/run_edge_reader_recovery.py
+TimeoutStartSec=8min
+Nice=19
+IOSchedulingClass=idle

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import inspect
 import json
 import os
 import random
@@ -898,6 +899,54 @@ def _build_panel_kwargs(config) -> dict:
     }
 
 
+def _preflight_day_trade_carry_abi(config) -> None:
+    """Reject a mixed physical-source implementation before loading a panel.
+
+    A pinned service can run a workspace-root entrypoint outside the pinned
+    package directories.  Validate the actual imported builder and config,
+    rather than assuming their versions match or silently defaulting a fee.
+    This check is scoped to the code path that will consume both interfaces.
+    """
+    if (str(config.trading.execution_mode) != "tw_day_trade"
+            or config.data.day_trade_minute_execution_root is None
+            or not config.trading.tw_day_trade_unlimited_margin_conversion):
+        return
+
+    from stockagent.data.tw_day_trade_carry_source import build_prepared_day_trade_carry_source
+
+    required = {
+        "panel", "minute_root", "public_feature_path", "cache_dir", "allow_daily_proxy",
+        "daily_proxy_price_policy", "corporate_action_mode", "subscription_right_policy",
+        "entry_remainder_policy", "terminal_liquidation_unlimited_capacity",
+        "short_limit_up_penalty_rate", "sparse_event_slots",
+    }
+    parameters = inspect.signature(build_prepared_day_trade_carry_source).parameters
+    keyword_kinds = {inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY}
+    missing_parameters = sorted(
+        name for name in required
+        if name not in parameters or parameters[name].kind not in keyword_kinds
+    )
+    required_config = {
+        "data": {"day_trade_minute_execution_root", "day_trade_minute_execution_cache_dir",
+                 "day_trade_minute_execution_allow_daily_proxy", "day_trade_minute_execution_daily_proxy_price_policy"},
+        "trading": {"tw_corporate_action_mode", "tw_day_trade_subscription_right_policy",
+                    "tw_day_trade_entry_remainder_policy", "tw_day_trade_terminal_liquidation_unlimited_capacity",
+                    "tw_day_trade_short_limit_up_penalty_rate"},
+        "training": {"day_trade_sparse_events", "day_trade_sparse_event_slots"},
+    }
+    missing_config = sorted(
+        f"{section}.{name}" for section, names in required_config.items() for name in names
+        if not hasattr(getattr(config, section, None), name)
+    )
+    if missing_parameters or missing_config:
+        raise RuntimeError(
+            "day-trade physical source ABI mismatch: train.py and the loaded config/source "
+            "must belong to a compatible verified release; "
+            f"missing builder keywords={missing_parameters}, missing config fields={missing_config}. "
+            "No fee or accounting value was defaulted."
+        )
+
+
 def _day_trade_physical_source_path(config, *, mode: str):
     """Localize inference inputs without rewriting the trained data schema."""
     override = getattr(config.data, "day_trade_inference_public_feature_path", None)
@@ -1500,6 +1549,12 @@ def parse_args() -> argparse.Namespace:
         help="Start from this fold id (inclusive), e.g. --start-fold 7",
     )
     parser.add_argument("--max-folds", type=int, default=None, help="Run at most this many folds after --start-fold filtering.")
+    parser.add_argument("--inference-year", type=int, default=None,
+                        help="Rebuild only this owned test calendar year; retain prior feature context and validation evidence.")
+    parser.add_argument(
+        "--fold-order", choices=("ascending", "descending"), default="ascending",
+        help="Processing order after start/max selection; descending requires independent fold initialization.",
+    )
     parser.add_argument("--epochs", type=int, default=None, help="Override training.epochs for benchmark/smoke runs.")
     parser.add_argument(
         "--early-stopping-no-improve-ratio",
@@ -1807,15 +1862,31 @@ def _build_requested_walk_forward_folds(dates, config, *, checkpoint=None, reque
     return folds
 
 
+def _order_training_folds(folds, *, order, warm_start_from_previous_fold=False):
+    """Change scheduling only; never carry later-fold weights into earlier data."""
+    if order not in {"ascending", "descending"}:
+        raise ValueError("fold order must be ascending or descending")
+    if order == "descending" and warm_start_from_previous_fold:
+        raise ValueError("descending fold order cannot warm-start from a later fold")
+    return sorted(folds, key=lambda fold: fold.fold_id, reverse=order == "descending")
+
+
 def main() -> None:
     global _ACTIVE_OUTPUT_DIR
     startup_timing = _StartupTimingRecorder()
     args = parse_args()
     os.environ["STOCKAGENT_CONFIG_PATH"] = str(Path(args.config).resolve())
     config = load_config(args.config)
+    _order_training_folds([], order=args.fold_order,
+        warm_start_from_previous_fold=config.training.warm_start_from_previous_fold)
     mode = args.mode if args.mode is not None else config.runner.mode
+    if args.inference_year is not None and (
+            mode != "infer" or config.trading.execution_mode != "tw_day_trade"
+            or not config.trading.tw_day_trade_unlimited_margin_conversion):
+        raise ValueError("inference-year is restricted to fresh-split physical TW day-trade inference")
     # Fail before cold restores, large panel allocation or a trainer launch.
     _day_trade_physical_source_path(config, mode=mode)
+    _preflight_day_trade_carry_abi(config)
     if config.trading.tw_futures_portfolio_capital_basis == "initial_margin":
         from stockagent.data.tw_futures_margin import validate_margin_rule_source
         try:
@@ -2296,6 +2367,7 @@ def main() -> None:
                     ),
                     daily_proxy_price_policy=config.data.day_trade_minute_execution_daily_proxy_price_policy,
                     policy=config.data.day_trade_minute_execution_policy,
+                    **({"materialization_year": args.inference_year} if args.inference_year is not None else {}),
                 )
 
             if _distributed_ready() and _distributed_world_size() > 1:
@@ -2351,6 +2423,7 @@ def main() -> None:
                             if config.training.day_trade_sparse_events
                             else None
                         ),
+                        **({"materialization_year": args.inference_year} if args.inference_year is not None else {}),
                     )
 
                 if _distributed_ready() and _distributed_world_size() > 1:
@@ -2672,9 +2745,14 @@ def main() -> None:
         original_count = len(folds)
         folds = folds[: int(args.max_folds)]
         print(f"[runner] max_folds={args.max_folds}: selected {len(folds)}/{original_count} folds")
+    folds = _order_training_folds(folds, order=args.fold_order,
+        warm_start_from_previous_fold=config.training.warm_start_from_previous_fold)
+    print(f"[runner] fold_order={args.fold_order}: {[fold.fold_id for fold in folds]}")
     startup_timing.checkpoint(
         "fold_filtering_and_trainer_handoff",
         selected_folds=int(len(folds)),
+        fold_order=args.fold_order,
+        selected_fold_ids=[fold.fold_id for fold in folds],
         mode=str(mode),
         resume=bool(resume),
     )
@@ -2720,12 +2798,14 @@ def main() -> None:
         folds=folds,
     )
     if mode == "infer":
+        panel.inference_year = args.inference_year
         results = run_inference(
             panel,
             folds,
             config,
             output_dir,
             deployment_folds=all_folds,
+            **({"inference_year": args.inference_year} if args.inference_year is not None else {}),
         )
     elif isolate_this_run:
         print(

@@ -1,0 +1,162 @@
+# Fixed calendar/source/accounts; all policies start independently from seed 42.
+base_config: configs/markets/tw_day_trade_unit_mgda_10m_ofat_20261104_v1.yaml
+output_root: artifacts/markets/tw_day_trade_unit_mgda_10m_ofat_20261104_v1
+fold_selection: last
+runtime:
+  parallel_jobs: 1
+  cpu_threads: 8
+  torch_compile_threads: 16
+  capacity_retry:
+    max_retries: 2
+    minimum_train_batch: 32
+postprocess_plots:
+  - split: val
+    prefix: ofat_val
+    baseline_label: 1000萬 Unit MGDA / Unit parameter-space MGDA
+    scope_label: last fold / 2025 validation / net log utility selection
+  - split: test
+    prefix: ofat_test_diagnostic
+    baseline_label: 1000萬 Unit MGDA / Unit parameter-space MGDA
+    scope_label: last fold / 2026 retrospective diagnostic
+matrix:
+  mode: one_factor_at_a_time
+  include_baseline: true
+  fixed_overrides:
+    runner:
+      require_cuda: true
+      resume: true
+      isolate_train_folds: false
+    trading:
+      volume_participation_equity: 10000000.0
+      tw_minute_initial_equity: 10000000.0
+      tw_day_trade_short_limit_up_penalty_rate: 0.07
+    training:
+      seed: 42
+      epochs: 1000
+      early_stopping_no_improve_ratio: 0.1
+      pretrained_initialization_root: null
+      warm_start_from_previous_fold: false
+      multi_gpu_strategy: distributed_data_parallel
+      record_epoch_curve: true
+      curve_plot_interval: 1
+      defer_epoch_curve_plot_until_end: false
+  dimensions:
+    - name: gradient
+      enabled: true
+      path: training.loss_type
+      values:
+        - name: raw_mgda_parameter
+          value: trajectory_mgda_parameter
+          description: 移除任務梯度單位化 / Raw parameter-space MGDA; same four objectives and SGD.
+        - name: raw_pcgrad_parameter
+          value: trajectory_pcgrad_parameter
+          description: 衝突梯度投影 / Raw parameter-space PCGrad; compare to raw_mgda_parameter to isolate the combiner.
+        - name: config_unit_parameter
+          value: trajectory_config_l2_parameter
+          description: 等對齊梯度 / Unit parameter-space ConFIG; retain MGDA-matched step length.
+        - name: dibs1_unit_parameter
+          value: trajectory_dibs_l2_1_parameter
+          description: 一步分佈式梯度搜尋 / Unit parameter-space DiBS, one inner step, MGDA-matched length.
+        - name: dibs5_unit_parameter
+          value: trajectory_dibs_l2_5_parameter
+          description: 五步分佈式梯度搜尋 / Unit parameter-space DiBS, five inner steps, MGDA-matched length.
+        - name: upgrad_log_unit_parameter
+          value: trajectory_upgrad_log_l2_parameter
+          description: 報酬偏好共同下降方向 / Unit parameter-space UPGrad with log-return preference and matched length.
+    - name: objective
+      enabled: true
+      path: training.loss_type
+      values:
+        - {name: log_return, value: log_utility, description: 單一對數報酬 / Single net log-return objective; same SGD and accounts.}
+        - {name: sharpe, value: trajectory_sharpe, description: 單一夏普比率 / Single Sharpe objective; same SGD and accounts.}
+        - {name: sortino, value: trajectory_sortino, description: 單一索提諾比率 / Single Sortino objective; same SGD and accounts.}
+        - {name: calmar, value: trajectory_calmar, description: 單一卡瑪比率 / Single Calmar objective; same SGD and accounts.}
+    - name: output
+      enabled: true
+      path: training.financial_transformer.portfolio_output_mode
+      values:
+        - {name: learned_cash, value: learned_cash, description: 可學習現金閘門 / Learned cash gate and signed L1 allocation.}
+        - {name: projection_l1, value: projection_l1, description: 投影 L1 配置 / Projected L1 allocation; replace the whole output mapping.}
+        - {name: score_cash_v2, value: score_entmax_cash_v2, description: 顯式現金競爭 / Score-entmax cash v2.}
+        - {name: log_cash, value: score_entmax_log_cash, description: 對數現金配置 / Log-cash entmax.}
+    - name: cross_context
+      enabled: true
+      variants:
+        - name: no_latent
+          description: 移除潛在因子路徑 / Remove latent-factor context; retain market tokens.
+          overrides: {training: {financial_transformer: {use_latent_factors: false}}}
+        - name: no_market
+          description: 移除市場 token 路徑 / Remove market-token context; retain latent factors.
+          overrides: {training: {financial_transformer: {use_market_tokens: false}}}
+    - name: temporal_layers
+      enabled: true
+      path: training.financial_transformer.temporal_layers
+      values:
+        - {name: zero, value: 0, description: 移除時間 Transformer / No temporal Transformer blocks.}
+        - {name: one, value: 1, description: 減少時間層 / One temporal Transformer layer.}
+    - name: time_position
+      enabled: true
+      path: training.financial_transformer.use_time_pos
+      values:
+        - {name: 'off', value: false, description: 移除時間位置編碼 / Remove time-position embedding.}
+    - name: rope
+      enabled: true
+      path: training.financial_transformer.rope_temporal
+      values:
+        - {name: 'off', value: false, description: 移除旋轉位置編碼 / Remove temporal RoPE.}
+    - name: qk_norm
+      enabled: true
+      path: training.financial_transformer.qk_norm
+      values:
+        - {name: 'off', value: false, description: 移除 QK 正規化 / Remove query-key normalization.}
+    - name: input_rms
+      enabled: true
+      path: training.financial_transformer.causal_feature_rms_normalization
+      values:
+        - {name: 'off', value: false, description: 移除特徵尺度校正 / Remove training-fitted feature RMS scaling.}
+    - name: norm
+      enabled: true
+      path: training.financial_transformer.norm_type
+      values:
+        - {name: rmsnorm, value: rmsnorm, description: 正規化算子替換 / LayerNorm to RMSNorm.}
+    - name: ffn
+      enabled: true
+      path: training.financial_transformer.ffn_type
+      values:
+        - {name: gelu, value: gelu, description: 前饋模組替換 / SwiGLU to GELU.}
+    - name: embedding
+      enabled: true
+      path: training.financial_transformer.d_model
+      values:
+        - {name: d64, value: 64, description: 嵌入寬度加倍 / Embedding width 32 to 64.}
+        - {name: d128, value: 128, description: 嵌入寬度四倍 / Embedding width 32 to 128; capacity retry only after OOM.}
+    - name: lookback
+      enabled: true
+      path: training.lookback
+      values:
+        - {name: d64, value: 64, description: 歷史窗口加倍 / Lookback 32 to 64; same calendar targets.}
+        - {name: d128, value: 128, description: 歷史窗口四倍 / Lookback 32 to 128; preserve complete annual accounts.}
+    - name: temporal_query
+      enabled: true
+      path: training.financial_transformer.temporal_query_mode
+      values:
+        - {name: full_then_last, value: full_then_last, description: 完整時間注意力 / Full temporal attention followed by last-step pooling.}
+    - name: pooling
+      enabled: true
+      variants:
+        - name: mean
+          description: 平均時間池化 / Full temporal attention plus mean pooling; compare to temporal_query__full_then_last.
+          overrides: {training: {financial_transformer: {temporal_query_mode: full_then_last, temporal_pooling: mean}}}
+        - name: attention
+          description: 可學習時間池化 / Full temporal attention plus learned pooling; compare to temporal_query__full_then_last.
+          overrides: {training: {financial_transformer: {temporal_query_mode: full_then_last, temporal_pooling: attention}}}
+    - name: step_size
+      enabled: true
+      path: training.learning_rate
+      values:
+        - {name: lr003, value: 0.03, description: 縮小 SGD 步長 / SGD learning rate 0.1 to 0.03.}
+    - name: head
+      enabled: true
+      path: training.financial_transformer.head_layers
+      values:
+        - {name: linear, value: 0, description: 移除評分隱藏層 / Linear score head without the gated hidden layer.}

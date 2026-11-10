@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the fixed offline repair candidate archive when permitted
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=stockagent-offline-repair-e-archive.service
+
+[Install]
+WantedBy=timers.target

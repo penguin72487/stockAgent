@@ -26,6 +26,18 @@ bash scripts/run_lakehouse_control.sh status
 完全唯讀查詢。鎖被占用或來源未收斂時，保留 defer／阻礙，不把沒有候選當作可刪除。
 `use` 會下載／解封／續租，不是進度查詢。
 
+2026-11-09 使用者取消 Vast 驗證協助後，`stockagent-pack-compute-spool.timer`
+及其專屬服務已移除，Vast 驗證政策已停用；舊 Vast bulk／legacy
+備份回傳服務也已移除，未完成的舊批次仍保留。訓練傳輸及現行成果
+回傳仍保留。
+以下是退役前的流程契約，不表示該 timer 仍在運行：
+`stockagent-pack-compute-spool.timer` 的可選壓力回收僅處理原私有 compute
+cache，先綁定已完成 D 完整還原的固定版本，再完整重算所選 D 封包 SHA；
+取得原 retention lease、遠端逐包鎖及程序引用檢查後，才以逐項 journal
+回收可重建副本。單批來源最多 16 GiB；零進展按有界重試，遠端結果不明則
+保留日誌並停下。這不是 source retirement 或 NAS ACK；不可依快取命中
+紀錄推定當次讀過 D 正本。網頁上的批次 ETA 只涵蓋當前階段。
+
 penguin 再查來源端 NAS 覆蓋和歷史回傳階段：
 
 ```bash
@@ -67,10 +79,11 @@ NTFS hash／copy 門檻與批次的實測範圍見 `docs/nas_send_verify_paralle
 | penguin | `stockagent-lifecycle-control-backup.timer` | 三個 lifecycle DB 的一致性 SQL dump → 原 Restic relay |
 | penguin | `stockagent-lake-transport-gc.timer` | 每次一批 NAS 已驗收暫存；canonical gates／每批鎖，保留 primary D/NAS |
 | penguin | `stockagent-e-workspace-mount.service`／`stockagent-transport-relocation.timer` | C 留應用服務、E 留進冷庫前工作、D 留主冷庫；依固定 volume／UUID、原 owner、完整 SHA 與 alias 交接，見 `docs/storage_c_e_d_layout_2026-11-02.md`；不能由 timer 存在推定全部來源已遷移 |
+| penguin | `stockagent-workspace-source-handoff.timer`／`stockagent-workspace-source-handoff-boot.service` | 已登錄 ETF、Coin Metrics、加密公開脈絡、Dune、keyed public catalogs、crypto reference、Frankfurter、Binance 市場來源的 C/E 鎖、完整 SHA 與多 namespace 交接；Frankfurter 另檢查官方歷史子目錄原鎖，Binance 另檢查各粒度 writer 鎖並讓路台股交易；其他來源不因已有複製收據而自動納入 |
 | penguin | `stockagent-control-release-verification.timer`／`stockagent-control-backup.timer` | 固定程式碼驗證／private same-MVCC logical backup；`docs/control_plane_workflow.md` |
 | penguin | `stockagent-remote-cold-artifact-ingress.timer` | `configs/data_sync/training_return.json`；新完成訓練成果 |
-| penguin | `stockagent-legacy-return@main.timer`／`@partitions.timer` | `configs/data_sync/vastai_legacy_archive_return.json`；既存一次性歷史 cohort |
-| penguin | `stockagent-vast-bulk-return.timer` | `configs/data_sync/vastai_bulk_preservation.json`；已註冊 bulk／cache cohort |
+| penguin | `stockagent-legacy-return@main.timer`／`@partitions.timer` | 2026-11-09 已移除；既存一次性歷史 cohort 與未完成資料保留 |
+| penguin | `stockagent-vast-bulk-return.timer` | 2026-11-09 已移除；已註冊 bulk／cache cohort 與原收據保留 |
 | penguin | `stockagent-d-cold-scan-retry.timer`／`stockagent-packed-transport.timer` | 精確 scan 重試與 edge payload demand |
 | penguin | `stockagent-data-cache-gc.timer`／`stockagent-storage-pressure.timer` | materialization lease 與另行 allowlist 的 compiler cache |
 | lab203 | `lab203-backup.timer`／`lab203-backup.service` | 既有單一 backup owner、pipeline 與 semantic post-hook；`lab203-nas.service` 掛載依賴 |
@@ -89,6 +102,9 @@ backup owner／ledger，不必等待完整 catalog／容量盤點。先驗證原
 
 用本機 unit／drop-in 和 runtime receipt 確認目前 schedule，runbook 的五分鐘或其他
 間隔是部署紀錄。大型工作可能占用數個週期，不是固定完成 ETA。
+各來源兩次逐檔 SHA 核對各有 generation／phase 計數；等待或阻擋時
+保留原 journal 與來源。開機修復成功只證明所列來源的 mount／namespace，
+C 原副本退休、D 原值恢復和 NAS ACK 仍各自驗收。
 2026-10-31 起，已授權的固定 WSL cohort 不再需要每次手動命令。queue 狀態在
 `service_data/storage-retirement/status.json`；只讀取這個檔案不會啟動回收。
 原 owner 忙碌、容量不足時等待；實際失敗採有界重試，三次後保留

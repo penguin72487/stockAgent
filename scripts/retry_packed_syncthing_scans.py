@@ -212,6 +212,97 @@ def retry_one(
     }
 
 
+def retry_batch(*, max_datasets: int, budget_seconds: int, batch_object_paths: bool,
+                after_failed: str | None = None) -> dict[str, object]:
+    """Drain a bounded FIFO snapshot without overlapping the folder's scans.
+
+    The time budget limits *starting* another dataset, not the duration of a
+    Syncthing request already in flight. Every dataset retains the existing
+    per-generation lock, acknowledgement and timeout rules in ``retry_one``.
+    """
+    if type(max_datasets) is not int or not 1 <= max_datasets <= 32:
+        raise SnapshotError("max_datasets must be between 1 and 32")
+    if type(budget_seconds) is not int or not 1 <= budget_seconds <= 240:
+        raise SnapshotError("budget_seconds must be between 1 and 240")
+    _check_mount()
+    pending = _pending_datasets()
+    directory = SYNC_ROOT / ".local-state/scan-pending"
+    ordered: list[tuple[int, str]] = []
+    for dataset in pending:
+        try:
+            info = (directory / f"{dataset}.json").lstat()
+        except FileNotFoundError:
+            continue  # Another owner already completed this generation.
+        if not stat.S_ISREG(info.st_mode):
+            raise SnapshotError("pending scan receipt changed into a nonregular file")
+        ordered.append((info.st_mtime_ns, dataset))
+    ordered.sort()
+    if after_failed is not None:
+        after_failed = validate_slug(after_failed, 'retry cursor')
+        # A prior repeatedly failing prefix must not indefinitely starve later
+        # datasets. The exact failed intent remains untouched in its owner
+        # queue, and rotation wraps so that it will be retried in a later run.
+        position = next((i for i, (_, name) in enumerate(ordered) if name == after_failed), None)
+        if position is not None:
+            ordered = ordered[position+1:] + ordered[:position+1]
+
+    started = time.monotonic()
+    results: list[dict[str, object]] = []
+    failures = 0
+    last_failed = None
+    for _, dataset in ordered[:max_datasets]:
+        if results and time.monotonic() - started >= budget_seconds:
+            break
+        try:
+            result = retry_one(dataset, batch_object_paths=batch_object_paths)
+        except (OSError, ValueError, SnapshotError, subprocess.TimeoutExpired) as exc:
+            # Retain the exact failed intent, but let a broken dataset stop
+            # neither unrelated datasets nor the independent NAS notifier.
+            result = {"dataset": dataset, "status": "retry_failed",
+                      "error_type": type(exc).__name__}
+            failures += 1
+            last_failed = dataset
+        results.append(result)
+        if result.get("status") == "deferred_existing_folder_scan":
+            break  # A previous owner still has this folder; do not queue POSTs.
+
+    if failures:
+        status = "retry_partial_failure"
+    elif any(item.get("status") == "deferred_existing_folder_scan" for item in results):
+        status = "deferred_existing_folder_scan"
+    elif results:
+        status = "scan_batch_processed"
+    else:
+        status = "idle_no_pending"
+    return {
+        "status": status,
+        "pending_before": len(pending),
+        "pending_after": len(_pending_datasets()),
+        "attempted_count": len(results),
+        "acknowledged_count": sum(item.get("status") == "scan_request_acknowledged" for item in results),
+        "failed_count": failures,
+        "retry_cursor": last_failed,
+        "datasets": results,
+        "peer_convergence": "not_checked",
+        "release_verification": "not_checked",
+    }
+
+
+def _previous_failure_cursor(path: Path) -> str | None:
+    """Read only the last bounded batch's private fairness cursor."""
+    try:
+        if path.is_symlink() or not path.is_file() or path.stat().st_size > 1024*1024:
+            return None
+        value = json.loads(path.read_bytes())
+        if (not isinstance(value, dict) or value.get('schema_version') != 1
+                or value.get('status') != 'retry_partial_failure'
+                or not isinstance(value.get('retry_cursor'), str)):
+            return None
+        return validate_slug(value.get('retry_cursor'), 'retry cursor')
+    except (OSError, ValueError, TypeError, SnapshotError):
+        return None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dataset", help="Drain only this already-pending dataset.")
@@ -224,7 +315,15 @@ def main(argv: list[str] | None = None) -> int:
         "--backup-transport", action="store_true",
         help="Also retry the enrolled NAS queue through its original notification owner.",
     )
+    parser.add_argument("--max-datasets", type=int, default=1,
+                        help="Retry at most this many pending datasets, oldest first (1-32).")
+    parser.add_argument("--budget-seconds", type=int, default=40,
+                        help="Do not start another dataset after this many seconds (1-240).")
     args = parser.parse_args(argv)
+    if not 1 <= args.max_datasets <= 32 or not 1 <= args.budget_seconds <= 240:
+        parser.error("--max-datasets must be 1-32 and --budget-seconds must be 1-240")
+    if args.dataset and args.max_datasets != 1:
+        parser.error("--dataset cannot be combined with --max-datasets greater than 1")
     started = time.monotonic()
     receipt: dict[str, object] = {
         "schema_version": 1,
@@ -238,6 +337,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.backup_transport:
         receipt["scope"] = "one_pending_D_primary_scan_and_enrolled_NAS_notifications"
         receipt["requested_scan_policy"]["backup_transport"] = True
+    if args.max_datasets > 1:
+        receipt["scope"] = "bounded_pending_D_primary_scans_and_optional_NAS_notifications"
+        receipt["requested_scan_policy"].update({"max_datasets": args.max_datasets,
+                                                  "budget_seconds": args.budget_seconds})
     # These are different Syncthing folders with independent canonical owners.
     # A slow D metadata scan must not delay an otherwise-ready NAS notification.
     # The original per-folder locks, generations and acknowledgement rules stay
@@ -246,11 +349,17 @@ def main(argv: list[str] | None = None) -> int:
     with pool as executor:
         backup_future = executor.submit(retry_backup_transport) if executor else None
         try:
-            receipt.update(retry_one(
-                args.dataset,
-                **({"batch_object_paths": True} if args.batch_object_paths else {}),
-            ))
-            exit_code = 0
+            if args.max_datasets > 1:
+                receipt.update(retry_batch(max_datasets=args.max_datasets,
+                                           budget_seconds=args.budget_seconds,
+                                           batch_object_paths=args.batch_object_paths,
+                                           after_failed=_previous_failure_cursor(args.receipt)))
+            else:
+                receipt.update(retry_one(
+                    args.dataset,
+                    **({"batch_object_paths": True} if args.batch_object_paths else {}),
+                ))
+            exit_code = int(receipt.get("status") == "retry_partial_failure")
         except (OSError, ValueError, SnapshotError, subprocess.TimeoutExpired) as exc:
             receipt.update({"status": "retry_failed", "error": f"{type(exc).__name__}: {exc}"})
             exit_code = 1

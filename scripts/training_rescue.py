@@ -6,11 +6,45 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import sys
+import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from stockagent.training_rescue import Rescue, RescueCapacityWait, RescueError, load_policy  # noqa: E402
+from stockagent.training_rescue_worker import atomic_json  # noqa: E402
+
+
+def reconcile_references_without_blocking_capture(rescue):
+    """Use the existing rescue owner; a busy reference writer never stops capture."""
+    try:
+        rescue.reconcile_source_references()
+    except (OSError, ValueError, KeyError, TypeError, RescueError) as error:
+        try:
+            atomic_json(rescue.state/'rescue-source-reference-status.json', {
+                'contract': 'stockagent.rescue_source_reconciliation.v1', 'state': 'waiting',
+                'error_type': type(error).__name__, 'observed_at_epoch': time.time(),
+                'source_objects_checked': False, 'recovery_or_nas_acceptance_claimed': False})
+        except (OSError, ValueError):
+            pass  # The original checkpoint owner still gets its normal turn.
+
+
+def record_cycle_without_blocking_capture(rescue, state, *, run_count=None):
+    """Persist one bounded liveness observation, never a checkpoint ACK."""
+    status = {'contract': 'stockagent.rescue_capture_cycle.v1', 'state': state,
+              'observed_at_epoch': time.time(), 'run_count': run_count,
+              'D_reserve_bytes': rescue.policy.get('reserve_bytes'),
+              'source_retirement': False, 'recovery_or_nas_acceptance_claimed': False}
+    if state == 'waiting_d_capacity':
+        try:
+            status['D_available_bytes'] = shutil.disk_usage(rescue.cold).free
+        except OSError:
+            pass
+    try:
+        atomic_json(rescue.state/'rescue-cycle-status.json', status)
+    except (OSError, ValueError):
+        pass  # Observation failure must not change checkpoint behavior.
 
 
 def main():
@@ -83,7 +117,14 @@ def main():
             elif args.action == "seal-bootstrap":
                 result = rescue.seal_bootstrap(args.run)
             elif args.action == "cycle":
-                result = rescue.cycle()
+                reconcile_references_without_blocking_capture(rescue)
+                try:
+                    result = rescue.cycle()
+                except RescueCapacityWait:
+                    record_cycle_without_blocking_capture(rescue, 'waiting_d_capacity')
+                    raise
+                record_cycle_without_blocking_capture(rescue, 'cycle_observed',
+                    run_count=len(result['runs']) if isinstance(result.get('runs'), list) else None)
             elif args.action == "fence-provider":
                 result = rescue.fence_provider(args.run, api_key_file=args.api_key_file)
             elif args.action == "fence-guardian":

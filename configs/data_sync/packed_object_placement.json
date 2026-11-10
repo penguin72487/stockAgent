@@ -1,0 +1,24 @@
+{
+  "contract": "stockagent.packed_object_placement.v1",
+  "authority_node_id": "penguin",
+  "enabled": true,
+  "cold_root": "/srv/stockagent-packed",
+  "workspace_root": "/srv/stockagent-workspace",
+  "state_root": "/var/lib/stockagent/packed-object-placement",
+  "default_tier": "D",
+  "warm_private_datasets": [
+    "local-tw-minute",
+    "local-tw-microstructure",
+    "tw-daytrade-close-rollback-workspace",
+    "tw-daytrade-offline-repair-workspace",
+    "tw-daytrade-panel-sources-20261004-gaprepair-v1",
+    "tw-daytrade-panel-sources-20261004-gaprepair-v3",
+    "local-tw-index-futures",
+    "local-tw-futures",
+    "local-tw-public",
+    "finlab-research",
+    "finmind-free"
+  ],
+  "maximum_wave_bytes": 8589934592,
+  "reserve_bytes": 68719476736
+}

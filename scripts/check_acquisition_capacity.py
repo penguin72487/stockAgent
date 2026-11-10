@@ -133,6 +133,21 @@ def check_dispatch(path: Path, *, report_admitted: bool = True, priority: bool =
     """
     try:
         workspace = path.absolute()
+        try:
+            workspace.lstat()
+        except FileNotFoundError:
+            # A missing child must not make a registered E provider silently
+            # fall back to the checkout's C filesystem during handoff/boot.
+            from stockagent.data_sync.desync_snapshots import SnapshotError
+            from stockagent.data_sync.provider_workspace import check_path
+            try:
+                check_path(workspace)
+            except (OSError, ValueError, SnapshotError):
+                result = {'contract': 'acquisition_dispatch_capacity_v1', 'state': 'deferred',
+                          'reason': 'provider_workspace_unavailable', 'retryable': True,
+                          'data_paths_removed': 0}
+                print(json.dumps(result), flush=True)
+                return 75
         while True:
             try:
                 workspace.lstat()

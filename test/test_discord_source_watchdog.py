@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
 import fcntl
 import io
 import subprocess
@@ -158,6 +159,56 @@ def test_existing_writer_wait_is_bound_to_the_real_lock_and_cleans_up(
     assert registry.snapshot(COMMAND) is None
 
 
+def test_existing_shared_reader_is_not_reported_as_a_source_writer(tmp_path, monkeypatch):
+    registry = SourceOperationRegistry()
+    lock_path = tmp_path / "source.lock"
+    monkeypatch.setattr(discord_bot, "_PRE_SIGNAL_SOURCE_OPERATIONS", registry)
+    monkeypatch.setattr(discord_bot, "_tw_data_layer_lock_path", lambda command: lock_path)
+    with lock_path.open("a+") as reader:
+        fcntl.flock(reader, fcntl.LOCK_SH)
+        try:
+            assert discord_bot._wait_for_existing_tw_data_update(
+                list(COMMAND), timeout_seconds=10) is False
+            assert registry.snapshot(COMMAND) is None
+            # The probe must release only its own lock, not the real reader.
+            with lock_path.open("a+") as other:
+                with pytest.raises(BlockingIOError):
+                    fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            fcntl.flock(reader, fcntl.LOCK_UN)
+
+
+def test_completed_writer_is_not_kept_waiting_by_a_new_reader(tmp_path, monkeypatch):
+    registry = SourceOperationRegistry()
+    lock_path = tmp_path / "source.lock"
+    blocked, retry = threading.Event(), threading.Event()
+    monkeypatch.setattr(discord_bot, "_PRE_SIGNAL_SOURCE_OPERATIONS", registry)
+    monkeypatch.setattr(discord_bot, "_tw_data_layer_lock_path", lambda command: lock_path)
+
+    def wait_one_probe(_seconds):
+        blocked.set()
+        assert retry.wait(timeout=5)
+
+    monkeypatch.setattr(discord_bot.time, "sleep", wait_one_probe)
+    with lock_path.open("a+") as writer, lock_path.open("a+") as reader:
+        fcntl.flock(writer, fcntl.LOCK_EX)
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(discord_bot._wait_for_existing_tw_data_update,
+                                 list(COMMAND), timeout_seconds=10)
+            try:
+                assert blocked.wait(timeout=5)
+                assert registry.snapshot(COMMAND)["kind"] == "verified_writer_lock_wait"
+                fcntl.flock(writer, fcntl.LOCK_UN)
+                fcntl.flock(reader, fcntl.LOCK_SH)
+                retry.set()
+                assert future.result(timeout=5) is True
+                assert registry.snapshot(COMMAND) is None
+            finally:
+                fcntl.flock(writer, fcntl.LOCK_UN)
+                fcntl.flock(reader, fcntl.LOCK_UN)
+                retry.set()
+
+
 def test_writer_wait_exception_does_not_leave_liveness_evidence(tmp_path, monkeypatch):
     registry = SourceOperationRegistry()
     lock_path = tmp_path / "writer.lock"
@@ -253,6 +304,49 @@ def test_background_catchup_retains_fixed_source_deadline_but_cannot_hide_stalle
         with pytest.raises(SystemExit):
             asyncio.run(discord_bot.service_heartbeat.coro())
         assert "action=exit_for_systemd_restart" in capsys.readouterr().out
+
+
+def test_real_preopen_progress_reaches_only_its_scheduled_watchdog(opening, clock, monkeypatch, capsys):
+    cfg, _registry, _notifications = opening
+    monkeypatch.setattr(discord_bot.bot, "_opening_attempt_started_monotonic", None)
+    stage = {"market": "test", "phase": "preopen_catch_up",
+             "started_monotonic": 100.0, "hot": False}
+    row = (cfg, datetime.fromisoformat("2026-11-04T09:00:00+08:00"), "session", True)
+    monkeypatch.setattr(discord_bot.bot, "_opening_input_stages", {"test": stage})
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_input_jobs", {"test": {"row": row}})
+
+    event = {"message": "panel load 250/2772", "step": 8, "total": 24}
+    clock["now"] = 250.0
+    discord_bot._record_preopen_catch_up_progress(cfg, event, session_date="2026-11-04")
+    assert stage["last_progress_monotonic"] == 250.0
+    clock["now"] = 300.0
+    asyncio.run(discord_bot.service_heartbeat.coro())
+    assert "action=exit_for_systemd_restart" not in capsys.readouterr().out
+
+    # Repeated identical events cannot give a stuck worker infinite liveness.
+    clock["now"] = 431.0
+    discord_bot._record_preopen_catch_up_progress(cfg, event, session_date="2026-11-04")
+    assert stage["last_progress_monotonic"] == 250.0
+    with pytest.raises(SystemExit) as error:
+        asyncio.run(discord_bot.service_heartbeat.coro())
+    assert error.value.code == 70
+    assert "action=exit_for_systemd_restart" in capsys.readouterr().out
+
+
+def test_preopen_progress_cannot_keep_wrong_session_config_or_phase_alive(opening, clock, monkeypatch):
+    cfg, _registry, _notifications = opening
+    stage = {"market": "test", "phase": "preopen_catch_up", "started_monotonic": 100.0, "hot": False}
+    row = (cfg, datetime.fromisoformat("2026-11-04T09:00:00+08:00"), "session", True)
+    monkeypatch.setattr(discord_bot.bot, "_opening_input_stages", {"test": stage})
+    monkeypatch.setattr(discord_bot.bot, "_scheduled_input_jobs", {"test": {"row": row}})
+    event = {"message": "panel load 250/2772", "step": 8, "total": 24}
+
+    discord_bot._record_preopen_catch_up_progress(cfg, event, session_date="2026-11-03")
+    other_cfg = SimpleNamespace(market="test", pre_signal_command=("other",))
+    discord_bot._record_preopen_catch_up_progress(other_cfg, event, session_date="2026-11-04")
+    stage["phase"] = "realtime_prepare"
+    discord_bot._record_preopen_catch_up_progress(cfg, event, session_date="2026-11-04")
+    assert "last_progress_monotonic" not in stage
 
 
 @pytest.mark.parametrize("stage", [None, "started", "realtime_prepare", "inference"])

@@ -9,6 +9,26 @@ def test_waiter_rechecks_unfinished_probe_before_the_sample_expires():
     assert capacity_retry_delay_seconds({'state': 'deferred', 'reason': 'capacity_sample_expired'}) == 5
     assert capacity_retry_delay_seconds({'state': 'deferred', 'reason': 'physical_backing_reserve'}) == 60
     assert capacity_retry_delay_seconds({'state': 'deferred', 'reason': 'capacity_probe_failed'}) == 60
+    assert capacity_retry_delay_seconds({'state': 'deferred', 'reason': 'physical_backing_headroom_unconfirmed', 'probe_inflight': True}) == 5
+    assert capacity_retry_delay_seconds({'state': 'deferred', 'reason': 'physical_backing_reserve', 'probe_inflight': True}) == 60
+
+
+def test_wait_for_refresh_reuses_inflight_probe_and_returns_only_new_result(tmp_path):
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+
+    def probe(root):
+        calls.append(root)
+        entered.set()
+        assert release.wait(2)
+        return {'state': 'admitted', 'available_bytes': 123}
+
+    sampler = AcquisitionCapacitySampler(tmp_path, probe=probe)
+    assert sampler.sample()['reason'] == 'capacity_sample_pending'
+    assert entered.wait(2)
+    release.set()
+    assert sampler.wait_for_refresh(timeout_seconds=2)['state'] == 'admitted'
+    assert len(calls) == 1
 
 
 def test_physical_capacity_observation_keeps_headroom_without_private_paths(tmp_path):

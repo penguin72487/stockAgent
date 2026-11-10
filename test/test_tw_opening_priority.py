@@ -243,7 +243,8 @@ def test_both_warmup_hooks_reuse_one_model_call_and_never_backdate_after_open(
                  "_touch_opening_attempt_progress", "_write_preopen_readiness", "_write_preopen_final_arm"):
         monkeypatch.setattr(bot, name, lambda *_args, **_kwargs: None)
     result = LiveSignalResult({"feature_cutoff_date": "2026-10-21", "live_latency": {
-        "panel_cache_hit": True, "model_cache_hit": True, "checkpoint_cache_hit": True}},
+        "panel_cache_hit": True, "model_cache_hit": True, "checkpoint_cache_hit": True,
+        "alignment_cache_hit": True}},
         [{"symbol": "A", "current_price": 100.}], [], [], "", _opening_priority_rows=[row("A", weight=.2)])
     calls = []
     def generate(**kwargs):

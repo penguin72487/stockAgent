@@ -245,8 +245,13 @@
         note.textContent = allPointCount
           ? `${chartWindowLabel} · 目前 ${formatCount(series.length)} 條曲線皆已隱藏。`
           : `${chartWindowLabel}內沒有可繪製資料。`;
-        note.textContent += staleNote;
       }
+      // The empty state is a rendered state too. Otherwise restoring the last
+      // hidden line reproduces the previous visible render key and is skipped.
+      renderedHistory = history;
+      renderedKey = renderKey;
+      renderedNote = note.textContent;
+      note.textContent = renderedNote + staleNote;
       return;
     }
 
@@ -341,12 +346,13 @@
       ? `；已保留端點與區間極值縮圖（原 ${formatCount(history.raw_points_in_range)} 點）`
       : "";
     const replayPoints = Number(history.historical_minute_replay_points || 0);
+    const delayedAuctionEvents = Number(history.historical_delayed_auction_event_points || 0);
     const replayMean = Number(history.historical_minute_mean_fresh_trade_notional_coverage_ratio);
     const replayMissing = Number(history.historical_minute_missing_price_points || 0);
     const replayQuality = replayPoints
       ? isOvernight
         ? `；歷史反事實集合競價事件 ${formatCount(replayPoints)} 點，缺價／延用 ${formatCount(replayMissing)} 點`
-        : `；歷史分鐘 ${formatCount(replayPoints)} 點，平均新成交名目覆蓋 ${Number.isFinite(replayMean) ? `${formatNumber(replayMean * 100)}%` : "—"}，缺價 ${formatCount(replayMissing)} 點（其餘無成交分鐘延用上一筆）`
+        : `；歷史分鐘 ${formatCount(replayPoints)} 點${delayedAuctionEvents ? `，延後收盤事件 ${formatCount(delayedAuctionEvents)} 點` : ""}，平均新成交名目覆蓋 ${Number.isFinite(replayMean) ? `${formatNumber(replayMean * 100)}%` : "—"}，缺價 ${formatCount(replayMissing)} 點（無新成交觀測時延用上一筆，不等於已證實無成交）`
       : "";
     const coverageGaps = (history.range_summary || []).filter((row) => Number(row.minute_coverage_ratio) < .999999);
     const coverageQuality = coverageGaps.length

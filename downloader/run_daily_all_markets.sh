@@ -57,6 +57,10 @@ PEPPERSTONE_WORKERS="${PEPPERSTONE_WORKERS:-8}"
 RUN_CEX_PERP="${RUN_CEX_PERP:-1}"
 CRYPTO_TAIL_ONLY="${CRYPTO_TAIL_ONLY:-0}"
 CRYPTO_HISTORICAL_FEATURES="${CRYPTO_HISTORICAL_FEATURES:-1}"
+# Independent background passes can wait for the current canonical source
+# owner without starting a competing provider request. Live tails retain the
+# shorter default; each scheduled background scope opts into a longer wait.
+CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS="${CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS:-180}"
 OKX_WORKERS="${OKX_WORKERS:-16}"
 OKX_REQUEST_INTERVAL="${OKX_REQUEST_INTERVAL:-}"
 OKX_MAX_RETRIES="${OKX_MAX_RETRIES:-8}"
@@ -635,6 +639,7 @@ run_okx_perp_incremental() {
     --end-date "$today"
     --workers "$OKX_WORKERS"
     --max-retries "$OKX_MAX_RETRIES"
+    --lock-timeout-seconds "$CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS"
   )
   if [[ -n "$OKX_REQUEST_INTERVAL" ]]; then
     cmd+=(--request-interval "$OKX_REQUEST_INTERVAL")
@@ -684,6 +689,7 @@ run_bybit_perp_incremental() {
     --end-date "$today"
     --workers "$BYBIT_WORKERS"
     --max-retries "$BYBIT_MAX_RETRIES"
+    --lock-timeout-seconds "$CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS"
     --categories "${categories[@]}"
   )
   if [[ -n "$BYBIT_REQUEST_INTERVAL" ]]; then
@@ -697,7 +703,7 @@ run_bybit_perp_incremental() {
   mkdir -p "$(dirname "$BYBIT_SOURCE_LOCK_FILE")"
   exec {bybit_lock_fd}>"$BYBIT_SOURCE_LOCK_FILE"
   bybit_lock_wait_start_ms="$(( $(date +%s%N) / 1000000 ))"
-  if ! flock -w 180 "$bybit_lock_fd"; then
+  if ! flock -w "$CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS" "$bybit_lock_fd"; then
     log "step=bybit_perp_1m_update failed reason=source_publish_lock_timeout wait_ms=$(( $(date +%s%N) / 1000000 - bybit_lock_wait_start_ms ))"
     exec {bybit_lock_fd}>&-
     return 1
@@ -736,6 +742,7 @@ run_binance_perp_incremental() {
     --workers "$BINANCE_WORKERS"
     --feature-workers "$BINANCE_FEATURE_WORKERS"
     --max-retries "$BINANCE_MAX_RETRIES"
+    --lock-timeout-seconds "$CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS"
   )
   if [[ -n "$BINANCE_REQUEST_WEIGHT_PER_MINUTE" ]]; then
     cmd+=(--request-weight-per-minute "$BINANCE_REQUEST_WEIGHT_PER_MINUTE")
@@ -1083,6 +1090,10 @@ acquire_lock() {
 }
 
 validate_settings() {
+  if ! [[ "$CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS" =~ ^[0-9]+$ ]]; then
+    echo "[daily] CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS must be an integer >= 0" >&2
+    exit 2
+  fi
   if [[ "$RUN_MODE" != "once" && "$RUN_MODE" != "daemon" && "$RUN_MODE" != "market-daemon" ]]; then
     echo "[daily] invalid RUN_MODE=${RUN_MODE} (supported: once|daemon|market-daemon)" >&2
     exit 2

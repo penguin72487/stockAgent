@@ -43,7 +43,7 @@ POST_START = {
     'stockagent-d-cold-mount.service': 'stockagent-backup-transport-mount.service',
     'stockagent-backup-transport-mount.service': 'syncthing@root.service',
 }
-PROPERTIES = ('Id', 'LoadState', 'UnitFileState', 'FragmentPath', 'ActiveState',
+PROPERTIES = ('Id', 'LoadState', 'UnitFileState', 'FragmentPath', 'ActiveState', 'Result',
               'MainPID', 'InvocationID', 'Restart', 'RestartUSec', 'RestartSteps',
               'RestartMaxDelayUSec', 'StartLimitIntervalUSec')
 

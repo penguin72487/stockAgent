@@ -138,6 +138,49 @@ def test_previous_session_is_not_shown_as_todays_signal(tmp_path, source):
     assert result["rows"] == []
 
 
+def test_preopen_previous_close_is_separate_from_current_signal(tmp_path, source, monkeypatch):
+    add, _ = source
+    _, directory, _ = add(session="2026-10-27", price_source="panel_close")
+    summary_path = directory / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary.update(execution_preview_only=True, price_data_date="2026-10-27 13:30:00")
+    summary_path.write_text(json.dumps(summary))
+    monkeypatch.setattr(published, "dashboard_session_clock", lambda observed: {
+        "display_session_date": "2026-10-27" if observed.hour == 8 and observed.minute < 30 else DAY,
+    })
+    before_open = datetime(2026, 10, 28, 8, 45, tzinfo=published._TAIPEI)
+    result = published.build_published_signal_snapshot(repo_root=tmp_path, observed_at=before_open)
+    assert result["modes"][0]["status"] == "waiting"
+    assert result["rows"] == []
+    assert result["preopen_reference"]["modes"][0]["price_data_date"] == "2026-10-27"
+    assert len(result["preopen_reference"]["rows"]) == 2
+    at_open = published.build_published_signal_snapshot(
+        repo_root=tmp_path, observed_at=datetime(2026, 10, 28, 9, 0, tzinfo=published._TAIPEI),
+    )
+    assert at_open["preopen_reference"] == {"modes": [], "rows": []}
+    assert at_open["rows"] == []
+
+
+def test_preopen_reference_requires_last_completed_session_and_preview_flag(tmp_path, source, monkeypatch):
+    add, _ = source
+    _, directory, _ = add(session="2026-10-27", price_source="panel_close")
+    summary_path = directory / "summary.json"
+    summary = json.loads(summary_path.read_text())
+    summary.update(execution_preview_only=True, price_data_date="2026-10-26")
+    summary_path.write_text(json.dumps(summary))
+    monkeypatch.setattr(published, "dashboard_session_clock", lambda observed: {
+        "display_session_date": "2026-10-27" if observed.hour == 8 and observed.minute < 30 else DAY,
+    })
+    now = datetime(2026, 10, 28, 8, 45, tzinfo=published._TAIPEI)
+    result = published.build_published_signal_snapshot(repo_root=tmp_path, observed_at=now)
+    assert result["preopen_reference"] == {"modes": [], "rows": []}
+    summary.update(execution_preview_only=False, price_data_date="2026-10-27")
+    summary_path.write_text(json.dumps(summary))
+    published._read_market.cache_clear()
+    result = published.build_published_signal_snapshot(repo_root=tmp_path, observed_at=now)
+    assert result["preopen_reference"] == {"modes": [], "rows": []}
+
+
 @pytest.mark.parametrize("hour", [0, 8, 12, 23])
 def test_nontrading_day_keeps_verified_previous_session_targets(tmp_path, source, monkeypatch, hour):
     add, _ = source

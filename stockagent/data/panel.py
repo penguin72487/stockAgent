@@ -415,6 +415,9 @@ class PanelData:
     # Optional real feature rows before the executable/account calendar.
     # They do not add dates, returns, masks, prices, or account events.
     feature_history: Any | None = None
+    # Result/account scope only. Earlier real feature rows remain available;
+    # an inference-scoped executor must never consume an older decision row.
+    inference_year: int | None = None
 
     @property
     def num_dates(self) -> int:
@@ -4193,6 +4196,22 @@ def build_tail_panel(
     feature_zero_fill_patterns = _normalize_feature_patterns(
         feature_zero_fill, label="feature_zero_fill"
     )
+    # Match the full training panel: the next-open gap is derived only after
+    # symbol rows have been aligned to the exchange-wide session axis. A
+    # symbol's next *available* row may be several sessions later and cannot
+    # be allowed to leak that future opening price into an earlier decision.
+    include_day_trade_open_gap = (
+        DAY_TRADE_OPEN_GAP_FEATURE in feature_include_patterns
+        and DAY_TRADE_OPEN_GAP_FEATURE not in feature_exclude_patterns
+    )
+    base_feature_include_patterns = tuple(
+        pattern for pattern in feature_include_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
+    base_feature_zero_fill_patterns = tuple(
+        pattern for pattern in feature_zero_fill_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
     availability_patterns = _normalize_feature_patterns(
         feature_availability_indicators,
         label="feature_availability_indicators",
@@ -4200,12 +4219,17 @@ def build_tail_panel(
     feature_shift_next_session_patterns = _normalize_feature_patterns(
         feature_shift_next_session, label="feature_shift_next_session"
     )
+    base_feature_shift_next_session_patterns = tuple(
+        pattern for pattern in feature_shift_next_session_patterns
+        if pattern != DAY_TRADE_OPEN_GAP_FEATURE
+    )
     selected_panel_feature_names, selected_external_feature_names = _resolve_external_feature_projection(
         external_feature_path,
         include_features=external_include_features,
         raw_input_features=raw_input_features,
-        feature_include=feature_include_patterns,
+        feature_include=base_feature_include_patterns,
         feature_exclude=feature_exclude_patterns,
+        exclude_open_gap=True,
     )
     normalized_panel_start_date = _normalize_panel_start_date(panel_start_date)
     from stockagent.data.partitioned_parquet import discover_sources
@@ -4343,7 +4367,7 @@ def build_tail_panel(
         feature_include=(
             selected_panel_feature_names
             if selected_panel_feature_names is not None
-            else feature_include_patterns
+            else base_feature_include_patterns
         ),
         feature_exclude=(
             ()
@@ -4355,11 +4379,11 @@ def build_tail_panel(
         progress_callback=report,
     )
     panel = _apply_external_rule_masks(panel, external_features)
-    panel = _zero_fill_panel_features(panel, feature_zero_fill_patterns)
+    panel = _zero_fill_panel_features(panel, base_feature_zero_fill_patterns)
     panel = _shift_panel_features_to_next_session(
         panel,
         _shift_patterns_with_availability_indicators(
-            panel, feature_shift_next_session_patterns
+            panel, base_feature_shift_next_session_patterns
         ),
     )
     panel = _slice_panel_start(panel, normalized_panel_start_date)
@@ -4370,6 +4394,12 @@ def build_tail_panel(
     )
     if panel.unresolved_corporate_action_mask is not None:
         panel = _attach_raw_close_forward_returns(panel)
+    if include_day_trade_open_gap:
+        panel = _append_configured_day_trade_open_gap_feature(
+            panel,
+            feature_zero_fill_patterns=feature_zero_fill_patterns,
+            feature_shift_next_session_patterns=feature_shift_next_session_patterns,
+        )
     assemble_seconds = time_module.perf_counter() - assemble_started
     print(
         "[panel] live tail stages "
@@ -5875,6 +5905,8 @@ def build_panel(
     overnight_1325_root: str | Path | None = None,
     overnight_decision_time: str = "13:25",
     overnight_1325_missing_price_policy: str = "reject",
+    allow_cache_write_deferred: bool = False,
+    on_cache_write_deferred: Callable[[dict[str, Any]], None] | None = None,
 ) -> PanelData:
     def append_overnight_context(panel: PanelData) -> PanelData:
         if overnight_1325_root is not None:
@@ -6186,7 +6218,22 @@ def build_panel(
         panel = _attach_raw_close_forward_returns(panel)
     assemble_seconds = time_module.perf_counter() - assemble_started
     cache_started = time_module.perf_counter()
-    _save_panel_cache(cache_root, panel, source_hash, backend_key)
+    cache_saved = False
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+    try:
+        _save_panel_cache(cache_root, panel, source_hash, backend_key)
+        cache_saved = True
+    except CapacityDeferred as error:
+        # A complete, already-built panel can be consumed by an explicitly
+        # opted-in strict audit without writing its disposable cache. Never
+        # waive physical admission, hide another failure, or alter inputs.
+        if (not allow_cache_write_deferred
+                or error.details.get('reason') != 'physical_backing_reserve'
+                or error.details.get('allocation_admitted') is not False):
+            raise
+        if on_cache_write_deferred is not None:
+            on_cache_write_deferred(dict(error.details))
+        print('[panel] optional cache write deferred by physical reserve; using the complete in-memory panel', flush=True)
     cache_save_seconds = time_module.perf_counter() - cache_started
     print(
         "[panel] cold build stages "
@@ -6197,7 +6244,8 @@ def build_panel(
         f"total={time_module.perf_counter() - build_started:.3f}s",
         flush=True,
     )
-    print(f"[panel] cache v2 saved: {panel_cache_v2_dir(cache_root)}")
+    if cache_saved:
+        print(f"[panel] cache v2 saved: {panel_cache_v2_dir(cache_root)}")
     if include_day_trade_open_gap:
         panel = _append_configured_day_trade_open_gap_feature(
             panel,

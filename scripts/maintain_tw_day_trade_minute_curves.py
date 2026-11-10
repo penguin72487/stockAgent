@@ -396,6 +396,27 @@ def _stock_calendar_source_state(
     }
 
 
+def _official_session_scope_state(calendar_root: Path, completed: list[str]) -> dict[str, Any]:
+    """Expose missing whole trading days instead of inferring the calendar from fills."""
+    if not completed or completed != sorted(set(completed)):
+        raise ValueError("completed session scope must be nonempty, sorted, and unique")
+    first, last = date.fromisoformat(completed[0]), date.fromisoformat(completed[-1])
+    try:
+        sessions, digest = _validated_taiex_session_dates(calendar_root, first, last)
+    except (OSError, RuntimeError, ValueError) as exc:
+        return {"ready": False, "status": "calendar_invalid",
+                "reason": f"{type(exc).__name__}: {exc}"}
+    official = {day.isoformat() for day in sessions}
+    recorded = set(completed)
+    missing, extra = sorted(official - recorded), sorted(recorded - official)
+    return {"ready": not missing and not extra,
+            "status": "complete" if not missing and not extra else "session_scope_mismatch",
+            "start_date": completed[0], "end_date": completed[-1],
+            "official_session_count": len(official), "recorded_session_count": len(recorded),
+            "missing_recorded_sessions": missing, "unverified_recorded_sessions": extra,
+            "sha256": digest}
+
+
 def _inspect_strategy_price_provenance(
     state_dir: Path,
     *,
@@ -480,11 +501,29 @@ def _proven_price_state_from_curve_validation(
 
     expected_sessions = len(completed_session_dates)
     mode_count = len(expected_markets)
+    from scripts.rebuild_tw_day_trade_minute_curves import opening_assumption_policy
+    first_bar = bool(isinstance(validation, Mapping) and validation.get(opening_assumption_policy(True)["key"]))
+    policy = opening_assumption_policy(first_bar)
+    cost = validation.get(policy["key"]) if isinstance(validation, Mapping) else None
+    cost_points = cost.get("points") if isinstance(cost, Mapping) else None
+    cost_count = cost.get("verified_minute_points") if isinstance(cost, Mapping) else None
+    cost_accepted = bool(isinstance(cost_points, list) and type(cost_count) is int
+        and cost_count > 0 and len(cost_points) == cost_count
+        and all(isinstance(point, list) and len(point) == 2
+                and all(isinstance(value, str) for value in point)
+                and point[0] in expected_markets
+                and point[1][:10] in completed_session_dates and point[1][10:] == "T09:01+08:00"
+                for point in cost_points)
+        and len({tuple(point) for point in cost_points}) == cost_count
+        and cost.get("contract") == policy["contract"]
+        and (not first_bar or cost.get("later_bar_source_verified") is True)
+        and cost.get("market_observation_verified") is False
+        and cost.get("financial_journals_changed") is False)
     if not (
         isinstance(validation, Mapping)
         and validation.get("required") is True
         and validation.get("contract") == MINUTE_CURVE_CONTRACT
-        and validation.get("opening_marks_revalued_at_completed_minute") is True
+        and (validation.get("opening_marks_revalued_at_completed_minute") is True or cost_accepted)
         and validation.get("completed_session_dates") == completed_session_dates
         and validation.get("points_per_session_mode") == MINUTE_CURVE_SESSION_POINTS
         and validation.get("validated_rows")
@@ -498,12 +537,15 @@ def _proven_price_state_from_curve_validation(
         "contract": MINUTE_CURVE_CONTRACT,
         "basis": "hash_checked_complete_minute_curve_validation",
         "expected_opening_rows": opening,
-        "audited_opening_rows": opening,
-        "unverified_opening_rows": 0,
+        "audited_opening_rows": opening - (cost_count if cost_accepted else 0),
+        "unverified_opening_rows": cost_count if cost_accepted else 0,
+        **({"authorized_provisional_opening_rows": cost_count,
+            "market_price_completeness_verified": False,
+            "provisional_opening_reference_policy": "later_first_bar" if first_bar else "entry_cost"} if cost_accepted else {}),
         "expected_interior_rows": interior,
         "audited_interior_rows": interior,
         "unverified_interior_rows": 0,
-        "unverified_sample": [],
+        "unverified_sample": [f"{market}:{minute}" for market, minute in cost_points] if cost_accepted else [],
     }
 
 
@@ -606,46 +648,6 @@ def main() -> None:
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
             return
 
-        # An attempted session is not a completed session: waiting_source also
-        # records completed_session_dates. Always check the exact receipt before
-        # starting the expensive benchmark rebuild, even on a retry.
-        stage_started = time.monotonic()
-        source_state = _tx_benchmark_source_state(
-            getattr(
-                args,
-                "tx_history_root",
-                Path("data_tw_index_futures/shioaji_history/TXFR1"),
-            ).resolve(),
-            completed[-1],
-            getattr(
-                args,
-                "fop_capture_root",
-                Path("data_tw_index_derivatives_ticks/shioaji_fop_captures"),
-            ).resolve(),
-        )
-        preflight_seconds["benchmark_source"] = round(time.monotonic() - stage_started, 6)
-        if not source_state["ready"]:
-            payload = {
-                "schema_version": 1,
-                "status": "waiting_source",
-                "failed_stage": "benchmark_source_preflight",
-                "observed_at": observed.isoformat(timespec="seconds"),
-                "completed_session_dates": completed,
-                "source": source_state,
-                "accepted_endpoint_preflight": endpoint_preflight,
-                "preflight_seconds": preflight_seconds,
-                "retry_contract": (
-                    "A complete retained FOP capture or verified TXFR1 receipt "
-                    "can supply the benchmark; retry on source change or the "
-                    "post-close timer. No benchmark subprocess was started"
-                ),
-                "simulation_only": True,
-                "production_order_possible": False,
-            }
-            _atomic_json(status_path, payload)
-            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
-            return
-
         stage_started = time.monotonic()
         calendar_state = _stock_calendar_source_state(
             getattr(args, "calendar_root", Path("data_tw_public")).resolve(),
@@ -669,6 +671,53 @@ def main() -> None:
                 ),
                 "simulation_only": True,
                 "production_order_possible": False,
+            }
+            _atomic_json(status_path, payload)
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return
+
+        scope_clock = time.monotonic()
+        official_scope = _official_session_scope_state(
+            getattr(args, "calendar_root", Path("data_tw_public")).resolve(), completed)
+        preflight_seconds["official_session_scope"] = round(time.monotonic() - scope_clock, 6)
+        if (not official_scope.get("ready")
+                or official_scope.get("sha256") != calendar_state.get("sha256")):
+            payload = {
+                "schema_version": 1,
+                "status": "waiting_unrecorded_official_sessions",
+                "observed_at": observed.isoformat(timespec="seconds"),
+                "completed_session_dates": completed,
+                "official_scope": official_scope,
+                "accepted_endpoint_preflight": endpoint_preflight,
+                "preflight_seconds": preflight_seconds,
+                "reason": "The official calendar and recorded account sessions differ or changed; inspect missing-session evidence before rebuilding.",
+                "simulation_only": True,
+                "production_order_possible": False,
+            }
+            _atomic_json(status_path, payload)
+            print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return
+
+        # A prior waiting-source result is not completion. Verify the exact
+        # futures benchmark receipt on every retry, after the calendar scope.
+        stage_started = time.monotonic()
+        source_state = _tx_benchmark_source_state(
+            getattr(args, "tx_history_root", Path("data_tw_index_futures/shioaji_history/TXFR1")).resolve(),
+            completed[-1],
+            getattr(args, "fop_capture_root", Path("data_tw_index_derivatives_ticks/shioaji_fop_captures")).resolve(),
+        )
+        preflight_seconds["benchmark_source"] = round(time.monotonic() - stage_started, 6)
+        if not source_state["ready"]:
+            payload = {
+                "schema_version": 1, "status": "waiting_source",
+                "failed_stage": "benchmark_source_preflight",
+                "observed_at": observed.isoformat(timespec="seconds"),
+                "completed_session_dates": completed, "source": source_state,
+                "official_scope": official_scope,
+                "accepted_endpoint_preflight": endpoint_preflight,
+                "preflight_seconds": preflight_seconds,
+                "retry_contract": "Retry when a verified futures benchmark source becomes available; no subprocess was started.",
+                "simulation_only": True, "production_order_possible": False,
             }
             _atomic_json(status_path, payload)
             print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
@@ -716,15 +765,26 @@ def main() -> None:
             and int(price_validation.get("unverified_opening_rows") or 0) == 0
             and int(price_validation.get("unverified_interior_rows") or 0) == 0
         )
+        authorized_cost_only = bool(
+            price_validation is not None
+            and type(price_validation.get("authorized_provisional_opening_rows")) is int
+            and price_validation["authorized_provisional_opening_rows"] > 0
+            and price_validation.get("unverified_opening_rows")
+                == price_validation["authorized_provisional_opening_rows"]
+            and price_validation.get("unverified_interior_rows") == 0
+            and price_validation.get("market_price_completeness_verified") is False)
         if (
             strategy_validation is not None
             and benchmark_validation is not None
-            and price_provenance_ready
+            and (price_provenance_ready or authorized_cost_only)
         ):
             payload = {
                 "schema_version": 1,
-                "status": "ready",
-                "action": "no_op_already_complete",
+                "status": "verified_with_data_gaps" if authorized_cost_only else "ready",
+                "action": (("no_op_authorized_provisional_first_bar_valuation"
+                            if price_validation.get("provisional_opening_reference_policy") == "later_first_bar"
+                            else "no_op_authorized_provisional_cost_valuation")
+                           if authorized_cost_only else "no_op_already_complete"),
                 "observed_at": observed.isoformat(timespec="seconds"),
                 "completed_session_dates": completed,
                 "accepted_endpoint_preflight": endpoint_preflight,

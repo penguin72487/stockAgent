@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the reviewed offline replay pair migration
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=stockagent-offline-replay-pair-migration.service
+
+[Install]
+WantedBy=timers.target

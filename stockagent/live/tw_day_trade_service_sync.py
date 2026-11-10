@@ -11,13 +11,16 @@ from __future__ import annotations
 from contextlib import contextmanager
 from datetime import datetime, timezone
 import json
+import os
 from pathlib import Path
+import stat
 import time
 from typing import Any, Final, Mapping
 from stockagent.live.paper_mode_snapshot import (
-    CONTRACT as MODE_SNAPSHOT_CONTRACT, mode_object_generations, read_paper_payload,
+    CONTRACT as MODE_SNAPSHOT_CONTRACT, MAX_SNAPSHOT_BYTES, mode_object_generations,
 )
 from stockagent.live.paper_journal import layout_generations
+from stockagent.private_json import loads as private_json_loads
 
 
 SERVICE_SYNC_FILENAME: Final[str] = "service_sync.json"
@@ -61,6 +64,35 @@ def _paper_file_generations(root: Path, names) -> dict[str, list[int] | None]:
 
 class PaperReadChanged(OSError):
     """The requested projection is not one stable committed paper view."""
+
+
+def _history_state_at_receipt(root: Path, receipt: Mapping[str, Any]) -> dict[str, Any]:
+    """Read a bounded state header from the exact durably acknowledged inode."""
+    expected = (receipt.get("projection_generations") or {}).get("state.json")
+    if not isinstance(expected, list) or len(expected) != 5:
+        raise PaperReadChanged("paper history state generation is unavailable")
+    try:
+        fd = os.open(root / "state.json", os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        with os.fdopen(fd, "rb") as source:
+            info = os.fstat(source.fileno())
+            signature = [info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns]
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SNAPSHOT_BYTES or signature != expected:
+                raise PaperReadChanged("paper history state is ahead of its commit marker")
+            raw = source.read(MAX_SNAPSHOT_BYTES + 1)
+            after = os.fstat(source.fileno())
+            if (len(raw) != expected[2]
+                    or [after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns] != expected):
+                raise PaperReadChanged("paper history state changed during scope capture")
+        state = private_json_loads(raw)
+        if (not isinstance(state, dict) or state.get("engine_run_id") != receipt.get("engine_run_id")
+                or state.get("state_revision") != receipt.get("state_revision")
+                or state.get("dashboard_content_revision") != receipt.get("content_revision")):
+            raise PaperReadChanged("paper history state differs from its commit identity")
+        return state
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        if isinstance(error, PaperReadChanged):
+            raise
+        raise PaperReadChanged("paper history state could not be captured") from error
 
 
 @contextmanager
@@ -144,29 +176,43 @@ def committed_paper_history_read_guard(root: Path):
                   if key in names or any(key.startswith(f"journal_heads/{name}.") for name in names)}
         return scoped == actual
 
-    def state_scope(*, require_committed=False):
-        # No mode/position expansion is needed: history consumes these header
-        # fields only. The canonical bounded reader detects a concurrent rename.
-        signature = _paper_file_generations(root, ("state.json",)) if require_committed else None
-        if require_committed and signature["state.json"] != (receipt.get("projection_generations") or {}).get("state.json"):
-            raise PaperReadChanged("paper history state is ahead of its commit marker")
-        state = read_paper_payload(root / "state.json")
-        if require_committed and _paper_file_generations(root, ("state.json",)) != signature:
-            raise PaperReadChanged("paper history state changed during scope capture")
-        roster = state.get("enabled_markets")
-        if state.get("engine_run_id") != run or (roster is not None and roster != markets):
-            raise PaperReadChanged("paper history state owner or roster differs from its commit")
-        return state.get("product") or "tw_day_trade", None if roster is None else tuple(roster)
+    def state_scope(initial, expected_journals):
+        # Opening a handle bound to the acknowledged generation makes a later
+        # atomic state rename irrelevant. If admission lands between renames,
+        # retry against a NEW receipt, never accept the uncommitted pathname.
+        candidate = initial
+        last_error = None
+        for attempt in range(16):
+            if attempt:
+                time.sleep(0.02)
+                candidate = load_service_sync(root)
+            if not isinstance(candidate, Mapping):
+                last_error = PaperReadChanged("paper history commit marker is invalid or unreadable")
+                continue
+            if candidate.get("engine_run_id") != run or candidate.get("enabled_markets") != markets:
+                raise PaperReadChanged("paper history state owner or roster differs from its commit")
+            if not acknowledged(expected_journals, candidate):
+                raise PaperReadChanged("history journals are ahead of their commit marker")
+            try:
+                state = _history_state_at_receipt(root, candidate)
+            except PaperReadChanged as error:
+                last_error = error
+                continue
+            roster = state.get("enabled_markets")
+            if roster is not None and roster != markets:
+                raise PaperReadChanged("paper history state owner or roster differs from its commit")
+            return state.get("product") or "tw_day_trade", None if roster is None else tuple(roster)
+        raise last_error or PaperReadChanged("paper history state capture failed")
 
     before = generations()
     if not acknowledged(before, receipt):
         raise PaperReadChanged("history journals are ahead of their commit marker")
-    scope = state_scope(require_committed=True)
+    scope = state_scope(receipt, before)
     yield {"product": scope[0], "enabled_markets": None if scope[1] is None else list(scope[1])}
     after = load_service_sync(root)
-    if (not isinstance(after, Mapping) or after.get("engine_run_id") != run
-            or after.get("enabled_markets") != markets or state_scope() != scope
-            or generations() != before or not acknowledged(before, after)):
+    if generations() != before:
+        raise PaperReadChanged("paper history inputs changed during view construction")
+    if state_scope(after, before) != scope or generations() != before:
         raise PaperReadChanged("paper history inputs changed during view construction")
 
 

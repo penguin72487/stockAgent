@@ -95,7 +95,7 @@ function captureApiNetworkEvent(message, requests, origin, maximum = 4096) {
     const prior = requests.get(params.requestId);
     const query = new URLSearchParams();
     for (const [key, value] of address.searchParams) {
-      if (["date", "start_date", "end_date", "mode", "symbol", "status", "hide_zero_targets",
+      if (["date", "start_date", "end_date", "mode", "symbol", "status", "hide_zero_targets", "revision_scope",
         "offset", "limit", "range", "resolution", "encoding"].includes(key)) query.append(key, value);
     }
     requests.set(params.requestId, {requestId:params.requestId, path:address.pathname + (query.size ? `?${query}` : ""),

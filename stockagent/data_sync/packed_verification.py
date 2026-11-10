@@ -503,7 +503,7 @@ def verify_pack_jobs(sync_root, resolved, entries, options, *, native, progress=
                                        for node in set(lanes)}, 'acceptance': False})
 
     def execute(item, rows, lane):
-        path = sync_root/item['relpath']
+        path = packed._read_object_path(sync_root, item['relpath'])
         info = path.lstat()
         before = (packed._source_stat(info), info.st_nlink)
         begin = time.monotonic()

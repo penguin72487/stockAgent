@@ -131,6 +131,50 @@ def test_scheduler_refreshes_after_each_completed_variant_and_before_next_worker
     assert events == ['plots']  # Refresh skipped completed results once, without retraining.
 
 
+@pytest.mark.parametrize('persistent', [False, True])
+def test_chart_failures_continue_workers_and_remain_visible(tmp_path, monkeypatch, persistent):
+    import subprocess
+
+    spec = _absolute_scheduler_spec(tmp_path)
+    payload = yaml.safe_load(spec.read_text())
+    payload['continue_on_plot_failure'] = True
+    spec.write_text(yaml.safe_dump(payload))
+    output = tmp_path / 'output'
+    events = []
+
+    class CompleteWorker:
+        def __init__(self, command, **kwargs):
+            self.name = Path(command[command.index('-c') + 1]).stem
+            self.pid = 99900
+            self.returncode = None
+            events.append(self.name)
+
+        def poll(self):
+            marker = output / self.name / 'fold_01/fold_complete.json'
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_text('{}')
+            self.returncode = 0
+            return 0
+
+    def render(*args, **kwargs):
+        events.append('plot')
+        if persistent or events.count('plot') == 1:
+            raise subprocess.CalledProcessError(1, ['plotter'])
+
+    monkeypatch.setattr(ablation_module.subprocess, 'Popen', CompleteWorker)
+    monkeypatch.setattr(ablation_module, '_render_postprocess_plots', render)
+    monkeypatch.setattr(ablation_module.sys, 'argv', ['ablation', '--spec', str(spec),
+        '--output-root', str(output), '--runner', '/bin/true', '--max-folds', '1'])
+    if persistent:
+        with pytest.raises(SystemExit) as failure:
+            ablation_module.main()
+        assert failure.value.code == 1
+    else:
+        ablation_module.main()
+    assert 'learning_rate__first' in events and 'learning_rate__second' in events
+    assert (output / 'plot_refresh_failures.jsonl').is_file()
+
+
 def test_scheduler_retains_actual_launch_error_for_each_failed_case(tmp_path, monkeypatch, capsys):
     spec = _absolute_scheduler_spec(tmp_path)
     output = tmp_path / 'output'

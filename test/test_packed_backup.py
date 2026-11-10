@@ -530,6 +530,31 @@ def test_regular_member_signature_keeps_cas_entrypoint_strict(tmp_path):
         reader.recheck()
 
 
+def test_directory_name_enumeration_uses_pins_without_leaf_type_probes(tmp_path, monkeypatch):
+    shard = tmp_path / 'objects/blobs/aa'
+    shard.mkdir(parents=True)
+    (shard / ('a' * 64 + '.blob')).write_bytes(b'exact original')
+    with PinnedObjectSignatures(tmp_path) as reader:
+        # Opening/fstatting directories remains required; enumeration never
+        # asks a leaf's type. The catalog later observes every selected leaf.
+        monkeypatch.setattr(os, 'scandir', lambda *_: pytest.fail('no per-leaf type walk'))
+        assert reader.directory_names('objects/blobs/aa') == ['a' * 64 + '.blob']
+        moved = tmp_path / 'old-shard'
+        shard.rename(moved)
+        shard.mkdir()
+        with pytest.raises(SnapshotError, match='directory changed'):
+            reader.recheck()
+
+
+def test_directory_name_enumeration_does_not_follow_an_unopened_alias(tmp_path):
+    outside = tmp_path / 'outside'
+    outside.mkdir()
+    (tmp_path / 'redirect').symlink_to(outside, target_is_directory=True)
+    with PinnedObjectSignatures(tmp_path) as reader:
+        with pytest.raises((OSError, SnapshotError)):
+            reader.directory_names('redirect')
+
+
 def test_parallel_member_signatures_overlap_and_keep_recheck_fences(tmp_path, monkeypatch):
     for name in ('first', 'second'):
         (tmp_path / name).write_bytes(name.encode())

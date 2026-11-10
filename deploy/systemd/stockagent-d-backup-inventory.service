@@ -1,0 +1,12 @@
+[Unit]
+Description=Read-only classification of existing D backup catalog
+After=local-fs.target stockagent-service-layout.service
+Wants=stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh && run_fintech_python scripts/observe_d_backup_inventory.py'
+Nice=19
+IOSchedulingClass=idle
+TimeoutStartSec=1800

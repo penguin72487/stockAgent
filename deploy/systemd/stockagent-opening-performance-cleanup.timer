@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume reviewed opening performance test cleanup
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=stockagent-opening-performance-cleanup.service
+
+[Install]
+WantedBy=timers.target

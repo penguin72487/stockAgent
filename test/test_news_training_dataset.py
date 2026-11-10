@@ -108,6 +108,21 @@ def source_fixture(tmp_path):
     return root
 
 
+def test_news_builder_never_enters_after_its_lock_path_is_replaced(tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_source_handoff
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    source, output = source_fixture(tmp_path), tmp_path/'dataset'
+    def reject_stale(root, handle, *, lock_name):
+        assert root == output and lock_name == '.build.lock' and not handle.closed
+        raise SnapshotError('source lock inode changed during handoff')
+    monkeypatch.setattr(workspace_source_handoff, 'guard_locked_path', reject_stale)
+    monkeypatch.setattr(corpus, 'freeze_inputs', lambda *_a, **_k: pytest.fail('must not snapshot'))
+    with pytest.raises(SnapshotError, match='lock inode changed'):
+        corpus.build_news_dataset(source, output)
+    assert not (output/'manifest.json').exists()
+    assert not (output/'versions').exists()
+
+
 @pytest.mark.parametrize("state,free", [
     ("available", corpus.MIN_FREE_BYTES - 1),
     ("unavailable", None),

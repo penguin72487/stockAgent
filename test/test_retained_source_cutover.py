@@ -195,6 +195,10 @@ def test_handoff_holds_all_original_owners_and_loads_the_reviewed_future_catalog
         return {name: {'status': 'RUNNING', 'first_run_id': name, 'run_id': name}
                 for name in (*rollout.IDS, *rollout.OPTIONAL_IDS)}
     monkeypatch.setattr(rollout, 'workflows', workflows)
+    async def started_activities(_):
+        events.append('activities_checked')
+        return []
+    monkeypatch.setattr(rollout, 'started_activities', started_activities)
     def run(command, **options):
         assert command[:2] in (['systemctl', 'stop'], ['systemctl', 'start'])
         events.append(command[1])
@@ -225,6 +229,7 @@ def test_handoff_holds_all_original_owners_and_loads_the_reviewed_future_catalog
     monkeypatch.setattr(rollout, 'commit_retained_cutover', commit)
     rollout.main(['--output', str(output), '--reload-code-only', '--retained-source-candidate', str(candidate),
                   *(['--restart-active-owner'] if active_restart else [])])
+    assert ('activities_checked' in events) is (not active_restart)
     receipt = json.loads(output.read_bytes())
     assert receipt['state'] == 'accepted' and receipt['authorized_active_owner_restart'] == active_restart
     assert receipt['source_cutover']['raw_files_verified'] == 1
@@ -233,4 +238,4 @@ def test_handoff_holds_all_original_owners_and_loads_the_reviewed_future_catalog
     assert receipt['postgres_and_temporal_server_not_restarted'] and receipt['workflow_chains_preserved']
     assert all((source / name).read_bytes() == raw for name, raw in before.items())
     assert private.read_bytes() == b'{"original_private_policy":true}'
-    assert events == ['stop', 'start', 'start']  # The final idempotent start also protects failures.
+    assert events == (([] if active_restart else ['activities_checked']) + ['stop', 'start', 'start'])

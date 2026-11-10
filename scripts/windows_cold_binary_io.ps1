@@ -11,9 +11,11 @@ $completedStageRead = $config.mode -eq 'read' -and (
     $path.StartsWith('D:\stockagent-legacy-archive-stage\', [StringComparison]::OrdinalIgnoreCase))
 $retiredEncodingHash = $config.mode -eq 'hash' -and
     $path.StartsWith('D:\stockagent-legacy-archive-stage\', [StringComparison]::OrdinalIgnoreCase)
+$immutableLakeHash = $config.mode -eq 'hash' -and
+    $path.StartsWith('D:\stockagent-immutable-lake\', [StringComparison]::OrdinalIgnoreCase)
 if ((!$path.StartsWith('D:\stockagent-cold-primary\', [StringComparison]::OrdinalIgnoreCase) -and
      !$path.StartsWith('D:\stockagent-backup-ingress-lab203\', [StringComparison]::OrdinalIgnoreCase) -and
-     (!$completedStageRead -and !$retiredEncodingHash)) -or $path -ne [string]$config.path) {
+     (!$completedStageRead -and !$retiredEncodingHash -and !$immutableLakeHash)) -or $path -ne [string]$config.path) {
     throw 'Fixed D cold namespace required'
 }
 $stream = $null

@@ -285,7 +285,11 @@ def export_delivery(plan: dict, destination: Path) -> dict:
                     else "control/" + row["relative"])
         target = safe_path(destination, relative)
         target.parent.mkdir(parents=True, exist_ok=True)
-        original = _regular(Path(row["path"]))
+        if row['role'] == 'packed_object':
+            from stockagent.data_sync.packed_snapshots import _read_object_path
+            original = _regular(_read_object_path(source, row['relative']))
+        else:
+            original = _regular(Path(row['path']))
         with original.open("rb") as reader, target.open("xb") as writer:
             for chunk in iter(lambda: reader.read(4 * 1024**2), b""):
                 writer.write(chunk)
@@ -403,6 +407,8 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
                                 catalog_identity: str, read_root: Path | None = None,
                                 copy_workers: int = 1, verify_workers: int = 1,
                                 namespace: str = 'cold', native_windows_io: bool = False,
+                                native_source_read: bool = False,
+                                include_destination_signatures: bool = False,
                                 source_authority_guard: Callable[[], None] | None = None,
                                 native_reserve_bytes: int | None = None) -> dict:
     """Export bounded, deduplicated canonical objects or fixed metadata.
@@ -410,11 +416,14 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
     A wave deliberately need not contain a whole release. Its envelope proves
     its exact file bytes; reconstruction is tested on the union of NAS restores.
     Live downloader workspaces, credentials and node-local files are excluded.
+    ``native_source_read`` independently accelerates D reads while retaining a
+    portable destination verifier, including for an E-backed Linux workspace.
     """
     from scripts.verify_backup_delivery import CONTRACT, verify
     if any(type(n) is not int or not 1 <= n <= 16 for n in (copy_workers, verify_workers)):
         raise SnapshotError("incremental export needs 1 to 16 bounded workers")
-    if namespace not in ('cold', 'private-history') or type(native_windows_io) is not bool:
+    if (namespace not in ('cold', 'private-history') or type(native_windows_io) is not bool
+            or type(native_source_read) is not bool or type(include_destination_signatures) is not bool):
         raise SnapshotError('incremental export needs an explicit cold/private namespace and I/O policy')
     if native_reserve_bytes is not None:
         from stockagent.data_sync.windows_cold_io import _copy_reserve
@@ -453,6 +462,13 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
     destination.mkdir(parents=True, mode=0o700)
     members = []
     with PinnedObjectSignatures(cold) as pinned:
+        def read_source(row):
+            if row['relative'].startswith('objects/'):
+                from stockagent.data_sync.packed_snapshots import _read_object_path
+                physical = _read_object_path(cold, row['relative'])
+                if physical != cold/row['relative']:
+                    return _regular(physical)
+            return _regular(safe_path(reader_root, row['relative']))
         # A WSL reboot may renumber the guarded D: mount. Admit that one
         # historical device-number difference only while retaining every
         # other recorded attribute; pin the current full signature for all
@@ -486,12 +502,13 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
 
         def copy_member(row):
             unchanged(row)
-            source = None if "captured_bytes_utf8" in row else _regular(safe_path(reader_root, row["relative"]))
+            source = None if "captured_bytes_utf8" in row else read_source(row)
             relative = namespace + '/' + row["relative"]
             target = safe_path(destination, relative)
             copy_verified_bytes(source, target, expected_sha256=row["sha256"], expected_bytes=row["bytes"],
                                 payload=row["captured_bytes_utf8"].encode("utf-8") if source is None else None,
-                                **({'native_windows_io': True} if native_windows_io else {}), **reserve_options)
+                                **({'native_windows_io': True} if native_windows_io or native_source_read else {}),
+                                **reserve_options)
             unchanged(row)
             return {"relative": relative, "sha256": row["sha256"], "bytes": row["bytes"]}
 
@@ -499,7 +516,7 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
         if native_windows_io:
             group, group_bytes = [], 0
             for row in rows:
-                if 'captured_bytes_utf8' not in row:
+                if 'captured_bytes_utf8' not in row and read_source(row).is_relative_to(reader_root):
                     if group and (len(group) == 16 or group_bytes + row['bytes'] > 16 * 1024**3):
                         copy_groups.append(group)
                         group, group_bytes = [], 0
@@ -518,7 +535,7 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
             # source signatures and the independent destination verifier below.
             for row in group:
                 unchanged(row)
-            copy_verified_many([(_regular(safe_path(reader_root, row['relative'])),
+            copy_verified_many([(read_source(row),
                                  safe_path(destination, namespace + '/' + row['relative']),
                                  row['sha256'], row['bytes']) for row in group], native_windows_io=True, **reserve_options)
             for row in group:
@@ -545,7 +562,8 @@ def export_incremental_delivery(cold_root: Path, rows: list[dict], destination: 
         envelope = {**body, "identity_sha256": identity_sha256(body)}
         private_json(destination / "backup-envelope.json", envelope)
         transport = verify(destination, envelope["identity_sha256"], require_ready=False, workers=verify_workers,
-                           **({'native_windows_io': True} if native_windows_io else {}))
+                           **({'native_windows_io': True} if native_windows_io else {}),
+                           **({'include_file_signatures': True} if include_destination_signatures else {}))
         for row in rows:
             unchanged(row)
         pinned.recheck()

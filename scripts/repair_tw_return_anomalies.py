@@ -1162,6 +1162,12 @@ def main() -> None:
     parser.add_argument("--progress-interval", type=int, default=25)
     parser.add_argument("--apply", action="store_true", help="Mutate parquet files. Without this flag only writes audit ledgers.")
     args = parser.parse_args()
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(args.data_root, args.output_dir, args.backup_dir):
+        _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args: argparse.Namespace) -> None:
     if args.apply_ledger is not None:
         methods = {part.strip() for part in str(args.ledger_methods).split(",") if part.strip()}
         apply_ledger(

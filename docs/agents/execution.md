@@ -27,6 +27,16 @@ Guidelines:
   `minute_vwap` or `minute_close`, and never relabel either as live execution,
   an exchange fill, queue acknowledgement, or guaranteed real fill.
 
+- User-selected exception, 2026-11-09: an explicitly isolated and provisional
+  completed-session research replay may use the pinned official daily open as
+  an assumed 09:01 paper entry when the minute price or volume is unavailable.
+  The first-trade time and full paper quantity remain unverified, and are
+  disclosed per entry and in the public display. Keep real zero-volume/no-print
+  evidence, eligibility, price bands, strict TP/SL guard, lot and NAV checks;
+  prefer an observed positive-volume 09:01 price. This does not change the live
+  execution policy, manufacture a historical quote, or authorize publication
+  or promotion without the existing independent accounting and cutover gates.
+
 - The active dual-RTX-5090 `tw_minute` long/short contract copies the ordinary
   TW day-trade trading rules and changes only decision frequency: L1 gross
   exposure `1.0` directly from raw signed scores (no de-meaning),
@@ -77,6 +87,21 @@ Guidelines:
   replace that independent contract or turn a late 09:01 replay into live fills.
   See [the candidate and acceptance evidence](../tw_opening_latency_stages_2026-10-14.md#逐版訊號與已成交庫存再平衡候選2026-10-24).
 
+- Training versus live implementation (user clarification, 2026-11-04): the
+  selected checkpoint was trained under its daily, once-per-session decision
+  contract. Use that **same model, checkpoint, feature semantics and economic
+  rules** in the paper service; do not replace it with a separately trained
+  intraday model. The user selected progressive revisions as a practical
+  execution adaptation because genuine opening references arrive at different
+  times: rerun that same model when its admissible opening input improves and
+  reconcile already-filled paper positions to the resulting target. This is
+  an inference/execution policy change, not a claim that training used multiple
+  intraday decisions. Retain input provenance, model/config fingerprints,
+  publication and execution clocks, every revision and actual prior fills.
+  The progressive paper trajectory and the original once-daily research
+  backtest can differ in prices, turnover, costs and return and must be reported
+  separately. Earlier missing revisions must never be invented or backdated.
+
 - A source-pinned completed-minute replay must not be rejected for lacking a
   live Shioaji L1 `book_exchange_at`. Keep the live causal predicate unchanged;
   admit historical entry/exit quotes only within the explicit replay contract,
@@ -109,6 +134,29 @@ Guidelines:
   journals and unrelated modes unchanged. See the 10/29 report's scoped replay
   acceptance for the actual source gaps and deployment boundary.
 
+- For the 2026-11-04 missing-session repair only, the user explicitly approved
+  publishing a **provisional, possibly incomplete** source-backed replay.
+  Unknown minute gaps do not prove zero trading and cannot create a fill; a
+  prior observed price may be carried for valuation only, with the carried
+  minutes and provisional state exposed and independently auditable. Every
+  fill, including a terminal settlement, needs a positive-volume observation
+  at its claimed minute; the daily close alone does not establish a 13:30
+  print. The 13:33 source-labelled event keeps its own clock and is paper only.
+  Keep the strict source gate as the default for all other repairs. Reconcile
+  against an independent source when available, preserve the original journals,
+  and report `verified_with_data_gaps` rather than verified complete.
+
+- For the 2026-10-30 repair only, the user additionally approved provisional
+  Factorized, Multi-Basis and Unit MGDA replays with explicitly disclosed
+  unknown held minutes. Missing observations are not zero-volume evidence and
+  cannot create trades. For Unit MGDA 2235 only, the user approved a non-execution book
+  settlement using the pinned last observed trade at 11:37:57.688508 and
+  NT$30.6, subject to source, accounting and remaining replay acceptance.
+  Preserve that observation's actual time; label the 13:30 bookkeeping event
+  as an assumption, not a simulated, exchange or broker fill, and retain any
+  actual partial exits. No other date, mode or symbol receives this settlement
+  exception. Preserve the original ledger and mark affected results provisional.
+
 - Every day-trade ledger replay/backfill must rebuild and validate one-minute
   curves before promotion. Each completed session and active paper mode must
   contain exactly 270 right-labelled points from 09:01 through 13:30; a daily
@@ -124,6 +172,53 @@ Guidelines:
   never use linear interpolation. The dashboard's full-minute mode must retain
   every available minute, including multi-month selections, and rebase each
   series at its first selected valid mark without modifying absolute equity.
+
+- `proven_recorded_paper_cash_session_valuation_v1` recovers **valuations only**
+  for a wholly absent, completed interior paper session. The complete retained
+  fill book must prove zero inventory and unchanged cash, the adjacent accepted
+  close/open must reconcile, and no order, fill or account event may fall in
+  the gap by either declared session or original local clock. Corporate,
+  financing and research adjustments are not inferred. Preserve original
+  journals and a hashed marks before-image; independently recompute the proof
+  before canonical additive promotion. The 270 constant cash valuations are
+  not interpolated market prices, proof of market zero volume, recreated
+  signals or successful execution. Keep the real reconstruction time separate
+  from the historical valuation coordinate. A separately accepted new mode's
+  minute values must remain exact during retained-account revaluation; never
+  apply another mode's fee or research-cost ABI to it. Evidence and limitations
+  are in the [200 萬 candidate report](../tw_day_trade_unit_mgda_2m_candidate_2026-11-04.md).
+
+- User-selected successor valuation-only exception, 2026-11-10: for explicitly
+  enumerated retained-mode 09:01 gaps in the 2026/01/02–11/09 additive candidate,
+  use a valid 09:01 completed bar first; otherwise the earliest positive-volume
+  completed bar available in the verified same-day sources. Keep the bar's real
+  right-labelled timestamp, source receipt and SHA. If later than 09:01, this is
+  an explicitly retrospective opening valuation assumption containing later
+  information, not a price known/executable at 09:01 or a new/backdated fill.
+  Preserve original executions, endpoint record clocks, ordinary fees, accepted
+  13:30 balances and later-minute causal valuation. No observed same-day bar or
+  conflicting earliest-source prices still fail closed. Bind
+  `user_authorized_missing_0901_later_first_bar_valuation_v1` and explicit
+  `--provisional-opening-first-bar-valuation MARKET:DATE:SYMBOL` targets through
+  plan, isolated curve recovery and independent native-source readback; disclose
+  actual source clocks and the noncausal assumption on the public dashboard.
+  This supersedes cost references for the current selected repair, without
+  altering live execution or the separate new-mode historical-entry contract.
+
+- Earlier valuation-only exception, 2026-11-10: retained
+  `tw_day_trade_100m`, session 2026-11-02, symbols 4767/5251/8488 may use their
+  immutable remaining entry cost for the existing 09:01 valuation bucket.
+  This is not a missing market observation, executable quote, new fill or
+  authority to backdate a later entry. Preserve the accepted endpoint's actual
+  record clock, original execution journals and normal net-liquidation fees.
+  Admit only explicit `--provisional-opening-cost-valuation MARKET:DATE:SYMBOL`
+  targets in isolated canonical additive curve recovery; independently
+  recompute their cohort shares/cost/clock from retained fills. Missing prices
+  elsewhere still fail closed. Disclose the cost assumption and source gap in
+  both the minute receipt and public warnings; do not label the opening prices
+  fully sourced or reuse this acceptance as a complete-price proof. This does
+  not extend the separate new-mode replay entry exception or change any live
+  execution policy.
 
 - TW day-trade discipline (user correction, 2026-09-10): same-day liquidation
   is mandatory whenever executable evidence permits it. The staged live

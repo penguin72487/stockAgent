@@ -607,6 +607,10 @@ for (const [name, suffix] of pages) {
             else if(performance.now()-started>30000) resolve({
               error:'full history render deadline', requests,
               recentRenders:StockAgentDashboard.performanceHistorySnapshot().filter(row=>row.observedAt>=startedAt&&row.kind==='render'),
+              diagnostic:{hidden:document.hidden,startDate:startInput.value,endDate:endInput.value,
+                refreshInFlight,refreshQueued,historyInFlight,historyLoadError,
+                historyRequestScopeInFlight,chartHistoryKey,requestedChartKey:chartRequestKey(),
+                appliedStatusRevision,latestServiceNotice},
             });
             else setTimeout(check,25);
           }; check();

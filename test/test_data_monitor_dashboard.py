@@ -34,6 +34,38 @@ def test_stock_stream_window_uses_official_closure_not_weekday(tmp_path: Path) -
     assert window["starts_at_utc"] == "2026-09-29T00:45:00Z"
 
 
+def test_tej_catalog_remains_listed_when_detailed_metadata_times_out(tmp_path, monkeypatch):
+    import sqlite3
+    from stockagent.live import tej_dashboard
+
+    root = tmp_path / 'data_tej'
+    root.mkdir()
+    with sqlite3.connect(root / 'queue.sqlite3') as con:
+        con.execute('CREATE TABLE tables (table_id TEXT, smart_id TEXT, name TEXT, category TEXT, phase TEXT, frequency TEXT)')
+        con.executemany('INSERT INTO tables VALUES (?,?,?,?,?,?)', [
+            ('a', 'Derivatives', 'Options', 'options', 'P1', 'daily'),
+            ('b', 'Stocks', 'Financials', 'financials', 'P2', 'quarterly'),
+        ])
+    monkeypatch.setattr(tej_dashboard, 'build_tej_public_status',
+                        lambda *_args, **_kwargs: {'state': 'metadata_unavailable', 'tables': []})
+    rows = dashboard._tej_sources(tmp_path, now=datetime.now(UTC))
+    assert {r['id'] for r in rows} == {'tej:a', 'tej:b'}
+    assert all(r['status'] == 'degraded' and r['rows'] is None and r['coverage'] is None for r in rows)
+    assert all(r['record_stats']['state'] == 'metadata_unavailable' and
+               r['eta']['estimated_complete_at_utc'] is None for r in rows)
+    assert next(r for r in rows if r['id'] == 'tej:a')['market_category'] == 'taiwan_derivatives'
+
+
+def test_tej_catalog_fallback_does_not_invent_rows_if_catalog_is_unreadable(tmp_path, monkeypatch):
+    import sqlite3
+    from stockagent.live import tej_dashboard
+
+    monkeypatch.setattr(tej_dashboard, 'build_tej_public_status',
+                        lambda *_args, **_kwargs: {'state': 'metadata_unavailable', 'tables': []})
+    monkeypatch.setattr(tej_dashboard, '_read', lambda *_args: (_ for _ in ()).throw(sqlite3.OperationalError('busy')))
+    assert dashboard._tej_sources(tmp_path, now=datetime.now(UTC)) == []
+
+
 def test_stock_stream_window_unknown_calendar_does_not_invent_next_open(tmp_path: Path) -> None:
     window = dashboard._stock_stream_window(
         datetime(2026, 9, 29, 1, tzinfo=UTC), parquet_root=tmp_path,
@@ -754,7 +786,7 @@ def test_data_monitor_page_is_local_read_only_and_exposes_progress() -> None:
     html = (root / "index.html").read_text(encoding="utf-8")
     javascript = (root / "app.js").read_text(encoding="utf-8")
     assert "dashboard-core.css?v=6" in html
-    assert 'src="../dashboard-core.js?v=15"' in html
+    assert 'src="../dashboard-core.js?v=20"' in html
     assert 'role="status" aria-live="polite"' in html
     assert 'class="table-scroll" tabindex="0" role="region"' in html
     assert "DETAIL_LINKS.has" in javascript

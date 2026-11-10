@@ -26,6 +26,7 @@ _MODE_FIELDS = (
     "signal_counts", "entry_requested_shares", "entry_filled_shares", "entry_unfilled_shares",
     "pending_entry_shares", "open_position_count", "stale_position_count", "initial_capital_twd",
     "total_equity_twd", "cumulative_realized_net_pnl_twd", "open_net_liquidation_pnl_twd",
+    "cumulative_nontrade_settlement_net_pnl_twd", "nontrade_settlement_count", "nontrade_settlement_shares",
     "execution_evidence_complete", "unresolved_exit_count", "force_exit_failures",
 )
 

@@ -14,6 +14,7 @@ import shutil
 import sqlite3
 import stat
 import tempfile
+import time
 import uuid
 from contextlib import closing
 from collections.abc import Callable, Iterable, Iterator
@@ -23,6 +24,33 @@ from typing import Any, Generic, TypeVar
 T = TypeVar("T")
 DEFAULT_METADATA_MEMORY_ROWS = 32768
 METADATA_SCRATCH_ROOT = Path('/var/tmp')
+
+
+def _metadata_scratch_location() -> tuple[Path, int, bool]:
+    """Use enrolled E for future spills; never fall back after enrollment.
+
+    Other nodes without an E enrollment keep their existing local scratch.
+    This selects only a new disposable index, never relocates a live one.
+    """
+    from stockagent.data_sync import workspace_volume
+    enrollment = workspace_volume.ENROLLMENT
+    if enrollment.exists() or enrollment.is_symlink():
+        config = workspace_volume.configuration()
+        workspace_volume.admit(0, c=config)
+        return (workspace_volume.path('verify', create=True),
+                config['minimum_free_bytes'], True)
+    return METADATA_SCRATCH_ROOT, 256 * 1024**2, False
+
+
+def _canonical_scratch_parent(parent: Path) -> bool:
+    # Old C indexes retain their exact retirement contract. An E index must
+    # still be on the enrolled volume, but deletion must not demand free space.
+    if parent == METADATA_SCRATCH_ROOT:
+        return True
+    from stockagent.data_sync import workspace_volume
+    enrollment = workspace_volume.ENROLLMENT
+    return ((enrollment.exists() or enrollment.is_symlink())
+            and parent == workspace_volume.path('verify'))
 
 
 def _scratch_document(path: Path) -> tuple[dict, str]:
@@ -56,7 +84,7 @@ def plan_failed_metadata_scratch(scratch: Path, failed_attempt: Path | None = No
     if not empty_index and failed_attempt is None:
         raise ValueError('a superseded failure or explicit empty-index proof is required')
     scratch = scratch.absolute()
-    if (scratch.parent != METADATA_SCRATCH_ROOT or scratch.resolve(strict=True) != scratch
+    if (not _canonical_scratch_parent(scratch.parent) or scratch.resolve(strict=True) != scratch
             or re.fullmatch(r'stockagent-packed-metadata-[a-z0-9_]{8}', scratch.name) is None):
         raise ValueError('not an explicit canonical metadata scratch directory')
     before = scratch.lstat()
@@ -98,6 +126,8 @@ def plan_failed_metadata_scratch(scratch: Path, failed_attempt: Path | None = No
         expected_table = ('CREATE TABLE entries (path BLOB PRIMARY KEY, kind TEXT NOT NULL, '
                           'size INTEGER NOT NULL, object_sha TEXT, bucket INTEGER, data TEXT NOT NULL) WITHOUT ROWID')
         expected = {('table', 'entries', 'entries', expected_table),
+                    ('table', 'portable_walk', 'portable_walk',
+                     'CREATE TABLE portable_walk (sort_key BLOB PRIMARY KEY, path BLOB NOT NULL) WITHOUT ROWID'),
                     ('index', 'changed_entries', 'entries',
                      'CREATE INDEX changed_entries ON entries(bucket,path) WHERE bucket IS NOT NULL'),
                     ('index', 'object_entries', 'entries',
@@ -198,6 +228,10 @@ class MetadataRows(Generic[T]):
         self._objects: dict[str, list[T]] | None = None
         self._db: sqlite3.Connection | None = None
         self._scratch: tempfile.TemporaryDirectory | None = None
+        self._scratch_root = METADATA_SCRATCH_ROOT
+        self._scratch_reserve = 256 * 1024**2
+        self._workspace_scratch = False
+        self._next_physical_check = 0.0
         self._count = 0
         self._work_index = self._object_index = False
         self._cursors: set[sqlite3.Cursor] = set()
@@ -245,10 +279,12 @@ class MetadataRows(Generic[T]):
     def _spill(self):
         # mkdtemp creates mode 0700. Only reconstructible metadata lives here;
         # no source file or authoritative cold object is copied or removed.
-        # /tmp is tmpfs on penguin: spilling there merely moves the RAM
-        # pressure into shmem/swap. /var/tmp is the observed local ext4 SSD.
+        # /tmp is tmpfs on penguin. E is the enrolled native SSD workspace;
+        # retain /var/tmp only on nodes without this enrollment.
+        self._scratch_root, self._scratch_reserve, self._workspace_scratch = _metadata_scratch_location()
+        self._next_physical_check = time.monotonic() + 60
         self._check_space()
-        self._scratch = tempfile.TemporaryDirectory(prefix="stockagent-packed-metadata-", dir="/var/tmp")
+        self._scratch = tempfile.TemporaryDirectory(prefix="stockagent-packed-metadata-", dir=self._scratch_root)
         self._db = sqlite3.connect(str(Path(self._scratch.name) / "index.sqlite"))
         self._db.execute("PRAGMA journal_mode=OFF")
         self._db.execute("PRAGMA synchronous=OFF")
@@ -262,10 +298,15 @@ class MetadataRows(Generic[T]):
         self._rows.clear()
         self._positions = None
 
-    @staticmethod
-    def _check_space():
-        if shutil.disk_usage("/var/tmp").free < 256 * 1024**2:
-            raise OSError("packed metadata scratch is below its 256 MiB reserve")
+    def _check_space(self):
+        # A local statvfs check per 8192 rows is cheap. Recheck native backing
+        # and enrollment at most once per minute, not once per database row.
+        if self._workspace_scratch and time.monotonic() >= self._next_physical_check:
+            from stockagent.data_sync.workspace_volume import admit
+            admit(0)
+            self._next_physical_check = time.monotonic() + 60
+        if shutil.disk_usage(self._scratch_root).free < self._scratch_reserve:
+            raise OSError("packed metadata scratch is below its free-space reserve")
 
     def append(self, value: T):
         if (self._db is None and self._memory_guard is not None
@@ -313,6 +354,18 @@ class MetadataRows(Generic[T]):
                 self._db.execute("UPDATE entries SET kind=?,size=?,object_sha=?,data=? WHERE path=?",
                                  (kind, size, digest, payload, path))
         self._groups = self._objects = None
+
+    def lookup(self, path: str) -> T | None:
+        """Non-consuming indexed lookup for reusable immutable content hints."""
+        if self._hints is not None:
+            raise ValueError('non-consuming lookup must precede hint consumption')
+        if self._db is not None:
+            found = self._db.execute('SELECT data FROM entries WHERE path=?', (self._key(path),)).fetchone()
+            return self._decode(json.loads(found[0])) if found else None
+        if self._positions is None:
+            self._positions = {self._encode(row)['path']: index for index, row in enumerate(self._rows)}
+        position = self._positions.get(path)
+        return self._rows[position] if position is not None else None
 
     def extend(self, values: Iterable[T]):
         values = iter(values)
@@ -385,6 +438,70 @@ class MetadataRows(Generic[T]):
                 if cursor in self._cursors:
                     self._cursors.remove(cursor)
                     cursor.close()
+
+    def in_portable_walk_order(self) -> Iterator[T]:
+        """Order a link-free tree as os.walk without holding it in Python RAM.
+
+        The SQLite sorter spills to the enrolled metadata workspace.  Paths
+        are BLOB keys so unusual Linux names keep Python's string ordering.
+        This is a disposable ordering, not a new authoritative index.
+        """
+        def walk_key(row):
+            path = row['path']
+            kind = row['kind']
+            if kind not in ('file', 'directory'):
+                raise ValueError('portable virtual union does not support symlinks')
+            parts = path.split('/')
+            encode = lambda part: part.encode('utf-8', errors='surrogatepass') + b'\0'
+            return b''.join(b'\2' + encode(part) for part in parts[:-1]) + (
+                b'\0' if kind == 'directory' else b'\1') + encode(parts[-1])
+
+        if self._db is None:
+            yield from sorted(self._rows, key=lambda value: walk_key(self._encode(value)))
+        else:
+            # Keep the sort index inside the already admitted E workspace
+            # database. SQLite's generic ORDER BY sorter may otherwise put
+            # its temporary file on the small WSL/C filesystem.
+            self._db.execute('CREATE TABLE portable_walk (sort_key BLOB PRIMARY KEY, '
+                             'path BLOB NOT NULL) WITHOUT ROWID')
+            try:
+                def records():
+                    with closing(self._db.execute('SELECT path,data FROM entries ORDER BY path')) as read:
+                        for index, (path, payload) in enumerate(read, 1):
+                            if index % 8192 == 0:
+                                self._check_space()
+                            yield walk_key(json.loads(payload)), path
+                self._db.executemany('INSERT INTO portable_walk VALUES (?,?)', records())
+                cursor = self._db.execute('SELECT e.data FROM portable_walk AS w '
+                    'CROSS JOIN entries AS e ON e.path=w.path ORDER BY w.sort_key')
+                self._cursors.add(cursor)
+                try:
+                    for payload, in cursor:
+                        yield self._decode(json.loads(payload))
+                finally:
+                    if cursor in self._cursors:
+                        self._cursors.remove(cursor)
+                        cursor.close()
+            finally:
+                self._db.execute('DROP TABLE portable_walk')
+
+    def require_directory_parents(self):
+        """Reject a logical path whose parent was replaced or omitted."""
+        if self._db is None:
+            kinds = {self._encode(value)['path']: self._encode(value)['kind'] for value in self._rows}
+            for path in kinds:
+                parent = path.rpartition('/')[0]
+                if parent and kinds.get(parent) != 'directory':
+                    raise ValueError(f'logical inventory parent is not a directory: {parent}')
+            return
+        self._db.create_function('stockagent_parent', 1,
+            lambda path: bytes(path).rpartition(b'/')[0], deterministic=True)
+        row = self._db.execute("SELECT e.path FROM entries AS e LEFT JOIN entries AS p "
+            "ON p.path=stockagent_parent(e.path) WHERE stockagent_parent(e.path) != X'' "
+            "AND (p.path IS NULL OR p.kind != 'directory') LIMIT 1").fetchone()
+        if row is not None:
+            raise ValueError('logical inventory parent is not a directory: '
+                             + bytes(row[0]).decode('utf-8', errors='surrogatepass'))
 
     def update(self, value: T, *, changed_bucket: int | None = None):
         if self._db is None:

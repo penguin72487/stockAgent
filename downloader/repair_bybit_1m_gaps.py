@@ -304,6 +304,12 @@ def _repair_symbol(
 
 def main() -> None:
     args = parse_args()
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard
+    with writer_guard(args.input_dir):
+        _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args) -> None:
     started = datetime.now(timezone.utc)
     input_dir = Path(args.input_dir)
     input_dir.mkdir(parents=True, exist_ok=True)

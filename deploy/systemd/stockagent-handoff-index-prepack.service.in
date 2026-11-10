@@ -1,0 +1,14 @@
+[Unit]
+Description=Prepare one additional fixed C generation while the archive owner is busy
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 120 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_authority_storage_operation.sh scripts/run_handoff_index_prepack_queue.py
+TimeoutStartSec=infinity
+Nice=12
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

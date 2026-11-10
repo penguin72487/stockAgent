@@ -39,7 +39,14 @@ PREPARED_ROOT = REPO_ROOT / "artifacts/data_preparation"
 # the complete generation budget and other active leases are still counted.
 TRADING_PREPARED_ROOT = PREPARED_ROOT / "tw_factorized_scale_cash_live_v1"
 TRADING_PANEL_ROOT = ARTIFACT_CACHE_ROOT / "tw_factorized_live/base/panel_cache_v2"
-TRADING_PHYSICAL_FLOOR = 20 * 1024**3
+TRADING_PHYSICAL_FLOOR = 4 * 1024**3
+# A bounded official-symbol refresh is needed by every protected stock model,
+# before the much larger Factorized build. It may spend the backup reserve,
+# with a separately measured growth bound and a 4 GiB physical emergency floor.
+TRADING_SYMBOL_ROOT = REPO_ROOT / "service_data/stockagent-live/data_tw_public/stocks"
+TRADING_SYMBOL_SOURCE_ROOT = ARTIFACT_CACHE_ROOT / "tw_official_source_groups"
+TRADING_SYMBOL_MAXIMUM_GROWTH = 1024**3
+TRADING_SYMBOL_PHYSICAL_FLOOR = 4 * 1024**3
 TRADING_PRIORITY_ENV = "STOCKAGENT_TW_DAY_TRADE_PRIORITY_SOURCE"
 # Not /tmp or /var/tmp: PrivateTmp services must see the SAME reservations.
 CONTROL_ROOT = Path("/var/lib") if os.geteuid() == 0 else Path.home() / ".cache"
@@ -254,6 +261,14 @@ def acquisition_dispatch_status(root: Path, *, maximum_growth_bytes: int = 0) ->
               "guard_kind": "dispatch_preflight_not_write_reservation", "data_paths_removed": 0}
     if socket.gethostname() not in policy["nodes"]:
         return {**result, "state": "not_enrolled"}
+    from stockagent.data_sync.provider_workspace import check_path
+    try:
+        placement = check_path(root)
+    except (OSError, ValueError, SnapshotError) as error:
+        return {**result, 'state': 'deferred', 'reason': 'provider_workspace_unavailable',
+                'error_type': type(error).__name__, 'retryable': True}
+    if placement is not None:
+        result['provider_workspace'] = placement
     minimum_free = max(policy["minimum_free_bytes"], load_acquisition_verification_reserve())
     if minimum_free + maximum_growth_bytes >= 2**63:
         raise ValueError("dispatch requirement exceeds bounded byte range")
@@ -381,6 +396,12 @@ def reserve_cache_write(root: Path, *, key: str, maximum_growth_bytes: int | Cal
         if (priority_path is not None and os.environ.get(TRADING_PRIORITY_ENV) == "1"
                 and root == _cache_root(priority_path)):
             physical_floor = min(physical_floor, TRADING_PHYSICAL_FLOOR)
+        if (family == "panel" and os.environ.get(TRADING_PRIORITY_ENV) == "1"
+                and root in {_cache_root(TRADING_SYMBOL_ROOT),
+                             _cache_root(TRADING_SYMBOL_SOURCE_ROOT),
+                             _cache_root(TRADING_SYMBOL_SOURCE_ROOT / "merged")}
+                and maximum_growth_bytes <= TRADING_SYMBOL_MAXIMUM_GROWTH):
+            physical_floor = min(physical_floor, TRADING_SYMBOL_PHYSICAL_FLOOR)
         backing = _admit_backing_volume(existing, maximum_growth_bytes
             + filesystem["other_reserved_growth_bytes"] + filesystem["control_bytes"]
             + physical_floor)

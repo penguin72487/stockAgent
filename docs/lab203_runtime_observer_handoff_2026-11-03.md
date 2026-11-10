@@ -1,5 +1,57 @@
 # lab203 每分鐘運行觀測交接
 
+## 2026-11-04 00:04 台北：v2 原始碼審核與原就緒檢查
+
+Penguin 的原 code-only 交接於 11 月 3 日 23:52:22 驗收，新儲存 worker
+PID 282975，61 個已驗收固定來源及原 workflow chains 保留，PostgreSQL／
+Temporal 與當沖／隔夜未重啟。這不是 lab203 或 NAS 的驗收。
+
+新版 `tools/storage-operations-20261103-v2/` 預定沿原控制包通道交付，包含
+本文件、C/E/D 報告，以及 SQL digest 的四份原始碼／測試；保留原 v1。
+這是六個成員的原始碼審核包，不是完整 runtime 或自動部署程序。封套自身仍須
+由原 verifier 核對 READY、精確清冊、每檔 SHA 與固定 identity；實際 identity
+見來源發布收據及到達的封套，不能把這段預告當成接收或 NAS ACK。
+
+1. 既有 CPU／RAM 回執持續更新，不用重新安裝主機 observer。仍請原 backup
+   owner 回傳真實 start-pre／job／repository／Restic lock 狀態與新的 readiness；
+   目前來源最後接受的正式 readiness 仍為 11 月 2 日 12:49:56。
+   歷史 01:14 鎖診斷不代表現在仍持鎖；原就緒與容量檢查通過後再發新回執。
+2. 回報私有 cold 的逐批獨立讀回與原始範圍；來源仍是
+   718,647,796,617／817,226,447,345 bytes，差 98,578,650,728 bytes。
+   已登錄一般 cold 的覆蓋另計，不能將兩個可能重疊的分母相加。
+3. 若原生 catalog restore 的寬 metadata 排序也是瓶頸，可審核 v2 中的共用
+   `_metadata_rows`／`_registered_table_digest`。來源 `stockagent/control/lakehouse.py`
+   固定 SHA 是 `6ea874613bff3473b18db2e0515772fc6ac73ae18a7f6ccac71a89070de04158`。
+   實際 snapshot 1049 的全部 10,248 列、3,909,791,481 原內容 bytes，原完整
+   `ORDER BY ALL` 與新版的全 SHA 均為
+   `e0ce8e232d9b163400a8b36746b3cabf0ca9795da17ce0e46b7f5eee7fee20fa`。
+   新版先確認 SQL 排序鍵真的唯一、目前 SQL／host／cgroup 記憶體足夠，再做
+   單次排序；舊環境或觀測失效維持原分頁。接收端須固定自己的 verifier 來源
+   與契約後再採用；來源測試不能取代接收端還原，也不解除 TW 原 runtime gate。
+
+## 2026-11-03 17:05 台北：沿原固定控制包接手
+
+Penguin 在 17:03:35 完成一組舊 FinLab preparation 的 E 搬移：1,456 檔、
+42,125,547,602 logical bytes，WSL 回收 42,137,661,440 allocated bytes。
+原 FinLab source、D CAS、NAS 與歷史 recovery receipts 保留；這不是 NAS ACK。
+
+本文件及 C/E/D 佈局報告由既有 `publish_backup_handoff.py` 封裝至
+`tools/storage-operations-20261103-v1/`；只含兩份公開 runbook，不含原始
+資料、credentials、installer 或自動執行指令。請按原 verifier 核對封套
+identity、READY、精確檔案集合及每個 SHA，再由原 owner 接手。
+
+17:05 主機心跳仍按分鐘更新，正式 readiness 仍為 11 月 2 日 12:49:56，
+私有備份尚有 98,578,650,728 bytes 等待。歷史 Restic 鎖診斷不能當作當前
+鎖狀態。請原 owner 回傳以下實際結果，沿原反向通道，不必重貼全資料清冊：
+
+1. 原 `lab203-backup.service` 當前 start-pre／job／repository 檢查階段、
+   原始失敗類型及下一次實際重試時間，不能只回 service active。
+2. 在合格工作邊界執行原就緒檢查並發新固定 readiness；若長批次一直沒有
+   邊界，評估在原逐批工作間合作讓出／重取自己的 owner。不另起 writer、
+   不強殺 NAS syscall、不刪未知 Restic lock，不以 `--no-lock` 或改舊時間免驗。
+3. 回傳最新 readiness identity 或具體阻擋證據、逐批 NAS 獨立讀回進度；
+   下方精確 CAS 缺件仍依 SHA／長度回覆固定查找結果。
+
 ## 2026-11-03 13:06 台北：來源解壓力，接收端仍待原 owner 就緒
 
 Penguin D 舊傳輸副本已依原完整 E 同名讀回及退休 gate 回收

@@ -186,3 +186,133 @@ def test_startup_installer_preserves_existing_units_and_unrelated_dropins(tmp_pa
     assert (units / "stockagent-example.service").read_text() == "[Service]\nExecStart=/bin/true\n"
     assert all("restart" not in call for call in calls)
     install(root, units, apply=True)  # no duplicate or conflicting unit
+
+
+def enrolled_control(root):
+    import json
+    source = root / "artifacts/operations"
+    source.mkdir()
+    target = root / "service_data/operations"
+    target.mkdir(parents=True)
+    slots = root / "service_data/.compatibility"
+    slots.mkdir()
+    slot = slots / "operations"
+    slot.symlink_to(target)
+    row = {"source": str(source), "target": str(target), "area": "operations",
+           "audit": {"device": target.stat().st_dev, "inode": target.stat().st_ino},
+           "binding": {"slot": str(slot), "mountpoint_inode": source.stat().st_ino}}
+    (root / "service_data/.placement-operations.json").write_text(json.dumps(row))
+    return source, target, row
+
+
+def test_enrolled_replay_ignores_unrelated_target_readers(tmp_path, monkeypatch):
+    import scripts.organize_service_storage as placement
+    from stockagent.data_sync import materialized_cache
+    root = checkout(tmp_path)
+    source, target, row = enrolled_control(root)
+    monkeypatch.setattr(placement, "owner_gate", lambda *_a, **_k: pytest.fail("initial-move gate used"))
+    observed = []
+    monkeypatch.setattr(materialized_cache, "process_references_many",
+                        lambda roots, **_: observed.append(roots) or [])
+    value = organize(root, ["operations"], boot_handoff=True)
+    assert value["rows"][0]["state"] == "planned_bind_restore"
+    assert observed == [[source]] and target.stat().st_ino == row["audit"]["inode"]
+    assert placement.required_bind_failures(root, ["operations"]) == ["operations"]
+
+
+def test_enrolled_mountpoint_reader_and_shadow_payload_block_replay(tmp_path, monkeypatch):
+    import scripts.organize_service_storage as placement
+    from stockagent.data_sync import materialized_cache
+    root = checkout(tmp_path)
+    source, target, row = enrolled_control(root)
+    monkeypatch.setattr(materialized_cache, "process_references_many", lambda *_a, **_k: [{"pid": 123}])
+    value = organize(root, ["operations"], boot_handoff=True)
+    assert value["rows"][0]["reason"] == "control_mountpoint_process_reference"
+    (source / "new-control.json").write_bytes(b"preserve interrupted-boot evidence")
+    value = organize(root, ["operations"], apply=True, boot_handoff=True)
+    assert value["rows"][0]["reason"] == "control_mountpoint_changed_requires_recovery"
+    assert (source / "new-control.json").read_bytes() == b"preserve interrupted-boot evidence"
+    assert placement.required_bind_failures(root, ["operations"]) == ["operations"]
+
+
+def test_already_bound_identity_needs_no_owner_gate_but_rejects_wrong_target(tmp_path, monkeypatch):
+    import scripts.organize_service_storage as placement
+    root = checkout(tmp_path)
+    source, target, row = enrolled_control(root)
+    monkeypatch.setattr(placement, "owner_gate", lambda *_a, **_k: pytest.fail("already bound owner gate"))
+    assert placement.enrolled_bind_gate(target, target, row, root, boot_handoff=True) is None
+    wrong = {**row, "audit": {"inode": source.stat().st_ino}}
+    with pytest.raises(ValueError, match="target identity"):
+        placement.enrolled_bind_gate(target, target, wrong, root, boot_handoff=True)
+
+
+def test_busy_retirement_cannot_report_success_for_unrestored_control(tmp_path, monkeypatch, capsys):
+    import fcntl
+    import json
+    import sys
+    import scripts.organize_service_storage as placement
+    root = checkout(tmp_path)
+    enrolled_control(root)
+    lock = tmp_path / "owner.lock"
+    with lock.open("w") as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        original_open = os.open
+        monkeypatch.setattr(placement.os, "open", lambda _path, flags, mode=0o777: original_open(lock, flags, mode))
+        monkeypatch.setattr(sys, "argv", ["organize_service_storage.py", "--root", str(root),
+                                        "--areas", "operations", "--apply", "--boot-handoff"])
+        assert placement.main() == 75
+    value = json.loads(capsys.readouterr().out)
+    assert value["startup_control_paths_ready"] is False
+    assert value["required_bind_failures"] == ["operations"]
+    assert value["source_files_deleted"] == 0
+
+
+def test_installer_upgrades_only_exact_previous_managed_unit(tmp_path, monkeypatch):
+    from scripts.install_service_storage_layout import install, UNIT
+    import scripts.install_service_storage_layout as installer
+    root = checkout(tmp_path)
+    template = Path(__file__).resolve().parents[1] / "deploy/systemd" / (UNIT + ".in")
+    destination = root / "deploy/systemd" / template.name
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(template.read_bytes())
+    units = root / "systemd"
+    units.mkdir()
+    current = template.read_text().replace("@REPO_ROOT@", str(root)).encode()
+    prior = current.replace(b"StartLimitIntervalSec=0\n", b"").replace(b"Restart=on-failure\nRestartSec=5s\n", b"")
+    (units / UNIT).write_bytes(prior)
+    calls = []
+    monkeypatch.setattr(installer.subprocess, "run", lambda args, **_: calls.append(args))
+    install(root, units, apply=True)
+    assert (units / UNIT).read_bytes() == current
+    assert all("restart" not in call for call in calls)
+    (units / UNIT).write_bytes(prior + b"# unrelated local policy\n")
+    with pytest.raises(ValueError, match="unrelated"):
+        install(root, units, apply=True)
+
+
+def test_private_reader_namespace_waits_for_enrolled_data_mount_attempts(tmp_path, monkeypatch):
+    from scripts.install_service_storage_layout import install, UNIT, DATA_MOUNTS
+    import scripts.install_service_storage_layout as installer
+    root = checkout(tmp_path)
+    template = Path(__file__).resolve().parents[1] / "deploy/systemd" / (UNIT + ".in")
+    destination = root / "deploy/systemd" / template.name
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(template.read_bytes())
+    units = root / "systemd"
+    units.mkdir()
+    reader = "stockagent-tw-day-trade-simulation.service"
+    (units / reader).write_text("[Service]\nPrivateMounts=yes\nExecStart=/bin/true\n")
+    calls = []
+    monkeypatch.setattr(installer.subprocess, "run", lambda args, **_: calls.append(args))
+    assert install(root, units)["data_readers_ordered"] == 0
+    for name in DATA_MOUNTS:
+        (units / name).touch()
+    value = install(root, units, apply=True)
+    ordering = (units / (reader + ".d") / "35-service-data-volume-order.conf").read_text()
+    assert value["data_readers_ordered"] == 1
+    assert "Wants=" in ordering and "After=" in ordering
+    assert all(name in ordering for name in DATA_MOUNTS)
+    # Broker quotes and the accepted C-backed service cache remain available
+    # if an E mount attempt fails. A missing E volume is not a source fallback.
+    assert "Requires=" not in ordering and "RequiresMountsFor=" not in ordering
+    assert all("restart" not in call for call in calls)

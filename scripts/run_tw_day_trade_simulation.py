@@ -34,10 +34,12 @@ from stockagent.live.market_config import (  # noqa: E402
     LiveMarketConfig,
     SIGNAL_UPDATE_ONCE,
     SIGNAL_UPDATE_PROGRESSIVE,
+    load_market_config,
     load_market_configs,
     resolved_live_output_dir,
 )
 from stockagent.live.market_status import verified_tw_stock_session_day  # noqa: E402
+from stockagent.live.minute_source_paths import DEFAULT_LOCAL_MINUTE_ROOTS  # noqa: E402
 from stockagent.live.quote_provider import (  # noqa: E402
     _load_prepared_tw_price_limits,
     day_trade_quote_broker_request_dir,
@@ -78,6 +80,7 @@ from stockagent.live.tw_day_trade_simulation import (  # noqa: E402
 
 
 TAIPEI = ZoneInfo("Asia/Taipei")
+PROMOTED_RESEARCH_ACCOUNTING_CAPABILITY = "promoted_research_paper_accounting_admission_v1"
 _LATEST_SIGNAL_CACHE: dict[
     str, tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], dict[str, Any], list[dict[str, Any]]]
 ] = {}
@@ -692,6 +695,211 @@ class _MissedOpeningPriceRecovery:
             self._prices, self._receipt = dict(prices), dict(receipt)
 
 
+def _build_research_terminal_source_contexts(*, observed, targets, limit_path, minute_roots):
+    """Read retained source evidence only; no API, broker order or account write."""
+    from scripts.rebuild_tw_day_trade_open_price_replay import _minute_bar_rows
+
+    day = observed.date().isoformat()
+    limit_path = Path(limit_path).resolve()
+    before = limit_path.stat()
+    with limit_path.open("rb") as stream:
+        limit_sha = hashlib.file_digest(stream, "sha256").hexdigest()
+    after = limit_path.stat()
+    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns, before.st_ctime_ns) != (
+            after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns, after.st_ctime_ns):
+        raise OSError("research terminal limit file changed during read")
+    needed = {symbol for symbol, item in targets.items()
+              if np.isclose(float(item["price"]), float(item["upper_limit"]), rtol=0, atol=1e-8)}
+    bars, selected_files = {}, {}
+    unresolved = set(needed)
+    minute_key = f"{day}T13:30+08:00"
+    # This live reader establishes only the terminal minute. Unlike a full-day
+    # historical replay, it does not merge or infer the earlier intraday path.
+    # A partial repair source must not hide a later root that actually retains
+    # the terminal observation. Select one source per symbol and still require
+    # the independent receipt/hash/volume audit before committing a paper fill.
+    for root in minute_roots:
+        if not unresolved:
+            break
+        candidate_bars, candidate_coverage = _minute_bar_rows(
+            (Path(root).resolve(),), trading_date=observed.date(), symbols=unresolved,
+            requested_minutes=frozenset({datetime_time(13, 30)}))
+        resolved = set()
+        for symbol in sorted(unresolved):
+            if minute_key not in candidate_bars.get(symbol, {}):
+                continue
+            sources = [row for row in candidate_coverage.get("source_files") or []
+                       if symbol in (row.get("symbols") or [])]
+            if len(sources) != 1:
+                continue
+            source = sources[0]
+            key = source["path"]
+            if key in selected_files and selected_files[key]["sha256"] != source["sha256"]:
+                raise ValueError("research terminal minute source changed between roots")
+            selected_files.setdefault(key, {**source, "symbols": []})["symbols"].append(symbol)
+            bars[symbol] = candidate_bars[symbol]
+            resolved.add(symbol)
+        unresolved -= resolved
+    for source in selected_files.values():
+        source["symbols"].sort()
+        source["symbol_count"] = len(source["symbols"])
+    coverage = {"source_files": [selected_files[key] for key in sorted(selected_files)]}
+    return _research_terminal_contexts_from_loaded(observed=observed, targets=targets,
+        limit_path=limit_path, limit_sha=limit_sha, bars=bars, coverage=coverage)
+
+
+def _research_terminal_contexts_from_loaded(*, observed, targets, limit_path, limit_sha, bars, coverage):
+    """Share exactly the same source-envelope construction in live and replay."""
+    day = observed.date().isoformat()
+    needed = {symbol for symbol, item in targets.items()
+              if np.isclose(float(item["price"]), float(item["upper_limit"]), rtol=0, atol=1e-8)}
+    result = {}
+    minute_key = f"{day}T13:30+08:00"
+    for symbol, item in targets.items():
+        proof = item["official_close_evidence"]
+        sources = [row for row in coverage.get("source_files") or [] if symbol in (row.get("symbols") or [])]
+        context = {"session_date": day, "price_limit_path": str(limit_path), "price_limit_sha256": limit_sha,
+            "close": {"terminal_close_sources": [{"path": proof["source_path"], "sha256": proof["source_sha256"]}]},
+            "intraday_replay": {"source_files": sources}}
+        minute = (bars.get(symbol) or {}).get(minute_key)
+        evidence = None
+        if symbol in needed and minute is not None and len(sources) == 1:
+            volume = minute.get("volume_shares")
+            if (isinstance(volume, (int, float)) and not isinstance(volume, bool)
+                    and np.isfinite(volume) and 0 < volume < 2**53 and float(volume).is_integer()):
+                evidence = {"contract": "source_backed_closing_minute_capacity_v1",
+                    "session_date": day, "symbol": symbol, "minute": f"{day}T13:30:00+08:00",
+                    "source_path": sources[0]["path"], "source_sha256": sources[0]["sha256"],
+                    "volume_shares": int(volume)}
+        result[symbol] = {"proof_sha256": proof["source_sha256"],
+            "research_terminal_source_context": context,
+            "research_closing_minute_evidence": evidence,
+            "minute_required": symbol in needed}
+    return result
+
+
+class _ResearchTerminalSourceRecovery:
+    """One asynchronous local-source reader; the financial loop never waits on IO."""
+
+    def __init__(self, *, limit_root=Path("artifacts/live/tw_price_limits"),
+                 minute_roots=None):
+        self.limit_root = Path(limit_root)
+        self.minute_roots = tuple(DEFAULT_LOCAL_MINUTE_ROOTS if minute_roots is None else minute_roots)
+        self._lock = threading.Lock()
+        self._thread: threading.Thread | None = None
+        self._day = None
+        self._signature = None
+        self._source_generation = None
+        self._results: dict[str, dict[str, Any]] = {}
+        self._retry_after = 0.0
+
+    def _source_generations(self, day, symbols):
+        paths = [self.limit_root / f"{day}.parquet"]
+        for root in self.minute_roots:
+            root = Path(root)
+            paths.append(root / f"trade_date={day}" / "data.parquet")
+            paths.extend(root / "minute_chunks" / symbol for symbol in sorted(symbols))
+        result = []
+        for path in paths:
+            try:
+                stat = path.stat()
+                generation = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns)
+            except OSError:
+                generation = None
+            result.append((str(path), generation))
+        return tuple(result)
+
+    def poll(self, observed, targets):
+        if observed.timetz().replace(tzinfo=None) < datetime_time(13, 30) or not targets:
+            return {}
+        signature = tuple(sorted((symbol, item["price"], item["upper_limit"],
+                                  item["official_close_evidence"]["source_sha256"])
+                                 for symbol, item in targets.items()))
+        with self._lock:
+            running = self._thread is not None and self._thread.is_alive()
+            if self._day != observed.date():
+                if running:
+                    return {}  # Never publish a previous session's source result.
+                self._day, self._signature, self._source_generation = observed.date(), None, None
+                self._results, self._retry_after = {}, 0.0
+            if signature != self._signature:
+                self._signature, self._results, self._retry_after = signature, {}, 0.0
+            generation = self._source_generations(observed.date().isoformat(), targets)
+            if generation != self._source_generation:
+                self._source_generation, self._results, self._retry_after = generation, {}, 0.0
+            ready = {symbol: dict(row) for symbol, row in self._results.items()
+                     if symbol in targets and row.get("proof_sha256")
+                     == targets[symbol]["official_close_evidence"].get("source_sha256")}
+            if not running and time_module.monotonic() >= self._retry_after:
+                snapshot = {symbol: {**item, "official_close_evidence": dict(item["official_close_evidence"])}
+                            for symbol, item in targets.items()}
+                self._thread = threading.Thread(target=self._run, args=(observed, signature, generation, snapshot),
+                    name="tw-research-terminal-sources", daemon=True)
+                self._thread.start()
+            return ready
+
+    def _run(self, observed, signature, generation, targets):
+        try:
+            result = _build_research_terminal_source_contexts(observed=observed, targets=targets,
+                limit_path=self.limit_root / f"{observed.date().isoformat()}.parquet",
+                minute_roots=self.minute_roots)
+        except Exception as exc:
+            print(f"[tw-day-trade-sim] research_terminal_source_error={type(exc).__name__}: {exc}", flush=True)
+            with self._lock:
+                if self._source_generation == generation and self._signature == signature:
+                    self._retry_after = time_module.monotonic() + 30.0
+            return
+        with self._lock:
+            if self._day != observed.date() or self._signature != signature or self._source_generation != generation:
+                return
+            self._results = result
+            # A source can be republished after a first read. Recheck while
+            # inventory remains open; expensive work stays off the main loop.
+            self._retry_after = time_module.monotonic() + 30.0
+
+
+def _attach_research_terminal_source_context(quotes, *, engine, observed, recovery):
+    """Submit eligible short residuals to the shared asynchronous local reader."""
+    if observed.timetz().replace(tzinfo=None) < datetime_time(13, 30):
+        return
+    day, targets, conflicts = observed.date().isoformat(), {}, set()
+    for mode in engine.state.get("modes", {}).values():
+        if mode.get("session_date") != day or not mode.get("research_short_limit_up_close_penalty_rate"):
+            continue
+        for position in (mode.get("positions") or {}).values():
+            if int(position.get("signed_shares") or 0) >= 0:
+                continue
+            symbol = str(position.get("symbol") or "")
+            quote = quotes.get(symbol) or {}
+            proof = quote.get("session_close_evidence") or {}
+            try:
+                price, upper = float(proof.get("price")), float(position.get("upper_limit"))
+            except (TypeError, ValueError):
+                continue
+            if (not symbol or proof.get("session_date") != day or not np.isfinite(price) or price <= 0
+                    or not np.isfinite(upper) or upper <= 0 or not proof.get("source_path")
+                    or not proof.get("source_sha256")):
+                continue
+            item = {"price": price, "upper_limit": upper, "official_close_evidence": dict(proof)}
+            if symbol in targets and targets[symbol] != item:
+                conflicts.add(symbol)
+            else:
+                targets[symbol] = item
+    for symbol in targets:
+        quotes[symbol].pop("research_terminal_source_context", None)
+        quotes[symbol].pop("research_closing_minute_evidence", None)
+    for symbol in conflicts:
+        targets.pop(symbol, None)
+    if not targets:
+        return
+    for symbol, result in recovery.poll(observed, targets).items():
+        if symbol not in targets or result.get("proof_sha256") != targets[symbol]["official_close_evidence"]["source_sha256"]:
+            continue
+        quotes[symbol]["research_terminal_source_context"] = result["research_terminal_source_context"]
+        if result.get("research_closing_minute_evidence") is not None:
+            quotes[symbol]["research_closing_minute_evidence"] = result["research_closing_minute_evidence"]
+
+
 def _acquire_engine_lock(state_dir: Path):
     """Keep exactly one writer for the in-memory simulation state."""
 
@@ -792,12 +1000,51 @@ def _fee_schedule(config: Any) -> TaiwanFeeSchedule:
     )
 
 
+def _require_supported_paper_accounting(experiment: Any, *, promoted_research: Mapping[str, Any] | None = None) -> None:
+    """Admit nonzero research costs only from an independently promoted ledger.
+
+    A nonzero value is a close-time expense on source-uncovered limit-up
+    shorts, not a commission or a broker fill. Ignoring it would silently
+    overstate paper NAV and make the selected model's results incomparable.
+    """
+    rate = float(experiment.trading.tw_day_trade_short_limit_up_penalty_rate)
+    if rate != 0.0:
+        if promoted_research is not None:
+            from stockagent.live.day_trade_addition import verify_promoted_research_admission
+            verify_promoted_research_admission(rate=rate, **promoted_research)
+            return
+        raise ValueError(
+            "unsupported_paper_accounting: "
+            "tw_day_trade_short_limit_up_penalty_rate requires an audited "
+            "source-capacity-aware close expense and recovery contract"
+        )
+
+
 def _mode_specs(
     markets_dir: Path,
     *,
     include_disabled: bool = False,
+    research_accounting_preflight_only: bool = False,
+    isolated_provisional_research_replay: bool = False,
+    preflight_market_config: Path | None = None,
+    promoted_research_state_dir: Path | None = None,
 ) -> tuple[list[ModeSpec], dict[str, LiveMarketConfig], dict[str, str]]:
-    configs = load_market_configs(markets_dir)
+    if research_accounting_preflight_only and isolated_provisional_research_replay:
+        raise ValueError("research source inspection and provisional replay are distinct")
+    inspect_research = research_accounting_preflight_only or isolated_provisional_research_replay
+    if promoted_research_state_dir is not None and inspect_research:
+        raise ValueError("promoted runtime admission is separate from isolated research inspection")
+    if inspect_research and not include_disabled:
+        raise ValueError("research accounting inspection requires disabled candidates")
+    if preflight_market_config is not None and not inspect_research:
+        raise ValueError("single candidate configuration is limited to research inspection")
+    if isolated_provisional_research_replay and preflight_market_config is None:
+        raise ValueError("provisional replay requires an exact disabled candidate configuration")
+    if preflight_market_config is None:
+        configs = load_market_configs(markets_dir)
+    else:
+        selected_config = load_market_config(preflight_market_config)
+        configs = {selected_config.market: selected_config}
     specs: list[ModeSpec] = []
     selected: dict[str, LiveMarketConfig] = {}
     errors: dict[str, str] = {}
@@ -813,6 +1060,22 @@ def _mode_specs(
                 raise ValueError(
                     "simulation consumer requires execution_mode=tw_day_trade"
                 )
+            # Disabled candidates may be inspected or sent to the explicitly
+            # isolated provisional replay. Neither is production admission;
+            # the live executor and normal replay keep the accounting guard.
+            if not inspect_research or live.enabled:
+                promoted_research = None
+                if (promoted_research_state_dir is not None and live.enabled
+                        and float(experiment.trading.tw_day_trade_short_limit_up_penalty_rate) != 0.0):
+                    if not live.checkpoint_path:
+                        raise ValueError("promoted research mode lacks its selected checkpoint")
+                    promoted_research = {
+                        "live": promoted_research_state_dir, "market": market,
+                        "initial_capital": float(live.current_capital or live.initial_capital
+                                                 or experiment.trading.volume_participation_equity),
+                        "checkpoint": _repo_path(live.checkpoint_path), "config": _repo_path(live.config_path),
+                    }
+                _require_supported_paper_accounting(experiment, promoted_research=promoted_research)
             initial_capital = float(
                 live.current_capital
                 or live.initial_capital
@@ -846,6 +1109,8 @@ def _mode_specs(
                         live.day_trade_terminal_liquidation_unlimited_capacity
                     ),
                     strict_intraday=live.day_trade_strict_intraday,
+                    research_short_limit_up_close_penalty_rate=float(
+                        experiment.trading.tw_day_trade_short_limit_up_penalty_rate),
                     opening_reference_policy=live.day_trade_opening_reference_policy,
                     signal_update_policy=live.day_trade_signal_update_policy,
                     odd_lot_execution_policy=live.day_trade_odd_lot_execution_policy,
@@ -1354,9 +1619,9 @@ def _attach_terminal_official_close_context(quotes, *, engine, specs, configs, o
             if row.get("price") is None or not has_trade:
                 continue  # A halted/no-trade carried close is not an execution price.
             quotes.setdefault(symbol, {})["session_close_evidence"] = {
-                "session_date": row["official_date"], "price": row["price"],
+                "session_date": row["official_date"], "symbol": symbol, "price": row["price"],
                 "source": row["source"], "source_sha256": row["source_sha256"],
-                "price_basis": row["price_basis"],
+                "source_path": row["source_path"], "price_basis": row["price_basis"],
             }
 
 
@@ -2243,7 +2508,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("poll-seconds must be positive")
     # A pinned native owner must prove its actual role/mounts BEFORE opening
     # the authoritative ledger. Legacy CLI/fixtures remain explicitly unpinned.
-    if os.environ.get("STOCKAGENT_SERVICE_CODE_RELEASE"):
+    pinned_native = bool(os.environ.get("STOCKAGENT_SERVICE_CODE_RELEASE"))
+    if pinned_native:
         from stockagent.live.service_code_release import verify_startup_namespace
         verify_startup_namespace(REPO_ROOT, role="engine")
     markets_dir = _repo_path(args.markets_dir)
@@ -2263,9 +2529,13 @@ def main(argv: list[str] | None = None) -> int:
             "state_ledger_audit_pending": True,
         }, durable=True)
         print(f"[tw-day-trade-sim] immutable_journal_heads_recovered={len(recovered_heads)} financial_audit=pending", flush=True)
-    engine = TwDayTradeSimulationEngine(state_dir, publication_clock=lambda: datetime.now(TAIPEI))
+    # Financial repair is restricted to the native owner holding engine_lock;
+    # audit/readback constructors keep the default (no missing-row writes).
+    engine = TwDayTradeSimulationEngine(state_dir, publication_clock=lambda: datetime.now(TAIPEI),
+                                        allow_research_commit_repair=True)
     if args.rearm_flat_session:
-        specs, _live_configs, errors = _mode_specs(markets_dir)
+        specs, _live_configs, errors = _mode_specs(
+            markets_dir, promoted_research_state_dir=state_dir if pinned_native else None)
         if errors:
             raise RuntimeError(f"cannot resolve paper modes for rearm: {errors}")
         enabled = {spec.market for spec in specs}
@@ -2327,6 +2597,7 @@ def main(argv: list[str] | None = None) -> int:
     stock_quote_wakeup = StockQuoteWakeup()
     set_shioaji_stock_quote_wakeup(stock_quote_wakeup)
     missed_opening_prices = _MissedOpeningPriceRecovery(engine.state_dir)
+    research_terminal_sources = _ResearchTerminalSourceRecovery()
     last_session_gate_log: tuple[str, tuple[tuple[str, str], ...]] | None = None
     non_session_invalidation_attempts: set[tuple[str, str]] = set()
     ready_notified = False
@@ -2347,7 +2618,8 @@ def main(argv: list[str] | None = None) -> int:
             monotonic_now, last_reload, _spec_reload_interval_seconds(observed)
         ):
             reload_started = time_module.perf_counter()
-            specs, live_configs, errors = _mode_specs(markets_dir)
+            specs, live_configs, errors = _mode_specs(
+                markets_dir, promoted_research_state_dir=state_dir if pinned_native else None)
             signal_watcher.configure(
                 [spec.live_output_dir for spec in specs]
                 + [day_trade_quote_broker_request_dir(state_dir)]
@@ -3016,6 +3288,8 @@ def main(argv: list[str] | None = None) -> int:
             _attach_terminal_official_close_context(
                 quotes, engine=engine, specs=specs, configs=live_configs, observed=observed
             )
+            _attach_research_terminal_source_context(
+                quotes, engine=engine, observed=observed, recovery=research_terminal_sources)
 
         if (use_execution_stream and active_symbols and not quote_due
                 and datetime_time(9, 0) <= wall_time < datetime_time(13, 35)

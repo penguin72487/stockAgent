@@ -2,6 +2,10 @@
 Description=Attach E NVMe data workspace; C services and D cold authority remain unchanged
 After=local-fs.target
 Before=stockagent-storage-lifecycle.service stockagent-backup-transport-mount.service
+# A failed early mount cancels dependent start jobs. Each later successful
+# mount activation must enqueue the original worker again; Wants is one-shot
+# and does not undo an intentional worker stop during its guarded handoff.
+Wants=stockagent-storage-lifecycle.service
 
 [Service]
 Type=oneshot

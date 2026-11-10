@@ -12,6 +12,8 @@ from pathlib import Path
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+if str(SCRIPT_DIR.parent) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR.parent))
 
 from common import atomic_write_text, resolve_end_date
 
@@ -176,6 +178,12 @@ def _write_root_summary(output_root: Path, *, selected_groups: list[str]) -> dic
 def main() -> None:
     args = parse_args()
     repo_root = Path(__file__).resolve().parents[1]
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(repo_root / args.output_root):
+        _run_with_workspace_guard(args, repo_root)
+
+
+def _run_with_workspace_guard(args: argparse.Namespace, repo_root: Path) -> None:
     groups = _resolve_groups(args.groups)
 
     for group in groups:

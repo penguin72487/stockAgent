@@ -17,6 +17,9 @@ import pyarrow.parquet as pq
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(REPO_ROOT))
 
 from common import PersistentProgress, atomic_write_text  # noqa: E402
 from artifact_io import atomic_write_parquet  # noqa: E402
@@ -175,6 +178,17 @@ def _daily_frame(path: Path, *, start_day: date | None = None) -> pl.DataFrame:
 def main() -> None:
     args = parse_args()
     started = datetime.now(timezone.utc)
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard as bybit_writer_guard
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(args.input_dir, args.output_dir, timeout_seconds=args.lock_timeout_seconds), \
+            bybit_writer_guard(args.input_dir, args.output_dir, timeout_seconds=args.lock_timeout_seconds):
+        _run_with_workspace_guard(args, started=started)
+
+
+def _run_with_workspace_guard(args: argparse.Namespace, *, started: datetime) -> None:
+    from stockagent.data_sync.workspace_source_handoff import guard_path
+    guard_path(Path(args.input_dir))
+    guard_path(Path(args.output_dir))
     # Reuse the collectors' source lock, not a parallel projection-only lock.
     # Keep it through the final receipt so a cooperative source writer cannot
     # replace the base or hot tail midway through full-history aggregation.
@@ -183,6 +197,8 @@ def main() -> None:
         provider=f"{args.provider.lower()}_daily_materialize",
         timeout_seconds=args.lock_timeout_seconds,
     ) as acquisition:
+        guard_path(Path(args.input_dir))
+        guard_path(Path(args.output_dir))
         _run_locked_materialization(
             args, started=started, lock_wait_seconds=acquisition.wait_seconds,
         )

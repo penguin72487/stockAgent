@@ -10,9 +10,10 @@ from __future__ import annotations
 import argparse
 from collections import Counter, defaultdict
 import csv
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -21,6 +22,7 @@ import sys
 import time
 
 from downloader.artifact_io import sha256_file
+from downloader.provider_priority import _items as priority_items, register as register_priority, task_key
 from downloader.finmind_futures_tick_conflicts import BATCHES as FUTURES_BATCHES, load_futures_tick_conflicts
 from downloader.finmind_source_conflict_rechecks import (
     CONTRACT_BATCHES, PRODUCT_BATCHES, RECENT_BATCHES, SIDECAR, load_option_conflicts,
@@ -36,6 +38,10 @@ OWNERS = (REPO / 'downloader/download_finmind_complement.py',
           REPO / 'downloader/finmind_corrections.py',
           REPO / 'downloader/finmind_source_conflict_rechecks.py',
           REPO / 'downloader/finmind_option_monthly_evidence.py',
+          REPO / 'stockagent/data_sync/cache_capacity.py',
+          REPO / 'stockagent/data_sync/provider_workspace.py',
+          REPO / 'stockagent/data_sync/workspace_volume.py',
+          REPO / 'stockagent/data_sync/acquisition_capacity_sampler.py',
           REPO / 'scripts/run_finmind_option_conflict_wait.py')
 
 
@@ -146,23 +152,29 @@ def product_predecessor_decision(record: dict, run_id: str, log_path: Path,
     return 'blocked'
 
 
-def wait_for_product_predecessor(root: Path, run_id: str, request_id: str) -> bool:
+def wait_for_product_predecessor(root: Path, run_id: str, request_id: str | None,
+                                 *, still_valid=None) -> bool:
     if not re.fullmatch(r'[a-zA-Z0-9][a-zA-Z0-9_-]{0,127}', run_id):
         raise ValueError('invalid product predecessor run id')
     run_dir = REPO / 'artifacts/operations/agent-workflow/runs' / run_id
     run_path, log_path = run_dir / 'run.json', run_dir / 'run.log'
-    priority_path = root / 'priority_queries' / f'{request_id}.json'
+    priority_path = root / 'priority_queries' / f'{request_id}.json' if request_id else None
     previous = None
     while True:
-        priority = json.loads(priority_path.read_text())
-        if (priority.get('request_id') != request_id
-                or priority.get('contract') != 'provider_priority_query_v1'):
-            raise ValueError('all-market priority identity mismatch')
-        expires = datetime.fromisoformat(priority['plan']['expires_at_utc'].replace('Z', '+00:00'))
-        if datetime.now(UTC) >= expires:
-            print(json.dumps({'state': 'priority_expired_waiting_for_product_backlog',
+        if still_valid is not None and not still_valid():
+            print(json.dumps({'state': 'owner_or_plan_changed_waiting_for_product_backlog',
                               'provider_calls_by_waiter': 0}), flush=True)
             return False
+        if priority_path is not None:
+            priority = json.loads(priority_path.read_text())
+            if (priority.get('request_id') != request_id
+                    or priority.get('contract') != 'provider_priority_query_v1'):
+                raise ValueError('all-market priority identity mismatch')
+            expires = datetime.fromisoformat(priority['plan']['expires_at_utc'].replace('Z', '+00:00'))
+            if datetime.now(UTC) >= expires:
+                print(json.dumps({'state': 'priority_expired_waiting_for_product_backlog',
+                                  'provider_calls_by_waiter': 0}), flush=True)
+                return False
         record = json.loads(run_path.read_text())
         unit_state = None
         if record.get('state') in {'queued', 'running'}:
@@ -296,9 +308,102 @@ def filter_superseded_contract_requests(requests: list[dict], readbacks: dict) -
     return selected, counts
 
 
+def renewed_option_priority(template: dict, requests: list[dict], states: list[dict], now: datetime) -> dict | None:
+    """Restrict a renewal to still-unresolved keys of the original request."""
+    if template.get('provider') != 'finmind':
+        raise ValueError('option renewal needs a FinMind priority template')
+    allowed = {task_key(item) for item in priority_items(template)}
+    needed = {}
+    for request, state in zip(requests, states, strict=True):
+        item = {'dataset': request.get('dataset', 'TaiwanOptionTick'),
+                'data_id': '', 'partition': request['start_date']}
+        if item['dataset'] != 'TaiwanOptionTick':
+            raise ValueError('option renewal cannot add a different dataset')
+        key = task_key(item)
+        if not done([state]):
+            if key not in allowed:
+                raise ValueError('unresolved source key outside original priority')
+            needed[key] = item
+    if not needed:
+        return None
+    return {'contract': 'provider_priority_query_v1', 'provider': 'finmind',
+            'reason': 'Resume evidenced option whole-market source checks after the exact product backlog.',
+            'created_at_utc': now.isoformat(), 'expires_at_utc': (now + timedelta(days=7)).isoformat(),
+            'items': [needed[key] for key in sorted(needed)]}
+
+
+def deferred_priority(root: Path, template_path: Path, output: Path, template_sha: str,
+                      corrected_paths: list[Path], owner_pins: dict[str, str] | None = None) -> str | None:
+    """Register only after the product run, without ignoring expired sidecars."""
+    market_root = (REPO / 'artifacts/markets').resolve()
+    if (template_path.is_symlink() or not template_path.resolve(strict=True).is_relative_to(market_root)
+            or output.is_symlink() or not output.parent.resolve(strict=True).is_relative_to(market_root)):
+        raise ValueError('priority renewal evidence must stay in the market artifacts')
+    if sha256_file(template_path) != template_sha:
+        raise ValueError('priority renewal template changed while waiting')
+    template = json.loads(template_path.read_bytes())
+    now = datetime.now(UTC)
+    sidecar = root / SIDECAR
+    product_paths = sorted((root / PRODUCT_BATCHES).glob('*.json'))
+    contract_paths = sorted((root / CONTRACT_BATCHES).glob('*.json'))
+    recent_paths = sorted((root / RECENT_BATCHES).glob('*.json'))
+    paths = ([sidecar] if sidecar.exists() else []) + product_paths + contract_paths + recent_paths
+    if not paths or any(len(items) > 16 for items in (product_paths, contract_paths, recent_paths)):
+        raise ValueError('option source-conflict sidecars are missing or exceed the owner bounds')
+    pins = {str(path): sha256_file(path) for path in paths}
+    expiries = []
+    for path in paths:
+        expiry = datetime.fromisoformat(json.loads(path.read_bytes())['expires_at_utc'].replace('Z', '+00:00'))
+        if expiry.tzinfo is None or now >= expiry:
+            raise ValueError('expired source-conflict sidecar needs revalidation before renewal')
+        expiries.append(expiry)
+    plans = active_plans(root, now, product_paths, contract_paths, recent_paths)
+    readbacks, readback_pins = corrected_contract_readbacks(root, corrected_paths)
+    requests, _ = filter_superseded_contract_requests(
+        [request for plan in plans for request in plan['requests']], readbacks)
+    states = read_states(root, requests)
+    now = datetime.now(UTC)
+    if any(now >= expiry for expiry in expiries):
+        raise ValueError('expired source-conflict sidecar needs revalidation before renewal')
+    if (sorted((root / PRODUCT_BATCHES).glob('*.json')) != product_paths
+            or sorted((root / CONTRACT_BATCHES).glob('*.json')) != contract_paths
+            or sorted((root / RECENT_BATCHES).glob('*.json')) != recent_paths
+            or bool(sidecar.exists()) != (sidecar in paths)
+            or sha256_file(template_path) != template_sha
+            or any(sha256_file(Path(path)) != digest
+                   for path, digest in {**pins, **readback_pins, **(owner_pins or {})}.items())):
+        raise ValueError('source evidence changed before priority renewal')
+    proposal = renewed_option_priority(template, requests, states, now)
+    if proposal is None:
+        return None
+    if output.exists():
+        saved = json.loads(output.read_bytes())
+        if (saved.get('contract') != proposal['contract'] or saved.get('provider') != proposal['provider']
+                or saved.get('reason') != proposal['reason'] or priority_items(saved) != priority_items(proposal)):
+            raise ValueError('existing renewal output has a different scope')
+        proposal = saved
+    else:
+        # Exclusive creation preserves any prior evidence if a retry races or dies.
+        with output.open('x', encoding='utf-8') as stream:
+            json.dump(proposal, stream, ensure_ascii=False, indent=2)
+            stream.write('\n')
+            stream.flush()
+            os.fsync(stream.fileno())
+    result = register_priority(root, proposal, now=now)
+    print(json.dumps({'state': 'priority_registered_after_product_backlog',
+                      'request_id': result['request_id'], 'items': len(proposal['items']),
+                      'priority_plan': str(output), 'provider_calls_by_waiter': 0}), flush=True)
+    return result['request_id']
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--request-id', required=True)
+    priority = parser.add_mutually_exclusive_group(required=True)
+    priority.add_argument('--request-id')
+    priority.add_argument('--renew-priority-from', type=Path,
+                          help='Renew an original option priority only after the product backlog')
+    parser.add_argument('--renew-priority-output', type=Path,
+                        help='New market artifact for the deferred priority plan')
     parser.add_argument('--futures-only', action='store_true', help='Use evidenced futures tick batches only')
     parser.add_argument('--corrected-contract-readback', action='append', type=Path, default=[],
                         help='Pinned v2 source comparison; repeat for each historical range')
@@ -306,10 +411,29 @@ def main() -> int:
                         help='Wait for this evidenced product backlog before replacing all-market sources')
     args = parser.parse_args()
     root = ROOT.resolve()
+    if bool(args.renew_priority_from) != bool(args.renew_priority_output):
+        parser.error('deferred priority needs both the original plan and a new output')
+    if args.renew_priority_from and (not args.after_product_run or args.futures_only
+                                     or not args.corrected_contract_readback):
+        parser.error('deferred option renewal needs the product gate and corrected readbacks')
+    template_sha = sha256_file(args.renew_priority_from) if args.renew_priority_from else None
+    owner_pins = {str(path): sha256_file(path) for path in OWNERS} if args.renew_priority_from else None
     if args.futures_only and args.after_product_run:
         parser.error('product predecessor gate applies to option source checks only')
-    if args.after_product_run and not wait_for_product_predecessor(root, args.after_product_run, args.request_id):
-        return 75
+    if args.after_product_run:
+        kwargs = ({'still_valid': lambda: all(sha256_file(Path(path)) == digest
+                                              for path, digest in owner_pins.items())}
+                  if owner_pins else {})
+        if not wait_for_product_predecessor(root, args.after_product_run, args.request_id, **kwargs):
+            return 75
+    if args.renew_priority_from:
+        args.request_id = deferred_priority(root, args.renew_priority_from, args.renew_priority_output,
+                                            template_sha, args.corrected_contract_readback, owner_pins)
+        if args.request_id is None:
+            print(json.dumps({'state': 'source_scope_empty_after_superseded_filter',
+                              'full_contract_or_training_completeness': False,
+                              'provider_calls_by_waiter': 0}), flush=True)
+            return 0
     sidecar = root / SIDECAR
     product_paths = sorted((root / PRODUCT_BATCHES).glob('*.json'))
     contract_paths = sorted((root / CONTRACT_BATCHES).glob('*.json'))

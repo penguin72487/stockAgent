@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry pinned edge reader observation and E candidate activation
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-v3-reader-activation.service
+
+[Install]
+WantedBy=timers.target

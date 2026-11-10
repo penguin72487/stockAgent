@@ -180,6 +180,49 @@ def test_future_backoff_does_not_even_load_configs(
     assert not runner.retry_probe(observed=NOW)["due"]
 
 
+@pytest.mark.parametrize("trigger", ["capacity", "source"])
+def test_capacity_backoff_wakes_early_for_recovered_hint_without_accepting_data(
+    receipt_scope, monkeypatch, trigger,
+):
+    _, path, _ = receipt_scope
+    key, job = _job(status="waiting_source", deadline="2026-10-01T01:00:00+00:00")
+    job.update(error_type="CapacityDeferred", capacity_wait_contract=runner.CAPACITY_WAIT_CONTRACT,
+               capacity_workspace_was_blocked=True, capacity_source_hint="old",
+               error_details={"reason": "physical_backing_reserve", "required_bytes_including_reserve": 100})
+    _write(path, (key, job))
+    before = path.read_bytes()
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: "new" if trigger == "source" else "old")
+    monkeypatch.setattr(runner, "_backing_capacity_hint",
+                        lambda _: ("available", 100) if trigger == "capacity" else ("unknown", None))
+    result = runner.retry_probe(observed=NOW)
+    assert result["due_keys"] == [key] and result["advisory_only"]
+    assert path.read_bytes() == before
+
+
+def test_capacity_recovery_hint_never_wakes_a_disabled_market(receipt_scope, monkeypatch):
+    _, path, configs = receipt_scope
+    key, job = _job(status="waiting_source", deadline="2026-10-01T01:00:00+00:00")
+    job.update(error_type="CapacityDeferred", capacity_wait_contract=runner.CAPACITY_WAIT_CONTRACT,
+               capacity_workspace_was_blocked=True, capacity_source_hint="same",
+               error_details={"reason": "physical_backing_reserve", "required_bytes_including_reserve": 100})
+    _write(path, (key, job))
+    cfg = configs / "market.yaml"
+    cfg.write_text(cfg.read_text().replace("enabled: true", "enabled: false"))
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: "same")
+    monkeypatch.setattr(runner, "_backing_capacity_hint", lambda _: ("available", 100))
+    assert not runner.retry_probe(observed=NOW)["due"]
+
+
+def test_backing_hint_has_an_entire_process_group_deadline(monkeypatch):
+    import time
+
+    monkeypatch.setattr(runner, "_CAPACITY_HINT_CHILD", "import time; time.sleep(30)")
+    monkeypatch.setattr(runner, "CAPACITY_HINT_TIMEOUT_SECONDS", 0.1)
+    started = time.monotonic()
+    assert runner._backing_capacity_hint(100) == ("unknown", None)
+    assert time.monotonic() - started < 3
+
+
 def test_aware_deadline_exact_boundary_preserves_receipt(receipt_scope):
     _, path, _ = receipt_scope
     key, job = _job(deadline="2026-10-01T08:00:00+08:00")

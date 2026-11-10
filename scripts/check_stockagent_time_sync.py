@@ -11,7 +11,9 @@ never stepped automatically.
 from __future__ import annotations
 
 import argparse
+import ctypes
 from datetime import datetime
+import fcntl
 import json
 import math
 import os
@@ -28,6 +30,9 @@ from zoneinfo import ZoneInfo
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 TAIPEI = ZoneInfo("Asia/Taipei")
+WSL_RATE_GUARD_CONTRACT = "wsl_kernel_rate_stability_guard_v1"
+WSL_RATE_REQUIRED_GOOD_SAMPLES = 5
+WSL_RATE_MAX_ESTIMATED_DEVIATION_PPM = 500.0
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -238,6 +243,7 @@ def _sample_windows_clock_process(
             rows.append({
                 "offset_seconds": host_seconds - ((before + after) / 2.0),
                 "round_trip_seconds": elapsed,
+                "sample_monotonic_seconds": (before_mono + after_mono) / 2.0,
                 # Host milliseconds are truncated; include their quantization.
                 "uncertainty_seconds": elapsed / 2.0 + 0.001,
             })
@@ -262,7 +268,51 @@ def _sample_windows_clock_process(
         "uncertainty_seconds": best["uncertainty_seconds"],
         "sampling_method": "persistent_request_response_v1",
         "sample_count": len(rows),
+        "sample_monotonic_seconds": best["sample_monotonic_seconds"],
     }
+
+
+class _Timeval(ctypes.Structure):
+    _fields_ = [("sec", ctypes.c_long), ("usec", ctypes.c_long)]
+
+
+class _Timex(ctypes.Structure):
+    # glibc Linux 64-bit ABI. Unsupported architectures fail closed instead of
+    # making a syscall with a guessed struct layout.
+    _fields_ = [
+        ("modes", ctypes.c_uint), ("offset", ctypes.c_long), ("freq", ctypes.c_long),
+        ("maxerror", ctypes.c_long), ("esterror", ctypes.c_long), ("status", ctypes.c_int),
+        ("constant", ctypes.c_long), ("precision", ctypes.c_long), ("tolerance", ctypes.c_long),
+        ("time", _Timeval), ("tick", ctypes.c_long), ("ppsfreq", ctypes.c_long),
+        ("jitter", ctypes.c_long), ("shift", ctypes.c_int), ("stabil", ctypes.c_long),
+        ("jitcnt", ctypes.c_long), ("calcnt", ctypes.c_long), ("errcnt", ctypes.c_long),
+        ("stbcnt", ctypes.c_long), ("tai", ctypes.c_int), ("reserved", ctypes.c_int * 11),
+    ]
+
+
+def _adjtimex(value: _Timex) -> None:
+    if value.modes != 0:
+        raise ValueError("kernel clock discipline observation is read-only")
+    if (sys.platform != "linux" or ctypes.sizeof(ctypes.c_long) != 8
+            or os.uname().machine not in {"x86_64", "aarch64"}):
+        raise RuntimeError("unsupported Linux time-discipline ABI")
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.adjtimex.argtypes = [ctypes.POINTER(_Timex)]
+    libc.adjtimex.restype = ctypes.c_int
+    if libc.adjtimex(ctypes.byref(value)) < 0:
+        error = ctypes.get_errno()
+        raise OSError(error, os.strerror(error))
+
+
+def _kernel_time_discipline() -> dict[str, Any]:
+    """Observe the kernel's rate separately from its current time offset."""
+    value = _Timex()
+    _adjtimex(value)
+    user_hz = int(os.sysconf("SC_CLK_TCK"))
+    if user_hz <= 0 or 1_000_000 % user_hz:
+        raise ValueError("cannot determine an exact nominal kernel tick")
+    return {"tick_us": int(value.tick), "nominal_tick_us": 1_000_000 // user_hz,
+            "frequency_ppm": float(value.freq) / 65536.0, "status": int(value.status)}
 
 
 def _chrony_tracking(
@@ -348,9 +398,22 @@ def evaluate_time_sync(
             ))
             if not math.isfinite(offset_seconds) or not math.isfinite(uncertainty) or uncertainty < 0:
                 raise ValueError("invalid WSL clock offset or uncertainty")
+            discipline = _kernel_time_discipline()
+            tick, nominal = int(discipline["tick_us"]), int(discipline["nominal_tick_us"])
+            frequency_ppm = float(discipline["frequency_ppm"])
+            if tick <= 0 or nominal <= 0 or not math.isfinite(frequency_ppm):
+                raise ValueError("kernel tick or frequency is invalid")
+            estimated_rate_ppm = (tick / nominal - 1.0) * 1_000_000.0 + frequency_ppm
+            discipline["estimated_combined_rate_deviation_ppm"] = estimated_rate_ppm
+            repair_evidence["kernel_time_discipline"] = discipline
+            if abs(estimated_rate_ppm) > WSL_RATE_MAX_ESTIMATED_DEVIATION_PPM:
+                # A separate NTP owner can change the shared WSL clock between
+                # observations. Stepping it repeatedly or resetting its rate
+                # would fight that owner and still give false readiness.
+                failures.append("WSL kernel tick rate is abnormal and is not continuously synchronized")
             lower_bound = max(0.0, abs(offset_seconds) - uncertainty)
             upper_bound = abs(offset_seconds) + uncertainty
-            if lower_bound * 1000.0 > float(max_offset_ms) and repair:
+            if lower_bound * 1000.0 > float(max_offset_ms) and repair and not failures:
                 if upper_bound > float(max_repair_offset_seconds):
                     failures.append(
                         "WSL host clock offset exceeds the bounded auto-repair limit"
@@ -419,21 +482,96 @@ def evaluate_time_sync(
     }
 
 
+def _valid_wsl_rate_guard(value: object) -> bool:
+    if (not isinstance(value, dict) or value.get("contract") != WSL_RATE_GUARD_CONTRACT
+            or type(value.get("consecutive_good_samples")) is not int):
+        return False
+    count, status = value["consecutive_good_samples"], value.get("status")
+    return ((status == "stable" and count == WSL_RATE_REQUIRED_GOOD_SAMPLES)
+            or (status == "unstable" and count == 0)
+            or (status == "recovering" and 0 < count < WSL_RATE_REQUIRED_GOOD_SAMPLES))
+
+
+def _apply_wsl_rate_stability_guard(payload: dict[str, Any], previous: dict[str, Any] | None) -> None:
+    """Keep a detected rate fault visible until five subsequent good checks.
+
+    A single low offset or nominal tick is not evidence that a competing
+    controller has stopped. The caller serializes this transition with the
+    receipt write, so overlapping timers cannot lose a fault observation.
+    """
+    old = (previous or {}).get("wsl_rate_stability")
+    if old is None and any("WSL kernel tick rate is abnormal" in str(item)
+                           for item in (previous or {}).get("failures", ())):
+        old = {"contract": WSL_RATE_GUARD_CONTRACT, "status": "unstable", "consecutive_good_samples": 0}
+    if old is not None and not _valid_wsl_rate_guard(old):
+        payload["failures"].append("previous WSL clock stability receipt is invalid")
+        payload["ready"], payload["status"] = False, "failed"
+        return
+    old_active = bool(old and old["status"] in {"unstable", "recovering"})
+    measured_wsl = (payload.get("simulation_schedule_authority") or {}).get("source") == "wsl_windows_host_clock"
+    discipline = (payload.get("repair_evidence") or {}).get("kernel_time_discipline")
+    rate_fault = (any("WSL kernel tick rate is abnormal" in str(item) for item in payload["failures"])
+                  or measured_wsl and not isinstance(discipline, dict))
+    if not measured_wsl and not old_active:
+        return
+    good = bool(payload.get("ready")) and measured_wsl
+    if rate_fault or (old_active and not good):
+        status, count = "unstable", 0
+    elif old_active:
+        count = min(WSL_RATE_REQUIRED_GOOD_SAMPLES, old["consecutive_good_samples"] + 1)
+        status = "stable" if count >= WSL_RATE_REQUIRED_GOOD_SAMPLES else "recovering"
+    else:
+        status, count = "stable", WSL_RATE_REQUIRED_GOOD_SAMPLES
+    payload["wsl_rate_stability"] = {"contract": WSL_RATE_GUARD_CONTRACT, "status": status,
+        "consecutive_good_samples": count, "required_good_samples": WSL_RATE_REQUIRED_GOOD_SAMPLES,
+        "max_estimated_rate_deviation_ppm": WSL_RATE_MAX_ESTIMATED_DEVIATION_PPM,
+        "does_not_guarantee_future_stability": True}
+    if status != "stable":
+        payload["failures"].append("WSL clock rate remains unstable or is awaiting consecutive verified samples")
+        payload["ready"], payload["status"] = False, "failed"
+
+
 def main() -> int:
     args = parse_args()
     if args.max_offset_ms <= 0 or args.max_repair_offset_seconds <= 0:
         raise ValueError("clock thresholds must be positive")
-    payload = evaluate_time_sync(
-        repair=bool(args.repair),
-        max_offset_ms=float(args.max_offset_ms),
-        max_repair_offset_seconds=float(args.max_repair_offset_seconds),
-        samples=int(args.samples),
-    )
     receipt = _repo_path(args.receipt)
-    _atomic_json(receipt, payload)
-    run_id = datetime.now(TAIPEI).strftime("%Y%m%dT%H%M%S%f")
-    _atomic_json(receipt.parent / "runs" / f"{run_id}.json", payload)
-    _prune_managed_runs(receipt.parent / "runs")
+    receipt.parent.mkdir(parents=True, exist_ok=True)
+    lock_path = receipt.with_name(receipt.name + ".lock")
+    with lock_path.open("a+") as lock:
+        deadline = time.monotonic() + 5.0
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("time sync receipt is owned by another active check")
+                time.sleep(0.05)
+        previous = None
+        if receipt.exists():
+            previous = json.loads(receipt.read_text(encoding="utf-8"))
+            if not isinstance(previous, dict):
+                raise ValueError("previous time sync receipt is not an object")
+        old_guard = (previous or {}).get("wsl_rate_stability")
+        prior_rate_unstable = (
+            old_guard is not None and (not _valid_wsl_rate_guard(old_guard) or old_guard["status"] != "stable")
+            or any("WSL kernel tick rate is abnormal" in str(item)
+                   for item in (previous or {}).get("failures", ()))
+        )
+        # Do not step the shared clock during the recovery window merely
+        # because this single tick sample happened to be near nominal.
+        payload = evaluate_time_sync(
+            repair=bool(args.repair) and not prior_rate_unstable,
+            max_offset_ms=float(args.max_offset_ms),
+            max_repair_offset_seconds=float(args.max_repair_offset_seconds),
+            samples=int(args.samples),
+        )
+        _apply_wsl_rate_stability_guard(payload, previous)
+        _atomic_json(receipt, payload)
+        run_id = datetime.now(TAIPEI).strftime("%Y%m%dT%H%M%S%f")
+        _atomic_json(receipt.parent / "runs" / f"{run_id}.json", payload)
+        _prune_managed_runs(receipt.parent / "runs")
     print(json.dumps(payload, ensure_ascii=False, sort_keys=True), flush=True)
     return 0 if payload["ready"] else 1
 

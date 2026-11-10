@@ -11,13 +11,16 @@
     }
   }
   async function retryTransientRead(fetcher, url, options, pause = ms => new Promise(resolve => global.setTimeout(resolve, ms))) {
-    const first = await fetcher(url, options);
-    if (first.status !== 503 && first.status !== 504) return first;
-    // A writer may temporarily be between two acknowledged projections. One
-    // bounded retry reduces a blank minute without accepting mixed data or
-    // increasing the normal 60-second display cadence.
-    await pause(250);
-    return fetcher(url, options);
+    const delays = [250, 750, 1500];
+    for (let attempt = 0; ; attempt++) {
+      const response = await fetcher(url, options);
+      if ((response.status !== 503 && response.status !== 504) || attempt === delays.length) return response;
+      // A live writer can cross several commit boundaries in succession. Only
+      // retry transient server failures, close each failed body, and bound the
+      // recovery burst; normal successful refreshes remain one per minute.
+      try { await response.body?.cancel?.(); } catch (_error) { /* response already closed */ }
+      await pause(delays[attempt]);
+    }
   }
 
   function validate(data) {
@@ -56,7 +59,10 @@
     if (!panel || !Dashboard || typeof detailComponents === "undefined") return;
     panel.classList.remove("hidden");
     const $ = Dashboard.byId, esc = Dashboard.escapeHtml, setHtml = Dashboard.setTrustedHtml;
-    const fetchSnapshot = Dashboard.createFetch({timeoutMs: 4000});
+    // A cold gateway may still be verifying the prior official daily-price
+    // source. Do not abort a valid committed snapshot before that bounded
+    // read can finish; this does not change the one-minute refresh cadence.
+    const fetchSnapshot = Dashboard.createFetch({timeoutMs: 10000});
     const clock = new Intl.DateTimeFormat("zh-TW", {timeZone: "Asia/Taipei", hour12: false,
       month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", second: "2-digit"});
     const number = value => typeof value === "number" && Number.isFinite(value)
@@ -69,10 +75,13 @@
       const freshness = current ? `${clock.format(new Date(current.as_of))} · 版本 ${current.state_revision}` : "尚未取得";
       const warning = error || (age != null && age > 120 ? `帳本快照已 ${Math.floor(age)} 秒未更新` : "");
       const summary = modes.map(mode => {
-        const flags = [mode.engine_status || "狀態未知", `未平 ${number(mode.open_position_count)} 筆`,
+        const nontrade = Number(mode.nontrade_settlement_count || 0) > 0;
+        const booked = mode.cumulative_nontrade_settlement_net_pnl_twd != null || nontrade;
+        const flags = [nontrade ? "含非成交假設結算" : mode.engine_status || "狀態未知", `${nontrade ? "帳面未平" : "未平"} ${number(mode.open_position_count)} 筆`,
           `估值延用 ${number(mode.stale_position_count)} 筆`, `權益 NT$ ${number(mode.total_equity_twd)}`,
-          `累積已實現 NT$ ${number(mode.cumulative_realized_net_pnl_twd)}`,
+          `${booked ? "累積帳面已結算（含假設）" : "累積已實現"} NT$ ${number(mode.cumulative_realized_net_pnl_twd)}`,
           `未平倉估值 NT$ ${number(mode.open_net_liquidation_pnl_twd)}`];
+        if (nontrade) flags.push(`${number(mode.nontrade_settlement_count)} 筆／${number(mode.nontrade_settlement_shares)} 股為非成交帳面結算`);
         if (Number(mode.entry_unfilled_shares) > 0) flags.push(`本版未成交 ${number(mode.entry_unfilled_shares)} 股`);
         if (Number(mode.unresolved_exit_count) > 0) flags.push(`待處理出場 ${number(mode.unresolved_exit_count)} 筆`);
         if (mode.readiness_error) flags.push("模式準備有誤");

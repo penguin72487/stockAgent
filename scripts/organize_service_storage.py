@@ -2,8 +2,9 @@
 """Audit and atomically relocate enrolled mutable service directories.
 
 No payload is copied, hashed, re-encoded or deleted. Existing open descriptors,
-locks and legacy paths keep referring to the original inode. Control/migration
-roots require their original owners to be idle; they are never forced forward.
+locks and legacy paths keep referring to the original inode. Initial control
+placement requires idle owners. Reboot replay restores only enrolled unchanged
+binds, preserving target readers and refusing referenced or populated placeholders.
 """
 from __future__ import annotations
 
@@ -172,6 +173,63 @@ def restore_bind(source: Path, target: Path, row: dict, receipt: Path) -> None:
     atomic_write_json(receipt, row)
 
 
+def enrolled_bind_gate(source: Path, target: Path, row: dict, root: Path, *,
+                       boot_handoff: bool) -> str | None:
+    """Replay an unchanged enrolled bind without waiting for unrelated owners.
+
+    Readers of the original target keep their exact inodes. Only references to
+    an unmounted compatibility name prevent replay; initial placement retains
+    the stricter, offline owner gate.
+    """
+    if (target.is_symlink() or target.resolve() != target
+            or target.stat().st_dev != source.parent.stat().st_dev
+            or target.stat().st_ino != row["audit"]["inode"]):
+        raise ValueError("control bind target identity differs")
+    if source.is_dir() and not source.is_symlink() and os.path.samestat(source.stat(), target.stat()):
+        return None
+    if not boot_handoff:
+        return owner_gate(source, root, boot_handoff=False)
+    # Never conceal new state created in an unmounted placeholder. An explicit
+    # recovery can preserve those names separately, as in the 2026-11-04 audit.
+    if source.is_dir() and not source.is_symlink():
+        if source.stat().st_ino != row["binding"]["mountpoint_inode"] or any(source.iterdir()):
+            return "control_mountpoint_changed_requires_recovery"
+    from stockagent.data_sync.materialized_cache import process_references_many
+    if process_references_many([source], limit=1, include_current_process=True):
+        return "control_mountpoint_process_reference"
+    return None
+
+
+def required_bind_failures(root: Path, areas: list[str]) -> list[str]:
+    """Bounded startup readback, including when retirement holds its lock.
+
+    Optional first-time organization may defer. A previously enrolled bind
+    must actually expose its original target before dependent services start.
+    """
+    mappings = {new.name: (old, new) for old, new in service_moves(root).items()}
+    failures = []
+    for area in areas:
+        source, target = mappings[area]
+        receipt = root / "service_data" / (".placement-" + area + ".json")
+        try:
+            if not receipt.exists() and not receipt.is_symlink():
+                continue
+            if receipt.is_symlink() or receipt.stat().st_size > 1024**2:
+                raise ValueError("invalid placement receipt")
+            row = json.loads(receipt.read_bytes())
+            if not row.get("binding"):
+                continue
+            if (row.get("source") != str(source) or row.get("target") != str(target)
+                    or target.is_symlink() or target.resolve() != target
+                    or target.stat().st_ino != row["audit"]["inode"]
+                    or target.stat().st_dev != source.parent.stat().st_dev
+                    or source.is_symlink() or not os.path.samestat(source.stat(), target.stat())):
+                raise ValueError("enrolled compatibility mount is not restored")
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            failures.append(area)
+    return failures
+
+
 @contextmanager
 def placement_lease(root: Path):
     directory = root / "service_data"
@@ -213,7 +271,8 @@ def organize(root: Path, areas: list[str], *, apply: bool = False, boot_handoff:
                     if (previous.get("source") != str(source) or previous.get("target") != str(target)
                             or previous["binding"].get("slot") != str(directory / ".compatibility" / area)):
                         raise ValueError("control placement receipt scope differs")
-                    reason = owner_gate(source, root, boot_handoff=boot_handoff)
+                    reason = enrolled_bind_gate(source, target, previous, root,
+                                                boot_handoff=boot_handoff)
                     if reason:
                         row.update(state="deferred", reason=reason)
                         continue
@@ -316,15 +375,21 @@ def main():
                      "reclaimed_bytes": 0}
         else:
             value = organize(args.root, args.areas, apply=args.apply, boot_handoff=args.boot_handoff)
+        failures = (required_bind_failures(args.root.resolve(strict=True), args.areas)
+                    if args.apply and args.boot_handoff else [])
+        if args.apply and args.boot_handoff:
+            value["required_bind_failures"] = failures
+            value["startup_control_paths_ready"] = not failures
         if args.report:
             if args.report.is_symlink() or args.report.parent.resolve() != args.report.parent.absolute():
                 raise ValueError("placement receipt path is redirected")
             args.report.parent.mkdir(parents=True, exist_ok=True)
             atomic_write_json(args.report, value)
         print(json.dumps(value, indent=2))
+        return 75 if failures else 0
     finally:
         os.close(fd)
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

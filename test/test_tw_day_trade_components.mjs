@@ -7,7 +7,7 @@ function pendingDetailHarness(kind) {
   const app = readFileSync(new URL("../services/tw_day_trade_dashboard/app.js", import.meta.url), "utf8");
   const requests = [];
   let release;
-  const page = {rows: [{symbol: "2330", target_weight: .1}], total: 1, has_more: false};
+  const page = {rows: [{symbol: "2330", target_weight: .1}], total: 1, has_more: false, revision_scope: "latest"};
   const context = vm.createContext({
     snapshot: {service_sync: {engine_generation: "owner-a", content_revision: 1}},
     selection: "scope-a", URLSearchParams, AbortController,
@@ -20,7 +20,8 @@ function pendingDetailHarness(kind) {
     $: () => ({value: ""}),
     detailSelectionKey: () => context.selection, detailRangeKey: () => "range",
     selectedDetailStartDate: () => "2026-11-02", selectedDetailEndDate: () => "2026-11-02",
-    selectedMode: () => "all", SIGNAL_PAGE_SIZE: 100, POSITION_PAGE_SIZE: 100, EVENT_PAGE_SIZE: 100,
+    selectedMode: () => "all", selectedSignalRevisionScope: () => "latest",
+    SIGNAL_PAGE_SIZE: 100, POSITION_PAGE_SIZE: 100, EVENT_PAGE_SIZE: 100,
     beginSilentTableUpdate() {}, validateDetailPage() {}, compareByAbsoluteWeight: () => 0,
     syncFeaturePanelSelection() {}, renderSignals() {}, renderPositions() {}, renderEvents() {},
     renderSignalFeaturePanel() {}, scheduleStatusRecovery() {},
@@ -247,6 +248,10 @@ test("fallback positions are scoped to a committed open snapshot, never closed h
 
 test("entry bracket rejections are explicit and never called a fill", () => {
   const {presentation} = components();
+  const limitLabel = presentation.signalReasonLabel("price_limit_unavailable");
+  assert.match(limitLabel, /未提供或不適用/);
+  assert.match(limitLabel, /不進場/);
+  assert.doesNotMatch(limitLabel, /已成交|已補齊/);
   for (const [reason, boundary] of [
     ["entry_price_at_or_beyond_take_profit", "TP"],
     ["entry_price_at_or_beyond_stop_loss", "SL"],
@@ -341,6 +346,35 @@ test("price withholding does not turn a closed day-trade or overnight position i
   }
 });
 
+test("a delayed closing replay is labeled as simulated and retains its 13:33 clock", () => {
+  const {view} = components({product: "tw_day_trade", formatOverrides: {shortTime: value => value || "—"}});
+  const html = view.positionRow({symbol: "6516", status: "closed", signed_shares: 0, filled_shares: 1000,
+    exit_reason: "13_33_delayed_close_paper_settlement", exit_at: "2026-11-04T13:33:00+08:00"});
+  assert.match(html, /13:33 延後收盤模擬沖銷（非券商成交）/);
+  assert.match(html, /2026-11-04T13:33:00\+08:00/);
+});
+
+test("nontrade book settlement is never displayed as a closing fill", () => {
+  const {view} = components({formatOverrides: {shortTime: value => value || "—"}});
+  const row = {symbol: "5906", status: "nontrade_book_settled", filled_shares: 1000,
+    nontrade_settlement_contract: "last_observed_trade_nonexecution_book_settlement_v1",
+    nontrade_settlement_shares: 1000, nontrade_reference_before_entry: true,
+    nontrade_reference_observed_at: "2026-11-04T09:40:46+08:00"};
+  const html = view.positionRow(row);
+  assert.match(html, /假設帳面結算（非成交）/);
+  assert.match(html, /參考成交早於回放進場時間/);
+  assert.match(html, /2026-11-04T09:40:46\+08:00/);
+  assert.doesNotMatch(html, /清算（已平倉）|>已實現 0/);
+  const signal = view.signalRow({symbol: "5906", filled_shares: 1000, position: row});
+  assert.match(signal, /假設帳面結算（非成交）/);
+  assert.match(signal, /非成交帳面估算/);
+  assert.doesNotMatch(signal, /已平倉價/);
+  const event = view.eventRow({purpose: "nontrade_last_observed_accounting_settlement", quantity: 1000});
+  assert.match(event, /假設帳面結算/);
+  assert.match(event, /非成交/);
+  assert.doesNotMatch(event, /nontrade_last_observed/);
+});
+
 test("public source clocks are escaped in the footer, not repeated beside event prices", () => {
   const {view} = components({formatOverrides: {sourceNumber: (value) => String(value ?? "—")}});
   const row = {price: 112.5, public_price_display: {visible_fields: {
@@ -404,6 +438,26 @@ test("missed opening replay is not labelled as a live market-order fill", () => 
   assert.match(html, /09:01 首分鐘價反事實模擬/);
   assert.match(html, /容量限制未建立委託/);
   assert.doesNotMatch(html, /市價成交/);
+});
+
+test("official-open fallback visibly discloses assumed timing and quantity", () => {
+  const {view, presentation} = components();
+  assert.match(presentation.signalReasonLabel("counterfactual_official_open_when_0901_unavailable"), /開盤價假設進場/);
+  const html = view.signalRow({symbol: "2330", side: "long", target_weight: 0.1,
+    requested_shares: 1000, filled_shares: 1000, execution_price: 100,
+    historical_open_fallback_fill: true,
+    entry_fill_policy: "official_open_signal_0900_execute_0901_vwap"});
+  assert.match(html, /09:01 假設進場/);
+  assert.match(html, /首筆時間、成交量未確認/);
+  assert.match(html, /數量為假設，非券商或交易所成交/);
+  assert.doesNotMatch(html, /首分鐘價反事實模擬/);
+  const position = view.positionRow({symbol: "2330", side: "long", target_weight: 0.1,
+    filled_shares: 1000, signed_shares: 1000, historical_open_fallback_fill: true});
+  assert.match(position, /開盤價假設進場/);
+  const event = view.eventRow({symbol: "2330", purpose: "entry", event_kind: "fill",
+    quantity: 1000, historical_open_fallback_fill: true});
+  assert.match(event, /開盤價假設進場/);
+  assert.match(event, /非實際成交/);
 });
 
 test("filled signals use their exact embedded valuation independently of position pagination", () => {
@@ -485,8 +539,21 @@ test("mode card keeps filtered returns separate from the shared Discord account 
   mode.indicative_valuation_position_count = 0;
   context.renderModes({modes: [mode]});
   assert.doesNotMatch(output, /參考快照估值（非成交證據）/);
-  assert.match(output, /模擬目標／成交／缺口/);
+  assert.match(output, /最新訊號目標／成交／缺口/);
+  assert.match(output, /最新訊號紙上成交/);
   assert.match(output, /等待成交資訊/);
+  mode.provisional_minute_source_coverage = true;
+  context.renderModes({modes: [mode]});
+  assert.match(output, /暫定回放：分鐘資料可能不完整/);
+  assert.match(output, /並非券商成交/);
+  mode.provisional_minute_source_coverage = false;
+  context.renderModes({modes: [mode]});
+  assert.doesNotMatch(output, /暫定回放：分鐘資料可能不完整/);
+  mode.cumulative_provisional_minute_source_coverage = true;
+  context.renderModes({modes: [mode]});
+  assert.match(output, /累積績效包含分鐘資料可能不完整的暫定歷史/);
+  assert.match(output, /並非券商成交/);
+  mode.cumulative_provisional_minute_source_coverage = false;
   assert.doesNotMatch(output, /data-paper-entry-counts/);
   Object.assign(mode, {entry_requested_shares: 1000, entry_filled_shares: 500, entry_unfilled_shares: 500});
   context.renderModes({modes: [mode]});

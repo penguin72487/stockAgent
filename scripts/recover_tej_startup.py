@@ -17,6 +17,18 @@ from downloader.dataset_lock import DatasetLockTimeout, exclusive_dataset_lock
 from downloader.tej_startup import bootstrap, drain_interactive_transport
 
 
+def enter_service_mount_namespace():
+    """Keep the interactive Windows relay while using the service-owned mounts."""
+    current = os.readlink('/proc/self/ns/mnt')
+    authority = os.readlink('/proc/1/ns/mnt')
+    if current != authority:
+        # exec keeps WSL_INTEROP and the Windows interactive session. The
+        # collector's existing placement and lock checks still run afterward.
+        os.execvp('nsenter', ['nsenter', '--mount=/proc/1/ns/mnt', '--',
+                              sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]])
+        raise RuntimeError('mount namespace handoff unexpectedly returned')
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--root', type=Path, default=ROOT/'data_tej')
@@ -24,6 +36,18 @@ def main():
     parser.add_argument('--windows-session-id', type=int, required=True)
     parser.add_argument('--watch', action='store_true', help='Keep the logged-in WSL relay alive and recover every minute')
     args = parser.parse_args()
+    # The original Windows task repeats independently of Linux service timers.
+    # A placement handoff must fence it BEFORE any lock/session/status writes.
+    from stockagent.data_sync.provider_workspace import MIGRATION_FENCE, check_path
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    if MIGRATION_FENCE.exists():
+        print(json.dumps({'state': 'provider_workspace_handoff_wait', 'provider_queries_sent': 0}))
+        return 75
+    try:
+        check_path(args.root)  # Persistent pending placement also fences a fresh boot.
+    except (OSError, ValueError, SnapshotError):
+        print(json.dumps({'state': 'provider_workspace_handoff_wait', 'provider_queries_sent': 0}))
+        return 75
     stop = Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda _signum, _frame: stop.set())
@@ -64,4 +88,5 @@ def main():
 
 
 if __name__ == '__main__':
+    enter_service_mount_namespace()
     raise SystemExit(main())

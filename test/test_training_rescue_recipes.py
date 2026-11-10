@@ -51,6 +51,42 @@ def test_working_directory_declaration_is_an_explicit_versioned_recovery_input(r
     assert effective["train_argv"] == base["train_argv"]
 
 
+def test_recipe_sources_are_protected_before_pointer_and_busy_owner_keeps_it_unpublished(recipe_case, monkeypatch):
+    owner, base, candidate, _ = recipe_case
+    pointer = owner.path(base['run_id'])/'input-recipe.json'
+    observed = []
+    def busy(spec):
+        observed.append(spec['data_sources'])
+        assert not pointer.exists()
+        raise BlockingIOError('publication owner busy')
+    monkeypatch.setattr(owner, '_protect_packed_sources', busy)
+    with pytest.raises(BlockingIOError):
+        owner.register_input_recipe(candidate)
+    assert observed == [candidate['data_sources']] and not pointer.exists()
+    monkeypatch.setattr(owner, '_protect_packed_sources', lambda spec: observed.append(spec['data_sources']))
+    owner.register_input_recipe(candidate)
+    assert pointer.is_file() and observed[-1] == candidate['data_sources']
+
+
+def test_reference_reconciliation_preserves_original_and_all_recorded_revisions(recipe_case, monkeypatch):
+    owner, base, candidate, _ = recipe_case
+    owner.register_input_recipe(candidate)
+    second = copy.deepcopy(candidate)
+    second['data_sources'][0]['snapshot_id'] = 'second-fixed-originals'
+    second['data_sources'][0]['manifest_sha256'] = 'b'*64
+    owner.register_input_recipe(second)
+    captured = []
+    def protect(spec):
+        captured.extend(spec['data_sources'])
+        return spec['data_sources']
+    monkeypatch.setattr(owner, '_protect_packed_sources', protect)
+    monkeypatch.setattr(owner, 'object_hash', lambda *_: pytest.fail('reference reconciliation reads no payloads'))
+    result = owner.reconcile_source_references()
+    assert result['state'] == 'completed' and result['revision_count'] == 2
+    assert {row['snapshot_id'] for row in captured} == {'fixed-originals', 'second-fixed-originals'}
+    assert result['source_objects_checked'] is False and result['recovery_or_nas_acceptance_claimed'] is False
+
+
 def test_recipe_registration_is_immutable_idempotent_and_does_not_reenroll_source(recipe_case, monkeypatch):
     owner, base, candidate, source = recipe_case
     path = owner.path(base["run_id"]) / "spec.json"

@@ -505,8 +505,10 @@ def _postprocess_plot_specs(spec: dict[str, Any]) -> list[dict[str, str]]:
         if not _SAFE_NAME.fullmatch(prefix):
             raise ValueError(f"postprocess_plots[{index}] has invalid prefix")
         comparison_mode = str(entry.get("comparison_mode", "paired"))
-        if comparison_mode not in {"paired", "absolute"}:
+        if comparison_mode not in {"paired", "absolute", "test_year"}:
             raise ValueError(f"postprocess_plots[{index}] has invalid comparison_mode")
+        if comparison_mode == "test_year" and split != "test":
+            raise ValueError("test_year comparison requires the test split")
         plots.append(
             {
                 "split": split,
@@ -556,7 +558,7 @@ def _available_postprocess_plots(output_root: Path, plots: list[dict[str, str]],
                                  baseline_root: Path | None) -> list[dict[str, str]]:
     if baseline_root is not None or (output_root / "baseline" / "summary.json").is_file():
         return plots
-    available = [plot for plot in plots if plot.get("comparison_mode", "paired") == "absolute"]
+    available = [plot for plot in plots if plot.get("comparison_mode", "paired") in {"absolute", "test_year"}]
     if len(available) != len(plots):
         print("[ablation] paired charts deferred: no matching baseline; "
               "absolute charts remain available", flush=True)
@@ -846,6 +848,13 @@ def _experiment_rows(spec_path: Path, selected: set[str] | None = None) -> tuple
         if row["name"] in seen:
             raise ValueError(f"duplicate experiment name: {row['name']}")
         seen.add(row["name"])
+    order = spec.get("experiment_order")
+    if order is not None:
+        if (not isinstance(order, list) or not all(isinstance(name, str) for name in order)
+                or len(order) != len(seen) or set(order) != seen):
+            raise ValueError("experiment_order must contain every experiment exactly once")
+        priority = {name: index for index, name in enumerate(order)}
+        rows.sort(key=lambda row: priority[row["name"]])
     if selected:
         missing = selected - seen
         if missing:
@@ -1050,6 +1059,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--only", default=None, help="Comma-separated experiment names.")
     parser.add_argument("--start-fold", type=int, default=None)
     parser.add_argument("--max-folds", type=int, default=None)
+    parser.add_argument("--fold-order", choices=("ascending", "descending"), default=None)
     parser.add_argument("--epochs", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--multi-gpu-strategy", default=None)
@@ -1126,6 +1136,9 @@ def main() -> None:
         else None
     )
     spec, experiments = _experiment_rows(spec_path, selected)
+    fold_order = args.fold_order or spec.get("fold_order", "ascending")
+    if fold_order not in {"ascending", "descending"}:
+        raise ValueError("fold_order must be ascending or descending")
     pinned_panel_cache_env = _resolve_pinned_panel_cache_env(spec)
     if pinned_panel_cache_env:
         print(
@@ -1153,6 +1166,10 @@ def main() -> None:
             _render_postprocess_plots(output_root, plots, baseline_root=baseline)
         return
     runs = _build_configs(spec_path, spec, experiments, output_root)
+    if fold_order == "descending":
+        from stockagent.config import load_config
+        if any(load_config(run["config_path"]).training.warm_start_from_previous_fold for run in runs):
+            raise ValueError("descending fold order cannot warm-start from a later fold")
     runtime = spec.get("runtime", {})
     if not isinstance(runtime, dict):
         raise ValueError("ablation spec runtime must be a mapping")
@@ -1202,9 +1219,13 @@ def main() -> None:
         else None
     )
     plots_refreshed = False
+    plot_failure = None
+    continue_on_plot_failure = spec.get("continue_on_plot_failure", False)
+    if not isinstance(continue_on_plot_failure, bool):
+        raise ValueError("continue_on_plot_failure must be a boolean")
 
     def refresh_plots(completed_name: str) -> None:
-        nonlocal plots_refreshed
+        nonlocal plots_refreshed, plot_failure
         if not postprocess_plots:
             return
         available_plots = _available_postprocess_plots(output_root, postprocess_plots, baseline_root)
@@ -1216,11 +1237,23 @@ def main() -> None:
                 available_plots,
                 baseline_root=baseline_root,
             )
-        except subprocess.CalledProcessError as exc:
-            raise RuntimeError(
-                f"ablation charts failed after completed experiment {completed_name}"
-            ) from exc
+        except (subprocess.CalledProcessError, OSError) as exc:
+            plot_failure = {"completed_name": completed_name, "returncode": getattr(exc, "returncode", None),
+                            "command": getattr(exc, "cmd", None), "error": str(exc),
+                            "time_unix_ns": time.time_ns()}
+            plots_refreshed = False
+            if not continue_on_plot_failure:
+                raise RuntimeError(
+                    f"ablation charts failed after completed experiment {completed_name}"
+                ) from exc
+            output_root.mkdir(parents=True, exist_ok=True)
+            with (output_root / "plot_refresh_failures.jsonl").open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(plot_failure, default=str) + "\n")
+            print(f"[ablation] chart refresh failed after {completed_name}; "
+                  "failure recorded, remaining experiments continue", flush=True)
+            return
         plots_refreshed = True
+        plot_failure = None
         print(
             f"[ablation] charts refreshed after completed experiment: {completed_name}",
             flush=True,
@@ -1318,6 +1351,8 @@ def main() -> None:
         if capacity_policy and not args.dry_run:
             run = _capacity_run(run, capacity_policy)
         command = [str(args.runner.resolve()), "-c", str(run["config_path"]), "--"]
+        if fold_order != "ascending":
+            command.extend(["--fold-order", fold_order])
         for flag, value in (
             ("--start-fold", _run_start_fold(run, args.start_fold)),
             ("--max-folds", args.max_folds),
@@ -1717,15 +1752,16 @@ def main() -> None:
         raise SystemExit(130)
 
     write_current_summary()
-    if first_failure is not None:
-        raise SystemExit(first_failure)
-    summary_rows = [summary_by_order[index] for index in sorted(summary_by_order)]
-    if any(row["returncode"] not in (None, 0) for row in summary_rows):
-        raise SystemExit(1)
-    if not args.collect_only and not plots_refreshed:
+    if (not args.collect_only and not plots_refreshed and
+            any(row["status"] in {"complete", "succeeded"} for row in summary_by_order.values())):
         # A fully resumed invocation may skip every already-complete worker.
         # Refresh its chart set once without retraining or touching checkpoints.
         refresh_plots("already-complete suite")
+    if first_failure is not None:
+        raise SystemExit(first_failure)
+    summary_rows = [summary_by_order[index] for index in sorted(summary_by_order)]
+    if plot_failure is not None or any(row["returncode"] not in (None, 0) for row in summary_rows):
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":

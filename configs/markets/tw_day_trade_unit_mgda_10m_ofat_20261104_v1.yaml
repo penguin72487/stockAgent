@@ -1,0 +1,11 @@
+# Selected legacy Unit MGDA policy; independent scratch OFAT, never live deployment.
+base_config: tw_day_trade_unit_mgda_capital_20261103_v1.yaml
+experiment_name: tw-day-trade-unit-mgda-10m-ofat-20261104-v1
+runner:
+  output_dir: artifacts/markets/tw_day_trade_unit_mgda_10m_ofat_20261104_v1/baseline
+  resume: true
+  start_fold: 10
+trading:
+  volume_participation_equity: 10000000.0
+  tw_minute_initial_equity: 10000000.0
+  tw_day_trade_short_limit_up_penalty_rate: 0.07

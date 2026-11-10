@@ -760,6 +760,10 @@ def main() -> int:
     api_key = os.getenv("DUNE_API_KEY", "").strip()
     if not api_key:
         raise SystemExit("DUNE_API_KEY is not configured; no Dune request was sent")
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+    guard_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_handle = (output_dir / ".download.lock").open("a+")
     try:
@@ -770,6 +774,11 @@ def main() -> int:
             flush=True,
         )
         return 0
+    try:
+        guard_locked_path(output_dir, lock_handle)
+    except BaseException:
+        lock_handle.close()
+        raise
 
     selected = set(args.queries) if args.queries else None
     contracts = _load_contracts(config_path, selected)

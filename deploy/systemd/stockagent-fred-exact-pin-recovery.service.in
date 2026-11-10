@@ -1,0 +1,14 @@
+[Unit]
+Description=Recover the exact FRED retained-history pin without changing its head
+Requires=stockagent-e-workspace-mount.service stockagent-d-cold-mount.service
+After=stockagent-e-workspace-mount.service stockagent-d-cold-mount.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 120 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_authority_storage_operation.sh scripts/recover_fred_exact_pin.py
+TimeoutStartSec=30min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

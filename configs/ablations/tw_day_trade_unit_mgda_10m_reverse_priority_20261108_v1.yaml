@@ -1,0 +1,47 @@
+# Extend the compatible existing study; retain its completed fold 10 and attempts.
+# Invoke with --start-fold 1 --max-folds 10. Each policy then processes 10 -> 1.
+base_spec: tw_day_trade_unit_mgda_10m_ofat_20261104_v1.yaml
+fold_order: descending
+expected_fold_count: 10
+experiment_order:
+  - temporal_layers__one
+  - objective__log_return
+  - qk_norm__off
+  - output__projection_l1
+  - head__linear
+  - embedding__d64
+  - baseline
+  - temporal_layers__zero
+  - gradient__config_unit_parameter
+  - time_position__off
+  - gradient__dibs1_unit_parameter
+  - gradient__dibs5_unit_parameter
+  - pooling__attention
+  - step_size__lr003
+  - rope__off
+  - gradient__raw_mgda_parameter
+  - temporal_query__full_then_last
+  - output__score_cash_v2
+  - objective__calmar
+  - output__learned_cash
+  - lookback__d128
+  - output__log_cash
+  - objective__sharpe
+  - objective__sortino
+  - norm__rmsnorm
+  - pooling__mean
+  - gradient__raw_pcgrad_parameter
+  - ffn__gelu
+  - gradient__upgrad_log_unit_parameter
+  - lookback__d64
+  - embedding__d128
+  - input_rms__off
+  - cross_context__no_latent
+  - cross_context__no_market
+continue_on_plot_failure: true
+postprocess_plots:
+  - split: test
+    prefix: reverse_test
+    comparison_mode: test_year
+    calendar_receipt: /root/stockAgent/artifacts/markets/tw_day_trade_unit_mgda_10m_reverse_priority_20261108_v1/_operations/calendar-admission.json
+    scope_label: First test year from each independent fold account

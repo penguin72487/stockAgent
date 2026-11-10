@@ -16,6 +16,9 @@ import polars as pl
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(REPO_ROOT))
 
 from common import PersistentProgress, atomic_write_text  # noqa: E402
 from artifact_io import (  # noqa: E402
@@ -456,6 +459,12 @@ def _download_symbol(
 
 def main() -> None:
     args = parse_args()
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard
+    with writer_guard(args.output_dir):
+        _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args) -> None:
     run_started = time.perf_counter()
     started = datetime.now(timezone.utc)
     snapshot_ms = int(started.timestamp() * 1000)

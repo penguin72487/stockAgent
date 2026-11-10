@@ -1,0 +1,16 @@
+[Unit]
+Description=Repack one fixed E or D source as a dataset-local D release
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 120 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/run_bounded_storage_maintenance.py scripts/run_source_local_repack_queue.py'
+# The wrapper stops before the next protected trading window, even if the
+# current child stalls. Complete E packs and install journals resume later.
+TimeoutStartSec=8h 1min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

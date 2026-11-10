@@ -36,13 +36,47 @@ RECOVERY_HOLDS = Path("/var/lib/stockagent-legacy-return/recovery-holds.json")
 _ACTIVE_CONFIG_VERSIONS = {}
 
 
-def _active_configuration(path: Path, cwd: Path, argv: list[str]):
-    """Resolve using the actual selected trainer when checkout schemas differ."""
-    from stockagent.config import load_config
+def _training_process_identity(process: Path):
+    """Bind a runtime observation to the live PID and executable generation."""
+    raw = (process / 'stat').read_bytes()
+    fields = raw.rsplit(b')', 1)[-1].split()
+    if len(fields) <= 19:
+        raise SnapshotError('training process identity unavailable')
+    executable = os.readlink(process / 'exe')
+    info = (process / 'exe').stat()
+    if not stat.S_ISREG(info.st_mode):
+        raise SnapshotError('training process executable is not regular')
+    return (executable, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, fields[19])
+
+
+def _training_process_python(process: Path, environment, identity) -> Path:
+    """Use the observed Python, preserving a matching active venv prefix."""
+    values = {}
+    for item in environment:
+        name, sep, value = item.partition('=')
+        if sep and name in {'VIRTUAL_ENV', 'CONDA_PREFIX'} and value:
+            values[name] = value
+    candidates = [Path(values[name])/'bin/python' for name in ('VIRTUAL_ENV', 'CONDA_PREFIX')
+                  if name in values and Path(values[name]).is_absolute()]
+    candidates.append(Path(identity[0]))
+    for candidate in candidates:
+        try:
+            if (candidate.is_absolute() and candidate.name.startswith('python') and candidate.is_file()
+                    and os.access(candidate, os.X_OK) and os.path.samefile(candidate, process/'exe')):
+                return candidate
+        except (OSError, ValueError):
+            continue
+    raise SnapshotError('active training Python could not be bound to its process')
+
+
+def _active_configuration(path: Path, cwd: Path, argv: list[str], *, process: Path | None = None,
+                          process_environment=()):
+    """Resolve a config with its selected trainer when the control runtime cannot."""
     try:
+        from stockagent.config import load_config
         signatures = {}
         return asdict(load_config(path, source_signatures=signatures)), list(signatures)
-    except (ValueError, KeyError, TypeError):
+    except (ModuleNotFoundError, ValueError, KeyError, TypeError) as error:
         # A new frozen experiment can be valid while this control checkout
         # predates its model fields. Never strip unknown fields or weaken the
         # consumer gate. Use its canonical loader in a fresh CPU process.
@@ -52,13 +86,22 @@ def _active_configuration(path: Path, cwd: Path, argv: list[str]):
         entry = Path(train_entry)
         root = (entry if entry.is_absolute() else cwd / entry).resolve().parent
         loader = root / 'stockagent/config.py'
-        if not loader.is_file() or root == Path(__file__).resolve().parents[2]:
+        if (not loader.is_file()
+                or root == Path(__file__).resolve().parents[2] and not isinstance(error, ModuleNotFoundError)
+                or isinstance(error, ModuleNotFoundError) and process is None):
             raise
-        key = (str(root), str(path.resolve()))
+        import subprocess, sys
+        process_before = _training_process_identity(process) if process is not None else None
+        executable = (_training_process_python(process, process_environment, process_before)
+                      if process_before is not None else Path(sys.executable))
+        executable_info = executable.stat()
+        key = (str(root), str(path.resolve()), str(executable), executable_info.st_dev,
+               executable_info.st_ino, executable_info.st_size, executable_info.st_mtime_ns)
         cached = _ACTIVE_CONFIG_VERSIONS.get(key)
         if cached and all(p.is_file() and sha256_file(p) == digest for p,digest in cached['proofs'].items()):
+            if process_before is not None and _training_process_identity(process) != process_before:
+                raise SnapshotError('training process changed during configuration observation')
             return cached['configuration'], cached['sources']
-        import subprocess, sys
         program = '''
 import sys,json,hashlib
 from pathlib import Path
@@ -76,9 +119,11 @@ for p,signature in sources.items():
 proofs[str(Path(module.__file__).resolve())]=hashlib.sha256(Path(module.__file__).read_bytes()).hexdigest()
 print(json.dumps({'configuration':asdict(config),'sources':[str(p) for p in sources],'proofs':proofs},default=str))
 '''
-        run = subprocess.run([sys.executable, '-c', program, str(path)], cwd=root,
+        run = subprocess.run([str(executable), '-c', program, str(path)], cwd=root,
                              env={**os.environ,'PYTHONDONTWRITEBYTECODE':'1'},
                              capture_output=True, text=True, timeout=30, check=True)
+        if process_before is not None and _training_process_identity(process) != process_before:
+            raise SnapshotError('training process changed during configuration observation')
         result = json.loads(run.stdout)
         source_paths = [Path(p) for p in result['sources']]
         proofs = {Path(p):digest for p,digest in result['proofs'].items()}
@@ -193,7 +238,8 @@ def active_configuration_references_many(sources, repo_root: Path) -> dict[str, 
             try:
                 documents = [yaml.safe_load(path.read_text())]
                 if training:
-                    configuration, sources_used = _active_configuration(path, cwd, argv)
+                    configuration, sources_used = _active_configuration(
+                        path, cwd, argv, process=process, process_environment=environment)
                     documents.append(configuration)
                     # A config's base chain is a runtime/resume dependency,
                     # even when resolved dataclasses omit inheritance keys.

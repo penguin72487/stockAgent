@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh staged cold object metadata attribution
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=stockagent-staged-cold-attribution.service
+
+[Install]
+WantedBy=timers.target

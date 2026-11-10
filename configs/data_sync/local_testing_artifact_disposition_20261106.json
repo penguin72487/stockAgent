@@ -1,0 +1,15 @@
+{
+  "contract": "explicit-local-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "使用者授權刪除舊效能驗證資料；逐項固定已檢查的本機效能測試工作副本，保留摘要收據，沿用原程序、pin、inode 與世代檢查。",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {"base": "artifact", "relative": "benchmarks/tw_daytrade_rank0_infer_20260720", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/tw_daytrade_gloo_infer_20260720", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/tw_daytrade_compiled_20260720", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/tw_parallel_manual_probe", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/tw_parallel_cache_eval_probe", "kind": "directory", "reason": "benchmark"}
+  ],
+  "identity_sha256": "a36706fb09ab4d1cf992f8fb7d3b3c868d80602ba5f8ff95e6aa46bf099ce103"
+}

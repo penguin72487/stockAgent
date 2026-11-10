@@ -7,12 +7,13 @@ The published projection contains neither connection details nor absolute paths.
 """
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
 import contextlib
 from datetime import datetime, time as datetime_time, timezone
 import fcntl
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -20,7 +21,7 @@ import shlex
 import stat
 import subprocess
 import tempfile
-from threading import Lock
+from threading import Lock, Timer
 import time
 from zoneinfo import ZoneInfo
 
@@ -33,9 +34,9 @@ CONTRACT = "stockagent.storage_monitor.v1"
 VOLUMES = {
     "penguin-wsl": ("penguin", "C 槽 WSL 服務磁碟", "程式、服務、帳本、資料庫與控制索引"),
     "penguin-c": ("penguin", "Windows C 槽", "Windows 系統與應用程式"),
-    "penguin-d": ("penguin", "Windows D 槽 · 主冷庫", "不可變冷庫與封閉資料正本"),
-    "penguin-e": ("penguin", "Windows E 槽 · NVMe 工作磁碟", "進冷庫前的下載、增量、封裝、驗證與傳輸"),
-    "penguin-workspace": ("penguin", "E 槽 Linux 資料卷", "原生 ext4 工作資料；容量包含在 E 槽內"),
+    "penguin-d": ("penguin", "Windows D 槽 · 本機備份", "不可變備份與既有固定版本；還原驗收分開計算"),
+    "penguin-e": ("penguin", "Windows E 槽 · NVMe 資料磁碟", "來源資料、增量及工作區的實體儲存"),
+    "penguin-workspace": ("penguin", "E 槽 Linux 資料卷", "來源資料、下載、整理與驗證；容量包含在 E 槽內"),
     "vastai1T-disk": ("vastai1T", "Vast 工作磁碟", "遠端訓練；實例回收後不保證留存"),
     "lab203-disk": ("lab203", "lab203 中繼磁碟", "封閉批次、備份與還原暫存"),
     "nas-disk": ("nas", "NAS 歸檔磁碟", "不可變歸檔與加密備份；共享磁碟使用量包含其他使用者"),
@@ -116,10 +117,13 @@ def ssh_prefix(config: dict) -> list[str]:
     target = os.environ.get(config["target_env"], "")
     port = os.environ.get(config["port_env"], "")
     identity = os.environ.get(config["identity_env"], "")
+    fallback = config.get("fallback_identity_env")
+    if not identity and isinstance(fallback, str):
+        identity = os.environ.get(fallback, "")
     if (not re.fullmatch(r"[A-Za-z0-9_.-]+@[A-Za-z0-9_.:-]+", target)
             or not port.isdigit() or not 1 <= int(port) <= 65535 or not Path(identity).is_file()):
         raise ValueError("remote_not_enrolled")
-    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes",
+    return ["ssh", "-T", "-o", "BatchMode=yes", "-o", "IdentitiesOnly=yes", "-o", "ConnectTimeout=5", "-o", "StrictHostKeyChecking=yes",
             "-o", "ServerAliveInterval=5", "-o", "ServerAliveCountMax=2", "-i", identity, "-p", port, target]
 
 
@@ -426,6 +430,16 @@ def census_root_order(roots: list[dict], previous: dict | None) -> list[dict]:
 
 def census_fingerprint(config: dict, volume: dict, remote: dict | None) -> str:
     scope = {"version": 2, "volume": volume, "depth": config["classification_depth"]}
+    if volume.get('id') in {'penguin-wsl', 'penguin-workspace'}:
+        options = config.get('operations', {})
+        path = options.get('provider_workspace_registry') if isinstance(options, dict) else None
+        placement = operation_metadata(Path(path)) if isinstance(path, str) else {}
+        if placement.get('contract') == 'temporary_provider_e_workspace_v1':
+            providers = placement.get('providers')
+            if isinstance(providers, dict) and not set(providers) - {'finlab', 'finmind', 'tej'}:
+                scope['provider_workspace_layout'] = {name: {k: entry.get(k) for k in
+                    ('state', 'alias', 'destination', 'backup', 'filesystem_uuid')}
+                    for name, entry in providers.items() if isinstance(entry, dict)}
     if remote:
         scope["enrolled_remote"] = [os.environ.get(remote[key], "") for key in ("target_env", "port_env")]
     return hashlib.sha256(json.dumps(scope, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
@@ -750,13 +764,15 @@ def public_cold_tiers(value, *, now: float) -> dict | None:
     observed = value.get("observed_at_epoch")
     if type(observed) not in (int, float) or not 0 < observed <= now + 300:
         return None
-    allowed = {"outside_daily_window", "waiting_d_capacity", "waiting_publication_window",
+    allowed = {"outside_daily_window", "waiting_d_capacity", "waiting_publication_window", "waiting_migration_priority",
                "bounded_cycle_complete", "partial_failures_preserved", "existing_tier_owner_busy"}
     state = value.get("state") if value.get("state") in allowed else "unknown"
     schedule = value.get("schedule") if isinstance(value.get("schedule"), dict) else {}
     start, end, stable = (schedule.get(key) for key in
         ("daily_window_start_hour", "daily_window_end_hour", "stable_after_hours"))
-    schedule = ({"timezone": "Asia/Taipei", "start_hour": start, "end_hour": end, "stable_after_hours": stable}
+    reserve_bytes = nonnegative(schedule.get("reserve_bytes"))
+    schedule = ({"timezone": "Asia/Taipei", "start_hour": start, "end_hour": end, "stable_after_hours": stable,
+                 **({"reserve_bytes": reserve_bytes} if reserve_bytes is not None else {})}
         if schedule.get("daily_window_timezone") == "Asia/Taipei"
            and type(start) is int and type(end) is int and 0 <= start < end <= 24
            and type(stable) is int and 1 <= stable <= 168 else None)
@@ -775,6 +791,14 @@ def public_cold_tiers(value, *, now: float) -> dict | None:
 
 def public_status(value: dict, *, now: float | None = None) -> dict:
     """Whitelist every field; last measurement clocks survive failed probes."""
+    # The paired lab203 observer only collects local capacities and does not
+    # ship Penguin's D-catalog classifier (or its ijson dependency). Keep
+    # these UI-only imports inside the Penguin public projection so that the
+    # fixed receiver bundle stays self-contained.
+    from stockagent.data_sync.d_backup_inventory import public_progress as public_d_backup_progress
+    from stockagent.data_sync.d_backup_inventory import public_status as public_d_backup_inventory
+    from stockagent.data_sync.d_backup_inventory import public_pack_trial as public_d_pack_trial
+    from stockagent.data_sync.d_pack_layout_inventory import public_status as public_d_pack_layout
     now = time.time() if now is None else now
     if value.get("contract") != CONTRACT:
         value = {}
@@ -825,6 +849,8 @@ def public_status(value: dict, *, now: float | None = None) -> dict:
             'retirement_wave_active', 'retirement_wave_pending', 'retirement_wave_lock_unobservable',
             'dataset_version_owner_active', 'dataset_version_owner_unobservable',
             'transport_relocation_owner_active',
+            'source_local_migration_active',
+            'provider_workspace_owner_active', 'provider_workspace_observation_unavailable',
             'tw_opening_guard_active', 'tw_opening_guard_unknown'} else None
         nodes[owner]["volumes"].append({"id": identity, "label": label, "role": role, "capacity": projected_cap,
             "classification": classification, "contained_in": row.get("contained_in") if row.get("contained_in") in VOLUMES else None})
@@ -857,6 +883,10 @@ def public_status(value: dict, *, now: float | None = None) -> dict:
         "nodes": list(nodes.values()), "aggregate_capacity_bytes": None,
         "efficiency": public_efficiency(value.get("efficiency")) if isinstance(value.get("efficiency"), dict) else None,
         "cold_tiers": public_cold_tiers(value.get("cold_tiers"), now=now),
+        "d_backup_inventory": public_d_backup_inventory(value.get("d_backup_inventory"), now=now),
+        "d_pack_layout": public_d_pack_layout(value.get("d_pack_layout"), now=now),
+        "d_backup_inventory_progress": public_d_backup_progress(value.get("d_backup_inventory_progress"), now=now),
+        "d_pack_trial": public_d_pack_trial(value.get("d_pack_trial")),
         "operations": public_operations(value.get("operations"), now=now),
         "runtime": public_runtime(value.get("runtime"), now=now),
         "definitions": {"capacity": "磁碟整體實測容量；NAS 可能與他人共享。未量測不當作零。",
@@ -879,10 +909,15 @@ def load_config(path: Path) -> dict:
     ids = [row.get("id") for row in value["volumes"]]
     if len(ids) != len(set(ids)) or not set(ids) <= allowed:
         raise ValueError("foreign_or_duplicate_volume")
+    if ('independent_local_capacity' in value
+            and (type(value['independent_local_capacity']) is not bool
+                 or value['independent_local_capacity'] and value['observer_node_id'] != 'penguin')):
+        raise ValueError('invalid_independent_local_capacity')
     return value
 
 
-def observe_capacities(config: dict) -> dict:
+def observe_local_capacities(config: dict) -> dict:
+    """Local statvfs and mount guards, with no Windows or network process."""
     measured = {}
     for row in config["volumes"]:
         try:
@@ -893,6 +928,11 @@ def observe_capacities(config: dict) -> dict:
                 measured[row["id"]]["source"] = "guarded_nas_statvfs"
         except (OSError, ValueError, KeyError, RuntimeError, SnapshotError) as exc:
             measured[row["id"]] = {"state": "unavailable", "error_code": type(exc).__name__, "attempted_at_utc": utc()}
+    return measured
+
+
+def observe_capacities(config: dict) -> dict:
+    measured = observe_local_capacities(config)
     if config["observer_node_id"] == "penguin":
         measured.update(windows_capacity())
     if config.get("remote"):
@@ -989,6 +1029,41 @@ def local_census_priority_reason(volume: dict, repo: Path) -> str | None:
         options = operation_metadata(repo/'configs/data_sync/storage_monitor.json').get('operations', {})
         if not isinstance(options, dict):
             options = {}
+        workspace_root = options.get('provider_workspace_root')
+        if isinstance(workspace_root, str) and Path(workspace_root).is_absolute():
+            # A full du over millions of E files adds random I/O and memory
+            # pressure while the sealed-pack and D-install owners are active.
+            # Their tiny heartbeat files are observations, not leases: never
+            # stop an owner, and let stale/missing observations expire.
+            migration = Path(workspace_root)/'migration'
+            statuses = (
+                ('source-local-exact-repack/queue-status.json', 'stockagent.source_local_repack_queue.v1.status'),
+                ('source-local-exact-repack/prepared-install-queue-status.json', 'stockagent.prepared_stream_install_queue.v1'),
+                ('handoff-index-archive-v1/queue-status.json', 'stockagent.handoff_index_archive_queue.v1'),
+                ('handoff-index-archive-v1/D-queue-status.json', 'stockagent.handoff_index_private_D_queue.v1'),
+                ('handoff-source-repack-v1/queue-status.json', 'stockagent.handoff_source_repack_queue.v1'),
+                ('handoff-source-repack-v1/D-queue-status.json', 'stockagent.handoff_private_D_queue.v1'),
+            )
+            for relative, contract in statuses:
+                status = operation_metadata(migration/relative)
+                stamp, entries = status.get('observed_at_epoch'), status.get('entries')
+                if (status.get('contract') == contract and type(stamp) in (int, float)
+                        and -60 <= time.time()-stamp <= 180 and isinstance(entries, list)
+                        and len(entries) <= 1024
+                        and any(isinstance(item, dict) and item.get('state') == 'running' for item in entries)):
+                    return 'source_local_migration_active'
+        registry = options.get('provider_workspace_registry')
+        if volume.get('id') in {'penguin-wsl', 'penguin-workspace'} and isinstance(registry, str):
+            placement = operation_metadata(Path(registry))
+            if Path(registry).exists():
+                providers = placement.get('providers')
+                if (placement.get('contract') != 'temporary_provider_e_workspace_v1'
+                        or not isinstance(providers, dict)
+                        or set(providers) - {'finlab', 'finmind', 'tej'}
+                        or any(not isinstance(v, dict) for v in providers.values())):
+                    return 'provider_workspace_observation_unavailable'
+                if any(v.get('state') != 'active' for v in providers.values()):
+                    return 'provider_workspace_owner_active'
         root = options.get('workspace_relocation_state_root')
         if isinstance(root, str):
             waiting = operation_metadata(Path(root)/'attempt.json')
@@ -1088,6 +1163,88 @@ def record_daily_capacity(history_path: Path, volumes: list[dict], *, now: datet
     return changed
 
 
+class SingleFlightCapacityProbe:
+    """Keep a slow native/remote probe off the minute publication path.
+
+    At most one probe can run. Pending or failed work retains the previous
+    observation and its original clock; it never makes old capacity look new.
+    """
+    def __init__(self, executor, config, initial=None, *, observe=None):
+        self.executor = executor
+        self.config = config
+        self.value = initial if isinstance(initial, dict) else {}
+        self.future = None
+        self.observe = observe_capacities if observe is None else observe
+        self.lock = Lock()
+
+    def _finish(self):
+        try:
+            value = self.future.result()
+            if not isinstance(value, dict):
+                raise ValueError('capacity_probe_not_mapping')
+            self.value = value
+        except Exception as exc:
+            print(json.dumps({'state': 'capacity_probe_unavailable', 'error_code': type(exc).__name__}), flush=True)
+        finally:
+            self.future = None
+
+    def poll(self):
+        with self.lock:
+            if self.future is not None and self.future.done():
+                self._finish()
+                return self.value
+            if self.future is None:
+                self.future = self.executor.submit(self.observe, self.config)
+                try:
+                    # A stalled WSL interop subprocess never holds up the
+                    # minute publication for its full timeout.
+                    self.future.result(timeout=0.25)
+                except FutureTimeout:
+                    return self.value
+                except Exception:
+                    pass  # _finish reports the type without leaking the message.
+                self._finish()
+            return self.value
+
+    def prefetch(self):
+        """Start the next actual sample shortly before publication, at most one."""
+        with self.lock:
+            if self.future is not None and self.future.done():
+                self._finish()
+            if self.future is None:
+                try:
+                    self.future = self.executor.submit(self.observe, self.config)
+                except RuntimeError:
+                    # Observer shutdown may race a daemon prefetch timer.
+                    return
+
+
+def merge_independent_local_capacity(slow, local):
+    """Use fresh guest measurements without attaching old native allocation."""
+    result = dict(slow) if isinstance(slow, dict) else {}
+    for identity, current in (local.items() if isinstance(local, dict) else []):
+        if identity in {'penguin-wsl', 'penguin-workspace'}:
+            result[identity] = current
+        elif identity in {'penguin-c', 'penguin-d', 'penguin-e'} and isinstance(current, dict):
+            native = result.get(identity)
+            native_time = epoch(native.get('observed_at_utc')) if isinstance(native, dict) else None
+            local_time = epoch(current.get('observed_at_utc'))
+            if (not isinstance(native, dict) or native.get('state') != 'measured'
+                    or native_time is None or local_time is not None and local_time - native_time > 60):
+                result[identity] = current
+    return result
+
+
+def receiver_aligned_delay(receiver, *, now):
+    """Observe the paired minute receipt after its usual delivery window."""
+    stamp = epoch(receiver.get('generated_at_utc')) if isinstance(receiver, dict) else None
+    if stamp is None or not -5 <= now - stamp <= 180:
+        return None
+    first = stamp + 12
+    cycles = max(0, math.ceil((now + 1 - first) / 60))
+    return max(1., min(60., first + cycles * 60 - now))
+
+
 def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
     """One owner lock; capacity keeps running while the census worker is busy."""
     config = load_config(config_path)
@@ -1125,7 +1282,15 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
             operation_history = read_snapshot(history_path)
         except (OSError, ValueError):
             operation_history = {}
-        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="storage-census") as pool:
+        with ThreadPoolExecutor(max_workers=1, thread_name_prefix="storage-census") as pool, \
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix="storage-capacity") as capacity_pool, \
+                ThreadPoolExecutor(max_workers=1, thread_name_prefix="storage-local-capacity") as local_capacity_pool:
+            initial_capacities = {identity: row['capacity'] for identity, row in rows.items()
+                                  if isinstance(row.get('capacity'), dict)}
+            capacity_probe = SingleFlightCapacityProbe(capacity_pool, config, initial_capacities) if watch else None
+            local_capacity_probe = (SingleFlightCapacityProbe(local_capacity_pool, config, initial_capacities,
+                                     observe=observe_local_capacities)
+                                    if watch and config.get('independent_local_capacity') is True else None)
             job = None
             job_progress = None
             specs = [(r, None) for r in config["volumes"]]
@@ -1146,9 +1311,12 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
             job_identity = None
             job_fingerprint = None
             job_previous = None
+            aligned_to_receiver = False
             while True:
                 started = time.monotonic()
-                observations = observe_capacities(config)
+                observations = capacity_probe.poll() if capacity_probe else observe_capacities(config)
+                if local_capacity_probe:
+                    observations = merge_independent_local_capacity(observations, local_capacity_probe.poll())
                 for identity, cap in observations.items():
                     if identity == "contained_in":
                         rows.setdefault("penguin-wsl", {"id": "penguin-wsl"})["contained_in"] = cap
@@ -1254,4 +1422,19 @@ def monitor(config_path: Path, output: Path, repo: Path, *, watch=False):
                                   "cycle_seconds": round(time.monotonic()-started, 3)}), flush=True)
                 if not watch:
                     return
-                time.sleep(max(1., config["capacity_interval_seconds"] - (time.monotonic()-started)))
+                remaining = max(1., config["capacity_interval_seconds"] - (time.monotonic()-started))
+                if (watch and config['observer_node_id'] == 'penguin' and not aligned_to_receiver
+                        and isinstance(receiver, dict)):
+                    aligned = receiver_aligned_delay(receiver, now=time.time())
+                    if aligned is not None:
+                        remaining = aligned
+                        aligned_to_receiver = True
+                if capacity_probe is not None and remaining > 8:
+                    # Most native/SSH probes take a few seconds. Starting the
+                    # next sample six seconds before the regular publication
+                    # avoids showing a routinely one-cycle-old remote value;
+                    # slow/failing probes still retain their true old clock.
+                    timer = Timer(remaining - 6, capacity_probe.prefetch)
+                    timer.daemon = True
+                    timer.start()
+                time.sleep(remaining)

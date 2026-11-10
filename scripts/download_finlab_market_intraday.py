@@ -207,6 +207,25 @@ def _capacity_deferred_finite_priority(root: Path, admission: dict) -> dict:
             "ordinary_dispatch": capacity}
 
 
+def _paused_general_futures_priority(admission: dict) -> dict:
+    """Allow only a registered futures query to precede a paused owner.
+
+    The caller must select the finite futures workspace, preserve the quota
+    floor and re-observe this condition before every source request. The
+    ordinary work remains due and its service state is not changed.
+    """
+    if (admission.get("state") != "general_work_pending"
+            or admission.get("minute_residual_allowed") is not False
+            or type(admission.get("actionable_pending")) is not int
+            or admission["actionable_pending"] <= 0):
+        return {"allowed": False, "reason": "general_state_not_eligible"}
+    from downloader.paused_provider_owners import explicitly_paused
+    if "finlab" not in explicitly_paused({"finlab"}):
+        return {"allowed": False, "reason": "ordinary_owner_not_verified_paused"}
+    return {"allowed": True, "reason": "ordinary_owner_verified_paused",
+            "ordinary_work_remains_due": True, "service_state_changed": False}
+
+
 def _dates_from_parquet(path: Path) -> tuple[date, date] | None:
     if not path.is_file():
         return None
@@ -934,11 +953,18 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                 authorization_slots: int | None = None,
                 finite_priority_only: bool = False,
                 capacity_deferred_priority: bool = False,
-                futures_workspace_only: bool = False) -> dict:
+                futures_workspace_only: bool = False,
+                preferred_futures_request_ids: tuple[str, ...] = ()) -> dict:
     if kind not in KINDS:
         raise ValueError("unsupported FinLab intraday family")
     if type(finite_priority_only) is not bool or (finite_priority_only and not 1 <= limit <= 64):
         raise ValueError("finite priority requires a bounded 1..64 partition pass")
+    if (not isinstance(preferred_futures_request_ids, tuple)
+            or len(set(preferred_futures_request_ids)) != len(preferred_futures_request_ids)
+            or any(not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None
+                   for value in preferred_futures_request_ids)
+            or preferred_futures_request_ids and not futures_workspace_only):
+        raise ValueError("preferred request identities require finite futures workspace")
     if (type(capacity_deferred_priority) is not bool or capacity_deferred_priority and (
             not finite_priority_only or not 1 <= limit <= (4 if kind == "tw_minute" else 1)
             or workers != 1 or range_calendar_days != 1
@@ -1288,13 +1314,18 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
                    if source_kind == "tw_minute" else general_admission.get("supplemental_allowed", False))
         capacity_exception = capacity_deferred_priority and (
             general_admission.get("finite_capacity_exception", {}).get("allowed") is True)
+        paused_exception = False
+        if futures_workspace_only and not allowed and not capacity_exception:
+            general_admission["paused_general_futures_exception"] = _paused_general_futures_priority(general_admission)
+            paused_exception = general_admission["paused_general_futures_exception"]["allowed"] is True
+        finite_exception = capacity_exception or paused_exception
         if minute_blocked and not capacity_exception:
             # A finite tick may overtake unavailable minute work only while
             # the normal acquisition owner is verifiably capacity-blocked.
             # Unknown/recovered capacity never bypasses the minute gate.
             state = "waiting_required_minutes"
             return False
-        if not allowed and capacity_exception:
+        if not allowed and finite_exception:
             # General work remains due, not completed. Before every finite
             # request independently recheck the existing priority reserve.
             if (check_futures_workspace_dispatch(root) if futures_workspace_only else
@@ -1316,7 +1347,7 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             return False
         policy_state = quota_admission(kind=source_kind, now=boundary, reserve_mb=reserve_mb,
             scheduled_reserve_mb=general_admission.get("scheduled_reserve_mb", 0), policy=quota_policy)
-        if capacity_exception:
+        if finite_exception:
             # The original minute floor does not reserve any upcoming general
             # work, and its pre-reset drain sets the floor to zero. This
             # explicit exception uses a higher floor even during the drain.
@@ -1325,13 +1356,16 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
             if type(future) not in (int, float) or not math.isfinite(future) or future < 0:
                 future = 500.0
             policy_state["effective_reserve_mb"] = max(policy_state["effective_reserve_mb"], 2000.0, future)
-            policy_state["capacity_deferred_priority_reserve_mb"] = 2000.0
-            policy_state["basis"] = "finite_capacity_exception; due_general_quota_cost_remains_unknown"
+            policy_state["finite_priority_reserve_mb"] = 2000.0
+            if capacity_exception:
+                policy_state["capacity_deferred_priority_reserve_mb"] = 2000.0
+            policy_state["basis"] = ("finite_capacity_exception" if capacity_exception else
+                                     "paused_general_futures_priority") + "; due_general_quota_cost_remains_unknown"
         effective_reserve = policy_state["effective_reserve_mb"]
         # The SDK still enforces official quota on every source request.
         # Reuse local observations for at most 4 Tick requests / 5 seconds;
         # within 100 MB of the reserve Tick returns to per-request sampling.
-        fresh = capacity_exception or quota_window.needs_refresh(
+        fresh = finite_exception or quota_window.needs_refresh(
             now=boundary, clock=time.monotonic(), reserve_mb=effective_reserve)
         if fresh:
             quota_checks += 1
@@ -1424,7 +1458,8 @@ def sync_market(root: Path, public_root: Path, *, start: date, end: date,
         from downloader.provider_priority import finlab_futures_candidates
         from scripts.download_finlab_intraday import record_failed_partition
         from stockagent.data.finlab_futures_sdk import PartitionFailure, validated_overlay, fetch_with_owner_session
-        for key, day in finlab_futures_candidates(index, datetime.now(UTC)):
+        for key, day in finlab_futures_candidates(index, datetime.now(UTC),
+                                                  prefer_request_ids=preferred_futures_request_ids):
             identity = (key, day)
             if identity in futures_priority_seen or attempts >= limit or state != 'batch_limit':
                 continue
@@ -2198,12 +2233,16 @@ def main() -> int:
                         help="allow four registered minute partitions or one stock Tick partition while ordinary dispatch is measurably capacity-blocked")
     parser.add_argument("--futures-workspace-only", action="store_true",
                         help="select only finite futures minutes and write validated objects to the enrolled E workspace")
+    parser.add_argument("--preferred-futures-request-id", action="append", default=[],
+                        help="order these registered futures requests first; retain all others")
     args = parser.parse_args()
     settings = load_policy()
     if args.capacity_deferred_priority and (not args.priority_only or args.limit > (4 if args.kind == "tw_minute" else 1)):
         parser.error("capacity-deferred-priority requires --priority-only and at most four minutes or one Tick")
     if args.futures_workspace_only and (not args.capacity_deferred_priority or args.kind != "tw_minute"):
         parser.error("futures-workspace-only requires capacity-deferred finite minute priority")
+    if args.preferred_futures_request_id and not args.futures_workspace_only:
+        parser.error("preferred futures requests require futures-workspace-only")
     if args.priority_only:
         if (args.status_only or args.derive_existing or args.limit > 64 or
                 any(value not in (None, 1) for value in (args.workers, args.range_calendar_days,
@@ -2259,6 +2298,7 @@ def main() -> int:
                                       finite_priority_only=args.priority_only,
                                       capacity_deferred_priority=args.capacity_deferred_priority,
                                       futures_workspace_only=args.futures_workspace_only,
+                                      preferred_futures_request_ids=tuple(args.preferred_futures_request_id),
                                       quota_policy=settings)
         except BlockingIOError:
             print(json.dumps({"state": "account_sync_active", "attempted_this_run": 0}))

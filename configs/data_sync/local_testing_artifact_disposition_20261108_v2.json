@@ -1,0 +1,20 @@
+{
+  "contract": "explicit-local-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "使用者授權刪除舊效能驗證資料；逐項固定舊本機工作副本，保留摘要，使用原程序與世代檢查。",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v1", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v2", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v3", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v4", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v5", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v6", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v7", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v8", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v9", "kind": "directory", "reason": "benchmark"},
+    {"base": "artifact", "relative": "benchmarks/dashboard-daily-incremental-20261020-v10", "kind": "directory", "reason": "benchmark"}
+  ],
+  "identity_sha256": "31e1d8b2249a0ee5df58386a195225734eaf3bb273f1c264ab0addfccd2b12d8"
+}

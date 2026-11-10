@@ -1,0 +1,11 @@
+[Unit]
+Description=Retry the fixed FRED source pin recovery without blocking other datasets
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=5min
+AccuracySec=10s
+Unit=stockagent-fred-exact-pin-recovery.service
+
+[Install]
+WantedBy=timers.target

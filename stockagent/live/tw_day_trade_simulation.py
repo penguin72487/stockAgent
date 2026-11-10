@@ -16,6 +16,7 @@ paper fill cannot be mistaken for a real exchange fill.
 from __future__ import annotations
 
 import csv
+from copy import deepcopy
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from contextlib import contextmanager, nullcontext
@@ -36,7 +37,10 @@ from stockagent.live.paper_mode_snapshot import (
     CONTRACT as MODE_SNAPSHOT_CONTRACT, MANIFEST_KEY as MODE_SNAPSHOT_KEY,
     ModeSnapshotWriter, expand_paper_state, mode_object_generations, read_paper_payload,
 )
-from stockagent.live.paper_journal import append_paper_journal, open_paper_journal
+from stockagent.live.paper_journal import (
+    append_paper_journal, managed as managed_paper_journal, open_paper_journal,
+    snapshot_of as paper_journal_snapshot_of,
+)
 
 from stockagent.backtest.tw_day_trade_contract import (
     AUCTION_SUBMIT_MINUTE,
@@ -130,6 +134,9 @@ REPLAY_PROGRESSIVE_CONTINUATION_CONTRACT: Final[str] = (
 PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT: Final[str] = (
     "published_signal_revisions_completed_minute_counterfactual_v1"
 )
+PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT: Final[str] = (
+    "published_signal_revisions_late_first_0901_counterfactual_v1"
+)
 ENTRY_FILL_POLICY_CAUSAL_BOOK: Final[str] = "causal_best_quote"
 ENTRY_FILL_POLICY_SYNTHETIC_OPEN_TICK: Final[str] = "synthetic_open_tick"
 ENTRY_FILL_POLICY_CAUSAL_BOOK_ELSE_OPEN_TICK: Final[str] = (
@@ -167,6 +174,12 @@ REPLAY_FULL_COUNTERFACTUAL_CONTRACTS: Final[frozenset[str]] = frozenset({
     LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
     REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
 })
+HISTORICAL_BRACKET_FULL_CROSS_CONTRACT: Final[str] = (
+    "historical_bracket_full_on_strict_observed_cross_paper_assumption_v1"
+)
+HISTORICAL_OPEN_FALLBACK_CONTRACT: Final[str] = (
+    "completed_session_official_open_as_0901_paper_entry_assumption_v1"
+)
 EXECUTION_REALISM_CONTRACT: Final[str] = "nav_budget_source_capacity_no_synthetic_terminal_v1"
 ENTRY_PRICE_GUARD_CONTRACT: Final[str] = "strict_inside_original_take_profit_stop_loss_v1"
 EXECUTION_POINTER_OBSERVATION_CONTRACT: Final[str] = "consumer_observed_atomic_pointer_before_quote_v1"
@@ -177,6 +190,9 @@ ENTRY_PRICE_GUARD_REASONS: Final[frozenset[str]] = frozenset({
 TERMINAL_CLOSE_UNLIMITED_CONTRACT: Final[str] = (
     "source_close_full_deliverable_residual_no_capacity_paper_only_v1"
 )
+RESEARCH_TERMINAL_COMMIT_CONTRACT: Final[str] = "research_terminal_paper_commit_v1"
+RESEARCH_TERMINAL_MANAGED_COMMIT_CONTRACT: Final[str] = "research_terminal_paper_commit_managed_v2"
+RESEARCH_ABSORBING_RUIN_CONTRACT: Final[str] = "research_flat_economic_nav_absorbing_ruin_v1"
 HISTORICAL_MINUTE_MARK_CONTRACT: Final[str] = "right_labelled_historical_last_trade_mark_v1"
 ENTRY_FILL_POLICIES: Final[frozenset[str]] = frozenset(
     {
@@ -301,11 +317,12 @@ def _completed_minute_replay_quote(
         and mode.get("session_date") == now.date().isoformat()
         and quote.get("historical_minute_valuation") is True
         and quote.get("source") == "retained_right_labelled_1m_ohlcv_counterfactual"
-        and quote.get("fill_contract") == (
-            "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
-            if mode.get("entry_fill_contract") in REPLAY_FULL_COUNTERFACTUAL_CONTRACTS
-            else "historical_1m_ohlcv_counterfactual_not_executable_bid_ask"
-        )
+        and (quote.get("fill_contract") == (
+                "historical_1m_ohlcv_full_target_counterfactual_no_liquidity_claim_v1"
+                if mode.get("entry_fill_contract") in REPLAY_FULL_COUNTERFACTUAL_CONTRACTS
+                else "historical_1m_ohlcv_counterfactual_not_executable_bid_ask")
+             or (mode.get("historical_bracket_cross_assumption") == HISTORICAL_BRACKET_FULL_CROSS_CONTRACT
+                 and quote.get("fill_contract") == HISTORICAL_BRACKET_FULL_CROSS_CONTRACT))
         and stamp == now and now.second == 0 and now.microsecond == 0
         and ENTRY_GATE <= now.time() <= SESSION_CLOSE
         and (_finite(quote.get("observed_minute_volume_lots")) or 0) > 0
@@ -313,6 +330,44 @@ def _completed_minute_replay_quote(
         and opening is not None and low <= opening <= high
         and close is not None and low <= close <= high
     )
+
+
+def _verified_historical_full_cross(position: Mapping[str, Any], mode: Mapping[str, Any],
+                                    quote: Mapping[str, Any], *, price: float,
+                                    reason: str, now: datetime, quantity: int) -> bool:
+    """Verify a labelled paper assumption without inventing minute volume."""
+    if (mode.get("historical_bracket_cross_assumption") != HISTORICAL_BRACKET_FULL_CROSS_CONTRACT
+            or quote.get("fill_contract") != HISTORICAL_BRACKET_FULL_CROSS_CONTRACT
+            or not _completed_minute_replay_quote(mode, quote, now)):
+        return False
+    evidence = quote.get("bracket_cross_evidence")
+    if not isinstance(evidence, Mapping) or evidence.get("contract") != HISTORICAL_BRACKET_FULL_CROSS_CONTRACT:
+        return False
+    signed = int(position.get("signed_shares") or 0)
+    side = "long" if signed > 0 else "short" if signed < 0 else ""
+    bracket = evidence.get("bracket")
+    if (not side or evidence.get("side") != side or evidence.get("symbol") != position.get("symbol")
+            or quantity != abs(signed) or evidence.get("simulation_only") is not True
+            or evidence.get("exchange_fill") is not False or evidence.get("broker_fill") is not False
+            or bracket not in {"stop_loss", "take_profit"}):
+        return False
+    try:
+        trigger = float(position["stop_trigger_price" if bracket == "stop_loss" else "take_profit_price"])
+        low, high = float(quote["historical_bar_low"]), float(quote["historical_bar_high"])
+        if (not math.isfinite(trigger) or not math.isclose(float(evidence["trigger_price"]), trigger,
+                                                            rel_tol=0.0, abs_tol=1e-9)):
+            return False
+    except (KeyError, TypeError, ValueError):
+        return False
+    crossed = ((low < trigger if side == "long" else high > trigger) if bracket == "stop_loss"
+               else (high > trigger if side == "long" else low < trigger))
+    if not crossed or not reason.startswith(bracket):
+        return False
+    # The adverse stop extremum is conservative without an invented
+    # intraminute sequence. Profit-limit price must remain inside the bar.
+    if bracket == "stop_loss":
+        return math.isclose(price, low if side == "long" else high, rel_tol=0.0, abs_tol=1e-9)
+    return low <= price <= high and (price >= trigger if side == "long" else price <= trigger)
 
 
 def _quote_after_signal(
@@ -600,6 +655,124 @@ def whole_lot_target_shares(weight: float, nav: float, price: float, lot_size: i
     return int(math.floor(abs(weight) * nav / price / int(lot_size))) * int(lot_size)
 
 
+def research_short_limit_up_close_cost(
+    *, signed_shares: int, official_close: float, upper_limit: float,
+    available_source_capacity_shares: int | None, rate: float,
+) -> dict[str, Any]:
+    """Calculate the selected research expense, not a trade or broker fee.
+
+    This arithmetic does not certify the caller's close, daily limit, timestamp
+    or remaining shared source capacity. Those must be proven independently
+    before the result can enter a committed paper ledger.
+    """
+    if type(signed_shares) is not int:
+        raise ValueError("signed shares must be an integer")
+    if (isinstance(rate, bool) or not isinstance(rate, (int, float))
+            or not math.isfinite(rate) or not 0 <= rate <= 1):
+        raise ValueError("research expense rate must be finite in [0, 1]")
+    close, upper = _finite(official_close), _finite(upper_limit)
+    if close is None or upper is None or close <= 0 or upper <= 0 or close > upper + 1e-8:
+        raise ValueError("research expense requires a legal official close and upper limit")
+    if (available_source_capacity_shares is not None and
+            (type(available_source_capacity_shares) is not int or available_source_capacity_shares < 0)):
+        raise ValueError("source capacity must be a nonnegative integer")
+    at_limit = math.isclose(close, upper, rel_tol=0.0, abs_tol=1e-8)
+    applicable = signed_shares < 0 and at_limit and rate > 0
+    if applicable and available_source_capacity_shares is None:
+        raise ValueError("source capacity is unknown at the official limit-up close")
+    covered = min(-signed_shares, available_source_capacity_shares or 0) if applicable else 0
+    uncovered = -signed_shares - covered if applicable else 0
+    try:
+        amount = uncovered * close * float(rate)
+    except OverflowError as exc:
+        raise ValueError("research expense exceeds finite accounting range") from exc
+    if not math.isfinite(amount):
+        raise ValueError("research expense exceeds finite accounting range")
+    return {
+        "contract": "official_limit_up_close_source_residual_short_expense_v1",
+        "official_close": close,
+        "upper_limit": upper,
+        "rate": float(rate),
+        "available_source_capacity_shares": available_source_capacity_shares,
+        "source_covered_shares": covered,
+        "uncovered_short_shares": uncovered,
+        "amount_twd": amount,
+        "simulation_only": True,
+        "broker_fee": False,
+    }
+
+
+def _research_close_expense_amount(
+    *, position: Mapping[str, Any], mode: Mapping[str, Any], price: float,
+    now: datetime, reason: str, order_type: str, quantity: int,
+    evidence: Mapping[str, Any],
+) -> float:
+    """Validate a paper expense envelope before allowing any account mutation.
+
+    Source hashes here bind a claim; the replay/source auditor must separately
+    read and verify those exact source bytes before promotion.
+    """
+    day = str(mode.get("session_date") or "")
+    symbol = str(position.get("symbol") or "")
+    signed = int(position.get("signed_shares") or 0)
+    rate = mode.get("research_short_limit_up_close_penalty_rate")
+    close = evidence.get("official_close_evidence")
+    limit = evidence.get("upper_limit_evidence")
+    capacity = evidence.get("closing_capacity_evidence")
+
+    def digest(value: object) -> bool:
+        return isinstance(value, str) and len(value) == 64 and all(c in "0123456789abcdef" for c in value)
+
+    if (signed >= 0 or quantity != -signed or reason != "13_30_unlimited_close_paper_settlement"
+            or order_type != "PAPER_CLOSE_SETTLEMENT" or now.date().isoformat() != day
+            or now.utcoffset() != timedelta(hours=8) or now.time() != SESSION_CLOSE
+            or not isinstance(rate, (float, int)) or isinstance(rate, bool)
+            or not math.isfinite(rate) or not 0 < rate <= 1):
+        raise ValueError("research close expense is not authorized for this paper position")
+    if (not isinstance(close, Mapping) or close.get("session_date") != day
+            or close.get("symbol") != symbol or close.get("price_basis") != "official_session_close"
+            or close.get("source") not in {"twse_official_daily_close", "tpex_official_daily_close"}
+            or not isinstance(close.get("source_path"), str) or not close["source_path"]
+            or not digest(close.get("source_sha256")) or close.get("price") != price):
+        raise ValueError("research close expense lacks official close evidence")
+    if (not isinstance(limit, Mapping) or limit.get("session_date") != day
+            or limit.get("symbol") != symbol
+            or not isinstance(limit.get("source_path"), str) or not limit["source_path"]
+            or not digest(limit.get("source_sha256"))
+            or _finite(limit.get("price")) is None
+            or limit.get("price") != position.get("upper_limit")):
+        raise ValueError("research close expense lacks session upper-limit evidence")
+    at_limit = math.isclose(price, limit["price"], rel_tol=0.0, abs_tol=1e-8)
+    available_capacity = None
+    if capacity is not None or at_limit:
+        if (not isinstance(capacity, Mapping)
+                or capacity.get("contract") != "source_backed_closing_minute_capacity_v1"
+                or capacity.get("session_date") != day or capacity.get("symbol") != symbol
+                or capacity.get("minute") != f"{day}T13:30:00+08:00"
+                or not isinstance(capacity.get("source_path"), str) or not capacity["source_path"]
+                or not digest(capacity.get("source_sha256"))):
+            raise ValueError("research close expense lacks source-backed closing capacity")
+        volume, used = capacity.get("volume_shares"), capacity.get("used_capacity_shares")
+        lot_size = int(position.get("lot_size") or 1_000)
+        if (type(volume) is not int or volume < 0 or type(used) is not int or used < 0
+                or lot_size <= 0):
+            raise ValueError("invalid source closing-volume capacity")
+        # Exact integer flooring avoids rounding a large observed share count
+        # across a lot boundary and incorrectly reducing the expense.
+        numerator, denominator = float(MINUTE_VOLUME_PARTICIPATION).as_integer_ratio()
+        source_budget = (volume * numerator // (denominator * lot_size)) * lot_size
+        if used > source_budget:
+            raise ValueError("previous closing-capacity use exceeds the source budget")
+        available_capacity = source_budget - used
+    calculated = research_short_limit_up_close_cost(
+        signed_shares=signed, official_close=price, upper_limit=limit["price"],
+        available_source_capacity_shares=available_capacity, rate=float(rate),
+    )
+    if evidence.get("cost") != calculated:
+        raise ValueError("research close expense differs from source-capacity arithmetic")
+    return float(calculated["amount_twd"])
+
+
 def realized_account_nav(
     mode: Mapping[str, Any], *, deduct_carry_cost: bool = True
 ) -> float:
@@ -611,6 +784,26 @@ def realized_account_nav(
         + float(mode.get("cumulative_corporate_action_net_twd") or 0.0)
         - (float(mode.get("cumulative_carry_cost_twd") or 0.0) if deduct_carry_cost else 0.0)
     )
+
+
+def _latch_research_flat_ruin(mode: dict[str, Any], *, nav: float, observed: datetime,
+                              research_rate: float) -> None:
+    """Preserve the economic ledger while preventing a dead research account reviving."""
+    if (mode.get("research_absorbing_ruin") is not None or not research_rate
+            or not math.isfinite(nav) or nav > 0.0
+            or any(int(position.get("signed_shares") or 0) != 0
+                   for position in (mode.get("positions") or {}).values())):
+        return
+    mode["research_absorbing_ruin"] = {
+        "contract": RESEARCH_ABSORBING_RUIN_CONTRACT,
+        "economic_nav_twd": nav,
+        "observed_at": observed.isoformat(timespec="microseconds"),
+        "clock_basis": ("counterfactual_effective_clock" if mode.get("counterfactual_open_replay")
+                        else "engine_observation_clock"),
+        "source_coverage_provisional": bool(mode.get("provisional_minute_source_coverage")),
+        "simulation_only": True,
+        "capital_reset_prohibited": True,
+    }
 
 
 def _progressive_funding_headroom(mode: Mapping[str, Any]) -> float:
@@ -641,6 +834,42 @@ def entry_bracket_prices(
     upper, lower = _finite(upper_limit), _finite(lower_limit)
     upper, lower = _entry_bracket_limits(upper, lower, offset_ticks, trading_date, security_type)
     return (upper, lower) if side == "long" else (lower, upper)
+
+
+DELAYED_AUCTION_PAPER_REPLAY_CONTRACT: Final[str] = "source_pinned_delayed_auction_paper_replay_v1"
+
+
+def _delayed_paper_close_time(mode: Mapping[str, Any], position: Mapping[str, Any],
+                              quote: Mapping[str, Any], now: datetime, price: float) -> tuple[datetime, dict] | None:
+    """Validate a source-labelled 13:33 replay clock without asserting a broker fill."""
+    proof = quote.get("delayed_paper_auction")
+    if not isinstance(proof, Mapping) or proof.get("contract") != DELAYED_AUCTION_PAPER_REPLAY_CONTRACT:
+        return None
+    repair = mode.get("opening_repair") or {}
+    if not isinstance(repair, Mapping):
+        return None
+    if (mode.get("historical_minute_valuation") is not True or mode.get("simulation_replay") is not True
+            or mode.get("counterfactual_open_replay") is not True or repair.get("simulation_only") is not True
+            or proof.get("session_date") != now.date().isoformat()
+            or proof.get("symbol") != position.get("symbol")
+            or proof.get("clock_basis") != "historical_source_minute_label_not_broker_match"):
+        return None
+    try:
+        stamp = datetime.fromisoformat(str(proof.get("source_minute_at") or ""))
+    except ValueError:
+        return None
+    volume = _finite(proof.get("volume_shares"))
+    observed_price = _finite(proof.get("observed_close"))
+    digest = str(proof.get("source_sha256") or "")
+    source_path = proof.get("source_path")
+    if (stamp.tzinfo is None or stamp.date() != now.date() or stamp.utcoffset() != timedelta(hours=8)
+            or stamp.time() != time(13, 33) or stamp > now
+            or volume is None or volume <= 0 or not math.isclose(volume, round(volume), abs_tol=1e-6)
+            or observed_price is None or not math.isclose(observed_price, price, rel_tol=0, abs_tol=1e-9)
+            or not isinstance(source_path, str) or not source_path
+            or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
+        return None
+    return stamp, dict(proof)
 
 
 @lru_cache(maxsize=16_384)
@@ -741,6 +970,34 @@ def _prepare_entry_plan(
         else None
     )
     prior_fill = prior_fill if isinstance(prior_fill, Mapping) else None
+    fallback_proof = quote_values.get("historical_open_fallback_evidence")
+    fallback_proof = fallback_proof if isinstance(fallback_proof, Mapping) else None
+    open_fallback = bool(spec.historical_open_price_fallback and fallback_proof)
+    fallback_created_at = _parse_timestamp(fallback_proof.get("proof_created_at")) if open_fallback else None
+    if open_fallback and not (
+        completed_minute_replay
+        and fallback_proof.get("contract") == HISTORICAL_OPEN_FALLBACK_CONTRACT
+        and fallback_proof.get("session_date") == observation_at.date().isoformat()
+        and fallback_proof.get("symbol") == symbol
+        and fallback_proof.get("simulation_only") is True
+        and fallback_proof.get("broker_fill") is False
+        and fallback_proof.get("exchange_fill") is False
+        and fallback_proof.get("opening_time_known") is False
+        and fallback_proof.get("full_quantity_assumed") is True
+        and fallback_proof.get("proof_clock_basis") == "host_wall_clock"
+        and fallback_created_at is not None
+        and fallback_created_at >= datetime.combine(observation_at.date(), time(13, 30), tzinfo=TAIPEI)
+        and observation_at.timetz().replace(tzinfo=None) == time(9, 1)
+        and quote_values.get("historical_source_quote_at") is None
+        and isinstance(fallback_proof.get("source_path"), str)
+        and isinstance(fallback_proof.get("source_sha256"), str)
+        and len(fallback_proof["source_sha256"]) == 64
+        and sizing_price is not None
+        and _finite(fallback_proof.get("price")) == sizing_price
+        and not quote_values.get("official_session_no_trade_print")
+        and not quote_values.get("opening_no_trade_print_through_0901")
+    ):
+        raise ValueError("invalid isolated official-open fallback evidence")
     prior_fill_at = _parse_timestamp(prior_fill.get("fill_at")) if prior_fill else None
     prior_fill_price = _finite(prior_fill.get("price")) if prior_fill else None
     if prior_fill and not (
@@ -760,7 +1017,8 @@ def _prepare_entry_plan(
     entry_price = (
         sizing_price
         if official_open_at_0901
-        else (prior_fill_price or _finite(quote_values.get("execution_price_0901")))
+        else (sizing_price if open_fallback else
+              (prior_fill_price or _finite(quote_values.get("execution_price_0901"))))
         if minute_price_at_0901
         else _finite(quote_values.get("ask" if side == "long" else "bid"))
     )
@@ -866,7 +1124,7 @@ def _prepare_entry_plan(
                     quote_values, observation_at
                 )):
             status, reason = "blocked", "waiting_non_trial_quote"
-        elif (causal_market_full_target or spec.strict_intraday) and not quote_is_causal:
+        elif (causal_market_full_target or spec.strict_intraday) and not quote_is_causal and not open_fallback:
             status, reason = "blocked", "quote_not_after_signal"
         elif entry_price is None:
             status, reason = (
@@ -892,6 +1150,11 @@ def _prepare_entry_plan(
             take_profit_price=take_profit, stop_trigger_price=stop_trigger,
         )):
             status, reason = "skipped", guard_reason
+        elif open_fallback:
+            # A user-authorized paper assumption, NOT an observed 09:01 trade
+            # or depth: the official session open can be first printed later.
+            filled_shares = requested_shares
+            reason = "counterfactual_official_open_when_0901_unavailable"
         elif minute_price_at_0901:
             # Missed-opening recovery separates the two causal roles that the
             # legacy replay conflated. The official session open sizes the
@@ -1039,8 +1302,10 @@ def _prepare_entry_plan(
             and filled_shares > 0
         ),
         "counterfactual_0901_price_fill": (
-            minute_price_at_0901 and not prior_fill and filled_shares > 0
+            minute_price_at_0901 and not prior_fill and not open_fallback and filled_shares > 0
         ),
+        "historical_open_fallback_fill": open_fallback and filled_shares > 0,
+        "historical_open_fallback_evidence": dict(fallback_proof) if open_fallback else None,
         "prior_paper_fill_reused": bool(prior_fill and filled_shares > 0),
         "prior_paper_fill_at": prior_fill_at.isoformat(timespec="seconds") if prior_fill_at else None,
         "entry_price_method": (
@@ -1217,6 +1482,10 @@ class ModeSpec:
     opening_reference_policy: str = OPENING_OBSERVED_REFERENCE_POLICY
     signal_update_policy: str = SIGNAL_UPDATE_ONCE
     historical_progressive_revision_replay: bool = False
+    historical_counterfactual_provisional: bool = False
+    historical_bracket_full_on_cross: bool = False
+    historical_open_price_fallback: bool = False
+    research_short_limit_up_close_penalty_rate: float = 0.0
 
     @property
     def uses_realistic_execution(self) -> bool:
@@ -1227,6 +1496,22 @@ class ModeSpec:
         }
 
     def __post_init__(self) -> None:
+        if type(self.historical_counterfactual_provisional) is not bool:
+            raise ValueError("historical provisional replay flag must be boolean")
+        if type(self.historical_bracket_full_on_cross) is not bool:
+            raise ValueError("historical bracket cross flag must be boolean")
+        if self.historical_bracket_full_on_cross and not self.historical_counterfactual_provisional:
+            raise ValueError("bracket full-on-cross requires a labelled isolated historical replay")
+        if type(self.historical_open_price_fallback) is not bool:
+            raise ValueError("historical open fallback flag must be boolean")
+        if self.historical_open_price_fallback and not self.historical_counterfactual_provisional:
+            raise ValueError("open fallback requires a labelled isolated historical replay")
+        rate = self.research_short_limit_up_close_penalty_rate
+        if (isinstance(rate, bool) or not isinstance(rate, (float, int))
+                or not math.isfinite(rate) or not 0 <= rate <= 1):
+            raise ValueError("research short limit-up close penalty rate must be finite in [0, 1]")
+        if rate and not (self.strict_intraday and self.terminal_liquidation_unlimited_capacity):
+            raise ValueError("research short close cost requires strict intraday terminal settlement")
         if self.signal_update_policy not in {SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE}:
             raise ValueError("unknown signal update policy")
         if self.historical_progressive_revision_replay and (
@@ -1234,6 +1519,11 @@ class ModeSpec:
                 or self.entry_fill_policy != ENTRY_FILL_POLICY_0901_MINUTE_PRICE
                 or self.historical_full_fill_at_0901):
             raise ValueError("historical progressive replay requires volume-capped minute execution")
+        if self.historical_counterfactual_provisional and (
+                self.entry_fill_policy != ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+                or self.signal_update_policy != SIGNAL_UPDATE_ONCE
+                or self.historical_full_fill_at_0901 or self.historical_progressive_revision_replay):
+            raise ValueError("provisional counterfactual requires one volume-capped historical decision")
         if self.signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE and (
                 self.opening_reference_policy != OPENING_PROVISIONAL_REFERENCE_POLICY
                 or (self.entry_fill_policy != ENTRY_FILL_POLICY_CAUSAL_MARKET_FULL_TARGET
@@ -1329,7 +1619,12 @@ def load_live_eligibility(
     trading_date: date,
     require_latest: bool = True,
 ) -> tuple[dict[str, LiveEligibility], dict[str, Any]]:
-    """Resolve exact-session membership; a missing venue/date fails closed."""
+    """Resolve membership from the session's venue list, not today's venue.
+
+    A security can move between TWSE and TPEx. Current symbol metadata is
+    useful for classification, but must not override a unique exact-date
+    official membership. Ambiguous or conflicting source rows fail closed.
+    """
 
     import polars as pl
 
@@ -1364,12 +1659,16 @@ def load_live_eligibility(
                     )
                     .collect()
                 )
-                venue_members = {
-                    str(row["symbol"]): str(row["suspension"] or "") == ""
-                    for row in rows.iter_rows(named=True)
-                    if str(row["symbol"] or "")
-                }
+                for row in rows.iter_rows(named=True):
+                    symbol = str(row["symbol"] or "")
+                    if not symbol:
+                        continue
+                    sell_first_allowed = str(row["suspension"] or "") == ""
+                    if symbol in venue_members and venue_members[symbol] != sell_first_allowed:
+                        raise ValueError(f"conflicting eligibility rows: {venue}/{target_date}/{symbol}")
+                    venue_members[symbol] = sell_first_allowed
             except Exception as exc:  # fail closed and surface provenance
+                venue_members = {}
                 error = f"{type(exc).__name__}: {exc}"
         else:
             error = f"missing {path}"
@@ -1384,26 +1683,38 @@ def load_live_eligibility(
             "error": error,
         }
 
+    all_venue_covered = all(row["covered"] for row in coverage.values())
     resolved: dict[str, LiveEligibility] = {}
     for raw_symbol in symbols:
         symbol = str(raw_symbol)
         item = metadata.get(symbol, {})
-        venue = str(item.get("venue") or "").casefold() or None
+        metadata_venue = str(item.get("venue") or "").casefold() or None
         security_type = str(item.get("security_type") or "").casefold() or None
+        session_venues = [venue for venue in ("twse", "tpex")
+                          if coverage[venue]["covered"] and symbol in members[venue]]
+        venue = session_venues[0] if len(session_venues) == 1 else metadata_venue
         venue_coverage = coverage.get(str(venue), {})
-        covered = bool(venue_coverage.get("covered"))
-        eligible = covered and symbol in members.get(str(venue), {})
-        short_open = eligible and bool(members[str(venue)][symbol])
-        if venue not in {"twse", "tpex"}:
+        # Preserve the existing metadata gate: official membership alone does
+        # not establish the security classification needed by accounting.
+        if metadata_venue not in {"twse", "tpex"}:
+            covered = eligible = short_open = False
             reason = "unknown_venue"
-        elif not covered:
+        elif len(session_venues) > 1:
+            covered = eligible = short_open = False
+            venue = None
+            reason = "ambiguous_official_session_venue"
+        elif len(session_venues) == 1:
+            covered = eligible = True
+            short_open = bool(members[venue][symbol])
+            reason = None if short_open else "sell_first_suspended"
+        elif not venue_coverage.get("covered") or not all_venue_covered:
+            # When a venue list is missing, today's metadata cannot prove that
+            # the symbol was not a member of the other venue on this date.
+            covered = eligible = short_open = False
             reason = "exact_session_eligibility_missing"
-        elif not eligible:
-            reason = "not_day_trade_eligible"
-        elif not short_open:
-            reason = "sell_first_suspended"
         else:
-            reason = None
+            covered, eligible, short_open = True, False, False
+            reason = "not_day_trade_eligible"
         resolved[symbol] = LiveEligibility(
             symbol=symbol,
             venue=venue,
@@ -1573,6 +1884,35 @@ def quote_map_from_snapshot(
     return output
 
 
+def expire_replay_entry_remainders(mode: dict, *, as_of: datetime) -> list[dict]:
+    """Cancel expired paper entry intentions without a quote or any execution."""
+    if (mode.get("simulation_replay") is not True
+            or mode.get("entry_fill_policy") != ENTRY_FILL_POLICY_0901_MINUTE_PRICE
+            or mode.get("entry_fill_contract") != REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE):
+        return []
+    if as_of.tzinfo is None or as_of.utcoffset() is None:
+        raise ValueError("replay entry expiry requires an aware clock")
+    cutoff = datetime.combine(date.fromisoformat(mode["session_date"]), EXIT_LIMIT_TIME, tzinfo=TAIPEI)
+    if as_of < cutoff:
+        return []
+    orders = mode.get("pending_entry_orders") or {}
+    expired = []
+    for symbol, order in orders.items():
+        if order.get("status") != "working":
+            continue
+        shares = order.get("remaining_shares")
+        if type(shares) is not int or shares < 0:
+            raise ValueError("invalid pending replay entry remainder")
+        expired.append({"symbol": symbol, "remaining_shares": shares})
+    for item in expired:
+        orders[item["symbol"]].update(status="cancelled_exit_priority",
+            cancelled_at=as_of.isoformat(timespec="microseconds"),
+            entry_deadline_at=cutoff.isoformat(timespec="seconds"))
+    if orders:
+        mode["pending_entry_shares"] = 0
+    return expired
+
+
 class TwDayTradeSimulationEngine:
     """One durable simulation ledger shared by all stock day-trade modes."""
 
@@ -1583,8 +1923,12 @@ class TwDayTradeSimulationEngine:
         final_settlement_path: str | Path = DEFAULT_TAIFEX_INDEX_FINAL_SETTLEMENT_PATH,
         publication_clock: Callable[[], datetime] | None = None,
         immutable_mode_snapshots: bool | None = None,
+        allow_research_commit_repair: bool = False,
     ) -> None:
         self._publication_clock = publication_clock
+        # Only the native engine owner may opt in while holding its lease.
+        # Readback and offline audit callers must never append a missing row.
+        self._allow_research_commit_repair = allow_research_commit_repair
         self.state_dir = Path(state_dir)
         self.state_path = self.state_dir / "state.json"
         self.status_path = self.state_dir / "status.json"
@@ -1628,8 +1972,24 @@ class TwDayTradeSimulationEngine:
                     mode["ledger_state_divergence"] = {"kind": "entry_retry_commit_interrupted",
                         "signal_id": mode.get("signal_id")}
                     mode["engine_status"] = "critical_ledger_state_divergence"
+        research_terminal_checked = False
+        for mode in self.state.get("modes", {}).values():
+            if not mode.get("research_terminal_pending_commit"):
+                continue
+            research_terminal_checked = True
+            divergence = mode.get("ledger_state_divergence") or {}
+            if divergence and divergence.get("kind") != "research_terminal_commit_interrupted":
+                mode["engine_status"] = "critical_ledger_state_divergence"
+                continue
+            if self._recover_interrupted_research_terminal(mode):
+                if divergence.get("kind") == "research_terminal_commit_interrupted":
+                    mode.pop("ledger_state_divergence", None)
+            else:
+                mode["ledger_state_divergence"] = {"kind": "research_terminal_commit_interrupted",
+                    "signal_id": mode.get("signal_id")}
+                mode["engine_status"] = "critical_ledger_state_divergence"
         self._restore_position_artifact_paths()
-        if stock_benchmarks_migrated or tx_benchmark_migrated or entry_retry_recovered:
+        if stock_benchmarks_migrated or tx_benchmark_migrated or entry_retry_recovered or research_terminal_checked:
             checkpoint = (self._mode_snapshot_writer.prepare(self.state)
                           if self._mode_snapshot_writer is not None else self.state)
             _atomic_json(self.state_path, checkpoint)
@@ -1806,6 +2166,365 @@ class TwDayTradeSimulationEngine:
             mode.pop("readiness_error", None)
         return True
 
+    @staticmethod
+    def _research_terminal_before_fingerprint(mode: Mapping[str, Any], position: Mapping[str, Any]) -> str:
+        """Bind the exact inventory and account values to a close intent."""
+        fields = ("cumulative_realized_net_pnl_twd", "cumulative_commission_rebate_accrued_twd",
+                  "cumulative_research_close_expense_twd", "terminal_flatten_count",
+                  "research_terminal_source_capacity_used", "research_close_pending_source_count",
+                  "open_position_count", "closing_auction_pending_count", "force_exit_failures",
+                  "execution_evidence_complete", "closing_auction_settled_at", "residual_conversion_completed_at")
+        payload = {"position": position, "account": {key: mode.get(key) for key in fields}}
+        raw = json.dumps(payload, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()
+        return hashlib.sha256(raw).hexdigest()
+
+    def _research_terminal_preview(self, mode, position, *, price, effective_at,
+                                   recorded_at, receipt, expense):
+        """Compute a close on private copies before durable journal writes."""
+        day, symbol = str(mode.get("session_date") or ""), str(position.get("symbol") or "")
+        signed = int(position.get("signed_shares") or 0)
+        if (signed == 0
+                or position.get("side") != ("long" if signed > 0 else "short")
+                or position.get("market") != mode.get("market")
+                or position.get("session_date") != day
+                or (mode.get("positions") or {}).get(position.get("position_id")) is not position
+                or receipt.get("contract") != TERMINAL_CLOSE_UNLIMITED_CONTRACT
+                or receipt.get("broker_fill") is not False
+                or receipt.get("full_quantity_is_user_assumption") is not True
+                or receipt.get("effective_at") != effective_at.isoformat()
+                or receipt.get("recorded_at") != recorded_at.isoformat()
+                or effective_at.utcoffset() != timedelta(hours=8)
+                or effective_at.date().isoformat() != day or effective_at.time() != SESSION_CLOSE
+                or recorded_at.utcoffset() != timedelta(hours=8) or recorded_at < effective_at):
+            raise ValueError("invalid research terminal close intent")
+        receipt_source = receipt.get("source_evidence") or {}
+        if receipt_source.get("session_date") != day or receipt_source.get("price") != price:
+            raise ValueError("research terminal close source has a different session or price")
+        digest = str(receipt_source.get("source_sha256") or "")
+        official_close = (receipt_source.get("price_basis") == "official_session_close"
+            and receipt_source.get("source") in {"twse_official_daily_close", "tpex_official_daily_close"}
+            and len(digest) == 64 and all(char in "0123456789abcdef" for char in digest))
+        exchanged = _parse_timestamp(receipt_source.get("exchange_quote_at"))
+        received = _parse_timestamp(receipt_source.get("received_at"))
+        auction_close = (receipt_source.get("price_basis") == "observed_regular_closing_auction"
+            and receipt_source.get("source") in {"exchange_non_trial_tick", "exchange_non_trial_quote_trade"}
+            and (_finite(receipt_source.get("observed_trade_volume_lots")) or 0) > 0
+            and exchanged is not None and received is not None
+            and exchanged.date().isoformat() == day and received.date().isoformat() == day
+            and effective_at <= exchanged <= received <= recorded_at
+            and exchanged.time() < time(13, 34))
+        if not (official_close or auction_close):
+            raise ValueError("research terminal close lacks authorized source metadata")
+        if signed < 0:
+            if not isinstance(expense, Mapping) or not official_close:
+                raise ValueError("research terminal short lacks cost evidence")
+            official = expense.get("official_close_evidence") or {}
+            if any(official.get(key) != receipt_source.get(key) for key in (
+                    "session_date", "price", "source", "source_sha256", "price_basis")):
+                raise ValueError("research cost and terminal close have different sources")
+        elif expense is not None:
+            raise ValueError("research short cost cannot be applied to a long position")
+        usage = deepcopy(mode.get("research_terminal_source_capacity_used") or {})
+        capacity = expense.get("closing_capacity_evidence") if expense is not None else None
+        usage_key = f"{day}:{symbol}"
+        if capacity is not None:
+            if not isinstance(capacity, Mapping):
+                raise ValueError("invalid research terminal capacity evidence")
+            prior = usage.get(usage_key) or {}
+            identity = {key: capacity.get(key) for key in ("source_path", "source_sha256", "volume_shares")}
+            if prior and any(prior.get(key) != value for key, value in identity.items()):
+                raise ValueError("research terminal cohorts use different source capacity")
+            if capacity.get("used_capacity_shares") != int(prior.get("used_capacity_shares") or 0):
+                raise ValueError("research terminal capacity was already consumed")
+        shadow_mode, shadow_position = dict(mode), deepcopy(position)
+        orders, fills = [], []
+        self._book_position_close(shadow_position, shadow_mode, price=price,
+            quote={"fill_contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT,
+                   "depth_assumption": "full_residual_ignores_close_capacity_no_exchange_fill_claim"},
+            now=effective_at, reason="13_30_unlimited_close_paper_settlement",
+            order_type="PAPER_CLOSE_SETTLEMENT", quantity=abs(int(position["signed_shares"])),
+            ledger_rows=(orders, fills), research_close_expense=expense)
+        if capacity is not None:
+            usage[usage_key] = {**identity, "used_capacity_shares": (
+                int(capacity["used_capacity_shares"]) + int(expense["cost"]["source_covered_shares"]))}
+        shadow_position["terminal_close_receipt"] = deepcopy(receipt)
+        shadow_position["closing_auction_order_status"] = "paper_settled_not_exchange_fill"
+        shadow_position.pop("research_close_pending_reason", None)
+        order = orders[0] | {"recorded_at": recorded_at.isoformat(), "terminal_close_receipt": deepcopy(receipt)}
+        fill = fills[0] | {"recorded_at": recorded_at.isoformat(), "terminal_close_receipt": deepcopy(receipt),
+                           "quote_at": None, "exchange_match_at": None}
+        account = {key: shadow_mode.get(key) for key in (
+            "cumulative_realized_net_pnl_twd", "cumulative_commission_rebate_accrued_twd",
+            "cumulative_research_close_expense_twd")}
+        account["terminal_flatten_count"] = int(mode.get("terminal_flatten_count") or 0) + 1
+        account["research_terminal_source_capacity_used"] = usage
+        remaining = sum(bool(int(item.get("signed_shares") or 0))
+                        for item in (mode.get("positions") or {}).values() if item is not position)
+        prior_pending = int(mode.get("research_close_pending_source_count") or 0)
+        if str(position.get("closing_auction_order_status") or "").startswith("waiting_research_"):
+            prior_pending = max(0, prior_pending - 1)
+        account.update(open_position_count=remaining, closing_auction_pending_count=remaining,
+                       force_exit_failures=remaining, execution_evidence_complete=not remaining,
+                       research_close_pending_source_count=prior_pending)
+        if not remaining:
+            account.update(closing_auction_settled_at=recorded_at.isoformat(timespec="seconds"),
+                           residual_conversion_completed_at=recorded_at.isoformat(timespec="seconds"))
+        return shadow_position, account, order, fill
+
+    @staticmethod
+    def _apply_research_terminal_preview(mode, position, preview):
+        updated, account, _, _ = preview
+        position.clear()
+        position.update(updated)
+        mode.update(account)
+        mode.pop("research_terminal_pending_commit", None)
+
+    @staticmethod
+    def _research_terminal_journal_row(path: Path, order_id: str) -> dict[str, Any] | None:
+        """Reject duplicate or torn journal tails during interrupted commit recovery."""
+        if not path.is_file():
+            # An open paper position must already have entry order and fill
+            # journals. Missing either file is corruption, not proof that the
+            # new close was never appended.
+            raise ValueError("research terminal journal file is missing")
+        found = None
+        with open_paper_journal(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.endswith("\n"):
+                    raise ValueError("partial research terminal journal tail")
+                row = json.loads(line)
+                if not isinstance(row, dict):
+                    raise ValueError("invalid research terminal journal record")
+                if str(row.get("order_id") or "") != order_id:
+                    continue
+                if found is not None:
+                    raise ValueError("duplicate research terminal journal row")
+                found = row
+        return found
+
+    @staticmethod
+    def _research_terminal_journal_parent(path: Path) -> dict[str, Any]:
+        """Capture a content-bound parent without enrolling a legacy journal."""
+        if not managed_paper_journal(path):
+            raise ValueError("research terminal repair requires managed journals")
+        with open_paper_journal(path, "rb") as handle:
+            snapshot = paper_journal_snapshot_of(handle)
+            if snapshot is None:
+                raise ValueError("research terminal journal snapshot unavailable")
+            return {"head": deepcopy(snapshot.head), "size": snapshot.size}
+
+    @staticmethod
+    def _research_terminal_journal_delta(path: Path, parent: Any, row: Mapping[str, Any]) -> str:
+        """Accept only an unchanged parent or its exact one-row extension."""
+        if (not managed_paper_journal(path) or not isinstance(parent, Mapping)
+                or set(parent) != {"head", "size"} or not isinstance(parent["head"], dict)
+                or type(parent["size"]) is not int or parent["size"] < 0):
+            raise ValueError("invalid research terminal journal parent")
+        encoded = ledger_lines_bytes((row,))
+        with open_paper_journal(path, "rb") as handle:
+            snapshot = paper_journal_snapshot_of(handle)
+            if snapshot is None:
+                raise ValueError("research terminal journal snapshot unavailable")
+            if snapshot.head == parent["head"] and snapshot.size == parent["size"]:
+                return "absent"
+            digest = parent["head"].get("sha256")
+            if (snapshot.size != parent["size"] + len(encoded)
+                    or not snapshot.extends(digest, parent["size"])):
+                raise ValueError("research terminal journal is not the expected extension")
+            handle.seek(parent["size"])
+            if handle.read() != encoded:
+                raise ValueError("research terminal journal extension differs from intent")
+            return "present"
+
+    @staticmethod
+    def _verify_research_terminal_repair_source(
+        mode: Mapping[str, Any], order: Mapping[str, Any], fill: Mapping[str, Any], receipt: Mapping[str, Any],
+    ) -> None:
+        """Re-read source evidence before completing a half-written paper close.
+
+        Shorts re-run their full research-cost audit; longs independently
+        re-read the dated official traded close. Auction-only observations have
+        no equivalent retained source here and stay quarantined.
+        """
+        from scripts.audit_tw_day_trade_margin_replay import _sha256, _verify_research_close_source
+        from polars.exceptions import PolarsError
+
+        side = order.get("side")
+        if (side not in {"sell", "buy_to_cover"} or fill.get("side") not in (None, side)
+                or order.get("order_id") != fill.get("order_id")
+                or order.get("simulation_only") is not True or fill.get("simulation_only") is not True):
+            raise ValueError("research terminal repair order side or identity differs")
+        expense = fill.get("research_close_expense")
+        if side == "sell":
+            from scripts.settle_tw_day_trade_official_close import official_closes
+
+            proof = receipt.get("source_evidence")
+            if expense is not None or not isinstance(proof, Mapping):
+                raise ValueError("research long repair lacks official close evidence")
+            day = str(fill.get("session_date") or "")
+            path = Path(str(proof.get("source_path") or ""))
+            digest = str(proof.get("source_sha256") or "")
+            if not path.is_absolute() or not path.is_file():
+                raise ValueError("research long repair source is unavailable")
+            path = path.resolve()
+            exchange = path.parent.name.removesuffix("_daily_ohlcv")
+            if (exchange not in {"twse", "tpex"} or path.name != f"{day}.json"
+                    or _sha256(path) != digest):
+                raise ValueError("research long repair source pin mismatch")
+            prices, _ = official_closes(path.parent.parent, date.fromisoformat(day), exchanges=(exchange,))
+            official = prices.get(str(fill.get("symbol") or "")) or {}
+            raw = official.get("official_row") or {}
+            try:
+                volume = float(str(raw.get("成交股數", raw.get("成交量", 0))).replace(",", ""))
+            except (TypeError, ValueError):
+                volume = 0.0
+            if (official.get("price") != fill.get("price") or official.get("source") != proof.get("source")
+                    or official.get("source_sha256") != digest or _sha256(path) != digest
+                    or not math.isfinite(volume) or volume <= 0 or not volume.is_integer()):
+                raise ValueError("research long repair differs from official traded close")
+            return
+        if not isinstance(expense, Mapping) or not isinstance(expense.get("source_context"), Mapping):
+            raise ValueError("research terminal repair lacks audited source context")
+        capacity = expense.get("closing_capacity_evidence")
+        day, symbol = str(fill.get("session_date") or ""), str(fill.get("symbol") or "")
+        previous = (mode.get("research_terminal_source_capacity_used") or {}).get(f"{day}:{symbol}") or {}
+        expected_used = int(previous.get("used_capacity_shares") or 0)
+        if capacity is None and expected_used:
+            raise ValueError("research terminal repair lacks prior capacity evidence")
+        try:
+            amount, sources = _verify_research_close_source(
+                {**fill, "side": order["side"]}, expense["source_context"],
+                rate=float(mode["research_short_limit_up_close_penalty_rate"]),
+                expected_used=expected_used,
+            )
+        except PolarsError as exc:
+            raise ValueError("research terminal repair source cannot be read") from exc
+        if (not math.isclose(amount, float((expense.get("cost") or {})["amount_twd"]),
+                             rel_tol=0.0, abs_tol=1e-5)
+                or any(_sha256(Path(path)) != digest for path, digest in sources.items())):
+            raise ValueError("research terminal repair source changed after audit")
+
+    def _recover_interrupted_research_terminal(self, mode: dict[str, Any]) -> bool:
+        """Recover exact paper intents; quarantine anything without proof."""
+        marker = mode.get("research_terminal_pending_commit")
+        try:
+            repair_recorded_at = None
+            if not isinstance(marker, dict) or marker.get("contract") not in {
+                    RESEARCH_TERMINAL_COMMIT_CONTRACT, RESEARCH_TERMINAL_MANAGED_COMMIT_CONTRACT}:
+                return False
+            position = (mode.get("positions") or {}).get(marker["position_id"])
+            if not isinstance(position, dict) or marker["before_sha256"] != self._research_terminal_before_fingerprint(mode, position):
+                return False
+            order, fill = marker["order"], marker["fill"]
+            order_id = str(order["order_id"])
+            if not order_id or fill.get("order_id") != order_id:
+                return False
+            actual_order = self._research_terminal_journal_row(self.orders_path, order_id)
+            actual_fill = self._research_terminal_journal_row(self.fills_path, order_id)
+            managed_commit = marker.get("contract") == RESEARCH_TERMINAL_MANAGED_COMMIT_CONTRACT
+            if managed_commit:
+                parents = marker["journal_parents"]
+                if not isinstance(parents, Mapping) or set(parents) != {"orders", "fills"}:
+                    return False
+                order_delta = self._research_terminal_journal_delta(self.orders_path, parents["orders"], order)
+                fill_delta = self._research_terminal_journal_delta(self.fills_path, parents["fills"], fill)
+                if ((actual_order is None) != (order_delta == "absent")
+                        or (actual_fill is None) != (fill_delta == "absent")):
+                    return False
+            if actual_order is None and actual_fill is None:
+                mode.pop("research_terminal_pending_commit", None)
+                self._mark_mode(str(mode["market"]), datetime.fromisoformat(marker["recorded_at"]), {},
+                                append_history=False)
+                return True  # Nothing was published; the source-backed close can retry.
+            preview = self._research_terminal_preview(mode, position, price=marker["price"],
+                effective_at=datetime.fromisoformat(marker["effective_at"]),
+                recorded_at=datetime.fromisoformat(marker["recorded_at"]),
+                receipt=marker["receipt"], expense=marker["expense"])
+            if preview[2] != order or preview[3] != fill:
+                return False
+            if (managed_commit and actual_order == order and actual_fill is None
+                    and self._allow_research_commit_repair):
+                self._verify_research_terminal_repair_source(mode, order, fill, marker["receipt"])
+                # The exact missing *paper settlement* row was already part of
+                # the durable intent. The owner lease and parent comparison
+                # prevent a competing writer or a second financial decision.
+                if (self._research_terminal_journal_delta(self.orders_path, parents["orders"], order) != "present"
+                        or self._research_terminal_journal_delta(self.fills_path, parents["fills"], fill) != "absent"):
+                    return False
+                repair_recorded_at = _now_taipei(
+                    self._publication_clock() if self._publication_clock is not None else None)
+                # Preserve the original intent timestamp on the paper row, but
+                # durably record the actual recovery attempt time separately.
+                self._event("research_terminal_paper_commit_recovery_attempt",
+                    recorded_at=repair_recorded_at, market=str(mode["market"]), order_id=order_id,
+                    intent_recorded_at=marker["recorded_at"], simulation_only=True,
+                    broker_fill=False, outcome="attempting_missing_paper_settlement_row")
+                append_paper_journal(self.fills_path, ledger_lines_bytes((fill,)),
+                                     expected_parent=parents["fills"])
+                if (self._research_terminal_journal_delta(self.orders_path, parents["orders"], order) != "present"
+                        or self._research_terminal_journal_delta(self.fills_path, parents["fills"], fill) != "present"):
+                    return False
+                actual_fill = self._research_terminal_journal_row(self.fills_path, order_id)
+            if actual_order != order or actual_fill != fill:
+                return False
+            self._apply_research_terminal_preview(mode, position, preview)
+            if repair_recorded_at is not None:
+                mode["research_terminal_recovery"] = {
+                    "contract": RESEARCH_TERMINAL_MANAGED_COMMIT_CONTRACT,
+                    "recorded_at": repair_recorded_at.isoformat(timespec="seconds"),
+                    "intent_recorded_at": marker["recorded_at"], "order_id": order_id,
+                    "source_reverified": True, "simulation_only": True, "broker_fill": False,
+                }
+            self._mark_mode(str(mode["market"]), datetime.fromisoformat(marker["recorded_at"]), {},
+                            append_history=False)
+            return True
+        except (KeyError, TypeError, ValueError, OverflowError, OSError, json.JSONDecodeError):
+            return False
+
+    def _commit_research_terminal_close(self, mode, position, *, price, effective_at,
+                                        recorded_at, receipt, expense):
+        """Stage one opt-in close; never infer a broker order or fill.
+
+        Source producers must independently prove the actual bytes before
+        calling this function. Runtime admission remains blocked until that
+        producer and the end-to-end replay/audit contract are wired.
+        """
+        if mode.get("research_terminal_pending_commit") or mode.get("ledger_state_divergence"):
+            raise ValueError("research terminal commit already pending or quarantined")
+        preview = self._research_terminal_preview(mode, position, price=price,
+            effective_at=effective_at, recorded_at=recorded_at, receipt=receipt, expense=expense)
+        _, _, order, fill = preview
+        if self._deferred_ledger_rows is not None:
+            self._order(order)
+            self._fill(fill)
+            self._apply_research_terminal_preview(mode, position, preview)
+            return
+        marker = {"contract": RESEARCH_TERMINAL_COMMIT_CONTRACT,
+                  "position_id": position["position_id"],
+                  "before_sha256": self._research_terminal_before_fingerprint(mode, position),
+                  "price": price, "effective_at": effective_at.isoformat(),
+                  "recorded_at": recorded_at.isoformat(), "receipt": deepcopy(receipt),
+                  "expense": deepcopy(expense), "order": deepcopy(order), "fill": deepcopy(fill)}
+        if managed_paper_journal(self.orders_path) and managed_paper_journal(self.fills_path):
+            marker["contract"] = RESEARCH_TERMINAL_MANAGED_COMMIT_CONTRACT
+            marker["journal_parents"] = {
+                "orders": self._research_terminal_journal_parent(self.orders_path),
+                "fills": self._research_terminal_journal_parent(self.fills_path),
+            }
+        mode["research_terminal_pending_commit"] = marker
+        self._persist(recorded_at)
+        self._order(order)
+        self._fill(fill)
+        self._apply_research_terminal_preview(mode, position, preview)
+        try:
+            self._mark_mode(str(mode["market"]), recorded_at, {}, append_history=False)
+            self._persist(recorded_at)
+        except Exception:
+            mode["research_terminal_pending_commit"] = marker
+            mode["ledger_state_divergence"] = {"kind": "research_terminal_commit_interrupted",
+                                               "order_id": order["order_id"]}
+            raise
+
     def begin_deferred_ledger_writes(self) -> None:
         """Batch historical replay ledgers until the session commit boundary."""
 
@@ -1826,11 +2545,21 @@ class TwDayTradeSimulationEngine:
             self._deferred_ledger_rows = None
 
     def _append_ledger(self, path: Path, payload: Mapping[str, Any]) -> None:
+        row = dict(payload)
+        mode = (self.state.get("modes") or {}).get(str(row.get("market") or "")) or {}
+        # Legacy readers use recorded_at as the replay's effective market
+        # clock. Preserve it for the existing ABI but never imply that the
+        # historical row was actually published at that clock.
+        if (mode.get("provisional_minute_source_coverage") is True
+                and row.get("session_date")
+                and str(row.get("recorded_at") or "")[:10] == str(row.get("session_date"))):
+            row["recorded_at_basis"] = "counterfactual_effective_clock_not_original_publication"
+            row["replay_generated_at"] = datetime.now(TAIPEI).isoformat(timespec="milliseconds")
         pending = self._deferred_ledger_rows
         if pending is None:
-            _append_jsonl(path, payload)
+            _append_jsonl(path, row)
             return
-        pending.setdefault(path, []).append(dict(payload))
+        pending.setdefault(path, []).append(row)
 
     def _audit_signal_commit_state(self) -> None:
         """Fail closed when an interrupted ledger commit and state disagree.
@@ -3529,6 +4258,9 @@ class TwDayTradeSimulationEngine:
         mode["configured_entry_fill_policy"] = spec.entry_fill_policy
         mode["configured_opening_reference_policy"] = spec.opening_reference_policy
         mode["configured_signal_update_policy"] = spec.signal_update_policy
+        if spec.research_short_limit_up_close_penalty_rate or "configured_research_short_limit_up_close_penalty_rate" in mode:
+            mode["configured_research_short_limit_up_close_penalty_rate"] = float(
+                spec.research_short_limit_up_close_penalty_rate)
         mode["configured_entry_price_guard_contract"] = ENTRY_PRICE_GUARD_CONTRACT
         mode["configured_intraday_contract"] = STRICT_INTRADAY_CONTRACT if spec.strict_intraday else None
         mode["configured_terminal_close_contract"] = (
@@ -3775,6 +4507,7 @@ class TwDayTradeSimulationEngine:
         mode["force_exit_started_at"] = None
         mode["closing_auction_submitted_at"] = None
         mode["closing_auction_settled_at"] = None
+        mode.pop("delayed_paper_auction_settled_at", None)
         mode["residual_conversion_completed_at"] = None
         mode["engine_status"] = "waiting_signal"
         mode["blocked_reason"] = None
@@ -4170,6 +4903,11 @@ class TwDayTradeSimulationEngine:
         counterfactual_open_replay: bool = False,
     ) -> str:
         observed = _now_taipei(now)
+        if spec.historical_counterfactual_provisional and not (
+                counterfactual_open_replay and summary.get("simulation_replay") is True
+                and summary.get("historical_minute_valuation") is True
+                and summary.get("provisional_minute_source_coverage") is True):
+            raise ValueError("provisional counterfactual is restricted to a labelled historical replay")
         # The executor may race the 13:20 cutoff after its caller has read a
         # valid pointer.  Do not let that late publication replace the day's
         # actual signal identity or consume a post-close cache as a rejection.
@@ -4193,6 +4931,28 @@ class TwDayTradeSimulationEngine:
             return "blocked_ledger_state_divergence"
         if signal_id in set(mode.get("processed_signal_ids") or ()):
             return "already_processed"
+        if mode.get("research_terminal_pending_commit"):
+            mode["engine_status"] = "critical_ledger_state_divergence"
+            mode["ledger_state_divergence"] = {"kind": "research_terminal_commit_interrupted",
+                                               "signal_id": mode.get("signal_id")}
+            self._persist(observed)
+            return "blocked_ledger_state_divergence"
+        if mode.get("research_absorbing_ruin") is not None:
+            # A proven, flat account that already reached nonpositive economic
+            # NAV cannot silently revive on a later revision or late credit.
+            # Closing any residual position remains the quote owner's job.
+            return self._block_signal(mode, signal_id, "research_absorbing_account_ruin", observed,
+                                      engine_status="blocked_research_account_ruined")
+        if (mode.get("session_date") == observed.date().isoformat() and mode.get("entry_completed_at")
+                and float(mode.get("research_short_limit_up_close_penalty_rate") or 0.0)
+                != float(spec.research_short_limit_up_close_penalty_rate)):
+            # Never relabel the already committed session or consume the new
+            # revision when a reload changes its accounting assumptions.
+            mode["pending_signal_id"] = signal_id
+            mode["pending_wait_reason"] = "research_close_policy_changed_during_session"
+            mode["engine_status"] = "blocked_research_close_policy"
+            self._persist(observed)
+            return "blocked_research_close_policy"
         historical_revision = spec.historical_progressive_revision_replay
         historical_revision_proof = summary.get("published_revision_replay") or {}
         if historical_revision:
@@ -4202,23 +4962,68 @@ class TwDayTradeSimulationEngine:
             # after their conservative publication bound. The first 09:01 cohort
             # is the separately disclosed historical opening counterfactual.
             proof = historical_revision_proof
+            if not isinstance(proof, Mapping):
+                return self._block_signal(mode, signal_id, "invalid_published_revision_replay_proof", observed)
             digest = proof.get("plan_sha256")
             published = _parse_timestamp(proof.get("publication_upper_bound"))
             first = not (mode.get("session_date") == observed.date().isoformat()
                          and mode.get("entry_completed_at"))
+            contract = proof.get("contract")
+            late_first_valid = False
+            if contract == PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT:
+                try:
+                    def aware(value):
+                        stamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+                        if stamp.utcoffset() is None:
+                            raise ValueError("replay source clock must be timezone-aware")
+                        return stamp.astimezone(TAIPEI)
+                    first_published = aware(proof["first_publication_upper_bound"])
+                    actual_published = aware(proof["publication_upper_bound"])
+                    pointer = aware(summary["execution_pointer_written_at"])
+                    artifact = aware(summary["artifact_published_at"])
+                    first_source = proof["first_source_signal_id"]
+                    original = proof["original_revision"]
+                    prior = mode.get("published_revision_replay") or {}
+                    late_first_valid = (
+                        proof.get("first_entry_is_counterfactual") is True
+                        and summary.get("original_weights_preserved") is True
+                        and summary.get("counterfactual_signal_regeneration") is False
+                        and isinstance(first_source, str) and bool(first_source)
+                        and isinstance(original, Mapping)
+                        and first_published.date() == observed.date()
+                        and ENTRY_GATE <= first_published.time().replace(tzinfo=None) < EXIT_LIMIT_TIME
+                        and actual_published == max(pointer, artifact)
+                        and actual_published.date() == observed.date()
+                        and actual_published >= first_published
+                        and summary.get("opening_repair_of_signal_id") == proof.get("source_signal_id")
+                        and (not first or (
+                            actual_published == first_published
+                            and proof.get("source_signal_id") == first_source
+                            and original.get("index") == 0
+                            and original.get("root_signal_id") == first_source))
+                        and (first or (prior.get("contract") == contract
+                            and prior.get("first_source_signal_id") == first_source
+                            and aware(prior["first_publication_upper_bound"]) == first_published))
+                    )
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    late_first_valid = False
             invalid = (
                 not counterfactual_open_replay
                 or summary.get("simulation_replay") is not True
                 or summary.get("historical_minute_valuation") is not True
                 or summary.get("simulation_only") is not True
                 or summary.get("production_order_possible") is not False
-                or proof.get("contract") != PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT
+                or contract not in {PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT,
+                                    PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT}
+                or (contract == PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT and not late_first_valid)
                 or not isinstance(digest, str) or len(digest) != 64
                 or any(c not in "0123456789abcdef" for c in digest)
                 or not proof.get("source_signal_id")
                 or published is None or published.date() != observed.date()
                 or observed.second != 0 or observed.microsecond != 0
-                or (first and (observed.time() != ENTRY_GATE or published >= observed))
+                or (first and (observed.time() != ENTRY_GATE
+                               or (contract == PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT
+                                   and published >= observed)))
                 or (not first and (
                     published is not None and published > observed - timedelta(minutes=1)
                     or (mode.get("published_revision_replay") or {}).get("plan_sha256") != digest
@@ -4471,6 +5276,10 @@ class TwDayTradeSimulationEngine:
             # A prior-day failure is a liquidation obligation, not today's
             # target inventory. Preserve its ledger and close it before any
             # new risk, even if today's model requests the same direction.
+            if self._research_prior_inventory_requires_reconciliation(mode, observed):
+                mode["pending_signal_id"] = signal_id
+                self._persist(observed)
+                return "waiting_prior_liquidation"
             if not self._margin_corporate_action_gate(mode, observed):
                 return "waiting_quote"
             self._accrue_margin_carry_cost(mode, observed)
@@ -4550,6 +5359,8 @@ class TwDayTradeSimulationEngine:
                     _finite(quotes[p["symbol"]].get("open")) or float(p["last_mark_price"])) for p in carrying_positions)
             sizing_nav -= float(mode.get("cumulative_carry_cost_twd") or 0.0)
             if not math.isfinite(sizing_nav) or sizing_nav <= 0.0:
+                _latch_research_flat_ruin(mode, nav=sizing_nav, observed=observed,
+                    research_rate=float(spec.research_short_limit_up_close_penalty_rate))
                 return self._block_signal(mode, signal_id, "nonpositive_account_nav", observed)
             mode["sizing_session_date"] = sizing_date
             mode["session_sizing_nav_twd"] = sizing_nav
@@ -4678,6 +5489,12 @@ class TwDayTradeSimulationEngine:
         prior_session_date = str(mode.get("session_date") or "")
         if prior_session_date and prior_session_date != observed.date().isoformat():
             self._archive_mode_positions(mode, archived_at=observed)
+            if "nontrade_settlement_count" in mode:
+                # The prior session's paper book is archived; its assumed PnL
+                # remains cumulative but its execution warning is not today's.
+                mode.pop("nontrade_settlement_count", None)
+                mode.pop("nontrade_settlement_shares", None)
+                mode.pop("execution_evidence_complete", None)
 
         if progressive_revision:
             # Reconciliation mutates actual FIFO inventory before building the
@@ -4687,6 +5504,8 @@ class TwDayTradeSimulationEngine:
                 market=spec.market, session_date=observed.date().isoformat(), signal_id=signal_id)
 
         mode["session_date"] = observed.date().isoformat()
+        if spec.research_short_limit_up_close_penalty_rate or "research_short_limit_up_close_penalty_rate" in mode:
+            mode["research_short_limit_up_close_penalty_rate"] = float(spec.research_short_limit_up_close_penalty_rate)
         if replay_continuation_origin is not None:
             mode["session_open_replay_origin"] = replay_continuation_origin
         elif not progressive_revision:
@@ -4742,7 +5561,24 @@ class TwDayTradeSimulationEngine:
         mode["checkpoint_fingerprint"] = summary.get("checkpoint_fingerprint")
         mode["config_fingerprint"] = summary.get("config_fingerprint")
         mode["eligibility_coverage"] = dict(eligibility_coverage)
+        # A later live session must not erase the provenance of the capital it
+        # inherits from an earlier provisional replay.  The current-session
+        # flag below can reset; this account-level flag stays true until an
+        # independently rebuilt account replaces the entire history.
+        if mode.get("provisional_minute_source_coverage") is True:
+            mode["cumulative_provisional_minute_source_coverage"] = True
         mode["simulation_replay"] = bool(summary.get("simulation_replay", False))
+        mode["provisional_minute_source_coverage"] = bool(
+            (historical_revision or spec.historical_counterfactual_provisional)
+            and summary.get("provisional_minute_source_coverage") is True
+        )
+        if mode["provisional_minute_source_coverage"]:
+            mode["cumulative_provisional_minute_source_coverage"] = True
+        mode["historical_bracket_cross_assumption"] = (
+            HISTORICAL_BRACKET_FULL_CROSS_CONTRACT if spec.historical_bracket_full_on_cross else None
+        )
+        if not progressive_revision:
+            mode["historical_bracket_full_cross_count"] = 0
         if historical_revision:
             mode["published_revision_replay"] = dict(historical_revision_proof)
         elif not progressive_revision:
@@ -4842,6 +5678,7 @@ class TwDayTradeSimulationEngine:
         mode["force_exit_started_at"] = None
         mode["closing_auction_submitted_at"] = None
         mode["closing_auction_settled_at"] = None
+        mode.pop("delayed_paper_auction_settled_at", None)
         mode["residual_conversion_completed_at"] = None
         mode["force_exit_failures"] = 0
         mode["pending_entry_shares"] = 0
@@ -4920,7 +5757,7 @@ class TwDayTradeSimulationEngine:
             if not int(plan["filled_shares"]):
                 for key in ("synthetic_fill", "synthetic_fallback_fill", "paper_market_fill",
                             "counterfactual_0901_price_fill", "counterfactual_open_price_fill",
-                            "prior_paper_fill_reused"):
+                            "historical_open_fallback_fill", "prior_paper_fill_reused"):
                     plan[key] = False
         mode["signal_inventory_targets"] = ({p["symbol"]:
             p.get("target_signed_shares", int(p["requested_shares"]) * (1 if p["side"] == "long" else -1))
@@ -5045,6 +5882,11 @@ class TwDayTradeSimulationEngine:
                 "entry_price_offset_ticks": plan["entry_price_offset_ticks"],
                 "entry_price_source": entry_price_source,
                 "entry_price_method": plan["entry_price_method"],
+                "historical_open_fallback_fill": bool(plan["historical_open_fallback_fill"]),
+                "historical_open_fallback_evidence": plan["historical_open_fallback_evidence"],
+                **({"recorded_at_basis": "counterfactual_effective_clock_not_original_publication",
+                    "replay_generated_at": plan["historical_open_fallback_evidence"]["proof_created_at"]}
+                   if plan["historical_open_fallback_fill"] else {}),
                 "synthetic_fill": bool(plan["synthetic_fill"]),
                 "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
                 "paper_market_fill": bool(plan["paper_market_fill"]),
@@ -5195,7 +6037,7 @@ class TwDayTradeSimulationEngine:
                 "realized_gross_pnl_twd": 0.0,
                 "realized_exit_fee_twd": 0.0,
                 "realized_net_pnl_twd": 0.0,
-                "valuation_stale": False,
+                "valuation_stale": bool(plan["historical_open_fallback_fill"]),
                 "simulation_replay": bool(mode.get("simulation_replay")),
                 "replay_basis": mode.get("replay_basis"),
                 "replay_source": mode.get("replay_source"),
@@ -5205,6 +6047,11 @@ class TwDayTradeSimulationEngine:
                 "entry_fill_is_synthetic": bool(plan["synthetic_fill"]),
                 "entry_price_source": entry_price_source,
                 "entry_price_method": plan["entry_price_method"],
+                "historical_open_fallback_fill": bool(plan["historical_open_fallback_fill"]),
+                "historical_open_fallback_evidence": plan["historical_open_fallback_evidence"],
+                **({"recorded_at_basis": "counterfactual_effective_clock_not_original_publication",
+                    "replay_generated_at": plan["historical_open_fallback_evidence"]["proof_created_at"]}
+                   if plan["historical_open_fallback_fill"] else {}),
                 "synthetic_fallback_fill": bool(plan["synthetic_fallback_fill"]),
                 "paper_market_fill": bool(plan["paper_market_fill"]),
                 "counterfactual_0901_price_fill": bool(
@@ -5260,6 +6107,8 @@ class TwDayTradeSimulationEngine:
                     "order_type": (
                         "PAPER_PRIOR_FILL_FULL_TARGET"
                         if bool(plan.get("prior_paper_fill_reused"))
+                        else "PAPER_ASSUMED_OFFICIAL_OPEN_0901"
+                        if bool(plan["historical_open_fallback_fill"])
                         else "PAPER_0901_MINUTE_PRICE"
                         if bool(plan["counterfactual_0901_price_fill"])
                         else "PAPER_OPEN_PRICE_0901"
@@ -5288,6 +6137,11 @@ class TwDayTradeSimulationEngine:
                     ),
                     "entry_price_source": entry_price_source,
                     "entry_price_method": plan["entry_price_method"],
+                    "historical_open_fallback_fill": bool(plan["historical_open_fallback_fill"]),
+                    "historical_open_fallback_evidence": plan["historical_open_fallback_evidence"],
+                    **({"recorded_at_basis": "counterfactual_effective_clock_not_original_publication",
+                        "replay_generated_at": plan["historical_open_fallback_evidence"]["proof_created_at"]}
+                       if plan["historical_open_fallback_fill"] else {}),
                     "historical_source_quote_at": quote.get(
                         "historical_source_quote_at"
                     ),
@@ -5313,8 +6167,12 @@ class TwDayTradeSimulationEngine:
                     "fee_and_tax_twd": entry_fee,
                     "gross_fee_and_tax_twd": entry_gross_fee,
                     "commission_rebate_accrued_twd": entry_rebate,
-                    "fill_contract": mode.get("entry_fill_contract"),
-                    "depth_assumption": mode.get("entry_liquidity_assumption"),
+                    "fill_contract": (HISTORICAL_OPEN_FALLBACK_CONTRACT
+                                      if plan["historical_open_fallback_fill"]
+                                      else mode.get("entry_fill_contract")),
+                    "depth_assumption": ("full_paper_quantity_assumed_no_depth_or_fill_evidence"
+                                         if plan["historical_open_fallback_fill"]
+                                         else mode.get("entry_liquidity_assumption")),
                     "simulation_replay": bool(mode.get("simulation_replay")),
                     "replay_basis": mode.get("replay_basis"),
                     "synthetic_fill": bool(plan["synthetic_fill"]),
@@ -5330,6 +6188,11 @@ class TwDayTradeSimulationEngine:
                     ),
                     "entry_price_source": entry_price_source,
                     "entry_price_method": plan["entry_price_method"],
+                    "historical_open_fallback_fill": bool(plan["historical_open_fallback_fill"]),
+                    "historical_open_fallback_evidence": plan["historical_open_fallback_evidence"],
+                    **({"recorded_at_basis": "counterfactual_effective_clock_not_original_publication",
+                        "replay_generated_at": plan["historical_open_fallback_evidence"]["proof_created_at"]}
+                       if plan["historical_open_fallback_fill"] else {}),
                 }
             )
             for purpose, order_type, price, order_status in (
@@ -5390,6 +6253,7 @@ class TwDayTradeSimulationEngine:
             and not bool(plan.get("synthetic_fill"))
             and not bool(plan.get("counterfactual_0901_price_fill"))
             and not bool(plan.get("counterfactual_open_price_fill"))
+            and not bool(plan.get("historical_open_fallback_fill"))
             and not bool(plan.get("prior_paper_fill_reused"))
             for plan in plans
         )
@@ -5405,6 +6269,12 @@ class TwDayTradeSimulationEngine:
         entry_official_open_fill_count = sum(
             bool(plan.get("counterfactual_open_price_fill")) for plan in plans
         )
+        mode["historical_open_fallback_fill_count"] = sum(
+            bool(plan.get("historical_open_fallback_fill")) for plan in plans
+        )
+        if mode["historical_open_fallback_fill_count"]:
+            mode["execution_evidence_complete"] = False
+            mode["cumulative_provisional_minute_source_coverage"] = True
         entry_0901_vwap_fill_count = sum(
             bool(plan.get("counterfactual_0901_price_fill"))
             and str(plan.get("entry_price_method") or "minute_vwap")
@@ -5562,6 +6432,7 @@ class TwDayTradeSimulationEngine:
                     entry_0901_minute_price_fill_count
                 ),
                 simulation_replay=bool(mode.get("simulation_replay")),
+                provisional_minute_source_coverage=bool(mode.get("provisional_minute_source_coverage")),
                 session_open_replay_origin=(
                     mode.get("session_open_replay_origin") if counterfactual_open_replay else None
                 ),
@@ -5591,8 +6462,32 @@ class TwDayTradeSimulationEngine:
             raise
         return "registered"
 
+    @staticmethod
+    def _research_prior_inventory_requires_reconciliation(mode, now):
+        """Do not substitute a later liquidation for an unverified research close.
+
+        A next-session quote cannot establish the earlier official close,
+        closing capacity, or its 7% research expense.  The prior session must
+        instead be reconciled against retained evidence before normal trading
+        can resume.  This is a paper-accounting guard, not a broker action.
+        """
+        if not mode.get("research_short_limit_up_close_penalty_rate"):
+            return False
+        day = now.date().isoformat()
+        prior = sorted({str(p.get("session_date") or mode.get("session_date") or "")
+                        for p in (mode.get("positions") or {}).values()
+                        if int(p.get("signed_shares") or 0)
+                        and str(p.get("session_date") or mode.get("session_date") or "") < day})
+        if not prior:
+            return False
+        mode["research_prior_session_reconciliation_required"] = prior[0] or "unknown"
+        mode["engine_status"] = "critical_prior_inventory_liquidation"
+        return True
+
     def _liquidate_prior_inventory(self, mode, quotes, now):
         """Old inventory is reduction-only, independently of today's inference."""
+        if self._research_prior_inventory_requires_reconciliation(mode, now):
+            return
         if not LIVE_ENTRY_GATE <= now.time() < AUCTION_OBSERVATION_DEADLINE:
             return
         for p in (mode.get("positions") or {}).values():
@@ -5711,10 +6606,7 @@ class TwDayTradeSimulationEngine:
         ):
             return
         if now.time() >= EXIT_LIMIT_TIME:
-            for order in orders.values():
-                if order.get("status") == "working":
-                    order["status"] = "cancelled_exit_priority"
-            mode["pending_entry_shares"] = 0
+            expire_replay_entry_remainders(mode, as_of=now)
             return
 
         reserved = sum(
@@ -6755,12 +7647,22 @@ class TwDayTradeSimulationEngine:
         for market, mode in self.state.get("modes", {}).items():
             if selected_markets is not None and str(market) not in selected_markets:
                 continue
-            if mode.get("ledger_state_divergence") or mode.get("entry_retry_pending_commit"):
+            if (mode.get("ledger_state_divergence") or mode.get("entry_retry_pending_commit")
+                    or mode.get("research_terminal_pending_commit")):
                 mode["engine_status"] = "critical_ledger_state_divergence"
                 continue
+            if mode.get("research_short_limit_up_close_penalty_rate"):
+                mismatch = self._research_position_identity_mismatch(mode, market)
+                if mismatch is not None:
+                    mode["ledger_state_divergence"] = {"kind": "research_terminal_position_identity_mismatch",
+                                                       "position_id": mismatch}
+                    mode["engine_status"] = "critical_ledger_state_divergence"
+                    continue
             positions = mode.get("positions") or {}
             if (mode.get("configured_intraday_contract") == STRICT_INTRADAY_CONTRACT
                     and str(mode.get("session_date") or "") < observed.date().isoformat()):
+                if self._research_prior_inventory_requires_reconciliation(mode, observed):
+                    continue
                 if not self._margin_corporate_action_gate(mode, observed):
                     continue
                 self._accrue_margin_carry_cost(mode, observed)
@@ -6840,6 +7742,8 @@ class TwDayTradeSimulationEngine:
             if wall_time >= SESSION_CLOSE:
                 self._submit_closing_auction_limits(market, mode, observed)
                 self._settle_closing_auction(market, mode, quotes, observed)
+                if mode.get("ledger_state_divergence"):
+                    continue
                 self._convert_residual_to_carry(market, mode, quotes, observed)
             self._retry_revision_reduction_orders(mode, quotes, observed)
             self._retry_entry_orders(mode, quotes, observed)
@@ -7318,6 +8222,77 @@ class TwDayTradeSimulationEngine:
                 position["closing_auction_order_status"] = "part_filled"
         self._event("closing_auction_settled", recorded_at=now, market=market)
 
+    @staticmethod
+    def _research_position_identity_mismatch(mode, market):
+        session_date = str(mode.get("session_date") or "")
+        for key, position in (mode.get("positions") or {}).items():
+            if not isinstance(position, Mapping):
+                return str(key)
+            signed = position.get("signed_shares")
+            if (type(signed) is not int or position.get("position_id") != key
+                    or position.get("market") != market or position.get("session_date") != session_date
+                    or (signed and position.get("side") != ("long" if signed > 0 else "short"))):
+                return str(key)
+        return None
+
+    def _research_terminal_expense(self, mode, position, *, price, proof, quote, effective_at):
+        """Verify source-bound research cost before a terminal paper commit.
+
+        The provider supplies only retained source evidence; a missing minute
+        is never assumed to be zero volume. The independent auditor reads the
+        same pinned bytes and the caller performs a final hash check before the
+        durable intent is written.
+        """
+        from scripts.audit_tw_day_trade_margin_replay import _sha256, _verify_research_close_source
+
+        day, symbol = str(mode.get("session_date") or ""), str(position.get("symbol") or "")
+        context = quote.get("research_terminal_source_context")
+        if not isinstance(context, Mapping) or context.get("session_date") != day:
+            raise ValueError("research terminal source context unavailable")
+        upper = _finite(position.get("upper_limit"))
+        if upper is None:
+            raise ValueError("research terminal upper limit unavailable")
+        close_evidence = dict(proof)
+        close_evidence["symbol"] = symbol
+        limit_evidence = {"session_date": day, "symbol": symbol, "price": upper,
+                          "source_path": context.get("price_limit_path"),
+                          "source_sha256": context.get("price_limit_sha256")}
+        capacity, available = None, None
+        if math.isclose(price, upper, rel_tol=0, abs_tol=1e-8):
+            source = quote.get("research_closing_minute_evidence")
+            if not isinstance(source, Mapping):
+                raise ValueError("research terminal closing-minute volume unavailable")
+            capacity = dict(source)
+            previous = (mode.get("research_terminal_source_capacity_used") or {}).get(f"{day}:{symbol}") or {}
+            used = int(previous.get("used_capacity_shares") or 0)
+            capacity["used_capacity_shares"] = used
+            volume = capacity.get("volume_shares")
+            lot = int(position.get("lot_size") or 1_000)
+            if type(volume) is not int or volume < 0 or lot <= 0:
+                raise ValueError("research terminal closing-minute volume invalid")
+            numerator, denominator = float(MINUTE_VOLUME_PARTICIPATION).as_integer_ratio()
+            budget = (volume * numerator // (denominator * lot)) * lot
+            if used > budget:
+                raise ValueError("research terminal source capacity already exhausted")
+            available = budget - used
+        cost = research_short_limit_up_close_cost(signed_shares=int(position["signed_shares"]),
+            official_close=price, upper_limit=upper, available_source_capacity_shares=available,
+            rate=float(mode["research_short_limit_up_close_penalty_rate"]))
+        expense = {"official_close_evidence": close_evidence, "upper_limit_evidence": limit_evidence,
+                   "closing_capacity_evidence": capacity, "cost": cost,
+                   "source_context": deepcopy(context)}
+        candidate_fill = {"session_date": day, "symbol": symbol, "quantity": abs(int(position["signed_shares"])),
+            "side": "buy_to_cover", "price": price, "fill_at": effective_at.isoformat(),
+            "purpose": "13_30_unlimited_close_paper_settlement", "research_close_expense": expense}
+        amount, sources = _verify_research_close_source(candidate_fill, context,
+            rate=float(mode["research_short_limit_up_close_penalty_rate"]),
+            expected_used=(capacity["used_capacity_shares"] if capacity else 0))
+        if not math.isclose(amount, cost["amount_twd"], rel_tol=0.0, abs_tol=1e-5):
+            raise ValueError("research terminal source audit disagrees with expense")
+        if any(_sha256(Path(path)) != digest for path, digest in sources.items()):
+            raise ValueError("research terminal source changed before paper commit")
+        return expense
+
     def _settle_unlimited_close(self, market, mode, quotes, now) -> None:
         """User-authorized paper liquidation, never a broker/queue fill.
 
@@ -7331,10 +8306,38 @@ class TwDayTradeSimulationEngine:
             return
         if _timestamp_is_for_session(mode.get("closing_auction_settled_at"), session_date):
             return
-        settled = 0
-        for p in (mode.get("positions") or {}).values():
+        research_rate = mode.get("research_short_limit_up_close_penalty_rate") or 0.0
+        if (isinstance(research_rate, bool) or not isinstance(research_rate, (float, int))
+                or not math.isfinite(research_rate) or not 0 <= research_rate <= 1):
+            mode["engine_status"] = "critical_invalid_research_close_policy"
+            return
+        research_mode = research_rate > 0
+        position_map = mode.get("positions") or {}
+        if research_mode:
+            mismatch = self._research_position_identity_mismatch(mode, market)
+            if mismatch is not None:
+                mode["ledger_state_divergence"] = {"kind": "research_terminal_position_identity_mismatch",
+                                                   "position_id": mismatch}
+                mode["engine_status"] = "critical_ledger_state_divergence"
+                return
+        positions = list(position_map.values())
+        mixed_symbols = set()
+        if research_mode:
+            directions: dict[str, set[int]] = {}
+            for position in positions:
+                signed = int(position.get("signed_shares") or 0)
+                if signed:
+                    directions.setdefault(str(position.get("symbol") or ""), set()).add(1 if signed > 0 else -1)
+            mixed_symbols = {symbol for symbol, sides in directions.items() if len(sides) > 1}
+            positions.sort(key=lambda p: (str(p.get("entry_at") or ""), str(p.get("position_id") or "")))
+        settled, research_pending = 0, 0
+        for p in positions:
             signed = int(p.get("signed_shares") or 0)
             if not signed:
+                continue
+            if research_mode and str(p.get("symbol") or "") in mixed_symbols:
+                p["closing_auction_order_status"] = "waiting_research_mixed_direction_capacity"
+                research_pending += 1
                 continue
             quote = quotes.get(str(p["symbol"])) or {}
             proof = quote.get("session_close_evidence")
@@ -7383,15 +8386,46 @@ class TwDayTradeSimulationEngine:
                 p["closing_auction_order_status"] = "waiting_valid_terminal_close_source"
                 continue
             effective_at = datetime.combine(now.date(), SESSION_CLOSE, tzinfo=TAIPEI)
+            delayed = None
+            if "delayed_paper_auction" in quote:
+                delayed = _delayed_paper_close_time(mode, p, quote, now, price)
+                if delayed is None:
+                    p["closing_auction_order_status"] = "waiting_valid_delayed_paper_auction"
+                    continue
+                effective_at = delayed[0]
             receipt = {"contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT,
                        "source_evidence": evidence, "recorded_at": now.isoformat(),
                        "effective_at": effective_at.isoformat(), "broker_fill": False,
                        "full_quantity_is_user_assumption": True}
+            if delayed is not None:
+                receipt["delayed_paper_auction"] = delayed[1]
+            if research_mode:
+                expense = None
+                if signed < 0:
+                    if not isinstance(evidence, Mapping) or evidence.get("price_basis") != "official_session_close":
+                        p["closing_auction_order_status"] = "waiting_research_official_close"
+                        research_pending += 1
+                        continue
+                    from polars.exceptions import PolarsError
+                    try:
+                        expense = self._research_terminal_expense(mode, p, price=price,
+                            proof=evidence, quote=quote, effective_at=effective_at)
+                    except (ValueError, OSError, KeyError, TypeError, PolarsError) as exc:
+                        p["closing_auction_order_status"] = "waiting_research_close_source"
+                        p["research_close_pending_reason"] = f"{type(exc).__name__}: {exc}"
+                        research_pending += 1
+                        continue
+                self._commit_research_terminal_close(mode, p, price=price, effective_at=effective_at,
+                    recorded_at=now, receipt=receipt, expense=expense)
+                p.pop("research_close_pending_reason", None)
+                settled += 1
+                continue
             orders, fills = [], []
             self._book_position_close(p, mode, price=price,
                 quote={"fill_contract": TERMINAL_CLOSE_UNLIMITED_CONTRACT,
                        "depth_assumption": "full_residual_ignores_close_capacity_no_exchange_fill_claim"},
-                now=effective_at, reason="13_30_unlimited_close_paper_settlement",
+                now=effective_at, reason=("13_33_delayed_close_paper_settlement" if delayed is not None
+                                          else "13_30_unlimited_close_paper_settlement"),
                 order_type="PAPER_CLOSE_SETTLEMENT", quantity=abs(signed),
                 ledger_rows=(orders, fills))
             for row in orders:
@@ -7401,17 +8435,23 @@ class TwDayTradeSimulationEngine:
                                   "quote_at": None, "exchange_match_at": None})
             p["terminal_close_receipt"] = receipt
             p["closing_auction_order_status"] = "paper_settled_not_exchange_fill"
+            if delayed is not None:
+                mode["delayed_paper_auction_settled_at"] = effective_at.isoformat()
             settled += 1
         remaining = sum(bool(p.get("signed_shares")) for p in (mode.get("positions") or {}).values())
         mode["closing_auction_pending_count"] = remaining
         mode["force_exit_failures"] = remaining
         mode["execution_evidence_complete"] = not remaining
-        mode["terminal_flatten_count"] = int(mode.get("terminal_flatten_count") or 0) + settled
+        if research_mode:
+            mode["research_close_pending_source_count"] = research_pending
+        else:
+            mode["terminal_flatten_count"] = int(mode.get("terminal_flatten_count") or 0) + settled
         if not remaining:
             mode["closing_auction_settled_at"] = now.isoformat(timespec="seconds")
             mode["residual_conversion_completed_at"] = now.isoformat(timespec="seconds")
         else:
-            mode["engine_status"] = "waiting_valid_terminal_close_source"
+            mode["engine_status"] = ("waiting_research_close_evidence" if research_pending
+                                     else "waiting_valid_terminal_close_source")
         if settled:
             self._event("unlimited_close_paper_settlement", recorded_at=now,
                         market=market, settled_count=settled, remaining_count=remaining,
@@ -7441,6 +8481,8 @@ class TwDayTradeSimulationEngine:
         if mode.get("intraday_contract") != STRICT_INTRADAY_CONTRACT:
             return "critical_legacy_carry_requires_review" if opened and now.time() >= SESSION_CLOSE else None
         if opened and now.time() >= SESSION_CLOSE:
+            if mode.get("research_close_pending_source_count"):
+                return "waiting_research_close_evidence"
             if not mode.get("closing_auction_settled_at"):
                 return "waiting_closing_auction_evidence"
             if any(not p.get("margin_exception_evidence") for p in opened):
@@ -8098,19 +9140,25 @@ class TwDayTradeSimulationEngine:
             return
         remaining_before = abs(signed)
         fill_quantity = min(max(int(quantity), 0), remaining_before)
+        assumed_full_cross = quote.get("fill_contract") == HISTORICAL_BRACKET_FULL_CROSS_CONTRACT
+        if assumed_full_cross and not _verified_historical_full_cross(
+                position, mode, quote, price=price, reason=reason, now=now, quantity=fill_quantity):
+            raise ValueError("invalid historical full-cross bracket assumption")
         if mode.get("margin_carry_contract") == MARGIN_CARRY_CONTRACT or mode.get("intraday_contract") == STRICT_INTRADAY_CONTRACT:
             # Multiple carried acquisition cohorts share ONE source budget.
             quote_at = _parse_timestamp(quote.get("quote_at"))
             if quote_at is None or quote_at.date() != now.date() or quote_at > now:
                 return
             key = str(quote.get("capacity_bucket") or f"{now.date()}:{quote_at.strftime('%H:%M')}:{position['symbol']}")
-            budget = _minute_kbar_capacity_shares(quote, lot_size=int(position["lot_size"]))
-            if now.time() < time(9, 1):
+            budget = (_minute_kbar_capacity_shares(quote, lot_size=int(position["lot_size"]))
+                      if not assumed_full_cross else fill_quantity)
+            if now.time() < time(9, 1) and not assumed_full_cross:
                 key += quote_at.isoformat()
                 budget = _top_book_capacity_shares(quote, transaction_side="sell" if signed > 0 else "buy", lot_size=int(position["lot_size"]))
             usage = mode.setdefault("margin_exit_capacity_used", {})
-            fill_quantity = min(fill_quantity, max(0, budget - int(usage.get(key) or 0)))
-            usage[key] = int(usage.get(key) or 0) + fill_quantity
+            if not assumed_full_cross:
+                fill_quantity = min(fill_quantity, max(0, budget - int(usage.get(key) or 0)))
+                usage[key] = int(usage.get(key) or 0) + fill_quantity
         if fill_quantity <= 0:
             return
         self._book_position_close(
@@ -8118,6 +9166,10 @@ class TwDayTradeSimulationEngine:
             order_type=order_type, quantity=fill_quantity, ledger_order_id=ledger_order_id,
             ledger_session_date=ledger_session_date, ledger_rows=ledger_rows,
         )
+        if assumed_full_cross:
+            position["bracket_cross_evidence"] = dict(quote["bracket_cross_evidence"])
+            mode["historical_bracket_full_cross_count"] = int(mode.get("historical_bracket_full_cross_count") or 0) + 1
+            mode["execution_evidence_complete"] = False
 
     def _book_position_close(
         self, position: dict[str, Any], mode: dict[str, Any], *, price: float,
@@ -8125,6 +9177,7 @@ class TwDayTradeSimulationEngine:
         quantity: int, ledger_order_id: str | None = None,
         ledger_session_date: str | None = None,
         ledger_rows: tuple[list[dict[str, Any]], list[dict[str, Any]]] | None = None,
+        research_close_expense: Mapping[str, Any] | None = None,
     ) -> None:
         """Accounting only, after execution or an explicit offline settlement gate.
 
@@ -8137,7 +9190,19 @@ class TwDayTradeSimulationEngine:
         fill_quantity = int(quantity)
         if not math.isfinite(price) or price <= 0 or not 0 < fill_quantity <= remaining_before:
             raise ValueError("invalid close accounting quantity or price")
+        if (signed < 0 and reason == "13_30_unlimited_close_paper_settlement"
+                and mode.get("research_short_limit_up_close_penalty_rate")
+                and research_close_expense is None):
+            raise ValueError("research short terminal close requires cost evidence")
+        research_cost = (
+            _research_close_expense_amount(position=position, mode=mode, price=price,
+                now=now, reason=reason, order_type=order_type, quantity=fill_quantity,
+                evidence=research_close_expense)
+            if research_close_expense is not None else 0.0
+        )
         side = str(position.get("side"))
+        precise_ledger_clock = mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
+        ledger_stamp = now.isoformat(timespec="microseconds" if precise_ledger_clock else "seconds")
         direction = 1 if signed > 0 else -1
         prefix = "cash_" if position.get("margin_carry_contract") else ""
         exit_rate = float(position[f"{prefix}sell_fee_rate"] if side == "long" else position[f"{prefix}buy_fee_rate"])
@@ -8157,7 +9222,7 @@ class TwDayTradeSimulationEngine:
             if fill_quantity == remaining_before
             else remaining_entry_fee * fill_quantity / remaining_before
         )
-        net_pnl = gross_pnl - entry_fee_allocated - exit_fee
+        net_pnl = gross_pnl - entry_fee_allocated - exit_fee - research_cost
         remaining_after = remaining_before - fill_quantity
         realized_gross = (
             float(position.get("realized_gross_pnl_twd") or 0.0) + gross_pnl
@@ -8171,9 +9236,7 @@ class TwDayTradeSimulationEngine:
             {
                 "signed_shares": direction * remaining_after,
                 "status": "closed" if fully_closed else "partially_closed",
-                "last_exit_at": now.isoformat(timespec=(
-                    "microseconds" if mode.get("day_trade_signal_update_policy") == SIGNAL_UPDATE_PROGRESSIVE
-                    else "seconds")),
+                "last_exit_at": ledger_stamp,
                 "last_exit_quote_at": quote.get("quote_at"),
                 "last_exit_price": float(price),
                 "last_exit_quantity": fill_quantity,
@@ -8191,10 +9254,13 @@ class TwDayTradeSimulationEngine:
                 "valuation_stale": False,
             }
         )
+        if research_close_expense is not None:
+            position["research_close_expense_twd"] = float(position.get("research_close_expense_twd") or 0.0) + research_cost
+            mode["cumulative_research_close_expense_twd"] = float(mode.get("cumulative_research_close_expense_twd") or 0.0) + research_cost
         if fully_closed:
             position.update(
                 {
-                    "exit_at": now.isoformat(timespec="seconds"),
+                    "exit_at": ledger_stamp,
                     "exit_quote_at": quote.get("quote_at"),
                     "exit_price": float(price),
                     "take_profit_order_status": "filled"
@@ -8239,7 +9305,7 @@ class TwDayTradeSimulationEngine:
             f"{position.get('position_id')}:{reason}:{remaining_before}"
         )
         common = {
-            "recorded_at": now.isoformat(timespec="seconds"),
+            "recorded_at": ledger_stamp,
             "session_date": ledger_session_date or mode.get("session_date"),
             "market": position.get("market"),
             "position_id": position.get("position_id"),
@@ -8250,6 +9316,8 @@ class TwDayTradeSimulationEngine:
             "requested_quantity": remaining_before,
             "remaining_quantity": remaining_after,
             "simulation_only": True,
+            **({"execution_clock_contract": "same_local_instant_microsecond_paper_commit_v1"}
+               if precise_ledger_clock else {}),
             "synthetic_terminal_ledger": (reason == "13_30_terminal_ledger_flatten"),
             "odd_lot_execution_policy": (position.get("odd_lot_execution_policy")
                                          if fill_quantity % int(position.get("lot_size") or 1000) else None),
@@ -8268,7 +9336,7 @@ class TwDayTradeSimulationEngine:
         append_fill(
             {
                 **common,
-                "fill_at": now.isoformat(timespec="seconds"),
+                "fill_at": ledger_stamp,
                 "quote_at": quote.get("quote_at"),
                 "exchange_match_at": quote.get("exchange_match_at"),
                 "price": float(price),
@@ -8278,6 +9346,8 @@ class TwDayTradeSimulationEngine:
                 "entry_fee_allocated_twd": entry_fee_allocated,
                 "gross_pnl_twd": gross_pnl,
                 "net_pnl_twd": net_pnl,
+                **({"research_close_expense": dict(research_close_expense)}
+                   if research_close_expense is not None else {}),
                 "fill_contract": (
                     str(quote.get("fill_contract"))
                     if quote.get("fill_contract")
@@ -8295,6 +9365,8 @@ class TwDayTradeSimulationEngine:
                 "counterfactual_minute_sweep_fill": bool(
                     quote.get("counterfactual_minute_sweep_fill")
                 ),
+                **({"bracket_cross_evidence": dict(quote["bracket_cross_evidence"])}
+                   if quote.get("fill_contract") == HISTORICAL_BRACKET_FULL_CROSS_CONTRACT else {}),
                 "simulation_replay": bool(mode.get("simulation_replay")),
                 "entry_fill_policy": quote.get("entry_fill_policy"),
                 "entry_price_method": quote.get("entry_price_method"),
@@ -8387,6 +9459,9 @@ class TwDayTradeSimulationEngine:
             + float(mode.get("cumulative_corporate_action_net_twd") or 0.0)
             - float(mode.get("cumulative_carry_cost_twd") or 0.0)
         )
+        _latch_research_flat_ruin(mode, nav=total_equity, observed=now,
+            research_rate=float(mode.get("research_short_limit_up_close_penalty_rate")
+                                or mode.get("configured_research_short_limit_up_close_penalty_rate") or 0.0))
         flat_status = "flat"
         source_waiting = int(mode.get("pending_entry_source_count") or 0) > 0
         if str(mode.get("session_date") or "") == now.date().isoformat() and mode.get(
@@ -8417,7 +9492,10 @@ class TwDayTradeSimulationEngine:
                 "valuation_stale": stale_count > 0,
                 "valuation_complete": missing_count == 0,
                 "engine_status": (
-                    "waiting_valid_terminal_close_source"
+                    "waiting_research_close_evidence"
+                    if open_count and mode.get("research_close_pending_source_count")
+                    and now.timetz().replace(tzinfo=None) >= SESSION_CLOSE
+                    else "waiting_valid_terminal_close_source"
                     if open_count and mode.get("terminal_close_contract") == TERMINAL_CLOSE_UNLIMITED_CONTRACT
                     and now.timetz().replace(tzinfo=None) >= SESSION_CLOSE
                     else
@@ -8437,6 +9515,8 @@ class TwDayTradeSimulationEngine:
                     and open_count
                     else "active"
                     if open_count
+                    else "blocked_research_account_ruined"
+                    if mode.get("research_absorbing_ruin") is not None
                     else "waiting_opening_source"
                     if source_waiting
                     else flat_status
@@ -8459,12 +9539,30 @@ class TwDayTradeSimulationEngine:
             settled_valid = False
         settled_flat = same_session and not open_count and settled_valid
         terminal = same_session and curve_clock >= SESSION_CLOSE
+        raw_delayed_settlement = mode.get("delayed_paper_auction_settled_at")
+        delayed_settlement = _parse_timestamp(raw_delayed_settlement)
+        delayed_receipt_exists = any(
+            isinstance(position.get("terminal_close_receipt"), Mapping)
+            and position["terminal_close_receipt"].get("broker_fill") is False
+            and position["terminal_close_receipt"].get("effective_at") == raw_delayed_settlement
+            and isinstance(position["terminal_close_receipt"].get("delayed_paper_auction"), Mapping)
+            and position["terminal_close_receipt"]["delayed_paper_auction"].get("contract")
+                == DELAYED_AUCTION_PAPER_REPLAY_CONTRACT
+            for position in (mode.get("positions") or {}).values())
+        delayed_terminal = bool(settled_flat and delayed_settlement is not None
+                                and delayed_settlement.date() == now.date()
+                                and delayed_settlement.time() == time(13, 33)
+                                and delayed_settlement <= now and delayed_receipt_exists)
+        if raw_delayed_settlement and not delayed_terminal:
+            # An inconsistent clock marker must not silently fall back to a
+            # fabricated 13:30 endpoint.
+            return
         if terminal and settled_flat:
             # A delayed loop/restart may publish a proven flat settlement NAV
             # at the session endpoint. No price, fill, or interior bar is made up.
-            mark_at = now.replace(hour=13, minute=30, second=0, microsecond=0)
-            curve_clock = SESSION_CLOSE
-        if not same_session or not ENTRY_GATE <= curve_clock <= SESSION_CLOSE:
+            mark_at = delayed_settlement if delayed_terminal else now.replace(hour=13, minute=30, second=0, microsecond=0)
+            curve_clock = mark_at.time()
+        if not same_session or not (ENTRY_GATE <= curve_clock <= SESSION_CLOSE or delayed_terminal):
             # The operational state may be marked immediately after a 09:00
             # signal or during post-close reconciliation, but the canonical
             # strategy curve is the 270 right-labelled minutes 09:01..13:30.
@@ -8485,6 +9583,7 @@ class TwDayTradeSimulationEngine:
                 "market": market,
                 "initial_capital_twd": mode.get("initial_capital_twd"),
                 "cumulative_realized_net_pnl_twd": cumulative,
+                "cumulative_nontrade_settlement_net_pnl_twd": mode.get("cumulative_nontrade_settlement_net_pnl_twd"),
                 "cumulative_carry_cost_twd": float(mode.get("cumulative_carry_cost_twd") or 0),
                 "cumulative_corporate_action_net_twd": float(mode.get("cumulative_corporate_action_net_twd") or 0),
                 "corporate_action_cash_net_twd": float(mode.get("corporate_action_cash_net_twd") or 0),
@@ -8500,8 +9599,10 @@ class TwDayTradeSimulationEngine:
                 "valuation_stale": stale_count > 0,
                 **({
                     "historical_minute_replay": True,
+                    "provisional_minute_source_coverage": bool(mode.get("provisional_minute_source_coverage")),
                     "minute_valuation_contract": HISTORICAL_MINUTE_MARK_CONTRACT,
-                    "valuation_source": "retained_1m_close_with_explicit_last_trade_carry",
+                    "valuation_source": ("source_pinned_delayed_auction_event_v1" if delayed_terminal
+                                         else "retained_1m_close_with_explicit_last_trade_carry"),
                     "valuation_executable": False,
                     "fresh_trade_position_count": open_count - stale_count,
                     "last_trade_carried_position_count": stale_count,
@@ -8841,6 +9942,9 @@ class TwDayTradeSimulationEngine:
                             "initial_capital_twd",
                             "total_equity_twd",
                             "cumulative_realized_net_pnl_twd",
+                            "cumulative_nontrade_settlement_net_pnl_twd",
+                            "nontrade_settlement_count",
+                            "nontrade_settlement_shares",
                             "open_net_liquidation_pnl_twd",
                             "open_position_count",
                             "stale_position_count",

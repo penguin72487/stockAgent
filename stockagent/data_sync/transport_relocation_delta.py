@@ -61,6 +61,16 @@ def _same_native_file_generation(observed, expected):
             and all(observed[index] == expected[index] for index in (1, 3, 4, 5, 6, 7, 8)))
 
 
+def same_E_generation(path: Path, expected, observed=None):
+    """Reuse a fixed E generation across an enrolled WSL device renumbering."""
+    from stockagent.data_sync.stream_repack import _generation_matches
+    try:
+        actual = signature(path) if observed is None else observed
+        return _generation_matches(path, expected, actual)
+    except (OSError, TypeError, ValueError):
+        return False
+
+
 def _verify_archive(path, manifest_bytes, records):
     expected = {record['archive_name']: record for record in records}
     seen = set()
@@ -130,7 +140,6 @@ def preserve_differences(evidence: Path, source: Path, output_dir: Path, *, admi
                 'source_names_deleted': 0, 'retirement_authorized': False, 'NAS_acceptance_claimed': False}
     manifest_bytes = (json.dumps(manifest, ensure_ascii=True, sort_keys=True, separators=(',', ':'))+'\n').encode()
     total = sum(r['bytes'] for r in records)
-    admit(total + max(64 * 1024**2, len(records) * 8192))
     output_dir.mkdir(parents=True, exist_ok=True)
     if output_dir.is_symlink() or output_dir.resolve() != output_dir.absolute():
         raise ValueError('redirected E delta destination')
@@ -141,7 +150,7 @@ def preserve_differences(evidence: Path, source: Path, output_dir: Path, *, admi
         if (saved.get('contract') == CONTRACT and saved.get('comparison_identity_sha256') == identity
                 and saved.get('state') == 'verified' and saved.get('files') == len(records)
                 and saved.get('logical_bytes') == total
-                and saved.get('archive_signature') == signature(final)):
+                and same_E_generation(final, saved.get('archive_signature'))):
             return saved
         raise ValueError('existing delta receipt or archive changed')
     start = time.monotonic()
@@ -153,6 +162,9 @@ def preserve_differences(evidence: Path, source: Path, output_dir: Path, *, admi
             'retirement_authorized': False, 'NAS_acceptance_claimed': False})
     progress('copying', 0, 0)
     if not final.exists():
+        # Reusing a fixed existing receipt is metadata-only and does not need
+        # space for another archive. Admit growth only before creating one.
+        admit(total + max(64 * 1024**2, len(records) * 8192))
         temporary = output_dir / ('.' + identity + '.' + uuid.uuid4().hex + '.partial')
         count = 0
         with temporary.open('xb') as output:

@@ -171,6 +171,29 @@ def test_no_binding_never_authorizes_partial_original_publication(cohort):
         closed.require_unbound_originals(source)
 
 
+@pytest.mark.parametrize('fault', ['none', 'no-active-handoff', 'nonempty', 'redirect', 'hardlink'])
+def test_supplemental_lock_requires_exact_active_handoff_and_empty_private_file(cohort, monkeypatch, fault):
+    from stockagent.data_sync import workspace_source_handoff
+
+    source, cold, cache, expected, _, _ = cohort
+    adopt(cohort)
+    path = source / '.download.lock'
+    path.write_bytes(b'x' if fault == 'nonempty' else b'')
+    path.chmod(0o600)
+    if fault == 'redirect':
+        path.unlink()
+        path.symlink_to(source / closed.LOCK)
+    elif fault == 'hardlink':
+        (source.parent / 'extra-lock-link').hardlink_to(path)
+    monkeypatch.setattr(workspace_source_handoff, 'guard_path', lambda _: (
+        None if fault == 'no-active-handoff' else {'state': 'active', 'source': str(source)}))
+    if fault == 'none':
+        assert closed.resolve_closed_source(source, cold, cache)[0].manifest_sha256 == expected.manifest_sha256
+    else:
+        with pytest.raises(SnapshotError):
+            closed.resolve_closed_source(source, cold, cache)
+
+
 def test_adoption_requires_actual_held_original_lock(cohort):
     source, cold, cache, resolved, _, _ = cohort
     with (source / closed.LOCK).open("r+b") as handle:

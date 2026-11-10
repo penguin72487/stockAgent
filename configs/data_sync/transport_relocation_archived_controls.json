@@ -1,0 +1,11 @@
+{
+  "contract": "stockagent.transport_relocation_archived_controls_retirement.v1",
+  "comparison_identity_sha256": "f725ed4e0a288a90c1d68254ae1320488c60f91990178b85a5e9b9dd8058e461",
+  "archive_sha256": "0656ff4f74431b27d567c585548f1545593665b04471c783f2a01651cb051b7c",
+  "members": [
+    ".transport-owner.json",
+    "tools/recovery-index.json",
+    "tools/source-status.json"
+  ],
+  "reason": "User-directed fast C/E/D migration; these old detached-D control generations are already preserved in the fixed E archive and current controls remain on E."
+}

@@ -1,0 +1,10 @@
+# Exact completed 2M run staged on E; not the separate 1,000 萬 deployment.
+# Origin: artifacts/markets/tw_day_trade_unit_mgda_capital_limitup_20261103_v1/capital__twd_2000000
+mode: manual
+config_path: configs/deployments/tw_day_trade_unit_mgda_capital_2m_20261103_fold10_candidate.yaml
+output_dir: /srv/stockagent-workspace/restore/completed-return-staging/1080930381086c7312e42d065d5df049e5f8f23a77d50cd4d745136d25b1f222/ingress-staging/vastai1T/artifact-auto-training-1a385d89ef07093c/artifacts/markets/tw_day_trade_unit_mgda_capital_limitup_20261103_v1/_capacity/capital__twd_2000000/attempt-00/training
+fold_id: 10
+checkpoint_path: /srv/stockagent-workspace/restore/completed-return-staging/1080930381086c7312e42d065d5df049e5f8f23a77d50cd4d745136d25b1f222/ingress-staging/vastai1T/artifact-auto-training-1a385d89ef07093c/artifacts/markets/tw_day_trade_unit_mgda_capital_limitup_20261103_v1/_capacity/capital__twd_2000000/attempt-00/training/fold_10/checkpoint_best.pt
+weights_path: /srv/stockagent-workspace/restore/completed-return-staging/1080930381086c7312e42d065d5df049e5f8f23a77d50cd4d745136d25b1f222/ingress-staging/vastai1T/artifact-auto-training-1a385d89ef07093c/artifacts/markets/tw_day_trade_unit_mgda_capital_limitup_20261103_v1/_capacity/capital__twd_2000000/attempt-00/training/fold_10/daily_weights.parquet
+model_scoped_live_output: true
+model_deployment_manifest: artifacts/discord_bot/deployments/tw_day_trade_unit_mgda_2m_20261103.json

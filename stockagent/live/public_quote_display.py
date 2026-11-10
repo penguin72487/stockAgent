@@ -14,7 +14,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, time
 from functools import cached_property, lru_cache
 import hashlib
 import json
@@ -263,6 +263,37 @@ class PublicQuoteDisplayPolicy:
             return None
         if _record_clock(clock_value, current_clock) is None:
             return None
+        assumption_record = None
+        if record_kind == "paper_position" and field in {"entry_price", "inventory_basis_price"}:
+            assumption_record = record if record.get("historical_open_fallback_fill") is True else None
+        elif record_kind == "paper_signal":
+            position = record.get("position")
+            position_assumed = isinstance(position, Mapping) and position.get("historical_open_fallback_fill") is True
+            if (record.get("historical_open_fallback_fill") is True) != position_assumed:
+                return None
+            assumption_record = position if position_assumed else None
+        elif record_kind == "paper_event" and record.get("historical_open_fallback_fill") is True:
+            if record.get("purpose") != "entry":
+                return None
+            assumption_record = record
+        if assumption_record is not None:
+            effective_value = (assumption_record.get("entry_at") if record_kind != "paper_event"
+                               else assumption_record.get("fill_at"))
+            effective = _record_clock(effective_value, current_clock)
+            generated_value = assumption_record.get("replay_generated_at")
+            generated = _record_clock(generated_value, current_clock)
+            if (assumption_record.get("recorded_at_basis") != "counterfactual_effective_clock_not_original_publication"
+                    or effective is None or generated is None or generated < effective
+                    or generated.astimezone(TAIPEI) < datetime.combine(
+                        effective.astimezone(TAIPEI).date(), time(13, 30), tzinfo=TAIPEI)):
+                return None
+            return float(private_value), {
+                "source": "使用者公開的模擬帳本", "price_role": field,
+                "publication_basis": PAPER_REPORT_CONTRACT, "evidence_kind": "paper_assumption",
+                "recorded_at": str(generated_value), "effective_at": str(effective_value),
+                "recorded_at_basis": "counterfactual_effective_clock_not_original_publication",
+                "opening_trade_time_verified": False, "broker_execution_verified": False,
+            }
         return float(private_value), {
             "source": "使用者公開的模擬帳本", "price_role": field,
             "publication_basis": PAPER_REPORT_CONTRACT, "evidence_kind": "paper_fill",

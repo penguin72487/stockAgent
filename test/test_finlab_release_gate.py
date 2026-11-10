@@ -410,7 +410,8 @@ if kind == 'tw_minute':
                                "minute_priority":{"tick_residual_allowed":MINUTE_CLEARED}}))
 '''.replace('MINUTE_CLEARED', repr(minute_cleared)))
     result = subprocess.run(["bash", str(root / "scripts/run_finlab_refresh.sh")],
-                            cwd=tmp_path, env={**os.environ, "FINLAB_REPO_ROOT": str(tmp_path)},
+                            cwd=tmp_path, env={**os.environ, "FINLAB_REPO_ROOT": str(tmp_path),
+                                "PYTHONPATH": os.pathsep.join((str(root), os.environ.get("PYTHONPATH", "")))},
                             capture_output=True, text=True, timeout=20)
     assert result.returncode == expected_exit, result.stdout + result.stderr
     assert (tmp_path / "minute-called").exists()
@@ -457,6 +458,80 @@ run_fintech_python() {{
     assert 'remaining work and timer state are unchanged' in result.stdout
 
 
+@pytest.mark.parametrize(('calendar', 'short_runway', 'reset_ok'), [
+    ('session', False, True), ('session', False, False), ('session', True, True),
+    ('holiday', False, True), ('failed', False, True),
+])
+def test_preopen_started_before_reset_uses_session_runway_and_confirms_midpass(
+        tmp_path, calendar, short_runway, reset_ok):
+    """A 07:59 timer pass cannot silently ignore the opening or the 08:00 reset."""
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[1]
+    scripts = tmp_path / 'scripts'
+    scripts.mkdir()
+    _write(tmp_path / 'data_finlab/runs/latest.json', {'state': 'partial'})
+    (scripts / 'runtime_env.sh').write_text(f'''
+resolve_fintech_python() {{ printf '%s\\n' '{sys.executable}'; }}
+date() {{
+  case "$1" in
+    +%H%M%S) if [[ -f crossed-reset ]]; then printf '080100\\n'; else printf '{"080800" if short_runway else "075900"}\\n'; fi;;
+    +%F) printf '2026-11-09\\n';;
+    +%s) if [[ -f crossed-reset ]]; then printf '1700000120\\n'; else printf '1700000000\\n'; fi;;
+    +%s%N) printf '1700000000000000000\\n';;
+    -d) printf '{1700000630 if short_runway else 1700001380}\\n';;
+    *) return 99;;
+  esac
+}}
+run_fintech_python() {{
+  case "$1" in
+    */check_acquisition_capacity.py) echo capacity >> work-order;;
+    */finlab_refresh_policy.py) printf '%s\\n' '{{"minute_partitions_per_pass":1,"maximum_intraday_passes":1,"catalog_current":true,"history_floor_mb":50,"general_batch_size":4,"processing_threads":1,"tick_partitions_per_pass":1}}';;
+    -c) '{sys.executable}' "$@";;
+    *) echo unexpected >> work-order; return 97;;
+  esac
+}}
+''')
+    calendar_results = {
+        'session': 'print(\'{"stock_session":true}\')\n',
+        'holiday': 'import sys\nprint(\'{"stock_session":false}\')\nsys.exit(1)\n',
+        'failed': 'import sys\nprint("unexpected error", file=sys.stderr)\nsys.exit(1)\n',
+    }
+    (scripts / 'check_outside_tw_opening_resource_window.py').write_text(calendar_results[calendar])
+    (scripts / 'download_finlab_history.py').write_text('''
+import sys
+from pathlib import Path
+with Path('work-order').open('a') as log:
+    log.write('general:' + sys.argv[sys.argv.index('--limit') + 1] + '\\n')
+Path('crossed-reset').touch()
+''')
+    (scripts / 'snapshot_finlab_quota.py').write_text('''
+import sys
+from pathlib import Path
+with Path('work-order').open('a') as log:
+    log.write('reset\\n')
+sys.exit(RESULT)
+'''.replace('RESULT', '0' if reset_ok else '1'))
+    env = {**os.environ, 'FINLAB_REPO_ROOT': str(tmp_path), 'FINLAB_FINITE_GENERAL_ONLY': '1',
+           'FINLAB_SYNC_MAX_BATCHES': '2', 'FINLAB_SYNC_BATCH_SIZE': '4'}
+    result = subprocess.run(['bash', str(root / 'scripts/run_finlab_refresh.sh')], cwd=tmp_path,
+                            env=env, capture_output=True, text=True, timeout=20)
+    assert result.returncode == (75 if calendar == 'failed' else 0), result.stdout + result.stderr
+    order = (tmp_path / 'work-order').read_text().splitlines()
+    if calendar == 'session' and short_runway:
+        assert order == ['capacity']
+        assert 'pre-open runway ended' in result.stdout
+    elif calendar == 'session':
+        assert order == (['capacity', 'general:1', 'reset', 'general:1'] if reset_ok
+                         else ['capacity', 'general:1', 'reset'])
+    elif calendar == 'holiday':
+        assert order == ['capacity', 'general:4', 'reset', 'general:4']
+    else:
+        assert order == ['capacity']
+        assert 'session calendar check failed' in result.stderr
+
+
 @pytest.mark.parametrize(('batches', 'batch_size'), [('9', '1'), ('1', '17'), ('0', '1')])
 def test_finite_general_pass_rejects_unbounded_scope_before_sync(tmp_path, batches, batch_size):
     import subprocess
@@ -497,7 +572,7 @@ resolve_fintech_python() {{ touch unexpected-sdk-start; return 99; }}
 run_fintech_python() {{
   case "$1" in
     */check_acquisition_capacity.py)
-      [[ "$2" == "--path" && "$3" == "$FINLAB_REPO_ROOT" ]] || return 98
+      [[ "$2" == "--path" && "$3" == "$FINLAB_REPO_ROOT/data_finlab" ]] || return 98
       touch capacity-checked
       return {capacity_exit};;
     *) touch unexpected-downloader; return 97;;

@@ -9,6 +9,7 @@ import polars as pl
 from scripts.rebuild_tw_day_trade_minute_curves import (
     _replay_opening_valuation_prices,
     rebuild_carried_strategy_marks,
+    validate_carried_endpoint_accounting,
 )
 from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
 
@@ -63,6 +64,381 @@ def test_carried_revaluation_preserves_fills_basis_cash_interest_and_endpoints()
     for endpoint in rows:
         actual = next(r for r in rebuilt if r["minute"] == endpoint["minute"])
         assert actual["total_equity_twd"] == endpoint["total_equity_twd"]
+
+
+def _missing_first_cost_fixture():
+    rows, positions, store, state, fills = fixture()
+    rows[0]["recorded_at"] = "2026-08-13T09:01:05+08:00"
+    fills[0]["recorded_at"] = "2026-08-13T09:01:02+08:00"
+
+    class MissingFirst:
+        def prices(self, symbol, day):
+            return {key: value for key, value in store.prices(symbol, day).items()
+                    if key != "2026-08-13T09:01+08:00"}
+
+    return rows, positions, MissingFirst(), state, fills
+
+
+def test_explicit_cost_valuation_is_not_a_quote_fill_or_backdated_clock():
+    from scripts.rebuild_tw_day_trade_minute_curves import (
+        validate_provisional_opening_cost_valuations, historical_minute_mark_has_source,
+    )
+    rows, positions, store, state, fills = _missing_first_cost_fixture()
+    unchanged = deepcopy((rows, positions, state, fills))
+    with pytest.raises(RuntimeError, match="missing completed 09:01"):
+        rebuild_carried_strategy_marks(rows, positions, store, state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True)
+    rebuilt, stats = rebuild_carried_strategy_marks(rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True,
+        provisional_opening_cost_targets={("a", "2026-08-13", "2330")})
+    row = rebuilt[0]
+    assert len(rebuilt) == 540 and row["total_equity_twd"] == pytest.approx(99990.)
+    assert row["recorded_at"] == rows[0]["recorded_at"]
+    assert row["opening_mark_revalued_from_completed_bar"] is False
+    assert row["valuation_stale"] is True and row["valuation_executable"] is False
+    assert row["fresh_trade_position_count"] == 0
+    assert historical_minute_mark_has_source(row) is False
+    assert row["provisional_opening_cost_valuation"]["cohorts"][0]["entry_cost_price"] == 100.
+    assert row["provisional_opening_cost_valuation"]["cohorts"][0]["entry_at"].startswith("2026-08-13T09:01:02")
+    assert "provisional_opening_cost_valuation" not in rebuilt[1]
+    assert rebuilt[1]["valuation_stale"] is False
+    accepted = validate_provisional_opening_cost_valuations(rebuilt, positions, state=state,
+        fill_rows=fills, authorization=stats["provisional_opening_cost_valuation"], source_rows=rows)
+    assert accepted["verified_symbol_points"] == 1
+    assert accepted["market_observation_verified"] is False
+    assert (rows, positions, state, fills) == unchanged
+
+
+def test_cost_valuation_readback_retains_uniquely_resolved_fractional_fill_clock():
+    from scripts.rebuild_tw_day_trade_minute_curves import validate_provisional_opening_cost_valuations
+
+    rows, positions, store, state, fills = _missing_first_cost_fixture()
+    fills[0]["recorded_at"] = fills[0]["fill_at"] = "2026-08-13T09:01:05.500000+08:00"
+    original = deepcopy((rows, fills))
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True,
+        provisional_opening_cost_targets={("a", "2026-08-13", "2330")},
+    )
+    accepted = validate_provisional_opening_cost_valuations(
+        rebuilt, positions, state=state, fill_rows=fills,
+        authorization=stats["provisional_opening_cost_valuation"], source_rows=rows,
+    )
+    assert accepted["verified_symbol_points"] == 1
+    assert rebuilt[0]["recorded_at"] == "2026-08-13T09:01:05+08:00"
+    assert rebuilt[0]["provisional_opening_cost_valuation"]["cohorts"][0]["entry_at"] == fills[0]["fill_at"]
+    assert (rows, fills) == original
+
+
+@pytest.mark.parametrize("prior_claimed_sourced", [False, True])
+def test_first_bar_assumption_preserves_actual_clock_fills_and_later_prices(prior_claimed_sourced):
+    from scripts.rebuild_tw_day_trade_minute_curves import (
+        OPENING_FIRST_BAR_VALUATION_CONTRACT, historical_minute_mark_has_source,
+        validate_provisional_opening_cost_valuations,
+    )
+    rows, positions, original_store, state, fills = _missing_first_cost_fixture()
+    if prior_claimed_sourced:
+        rows[0].update(historical_minute_replay=True,
+                       minute_valuation_contract="right_labelled_historical_last_trade_mark_v1",
+                       valuation_source="legacy_replay_claim", valuation_executable=False,
+                       fresh_trade_position_count=1, last_trade_carried_position_count=0,
+                       missing_price_position_count=0, fresh_trade_notional_coverage_ratio=1.)
+        assert historical_minute_mark_has_source(rows[0]) is True
+    original = deepcopy((rows, positions, state, fills))
+    reference = {"symbol": "2330", "session_date": "2026-08-13",
+        "source_minute": "2026-08-13T09:02+08:00", "price": 103.,
+        "source": "verified_fixture", "source_pins": [], "price_method": "observed_completed_minute_close"}
+
+    class Store:
+        def prices(self, symbol, day):
+            values = original_store.prices(symbol, day)
+            if day == "2026-08-13":
+                values[reference["source_minute"]] = 103.
+            return values
+
+        def first_observed_bar(self, symbol, day):
+            assert (symbol, day) == ("2330", "2026-08-13")
+            return deepcopy(reference)
+
+        def assert_sources_unchanged(self):
+            pass
+
+    store = Store()
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True,
+        provisional_opening_first_bar_targets={("a", "2026-08-13", "2330")})
+    row = rebuilt[0]
+    key = "provisional_opening_first_bar_valuation"
+    assert row["total_equity_twd"] == pytest.approx(102990.)
+    assert row["recorded_at"] == "2026-08-13T09:01:05+08:00"
+    assert row[key]["contract"] == OPENING_FIRST_BAR_VALUATION_CONTRACT
+    assert row[key]["cohorts"][0]["reference_bar"] == reference
+    assert row[key]["uses_later_observation"] is True
+    assert row[key]["causal_0901_market_observation"] is False
+    assert row["valuation_stale"] is True and row["valuation_executable"] is False
+    assert historical_minute_mark_has_source(row) is False
+    assert key not in rebuilt[1] and rebuilt[1]["total_equity_twd"] == row["total_equity_twd"]
+    assert rebuilt[269]["total_equity_twd"] == rows[1]["total_equity_twd"]
+    result = validate_provisional_opening_cost_valuations(
+        rebuilt, positions, state=state, fill_rows=fills, authorization=stats[key],
+        source_rows=rows, first_bar=True, store=Store())
+    assert result["later_bar_source_verified"] is True
+    assert result["market_observation_verified"] is False
+    row[key]["cohorts"][0]["reference_bar"]["source_minute"] = "2026-08-13T09:01+08:00"
+    with pytest.raises(ValueError, match="immutable cost, clock or disclosure"):
+        validate_provisional_opening_cost_valuations(
+            rebuilt, positions, state=state, fill_rows=fills, authorization=stats[key],
+            source_rows=rows, first_bar=True, store=Store())
+    assert (rows, positions, state, fills) == original
+
+
+@pytest.mark.parametrize("tamper", ["cost", "quantity", "clock", "hide_stale", "claim_quote", "claim_bar"])
+def test_cost_valuation_independent_readback_rejects_changed_basis_or_disclosure(tamper):
+    from scripts.rebuild_tw_day_trade_minute_curves import validate_provisional_opening_cost_valuations
+    rows, positions, store, state, fills = _missing_first_cost_fixture()
+    rebuilt, stats = rebuild_carried_strategy_marks(rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True,
+        provisional_opening_cost_targets={("a", "2026-08-13", "2330")})
+    row = rebuilt[0]
+    if tamper == "cost":
+        row["provisional_opening_cost_valuation"]["cohorts"][0]["entry_cost_price"] += 1
+    elif tamper == "quantity":
+        row["provisional_opening_cost_valuation"]["cohorts"][0]["signed_shares"] += 1000
+    elif tamper == "clock":
+        row["recorded_at"] = "2026-08-13T09:01:00+08:00"
+    elif tamper == "hide_stale":
+        row["valuation_stale"] = False
+    elif tamper == "claim_quote":
+        row["valuation_executable"] = True
+    else:
+        row["opening_mark_revalued_from_completed_bar"] = True
+    with pytest.raises(ValueError, match="immutable cost, clock or disclosure"):
+        validate_provisional_opening_cost_valuations(rebuilt, positions, state=state, fill_rows=fills,
+            authorization=stats["provisional_opening_cost_valuation"], source_rows=rows)
+
+
+@pytest.mark.parametrize("target", [("b", "2026-08-13", "2330"), ("a", "2026-08-14", "2330"),
+                                     ("a", "2026-08-13", "2317")])
+def test_cost_valuation_authorization_does_not_cover_neighboring_scope(target):
+    rows, positions, store, state, fills = _missing_first_cost_fixture()
+    with pytest.raises(RuntimeError, match="missing completed 09:01"):
+        rebuild_carried_strategy_marks(rows, positions, store, state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True,
+            provisional_opening_cost_targets={target})
+
+
+def test_public_first_bar_warning_keeps_actual_source_clock_without_private_prices(tmp_path):
+    from stockagent.live.tw_day_trade_dashboard import _provisional_opening_cost_issues
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({"retained_curve_recovery": {
+        "provisional_opening_first_bar_valuation_targets": [["a", "2026-10-14", "6624"]],
+        "provisional_opening_first_bar_references": [{"market": "a", "session_date": "2026-10-14",
+            "symbol": "6624", "source_minute": "2026-10-14T12:43+08:00",
+            "private_source_path": "/private/source", "price": 39.85}],
+    }}))
+    issues = _provisional_opening_cost_issues(tmp_path)
+    assert len(issues) == 1 and issues[0]["code"] == "provisional_opening_first_bar_valuation"
+    assert "12:43" in issues[0]["detail"] and "事後觀測" in issues[0]["detail"]
+    assert issues[0]["observed_at"] == "2026-10-14T12:43+08:00"
+    assert "/private/source" not in json.dumps(issues) and "39.85" not in json.dumps(issues)
+
+
+def test_public_cost_valuation_warning_has_no_private_prices_or_paths(tmp_path):
+    from stockagent.live.tw_day_trade_dashboard import _provisional_opening_cost_issues
+    assert _provisional_opening_cost_issues(tmp_path) == []
+    (tmp_path / "rebuild_receipt.json").write_text(json.dumps({
+        "retained_curve_recovery": {"provisional_opening_cost_valuation_targets": [
+            ["a", "2026-11-02", "5251"], ["a", "2026-11-02", "4767"]]},
+        "private": {"path": "/private/hidden", "cost": 27.1}}))
+    issues = _provisional_opening_cost_issues(tmp_path)
+    assert len(issues) == 1 and issues[0]["count"] == 2
+    assert issues[0]["severity"] == "warning"
+    assert "不是可成交報價" in issues[0]["detail"]
+    assert "原成交" in issues[0]["detail"] and "4767" in issues[0]["detail"]
+    assert "/private" not in json.dumps(issues) and "27.1" not in json.dumps(issues)
+
+
+def test_carried_opening_counts_fill_with_zero_fractional_seconds():
+    rows, positions, store, state, fills = fixture()
+    fills[0]["fill_at"] = "2026-08-13T09:01:00.000000+08:00"
+    rebuilt, _ = rebuild_carried_strategy_marks(
+        rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14),
+    )
+    assert len(rebuilt) == 540
+    assert rebuilt[0]["open_position_count"] == 1
+    assert rebuilt[0]["total_equity_twd"] == rows[0]["total_equity_twd"]
+
+
+def test_second_precision_endpoint_reconciles_one_unique_fractional_fill():
+    rows, positions, store, state, fills = fixture()
+    rows[0]["recorded_at"] = "2026-08-13T09:01:00+08:00"
+    fills[0]["fill_at"] = "2026-08-13T09:01:00.051038+08:00"
+    fills[0]["recorded_at"] = fills[0]["fill_at"]
+    original = deepcopy((rows, positions, state, fills))
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14),
+    )
+    assert rebuilt[0]["recorded_at"] == "2026-08-13T09:01:00+08:00"
+    assert rebuilt[0]["open_position_count"] == 1
+    assert stats["second_precision_endpoint_reconciliations"] == 1
+    assert (rows, positions, state, fills) == original
+    proof = validate_carried_endpoint_accounting(
+        rows, positions, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14),
+    )
+    assert proof == {"status": "validated_component_only", "endpoints_checked": 4,
+                     "second_precision_endpoint_reconciliations": 1,
+                     "archived_terminal_fill_clock_resolutions": [],
+                     "price_and_minute_coverage_validated": False}
+
+
+def test_second_precision_endpoint_rejects_ambiguous_inventory():
+    rows, positions, store, state, fills = fixture()
+    rows[0]["recorded_at"] = "2026-08-13T09:01:00+08:00"
+    fills[0]["fill_at"] = "2026-08-13T09:01:00.051038+08:00"
+    fills[0]["recorded_at"] = fills[0]["fill_at"]
+    completion = dict(fills[0], purpose="entry_completion", quantity=500,
+                      fill_at="2026-08-13T09:01:00.700000+08:00",
+                      recorded_at="2026-08-13T09:01:00.700000+08:00")
+    fills.append(completion)
+    with pytest.raises(RuntimeError, match="ambiguous.*second.precision"):
+        rebuild_carried_strategy_marks(
+            rows, positions, store, state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14),
+        )
+    with pytest.raises(RuntimeError, match="ambiguous.*second.precision"):
+        validate_carried_endpoint_accounting(
+            rows, positions, state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14),
+        )
+
+
+def test_fractional_precision_endpoint_never_admits_a_later_fill():
+    rows, positions, store, state, fills = fixture()
+    rows[0]["recorded_at"] = "2026-08-13T09:01:00.000000+08:00"
+    fills[0]["fill_at"] = "2026-08-13T09:01:00.051038+08:00"
+    fills[0]["recorded_at"] = fills[0]["fill_at"]
+    with pytest.raises(RuntimeError, match="endpoint accounting"):
+        rebuild_carried_strategy_marks(
+            rows, positions, store, state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14),
+        )
+
+
+def test_replayed_minute_label_is_not_treated_as_an_observed_second_interval():
+    rows, positions, store, state, fills = fixture()
+    rows[0].update(recorded_at="2026-08-13T09:01:00+08:00",
+                   historical_minute_replay=True,
+                   opening_mark_revalued_from_completed_bar=True)
+    fills[0]["fill_at"] = "2026-08-13T09:01:00.051038+08:00"
+    fills[0]["recorded_at"] = fills[0]["fill_at"]
+    with pytest.raises(RuntimeError, match="endpoint accounting"):
+        rebuild_carried_strategy_marks(
+            rows, positions, store, state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14),
+        )
+
+
+def test_scoped_replayed_opening_correction_uses_only_the_original_fill_clock():
+    rows, positions, store, state, fills = fixture()
+    rows[0].update(recorded_at="2026-08-13T09:01:00+08:00",
+                   historical_minute_replay=True, simulation_only=True,
+                   opening_mark_revalued_from_completed_bar=True,
+                   minute_valuation_contract="right_labelled_historical_last_trade_mark_v1",
+                   valuation_source="retained_1m_close_from_immutable_carried_fill_and_action_book",
+                   valuation_executable=False, fresh_trade_position_count=1,
+                   last_trade_carried_position_count=0, missing_price_position_count=0,
+                   fresh_trade_notional_coverage_ratio=1.,
+                   cumulative_realized_net_pnl_twd=-100., open_position_count=0)
+    original = deepcopy((rows, positions, state, fills))
+    target = {("a", "2026-08-13")}
+    preflight = validate_carried_endpoint_accounting(
+        rows, positions, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14), repair_opening_targets=target,
+    )
+    assert preflight["status"] == "repair_candidates_identified_not_applied"
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True,
+        repair_opening_targets=target,
+    )
+    opening = rebuilt[0]
+    assert opening["open_position_count"] == 1
+    assert opening["cumulative_realized_net_pnl_twd"] == 0.
+    assert opening["total_equity_twd"] == pytest.approx(99990.)
+    assert opening["historical_opening_endpoint_repair"]["prior_accounting"] == {
+        "cumulative_realized_net_pnl_twd": -100., "open_position_count": 0,
+    }
+    assert opening["historical_opening_endpoint_repair"]["broker_fill"] is False
+    assert len(stats["repaired_opening_endpoints"]) == 1
+    assert (rows, positions, state, fills) == original
+
+
+def test_scoped_replayed_opening_repair_fails_closed_for_missing_price_or_provenance():
+    rows, positions, store, state, fills = fixture()
+    rows[0].update(recorded_at="2026-08-13T09:01:00+08:00",
+                   historical_minute_replay=True, simulation_only=True,
+                   opening_mark_revalued_from_completed_bar=True,
+                   minute_valuation_contract="right_labelled_historical_last_trade_mark_v1",
+                   valuation_source="retained_1m_close_from_immutable_carried_fill_and_action_book",
+                   valuation_executable=False, fresh_trade_position_count=1,
+                   last_trade_carried_position_count=0, missing_price_position_count=0,
+                   fresh_trade_notional_coverage_ratio=1., open_position_count=0)
+    target = {("a", "2026-08-13")}
+
+    class MissingOpeningStore:
+        def prices(self, symbol, day):
+            prices = store.prices(symbol, day)
+            prices.pop(day + "T09:01+08:00", None)
+            return prices
+
+    with pytest.raises(RuntimeError, match="missing completed 09:01 valuation bar"):
+        rebuild_carried_strategy_marks(
+            rows, positions, MissingOpeningStore(), state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14), revalue_opening_marks=True,
+            repair_opening_targets=target,
+        )
+    rows[0]["simulation_only"] = False
+    with pytest.raises(RuntimeError, match="endpoint accounting"):
+        validate_carried_endpoint_accounting(
+            rows, positions, state=state, fill_rows=fills,
+            start=date(2026, 8, 13), end=date(2026, 8, 14), repair_opening_targets=target,
+        )
+
+
+def test_carried_revaluation_ignores_future_fills_outside_requested_end():
+    rows, positions, store, state, fills = fixture()
+    # A later already-recorded session is not part of the selected valuation
+    # interval, so its position will correctly be absent from this inventory.
+    # It must remain in the original ledger, not fail or enter this replay.
+    future = dict(position_id="future", market="a", symbol="2317", purpose="entry",
+                  quantity=1000, recorded_at="2026-08-17T09:01:00+08:00",
+                  session_date="2026-08-17", price=100., fee_and_tax_twd=0.)
+    fills.append(future)
+    unchanged = deepcopy(fills)
+    rebuilt, stats = rebuild_carried_strategy_marks(
+        rows, positions, store, state=state, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 14),
+    )
+    assert len(rebuilt) == 540
+    assert stats["carried_fill_book_revalued_without_execution"]
+    assert fills == unchanged
+
+
+def test_future_exit_does_not_close_the_selected_end_day():
+    rows, positions, store, state, fills = fixture()
+    original = deepcopy((rows, positions, state, fills))
+    rebuilt, _ = rebuild_carried_strategy_marks(
+        rows, {"2026-08-13": positions["2026-08-13"]}, store,
+        state=state, fill_rows=fills, start=date(2026, 8, 13), end=date(2026, 8, 13),
+    )
+    endpoint = next(row for row in rebuilt if row["minute"] == "2026-08-13T13:30+08:00")
+    assert endpoint["open_position_count"] == 1
+    assert endpoint["total_equity_twd"] == rows[1]["total_equity_twd"]
+    assert [row for row in rebuilt if row["session_date"] == "2026-08-14"] == rows[2:]
+    assert (rows, positions, state, fills) == original
 
 
 def test_carried_revaluation_counts_disclosed_entry_completion_as_inventory():
@@ -376,6 +752,18 @@ def test_carried_revaluation_rejects_a_changed_endpoint_or_impossible_exit():
     with pytest.raises(RuntimeError, match="endpoint accounting"):
         rebuild_carried_strategy_marks(rows, positions, store, state=state, fill_rows=fills,
                                        start=date(2026, 8, 13), end=date(2026, 8, 14))
+    diagnosis = validate_carried_endpoint_accounting(
+        rows, positions, state=state, fill_rows=fills, collect_failures=True,
+        start=date(2026, 8, 13), end=date(2026, 8, 14),
+    )
+    assert diagnosis["status"] == "failed_component_check"
+    assert diagnosis["failures"] == [{
+        "market": "a", "minute": "2026-08-14T13:30+08:00",
+        "field": "cumulative_realized_net_pnl_twd", "recorded_at": None,
+        "retained_value": 99., "journal_value": -2510.,
+        "historical_minute_replay": None,
+        "opening_mark_revalued_from_completed_bar": None,
+    }]
 
 
 def test_carried_opening_revaluation_requires_completed_bar_and_preserves_fills():

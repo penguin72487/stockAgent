@@ -1,0 +1,17 @@
+[Unit]
+Description=Install already sealed E dataset packs into D
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+# The checkpointed installer can use the remaining time before 08:00. Its
+# bounded owner stops at that boundary; a two-hour start runway wasted sealed
+# E work completed between 06:20 and 08:00.
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 20 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecStart=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/run_bounded_storage_maintenance.py scripts/run_prepared_stream_install_queue.py'
+TimeoutStartSec=8h 1min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

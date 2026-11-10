@@ -155,6 +155,16 @@ class CrossSectionalDataset(Dataset[dict[str, torch.Tensor]]):
         if self.lookback <= 0:
             raise ValueError(f"lookback must be positive, got {lookback!r}")
         self.execution_mode = normalize_execution_mode(execution_mode)
+        if getattr(panel, "inference_year", None) is not None:
+            from stockagent.data.inference_scope import year_decision_mask
+            allowed = year_decision_mask(panel.dates, panel.inference_year)
+            requested = np.asarray(date_indices)
+            if (requested.ndim != 1 or (requested.size and requested.dtype.kind not in "iu")
+                    or np.any(requested < 0)
+                    or np.any(requested >= len(allowed))):
+                raise ValueError("inference decision indices must be valid nonnegative calendar rows")
+            if requested.size and not allowed[requested].all():
+                raise ValueError("decision rows exceed the declared inference year; earlier features are context only")
         # Explicit source binding is deliberately separate from enabling an
         # experiment: checkpoint and full lifecycle gates still apply.
         self.futures_account_source_fingerprint: str | None = None

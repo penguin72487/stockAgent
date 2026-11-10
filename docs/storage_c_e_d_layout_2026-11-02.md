@@ -25,6 +25,370 @@ ext4 UUID、私有 enrollment、marker 與 mount alias 必須一致，缺 E 不�
 `wsl --shutdown`。任何大型搬移均取 E 實體 free 與資料卷 available 的較小值，
 再保留驗證空間；不能宣稱 E 的 4 TB 都已可被此 guest 使用。
 
+## 2026-11-04 00:04 台北：排程及 SQL 優化正式載入
+
+依使用者先前允許立即重啟儲存 worker 的授權，先固定通過測試的 source 與
+完整 SQL parity，再暫停獨立的 transport maintenance waiter；原 code-only
+交接器於 23:52:22 驗收，儲存 PID 3881792 → **282975**。只有這個 storage
+worker 的未完成階段由原 durable journals／Temporal heartbeat 重排；原 PG、
+Temporal server、工作鏈與 **61 個固定版本**保留。原 maintenance timer 已恢復。
+原下載器與當沖 PID 430／隔夜 PID 2335 的啟動時鐘不變。
+
+正式 candidate／loaded identity 同為
+`b83277fcd0b63b1df53de6ff88cf337813490bf32c76c0df2fabaa860cce41da`。
+完整交接、before intent 與實測證據位於 E 的
+`verify/backup-optimization-handoff-20261103-v1.json` 及同名 `-intent.json`，
+原 timer 的 `worker-reload.json` 也由同一 helper 寫入真實 accepted，並非觀測器
+改時間或複製舊 ACK。切換前因開發期間 candidate 改變而中止的 waiter 證據保留，
+沒有清除失敗、鎖或任何來源。這次沒有新增 C 原件、D authority、NAS 刪除。
+
+排程修正的實機覆核另抓到兩層問題，現已一併處理：
+
+- `sender_boundary` 的 GC purpose 曾在 installer 的外層 `BlockingIOError`
+  處理被覆寫為通用 hint。現在由 `SenderBoundaryBusy` 保留類型，外層原
+  `record_placement_wait` 沿同一封閉控制檔保存；例外經過完整 timer 出口後仍
+  能分辨獨立 GC 與 namespace 交接。23:55 原回執的 purpose 為
+  `old_D_transport_retirement`，不再借用 cutover 優先權。
+- 目前持 catalog-owner 的是 SQL／catalog activity；BackupStream 不取得這個
+  SQL lock，讓它停住也不能釋放該鎖。新鮮 worker 交接 hint 只在來源 stream
+  能讓出的邊界上優先；獨立 catalog 等待不抑制新備份，真正 namespace 交接
+  仍保留優先。全部原有 locks、physical reserve、完整讀回與退休 gate 不變。
+
+共用 export／restore 的 SQL digest 已按數學等價條件優化：先確認原欄序及
+非 NULL 唯一鍵，再以 SQL `dense_rank` 確認排序語義下也無 ties，避免大小寫
+collation 把不同字串當成相同排序鍵。可用 SQL budget 與目前 host／cgroup
+headroom 足夠時，只按前兩個唯一鍵排序一次，仍串流全部欄位產生原 canonical
+JSON SHA。低記憶體／觀測失效維持 64 MiB／2,048 列分頁；異常鍵、NULL、
+重複或欄序不符維持原 `ORDER BY ALL`，沒有省略、去重或改 source identity。
+記憶體判斷不調高任何正式限制；舊 restore capsule 缺少可選觀測 helper 時也
+保留原演算法。
+
+| 固定 snapshot 1049，全 10,248 列 | SQL／digest 秒 | process peak RSS | 完整 SHA |
+| --- | ---: | ---: | --- |
+| 單次唯一鍵排序，獨立 probe | 88.48 | 7.93 GiB | `e0ce8e23…fee20fa` |
+| 原完整 `ORDER BY ALL`，獨立對照 | 139.95 | 10.88 GiB | 相同 |
+| 最終 adaptive helper，含 SQL rank／容量判斷 | 112.33 | 7.99 GiB | 相同 |
+
+原內容為 **3,909,791,481 bytes**；三者前後 snapshot 均為 1049，code source
+在各自試驗期間未變，沒有 production catalog／source write。最終 adaptive
+實測是 **1 次 single-pass sort、0 次 payload page sort**。這些是並行工作負載
+下的 SQL／digest 單階段結果，不是 A/B/B/A、公平的全備份倍數或硬體極限。
+證據為 E `verify/catalog-native-digest-probe-20261103-v1.json`、
+`verify/catalog-native-full-reference-20261103-v1.json`、
+`verify/catalog-adaptive-native-probe-20261103-v2.json`。完整 SHA 及來源固定版本
+另列於 [lab203 交接](lab203_runtime_observer_handoff_2026-11-03.md)。
+
+最終回歸為 **488 個備份／排程／監控測試**、**270 個原生 control／還原／
+workflow 測試**、**166 個交接模式／生命週期測試**；三組有重疊，不相加。
+公開 HTTPS 桌面／手機另有 39 案例通過，provider calls 為 0。早期金融環境的
+62 passed／1 skipped 沒有當作完整驗收，後續用鎖定的 control role 完整重跑。
+
+### 尚未完成與目前耗時
+
+23:43:27 有一輪原備份實際發布新 envelope，完整循環 **1,069.11 秒**；
+23:15:50 另一次為 670.77 秒。負載、冷目錄與並行試驗不同，不能用這兩個
+自然循環聲稱整體已加速。23:55 的新 worker stack 在
+`register → capture_catalog → prefetch_manifest/read_metadata`：目前瓶頸
+已包含來源改變後的完整 metadata 清點，最終正式 export／NAS 讀回仍另驗。
+全量原始碼與 index/manifest 的增量設計仍有後續工作，尚未證明只剩硬體限制。
+
+三端分鐘觀測仍有各自原時鐘；23:54:56 Penguin、23:54:36 lab203、23:54:55
+Vast 皆可讀。Vast private 為 256／256、public 為 697／697 個已封閉候選；
+它持續接新包，沒有派送重複的候選。私有 NAS 仍是 87.94%，差 91.81 GiB，
+正式 readiness 仍待 lab203 原 owner。C 三個回復入口仍保留，不能把本輪
+278.58 GiB E copy 當成 WSL 或 C 已釋放。舊 D transport 的 162 個差異名稱
+仍依原回收 gate 保留，不以 E archive 的成員演練代替 live-name 完整讀回。
+
+lab203 的新審核包使用獨立 `storage-operations-20261103-v2`，沿原不可變
+control namespace 發布，不覆寫 v1，也不部署 receiver、修改資料 ledger 或
+代替 NAS ACK。先完成原就緒／repository 檢查，才能繼續私有歷史的驗收。
+
+## 2026-11-03 23:20 台北：區分新備份交接與獨立的舊 D 副本回收
+
+沿用同一 task 與使用者指定的視窗分工，本輪未修改 provider 搬移、下載器或
+共用 copy 實作。三份 E 工作區交接與 61／61 固定 D 重建證據保留；C 三個
+回復副本仍存在，沒有新的 C 原件、D authority 或 NAS 刪除。
+
+獨立發現的排程問題是：舊 D transport 的 162 檔保留差異仍由原 GC 檢查，
+等待原三個 writer locks 時持續發出通用 `waiting_for_original_owner_or_reader`。
+BackupStream 會把新鮮訊號當成 cutover，先 ingest 既有 ACK 後跳過 catalog
+capture，原 status 因而反覆為 `waiting_for_transport_placement`。這不是所有
+循環都沒有派送：23:15:50 仍有一輪 `published_waiting_nas_receipt`，完整循環
+670.77 秒。問題是獨立 GC 的等待可以重複抑制後續來源捕捉，不能以 source
+服務 active 或通用等待標籤認定 throughput 正常。
+
+原 sender boundary 現在明示 `namespace_handoff` 或
+`old_D_transport_retirement`。新鮮的真正 namespace 交接仍優先；獨立 GC
+等待不再抑制新備份。另讀原 `worker-reload.json` 的固定 contract、候選 SHA、
+非強制／未更新進度 flags 與 120 秒有效期，讓真正的 drained-worker 交接仍能
+取得安全邊界。所有 partial locks 仍於等待前釋放，單次 60 秒回到原 timer；
+沒有改動 mount、physical reserve、來源讀回、NAS ACK 或退休條件。
+
+474 個 backup／placement／progress／monitor 核心回歸通過，包含真實 fixture
+備份循環在 GC 等待時仍執行 catalog capture、真正交接仍讓路，以及失敗／
+過期 metadata 不清除任何鎖。新增 publication 監控後的 295 個 progress／
+monitor 測試另通過；兩組範圍重疊，不相加。E 證據為
+`verify/backup-gc-wait-isolation-20261103-v1.log` 與
+`verify/backup-wait-monitor-20261103-v2.log`。
+
+23:22:12 公開 HTTPS 的桌面／手機 39 案例通過，provider calls 為 0，收據在
+E `verify/backup-wait-browser-20261103-v1/browser_acceptance.json`。監控同時揭露
+台股公開發布的最後真實阻擋：19:07:56 原發布收據報告
+`stale_official_symbol_build_receipt`。頁面只顯示白名單原因及原收據時間，
+不送出 traceback、私有路徑、原始值，也不把分鐘心跳當成新的發布或故障。
+原建置收據 gate 保留，仍由原建置／發布 owner 處理。
+
+### 另行定位的 SQL 匯出瓶頸
+
+唯讀原程序 stack 顯示 catalog owner 正在 `_metadata_rows` 的分頁 SQL，
+不是僅因鎖檔存在便判為死鎖。固定 snapshot 1049 實際有 10,248 列、
+3,909,791,481 原內容 bytes，最大單列 4,275,841 bytes。一次窄欄位統計
+前後 snapshot 皆為 1049，沒有 catalog／來源寫入，證據是 E
+`verify/catalog-export-metadata-size-20261103-v1.json`。
+
+既有唯讀 benchmark 增加「觀測目前原生資源」模式，不恢復歷史 cgroup 限額，
+也不更改任何正式設定。先確認 RAM 可容納完整排序，再對全部欄位逐列 canonical
+JSON 雜湊，結果保持自己的快照、程式／owner 身分與實際耗時。第一次唯一鍵
+排序讀完全部 10,248 列，88.48 秒，程序尖峰 RSS 8,511,258,624 bytes；完整
+SHA 為 `e0ce8e232d9b163400a8b36746b3cabf0ca9795da17ce0e46b7f5eee7fee20fa`。
+這只是本機完整 SQL／digest 階段，不能外推成公平的整條備份倍率、硬體上限、
+NAS 完成或新的 source retirement。原完整 `ORDER BY ALL` 另作獨立對照，
+正式採用狀態與後續驗證依下一段收據更新。
+
+## 2026-11-03 22:20 台北：E 交接完成，C 回收與 NAS 驗收分開呈現
+
+沿用使用者的視窗分工，本次只修改監控及其獨立驗證，沒有接管或修改另一視窗
+的 provider 搬移／下載程式。原 `provider-state-temporary-20261103/result.json`
+於 21:59:22 記錄 `verified_e_provider_placement`，三份 selected copy、placement
+與 namespace 收據均通過原觀測條件，原來源刪除計數為 0。
+
+| 本輪選定來源 | 已複製並獨立讀回的檔數 | 邏輯 bytes |
+| --- | ---: | ---: |
+| FinLab | 1,086,965 | 168,813,852,834 |
+| FinMind | 2,663,365 | 118,221,861,150 |
+| TEJ | 1,617,244 | 12,085,487,004 |
+| 合計 | 5,367,574 | 299,121,200,988（278.58 GiB） |
+
+這些是本輪選定工作區的 E 完整讀回量，**不是 C 可回收量、全部來源歷史或 NAS
+驗收量**。FinLab 已存在的 E 期貨子樹沿用；FinMind 排除的美股分鐘子樹仍依原
+唯讀來源合約保留。本次沒有刪除三個 provider 的 C 回復副本，也沒有新的實際
+WSL 釋放量。原 `resumed.json` 於 21:59:02 記錄六個原排程單元恢復；有限任務
+已由另一視窗沿原排程啟動，其資料驗收不能由 dispatcher 的 running 代替。
+
+監控新增「E 交接後的 C 回復副本」獨立列。每分鐘只對已登錄的三個固定入口
+做 metadata 檢查，不掃描其中 536 萬檔，不將已複製邏輯 bytes 當作 C 配置量；
+入口缺失、換盤或改成連結也不會變成回收驗收。原 owner 尚未提供本輪 C 回收
+證據時，明示待驗收且不套用 E 複製的 ETA；觀測器過期仍照常告警。
+FinMind 三個舊常駐單元全部實測 disabled／inactive 時，開機稽核只陳述舊單元
+已停用，有限任務另驗；未啟用重複下載器，也沒有清除真正的儲存回執過期告警。
+
+22:19:43 的三端公開快照中，Penguin、lab203、Vast 的獨立時間皆在同一分鐘
+附近。原 D 固定重建維持 61／61；Vast 候選預驗證為 private 256／256、public
+663／663，等待新封閉封包，不能因此稱 NAS 完成。私有 NAS 仍是
+718,647,796,617／817,226,447,345 bytes，差 98,578,650,728 bytes（91.81 GiB）；
+正式 readiness 仍為 11 月 2 日 12:49:56。新的 CPU／RAM 心跳沒有更新舊驗收，
+01:14 的 Restic 鎖診斷也不是目前仍持鎖的證明。原 lab203 接手要求仍在
+[每分鐘觀測交接](lab203_runtime_observer_handoff_2026-11-03.md)，沿既有固定控制包
+與回執通道，不另建備份 owner。
+
+本輪 projector／monitor 回歸為 **287 passed**，JavaScript 語法與限定檔案 diff
+檢查通過，完整 log 在 E `verify/provider-retained-monitor-20261103-v1.log`。
+這些是監控語義與工程驗證，不是 C 副本退休授權或硬體吞吐極限的實測。
+
+22:31:11 公開 HTTPS 的桌面／手機 Chromium **39 案例通過**，`provider_calls: 0`，
+證據在 E `verify/provider-retained-browser-20261103-v2/browser_acceptance.json`。
+未知 ETA 顯示「完成時間：尚無可用估計」，阻擋原因只呈現一次，避免在
+「預估完成」標題後重複長段文字或讓未知時間看似完成。自然取得的三份公開
+快照中，lab203 原取樣增量為 59.998、60.001 秒；Penguin／Vast 的實際完成
+時間有探測延遲（約 52–73 秒），沒有將它們回填成整分鐘。原 observer 及前景
+頁的排程均為 60 秒；這三份證據不是最壞情況 SLA。自然更新證據是 E
+`verify/provider-retained-natural-refresh-20261103-v1.json`。只重啟唯讀 observer
+及 gateway，當沖 PID 430／隔夜 PID 2335 與 11 月 2 日的啟動時鐘一致。
+
+後續釋放空間的原作業依賴仍明確保留：原 provider 搬移 owner 固定 C 副本的
+清冊、排除子樹與實際配置量，通過獨立還原、世代和程序引用條件後接續正式
+退休；lab203 原 backup owner 需回傳新的就緒及逐批 NAS 證據。不能只將 E
+可讀、C 入口不存在、NAS 心跳或 Vast 候選全數驗完當成這兩項已完成。本視窗
+沒有替另一視窗啟動第二套搬移／刪除器，也沒有宣稱這個新增 C 回收階段已排程。
+
+## 2026-11-03 20:43 台北：限監控接手，確認搬移子任務的兩項例外
+
+使用者確認另有視窗更新 provider 搬移程式，本視窗只處理監控與獨立問題。
+未修改該組 `relocate_provider_workspace.py`、`provider_workspace.py`、
+`workspace_relocation.py` 或其原搬移進度，沒有停止仍在複製的 FinMind。
+
+唯讀堆疊顯示原父程序在 `ProcessPoolExecutor.__exit__` 等待其他子任務結束，
+兩個 child 已閒置。為取得尚未印出的既有例外，僅讀取已辨識 migration
+owner 的 CPython 3.12 exception 物件，核對 PID／start ticks／boot，沒有
+向目標注入執行或更改記憶體；完整診斷留在 E 私有驗證區。
+
+- FinLab 原任務在舊 namespace 讀取 registry 時發生 `KeyError: 'finlab'`。
+  E 複製收據仍有效；失敗的是路徑交接，不能標成整份複製失敗，也不能稱交接完成。
+  另一視窗已準備新的 FD-based namespace helper，仍由其原接手器處理。
+- TEJ 原任務為 `ValueError: source namespace changed after relocation`。
+  另一次有界 10,000-entry 盤點看到 `api_trial_v1` 目錄的 mtime／ctime 與原清冊
+  不同；這不是完整差異清冊。原 owner 仍需找齊真正差異與寫入來源，不可直接
+  改舊驗收或將整份來源當作已完整遷移。保留原索引、已驗證的 E payload 與失敗證據，
+  再由該視窗決定原流程的增量重核／replan。
+
+診斷在 E `verify/provider-runtime-diagnostic-20261103-v1.json`，是非 ACK
+的監控輸入。每分鐘只核對小型 metadata、原父子 PID／start／boot，以及 exact
+intent／progress 的 SHA；新進度、新 intent、程序替換或真正交接收據出現後，
+舊診斷自動不再覆蓋目前狀態。診斷時間維持 20:33 的實際例外觀測時間，不寫成
+例外發生時間、工作進度或驗收。公開頁只顯示 allowlist 原因與時間，不傳 traceback、
+process identity、私有路徑或來源資料；沒有新增持續掃記憶體的監控程序。
+
+監控自身的遞迴分類也讓路給已登錄、尚未完成的 C／E provider 搬移；容量、
+運行與工作進度照常每分鐘更新。分類 fingerprint 納入 provider 位置／交接狀態，
+讓切換完成後自動重新清點，不把 heartbeat 當佈局改變或重掃全部遠端磁碟。
+這是監控 I/O 排程，沒有調整 provider workers、配額、來源或原 publication gates。
+原搬移視窗後續可在每個子任務返回前記錄原生例外與階段計數，並即時收集已完成
+的 futures；保留尚在運作的其他任務。這能取代本次一次性的例外記憶體診斷，
+避免父程序等最慢任務收尾時，其他失敗工作仍停在最後一個 100% 計數。
+
+本輪 281 個 projector／monitor 測試通過；桌面／手機 39 個 Chromium 案例通過，
+provider calls 為 0，包含例外顯示、原進度時間保留及不可繼續給有限 ETA。
+E 證據分別是 `verify/provider-exception-monitor-20261103-v2.log` 與
+`verify/provider-exception-browser-20261103-v1/browser_acceptance.json`。
+公開 20:53:42 快照的三端觀測在同一分鐘內，兩項故障已明確顯示，FinMind
+仍持續複製。觀測到 TEJ intent 於 20:43:03 有另一視窗的新修改；上方診斷
+指原執行者保留的例外收尾，不表示該新清冊已重跑並失敗。新原執行者／進度
+或真正驗收將取代這個暫態診斷。當沖／隔夜 PID 與 11 月 2 日原啟動時間保留。
+
+## 2026-11-03 晚間：61／61 固定來源完成，工作區搬移分階段觀測
+
+18:32:54 的原 `dataset-versions/current.json` 為 `verified`，61／61 固定來源
+完成 D 原始重建；最後 `tw-index-futures` 的 4,601,679 檔通過驗證，177 個
+pack 由 Penguin 完成 167 個、Vast 完成 10 個。這是固定 D release 的恢復
+證據，不能代表後來新增的 provider 原始值、NAS 或所有歷史皆已驗收。
+原 lifecycle 在 18:35:19 自然交接，`worker-reload.json` 的 candidate／loaded
+identity 相同，PG／Temporal 與原 workflow chains 保留。
+晚間追加的工程修改另有新 candidate，仍由同一 timer 等完整發布邊界；
+不能用 18:35 的接受證據宣稱後來每一份程式都已載入主 worker。
+
+這輪從 preparation JSON 的固定名稱逐項 stat，舊 186.8 GB 宣告量中，仍在
+C 的已註冊工作副本只剩約 111 MiB；不是額外可回收 186.8 GB。沿原
+`relocate_private_sqlite_scratch.py` 完成 FinLab `intraday/market_index.sqlite3`
+的 E 複製、完整 SHA、獨立讀回、綁定與程序／世代核對，再回收
+**116,158,464 allocated bytes（110.78 MiB）**。SQLite 原來源、D、NAS 的
+刪除計數皆為 0。證據位於 `7fa3bf9d5be100aa-c113544519884b839486d655bbbe3d66`
+operation 的 `workspace-relocation/556d999838396b17023d5e0b/complete.json`。
+
+三個 provider 的原搬移工作由另一個既有 task 執行；沒有接管其原 coordination
+locks、修改 raw、刪 C 回復副本或重新啟動第二份搬移器。每分鐘 observer 只讀
+固定 registry、intent、copy／placement／namespace JSON，加入獨立容量及檔數
+進度。複製階段 ETA 取 bytes 與 file tail 較慢者；原路徑交接用另一列及自己的
+計數，不將 100% 複製或複製速率當作 namespace 完成時間。原服務恢復仍另驗。
+本輪選定清冊為 5,367,574 檔、299,121,192,775 logical bytes；FinLab 已在 E
+的期貨子樹沿用，FinMind 美股分鐘的三個排除子樹仍留在 C 的固定唯讀副本。
+這些排除部分不能宣稱已搬 E，三來源 C 原件也不能當成本輪已回收量。
+
+### D 冷庫名稱列舉
+
+19:50 對當時原 backup child 的單次非阻塞堆疊取樣，定位在
+`_capture_catalog` 的 `os.walk(cold / 'objects')`；該輪總執行時間已超過
+十多分鐘，單次取樣不能證明整段時間全耗在此行。原程式已取得引用物件的
+fresh regular-file signatures，又在遍歷目錄時重做每個 leaf 的類型查詢。
+現在使用同一 `PinnedObjectSignatures` 的 no-follow 目錄 FD 列舉名稱；原本
+每個引用物件的本輪簽章、未引用物件的獨立 regular-file 簽章、完整 SHA、
+目錄／root identity 重查及所有 NAS／退休 gate 保留。非標準目錄結構沿原
+遞迴診斷，不靜默漏件；Linux 對 no-follow symlink 回 ENOTDIR 的情形明確拒絕。
+
+原 owner namespace、D `objects/blobs/00` 的 209 個名稱 ABBA 實測：舊步驟
+0.0697／0.0510 秒，新步驟 0.0263／0.0361 秒，中位比約 1.93 倍；四輪名稱
+集合 SHA 相同，未清 OS cache。只證明這個列舉步驟，沒有宣稱完整 backup
+或硬體極限。證據在 E `verify/backup-cas-name-census-abba-20261103-v1.json`。
+首次從非 owner namespace 進行測量被原 D mount request-size guard 拒絕，
+沒有降低 gate；之後以原 control wrapper 實測。207 個 backup／pinned-reader
+測試通過；先前 symlink regression 的失敗日誌保留，修正後重跑通過。
+只在原 backup service 已退出的邊界暫停 timer 完成驗證，之後恢復同一 timer；
+未中斷一個正在執行的備份。正式整輪效益仍看新一輪原 owner 的收據。
+20:08:54 的實際新 backup child 堆疊已出現 `directory_names`／
+`_cold_object_paths`，證明原 oneshot 已採用新路徑，並非只修改原始碼。
+原 unit 的下一輪於 20:12:31 正常結束：systemd 記錄完整 process wall time
+12 分 12.133 秒、CPU 7 分 31.379 秒；前一個完整清點／發送循環為
+16 分 19.695 秒、CPU 9 分 26.217 秒。這些是原單一 owner 的實際循環，
+含程序啟動、不含獨立 NAS 驗收；期間清冊與併行負載不同，不能當作純程式
+加速比或硬體峰值證明。固定 journal 摘要保存在
+E `verify/backup-live-cycles-20261103-v1.json`。原 timer 20:13:02 已自動接續
+下一輪，沒有另外啟動一套備份或改寫前一輪驗收。
+
+工作區 projector／monitor／原 SQLite 搬移器 283 項測試通過。新階段測試另
+驗證「交接尚未開始」沒有工作計數、沒有 ETA，不誤稱壞 metadata；每分鐘
+觀測本身過期時仍顯示過期。早先 focused stale-clock 失敗及 observer 重載
+期間讀到前一版快照的 browser 失敗都保留，最終瀏覽器驗收須在新快照與
+公開服務就緒後執行，不能以較早的 37 案例替代新階段驗收。
+最後先核對公開 API 已使用 20:09 的新快照與交接等待原因，再啟動獨立驗收；
+E `verify/storage-browser-provider-e-20261103-final/browser_acceptance.json`
+的桌面／手機 37 案例通過、provider calls 為 0，包含交接列不可沿用複製 bytes／
+ETA 的驗證。20:11 公開快照三端觀測皆在一分鐘內；FinMind 為
+102,446,860,605／118,221,861,150 bytes（86.66%）、
+1,356,097／2,663,365 files，複製階段暫估 21:06 台北。此後的名稱集合、
+路徑交接、C 原件回收和 NAS 不能套用該 ETA；原頁面每分鐘持續重估。
+
+lab203 主機分鐘觀測正常，原 readiness 仍未更新；私有備份尚待
+98,578,650,728 bytes。既有固定 `storage-operations-20261103-v1` 控制包已由
+paired receiver 索引回報可用，仍不等於接收驗證或 NAS ACK。請原 lab owner
+核對目前前置階段、repository／Restic 鎖與實際重試時間，執行真正就緒檢查，
+沿原反向通道回傳新 readiness 與逐批獨立還原結果。本報告晚間新增內容
+不是已凍結 v1 控制包的新成員版本。
+
+## 2026-11-03 17:05 台北：WSL 新增回收 39.24 GiB
+
+舊 preparation metadata 有 62 組仍指向 C，宣告 logical bytes 合計
+186,757,358,581；它不是實際配置量或可刪除量。這輪只選沒有固定發布或
+還原綁定的舊 `7fa3bf9d5be100aa-c113544519884b839486d655bbbe3d66`／
+`finlab-research`，加入原 controls-relocation timer 的第四組固定清冊。
+16:57:52 啟動，17:03:35 完成 1,456 檔、42,125,547,602 logical bytes
+的 E 複製、完整 SHA 讀回、引用切換、程序與刪除前世代核對，實際回收
+**42,137,661,440 allocated bytes（39.24 GiB）**。source／D CAS／NAS
+刪除計數皆為 0。固定 controls identity 為
+`c109782cf06edb7cbf6a45ac0f53a3bf9e28bfeec9729b7e45016da87684a933`，
+原日誌在該 operation 的 `workspace-relocation/1cadf944abb9cf863ff3f0c9/`。
+
+17:05 公開快照的 WSL guest available 為 392,736,608,256 bytes，C 實體
+free 24,514,011,136、D free 65,767,956,480、E 工作卷 available
+817,171,791,872 bytes；guest 回收不是 Windows VHDX 同額縮小，D 淨 free
+亦受新冷庫寫入影響。13:36 排定的 gateway 載入已完成；這輪收盤後補入
+FinLab 副本及 bytes 進度條，ETA 保留較慢 file tail 的正確 items 單位。
+17:03 重複重啟造成短暫 502，17:04:33 恢復，17:05 公開端點已核對。
+沒有重啟交易服務。相關搬移／進度 180、後續 projector／monitor 264、控制
+交接 41 項通過；Chromium 桌面／手機 35 案例通過。舊控制包測試的
+1-MiB 斷言已與原有 2-MiB 上限對齊，早先失敗日誌保留。
+
+17:06 期貨仍在第 15／16 組、4,458,704／4,601,679 檔；主 worker 仍待
+原安全交接。lab203 readiness、C 其餘來源及有固定綁定的舊 scratch
+仍未完成，不將上述回收或分鐘心跳當作整體驗收。
+
+## 2026-11-03 17:32 台北：封裝進度與兩種長等待修復
+
+- 同一 bucket 會包含多個有界 pack，原 producer 在每個 pack 後提早報
+  bucket 完成。已將 bucket 完成移至內迴圈結束後；面板改讀實際
+  `files_hashed`／bytes，並用 `source_phase_counters_v3` 重置舊估算樣本。
+  舊 worker 尚未換版時也不再因 bucket 計數而提早顯示 100%。相關 packed／
+  progress 532 項及原 lifecycle 118 項通過。
+- 17:20 堆疊顯示 compute spool 的唯一 D reader 卡在 native stdout
+  `peek(1)`，讀取子程序自 16:40 起沒有完成第一個 byte。原 SSH deadline
+  不能涵蓋阻塞的 source.seek/read。已對此唯讀供料路徑加入 120 秒無進度
+  逾時，首 byte 與後續 read 都受保護；保留全部 bytes／SHA／source-generation
+  gate，逾時不冒充 EOF、不自動隱藏部分輸出。原 legacy reader 其他 caller
+  預設行為未改，這是 speculative spool 的明確 opt-in。
+- 固定 cgroup／parent／PID start ticks，並將其 PowerShell 完整內容與
+  canonical `mode=read` CAS 命令比對後，只交接原 compute-spool unit，
+  不重啟主 migration、backup、PG、Temporal 或訓練服務。原 477 個 public
+  scope proof 保留，17:27:24 新 spool 載入；17:32 實際推進至 478／517，
+  私有 scope 256／256。新候選會繼續加入；這不是 NAS 或最終來源驗收。
+  原停止記錄的 signal 結果保留，不改寫成自然成功。
+- placement 曾進入無期限 sender／GC wait，錯過重新評估自己的 worker
+  換版條件。已讓該獨立鎖等待每 60 秒返回原 timer，釋放全部部分取得的鎖；
+  process churn 的不完整 namespace census 最多重取三次，不把失敗觀測
+  當作通過。原 service 自然退出後載入，17:29 已恢復新的 worker 等待心跳。
+  新 reader／sender／spool 相關 142 項通過，資料與刪除 gate 未放寬。
+- 17:16:02 原通道確認固定控制包五個成員均由 paired receiver 索引回報可用。
+  封套 identity 為 `bd5599a6a851b91819eafcc498e3cfa185fdfc1c5f2b947471d8dcc07268cf07`，
+  只含兩份 runbook、56,414 bytes；未取得 receiver verifier 或 NAS ACK。
+  該 v1 成員固定於 17:08，本報告之後新增的段落不是 v1 成員的新版本。
+
 ## I/O 與封裝
 
 既有 packed 格式、原值 SHA 與獨立還原不變。builder 在 E 關閉／驗證物件，
@@ -61,11 +425,13 @@ ACK 與配對身分。D 舊 transport 副本經程序引用檢查、quarantine �
 才回收；不刪 D CAS、來源觀測或 NAS 原件。程序／原 owner 忙碌則 timer 續等，
 不強制解鎖。這是 transport 位置證明，不能冒充來源歷史、NAS 或 runtime 驗收。
 
-E 掛載的 boot ordering 在修改 sender 配置之前安裝。原 timer 在搬移完成後另呼叫
-既有 `rollout_lakehouse_source_policy.py --reload-code-only`，每次有界等待 45 秒，
-只在原 publisher 釋放鎖後交接；不使用強制重啟。保留 PG／Temporal 與持久
-workflow 鏈的正式驗收。owner 忙碌可續等；其他錯誤每一固定程式版本最多三次，
-保留失敗記錄。這個 code reload 尚未執行，須待本次搬移驗收完成。
+E 掛載的 boot ordering 在修改 sender 配置之前安裝。E alias 及 namespace
+驗收後，原 timer 呼叫既有 `rollout_lakehouse_source_policy.py --reload-code-only`，
+每次有界等待 600 秒、最多每 30 秒回報真正的鎖等待，不排在無關 GC 鎖後。
+只在原 publisher 釋放完整邊界後交接，保留 PG／Temporal 與持久 workflow
+鏈的正式驗收。`PublicationOwnerBusy` 可續等；其他錯誤每一固定程式版本
+最多三次並保留失敗記錄。是否真正載入以原 `worker-reload.json` 的 exact
+candidate／loaded-code 及 workflow 驗收判定，不能由 timer 或預定時刻推論。
 
 其餘來源按目前 writer／reader 與活動中的 publication 分組遷移；不能將整個
 `service_data` 搬到 E，也不能在 460 萬檔 publication 中途改來源 inode，使已做

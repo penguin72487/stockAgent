@@ -15,6 +15,21 @@ for policy in /etc/stockagent/pack-compute-spool.json /etc/stockagent/pack-verif
         exit 1
     fi
 done
+# A formerly installed service must not silently undo an explicit withdrawal.
+# Re-enrollment requires changing the private policies before any unit writes.
+source "$repo_root/scripts/runtime_env.sh"
+run_fintech_python - <<'PY'
+import json
+from pathlib import Path
+import sys
+spool = json.loads(Path('/etc/stockagent/pack-compute-spool.json').read_text())
+verification = json.loads(Path('/etc/stockagent/pack-verification.json').read_text())
+if (spool.get('enabled') is not True or verification.get('enabled') is not True
+        or verification.get('remote_spool') is not True
+        or type(verification.get('remote_workers')) is not int or verification['remote_workers'] < 1):
+    print('Vast verification is disabled; explicit policy re-enrollment is required.', file=sys.stderr)
+    raise SystemExit(1)
+PY
 temporary_dir="$(mktemp -d)"
 trap 'rm -rf "$temporary_dir"' EXIT
 escaped_root="${repo_root//\\/\\\\}"

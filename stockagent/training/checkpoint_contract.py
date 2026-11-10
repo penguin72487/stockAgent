@@ -309,8 +309,11 @@ def _project_temporal_basis_model_config(
         projected.pop("factorized_sparse_projection", None)
         projected.pop("factorized_sparse_cache_bytes", None)
     else:
-        projected["factorized_sparse_projection_contract"] = "full_schema_csr_fixed_row_fp32_date_view_forward_v4"
-        from stockagent.models.factorized_sparse_projection import sparse_adjoint_contract
+        from stockagent.models.factorized_sparse_projection import FORWARD_CONTRACT, sparse_adjoint_contract
+        from stockagent.data.factorized_sparse_rows import SPARSE_ROW_CONTRACT
+        if SPARSE_ROW_CONTRACT != "full_schema_csr_affine_stable_date_view_gpu_resident_v3":
+            raise RuntimeError("sparse model/source date-view contract mismatch")
+        projected["factorized_sparse_projection_contract"] = FORWARD_CONTRACT
         if (adjoint := sparse_adjoint_contract()) is not None:
             projected["factorized_sparse_adjoint_contract"] = adjoint
     if int(projected.get("feature_bottleneck_dim", 0) or 0) == 0:
@@ -2580,6 +2583,25 @@ def _transformer_base_checkpoint_model_values(
     return contract
 
 
+def _sparse_forward_inference_compatibility(model_contract: Mapping[str, Any]) -> dict[str, str]:
+    """Full-row v3 uses the same v4 projection; never relax optimizer resume.
+
+    v4 adds aligned immutable date views, not a different full-row operation.
+    Keep every feature, symbol, normalization and adjoint field exact. The
+    inference-only validator below is the sole consumer of this candidate.
+    """
+    from stockagent.models.factorized_sparse_projection import FORWARD_CONTRACT
+    from stockagent.data.factorized_sparse_rows import SPARSE_ROW_CONTRACT
+    values = model_contract.get("model", {})
+    if (FORWARD_CONTRACT != "full_schema_csr_fixed_row_fp32_date_view_forward_v4"
+            or SPARSE_ROW_CONTRACT != "full_schema_csr_affine_stable_date_view_gpu_resident_v3"
+            or values.get("factorized_sparse_projection_contract") != FORWARD_CONTRACT):
+        return {}
+    previous = {**model_contract, "model": {**values,
+        "factorized_sparse_projection_contract": "full_schema_csr_fixed_row_fp32_forward_v3"}}
+    return {"model": _stable_fingerprint(previous)}
+
+
 def _checkpoint_model_values(
     config: ExperimentConfig,
     active_model: Mapping[str, Any],
@@ -3347,6 +3369,7 @@ def _checkpoint_manifest(
                 "model": _stable_fingerprint(model_contract),
             },
             "compatibility_fingerprints": {
+                "schema_4_sparse_forward_inference_only": _sparse_forward_inference_compatibility(model_contract),
                 "schema_4_pre_external_feature_source": {
                     name: value
                     for name, value in schema_4_pre_external_source_fingerprints.items()
@@ -3534,6 +3557,7 @@ def _checkpoint_manifest(
         "configuration": configuration_snapshot,
         "configuration_fingerprint": _stable_fingerprint(configuration_snapshot),
         "compatibility_fingerprints": {
+            "schema_4_sparse_forward_inference_only": _sparse_forward_inference_compatibility(model_contract),
             "schema_4_physical_source_domain_extensions": (
                 physical_source_extension_fingerprints
             ),
@@ -3935,6 +3959,10 @@ def _validate_checkpoint_manifest(
                 candidate = compatibility.get(compatibility_key, {})
                 if layer in candidate and actual_fingerprints.get(layer) == candidate.get(layer):
                     expected_fingerprints[layer] = candidate[layer]
+            if normalized_scope in {"model", "inference"}:
+                candidate = compatibility.get("schema_4_sparse_forward_inference_only", {})
+                if actual_fingerprints.get("model") == candidate.get("model"):
+                    expected_fingerprints["model"] = candidate["model"]
             source_extensions = compatibility.get(
                 "schema_4_physical_source_domain_extensions", ()
             )

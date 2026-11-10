@@ -368,13 +368,18 @@
       "pack_buckets": 64,
       "loose_threshold_mib": 8,
       "active_process_substrings": [
-        "build_shioaji_tw_minute_dataset.py"
+        "build_shioaji_tw_minute_dataset.py",
+        "reconcile_tw_stock_minute_day.py"
       ],
       "validation_gate": {
         "kind": "stock_minute_dataset",
         "calendar_root": "data_tw_public"
       },
       "source_coordination_lock": "artifacts/data_repair/shioaji_minute_full/runner.lock",
+      "excluded_subtrees": [
+        ".download.lock",
+        ".minute_repair.lock"
+      ],
       "note": "Canonical audited one-minute partitions; excludes the known schema2 volume-bug quarantine tree."
     },
     {
@@ -410,6 +415,8 @@
       "reader_contract": "packed-v2-chunks",
       "file_chunk_bytes": 8388608,
       "source": "data_tw_microstructure/hft_dataset",
+      "source_coordination_lock": "data_tw_microstructure/hft_dataset/.download.lock",
+      "excluded_subtrees": [".download.lock"],
       "role": "training",
       "publish": true,
       "pack_buckets": 64,
@@ -598,6 +605,8 @@
       "reader_contract": "packed-v2-chunks",
       "file_chunk_bytes": 8388608,
       "source": "data_free_public",
+      "source_coordination_lock": "data_free_public/.download.lock",
+      "excluded_subtrees": [".download.lock"],
       "role": "analytics-and-audit",
       "publish": true,
       "pack_buckets": 16,
@@ -612,6 +621,8 @@
       "reader_contract": "packed-v2-chunks",
       "file_chunk_bytes": 8388608,
       "source": "data_public_economic",
+      "source_coordination_lock": "data_public_economic/.download.lock",
+      "excluded_subtrees": [".download.lock", ".bea.lock", ".census.lock", ".moi.lock"],
       "role": "local-economic-history-and-quality-audit",
       "publish": false,
       "pack_buckets": 0,
@@ -711,7 +722,7 @@
     },
     {
       "dataset": "tw-index-futures",
-      "reader_contract": "packed-v2-chunks",
+      "reader_contract": "packed-v3-content-alias",
       "file_chunk_bytes": 8388608,
       "source": "data_tw_index_futures",
       "role": "training",
@@ -961,6 +972,7 @@
       "source": "data_news",
       "role": "local-news-training-copy-on-write-parts",
       "publish": false,
+      "source_coordination_lock": "data_news/.build.lock",
       "pack_buckets": 32,
       "loose_threshold_mib": 8,
       "active_process_substrings": [

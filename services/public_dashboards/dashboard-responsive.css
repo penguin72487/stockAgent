@@ -99,6 +99,7 @@ body details > summary {
   }
 
   .jump-nav a { min-width: 44px; }
+  body .jump-nav { flex-wrap: wrap; overflow-x: visible; }
 
   body .range-buttons button,
   body .range-picker button,

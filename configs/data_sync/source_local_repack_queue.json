@@ -1,0 +1,15 @@
+{
+  "contract": "stockagent.source_local_repack_queue.v1",
+  "entries": [
+    {
+      "dataset": "tw-microstructure-train",
+      "source": "/srv/stockagent-workspace/downloads/tw-microstructure-train-e-primary-20261104-v1/data_tw_microstructure/hft_dataset",
+      "expected_manifest_sha256": "a754984102d059d0d70712518d4f8c18217c09fc456cf6801aa1fa5f74ae6bc0"
+    },
+    {
+      "dataset": "tw-futures-margin-sources",
+      "source": "/srv/stockagent-workspace/downloads/futures-margin-source-e-temporary-20261103-v1/data_tw_index_futures/preparation_sources/margin_sources",
+      "expected_manifest_sha256": "8433b1e5ab9d9693f5f5f981fddc291e2b11a525d2bfee10bb47729ddf6a8613"
+    }
+  ]
+}

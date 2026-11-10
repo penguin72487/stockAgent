@@ -71,7 +71,8 @@ def main():
         result = build_recipe(args.recipe, repo=ROOT, sync_root=args.sync_root,
             input_paths=inputs,
             parameters=json.loads(args.parameters_json.read_text()) if args.parameters_json else {},
-            receipt_path=args.receipt, output_root=args.build_output, trial=args.mode=='trial')
+            receipt_path=args.receipt, output_root=args.build_output, trial=args.mode=='trial',
+            research_materialized_root=args.materialized_root if args.mode == 'build' else None)
     print(json.dumps(result, ensure_ascii=False))
 
 

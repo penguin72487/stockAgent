@@ -2,19 +2,36 @@
   "schema_version": 1,
   "observer_node_id": "penguin",
   "capacity_interval_seconds": 60,
+  "independent_local_capacity": true,
   "classification_interval_seconds": 21600,
   "classification_timeout_seconds": 1800,
   "classification_depth": 3,
   "receipt_root": "/srv/stockagent-backup-receipts-lab203",
   "operations": {
+    "windows_storage_preparation_receipt": "/srv/stockagent-workspace/verify/windows-c-e-3tib-preparation-20261104-v4.json",
+    "provider_workspace_registry": "/var/lib/stockagent/workspace-volume/provider-placement.json",
+    "provider_workspace_root": "/srv/stockagent-workspace",
+    "source_local_candidates": [
+      {"name": "source-local-cftc-20261106-v2", "subject": "cftc-legacy-pre2000", "pack_layout": "source-dataset-v1", "original_manifest_sha256": "0181df327dd360d95dc8a37515af1c14b6305c892b61af533974de4303b91c71"}
+    ],
+    "workspace_source_staging_config": "configs/data_sync/workspace_source_staging.json",
+    "provider_workspace_diagnostics": "/srv/stockagent-workspace/verify/provider-runtime-diagnostic-20261103-v1.json",
     "workspace_relocation_state_root": "/var/lib/stockagent/workspace-volume/transport-relocation-v1",
     "workspace_private_scratch_state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/c1fe0af6f2b34891429bc194",
+    "workspace_private_scratch_candidates": [
+      {"state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/7fa3bf9d5be100aa-c113544519884b839486d655bbbe3d66/workspace-relocation/556d999838396b17023d5e0b", "snapshot_sha256": "3df164841cf1ef42230853b89ef18ffaccd49cfa2c8f0814307d25999a95ac2b", "subject": "finlab"}
+    ],
     "workspace_controls_candidates": [
       {"batch_number": 1, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/5c3dcaf868ff5171b478326e", "controls_identity": "6cbcb45473dfe97ed2627f244af0406d89dcbe8809b71939b5b2c32f9b396618", "files": 47, "logical_bytes": 1992596286},
       {"batch_number": 2, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/3e8c4f4eb26d2d9c57d63414", "controls_identity": "e03d7b26d3f07dd714db8087356c9098f0c2b6c8ce2fd3548fe18e0e24f32394", "files": 862, "logical_bytes": 1687007536},
-      {"batch_number": 3, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/9d30fe6d7e1b3d5d033d18ad", "controls_identity": "7c152fec673dbedadab34264dfc431b36765f4f17361118432f26c399d0eaf3d", "files": 36, "logical_bytes": 865661000}
+      {"batch_number": 3, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/9d30fe6d7e1b3d5d033d18ad", "controls_identity": "7c152fec673dbedadab34264dfc431b36765f4f17361118432f26c399d0eaf3d", "files": 36, "logical_bytes": 865661000},
+      {"batch_number": 4, "state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions/operations/7fa3bf9d5be100aa-c113544519884b839486d655bbbe3d66/workspace-relocation/1cadf944abb9cf863ff3f0c9", "controls_identity": "c109782cf06edb7cbf6a45ac0f53a3bf9e28bfeec9729b7e45016da87684a933", "files": 1456, "logical_bytes": 42125547602}
     ],
     "bulk_return_state_root": "/var/lib/stockagent-vast-bulk-return",
+    "d_mount_repair_status": "/var/lib/stockagent-d-root-mount-repair/status.json",
+    "remote_return_status": "/var/lib/stockagent-cold-artifacts/remote-ingress-status.json",
+    "catalog_export_observation": "/var/lib/stockagent/lakehouse-control/catalog-export-observation.json",
+    "catalog_export_progress": "/var/lib/stockagent/lakehouse-control/catalog-export-progress.json",
     "backup_state_root": "/var/lib/stockagent/backup-stream",
     "migration_state_root": "/var/lib/stockagent/lakehouse-control/dataset-versions",
     "transport_gc_state_root": "/var/lib/stockagent/lakehouse-control",
@@ -34,6 +51,8 @@
     {"id": "penguin-workspace", "path": "/srv/stockagent-workspace", "filesystem": "ext4", "roots": [
       {"path": "/srv/stockagent-workspace/downloads", "label": "下載資料", "kind": "source"},
       {"path": "/srv/stockagent-workspace/build", "label": "封裝工作區", "kind": "cache"},
+      {"path": "/srv/stockagent-workspace/archives", "label": "常用資料集及服務封存", "kind": "cold"},
+      {"path": "/srv/stockagent-workspace/migration", "label": "遷移及尚未交接資料", "kind": "source"},
       {"path": "/srv/stockagent-workspace/verify", "label": "驗證工作區", "kind": "materialized"},
       {"path": "/srv/stockagent-workspace/restore", "label": "按需還原", "kind": "materialized"},
       {"path": "/srv/stockagent-workspace/transport", "label": "備份傳輸暫存", "kind": "runtime"}
@@ -43,7 +62,8 @@
     "id": "vastai1T-disk",
     "target_env": "COLD_ARTIFACT_INGRESS_SSH_TARGET",
     "port_env": "COLD_ARTIFACT_INGRESS_SSH_PORT",
-    "identity_env": "COLD_ARTIFACT_INGRESS_IDENTITY_FILE",
+    "identity_env": "STOCKAGENT_STORAGE_MONITOR_IDENTITY_FILE",
+    "fallback_identity_env": "COLD_ARTIFACT_INGRESS_IDENTITY_FILE",
     "roots": [
       {"path": "/root/stockAgent", "label": "StockAgent 專案", "kind": "project"},
       {"path": "/srv/stockagent-packed", "label": "工作冷庫", "kind": "cold"},

@@ -32,3 +32,15 @@ def test_verified_session_and_unknown_calendar_remain_protected():
             result = evaluate(observed, official_calendar_root=Path("data_tw_public"))
         assert result["stock_session"] is True
         assert result["allowed"] is False
+
+
+def test_official_weekend_session_overrides_weekday_assumption():
+    observed = datetime.fromisoformat('2026-11-07T08:30:00+08:00')
+    for response, expected in (
+        ((True, 'official TWSE schedule as-of 2026-10-20: 補行交易'), False),
+        ((False, 'official TWSE schedule as-of 2026-10-20: weekend'), True),
+        ((False, 'official TWSE holiday schedule is unverified: malformed'), False),
+    ):
+        with patch('stockagent.live.market_status.verified_tw_stock_session_day', return_value=response):
+            result = evaluate(observed, official_calendar_root=Path('data_tw_public'))
+        assert result['allowed'] is expected

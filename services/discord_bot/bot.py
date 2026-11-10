@@ -28,6 +28,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[2]
+FORMAL_HISTORY_SCOPE_CONTRACT = "tw_current_year_formal_history_v1"
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
@@ -2564,6 +2565,14 @@ def _tw_data_layer_lock_path(command: list[str]) -> Path | None:
 
 
 def _wait_for_existing_tw_data_update(command: list[str], *, timeout_seconds: int) -> bool:
+    """Wait for an actual source writer, not concurrent source readers.
+
+    The canonical TW refresh lock uses shared leases for model reads and an
+    exclusive lease for a producer. An exclusive probe mistakes our own
+    warmup/prefetch readers for a writer and can make the signal scheduler
+    wait on its own process. This is only a probe: it is released immediately
+    and the command's normal receipt/source checks still apply afterward.
+    """
     lock_path = _tw_data_layer_lock_path(command)
     if lock_path is None:
         return False
@@ -2571,7 +2580,7 @@ def _wait_for_existing_tw_data_update(command: list[str], *, timeout_seconds: in
     handle = lock_path.open("a+")
     try:
         try:
-            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
         except BlockingIOError:
             print(
                 f"[pre-signal] existing TW data update owns lock={_display_path(lock_path)}; waiting",
@@ -2586,7 +2595,7 @@ def _wait_for_existing_tw_data_update(command: list[str], *, timeout_seconds: in
         ) as operation:
             while True:
                 try:
-                    fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    fcntl.flock(handle.fileno(), fcntl.LOCK_SH | fcntl.LOCK_NB)
                 except BlockingIOError:
                     _PRE_SIGNAL_SOURCE_OPERATIONS.observe_blocked(operation)
                     if time.monotonic() >= operation.deadline:
@@ -3551,6 +3560,20 @@ def _record_opening_input_progress(stage, event):
                      last_progress_monotonic=time.monotonic())
 
 
+def _record_preopen_catch_up_progress(cfg, event, *, session_date: str) -> None:
+    """Attach real prewarm progress only to its matching scheduled input job."""
+    market = str(cfg.market)
+    stage = bot._opening_input_stages.get(market)
+    job = bot._scheduled_input_jobs.get(market)
+    if not stage or stage.get("phase") != "preopen_catch_up" or not job:
+        return
+    row = job.get("row")
+    if (not row or row[0] != cfg or row[1] is None
+            or row[1].date().isoformat() != session_date):
+        return
+    _record_opening_input_progress(stage, event)
+
+
 def _opening_source_operation(now_monotonic: float, *, input_stage=None) -> dict[str, Any] | None:
     """Use actual source liveness only in this market's catch-up phase.
 
@@ -4490,6 +4513,10 @@ def _prewarm_market_signal_serialized(cfg: LiveMarketConfig) -> LiveSignalResult
 
     def update_progress(step: int, message: str) -> None:
         _touch_opening_attempt_progress(f"preopen:{cfg.market}: {message}")
+        _record_preopen_catch_up_progress(
+            cfg, {"message": message, "step": step, "total": progress_total},
+            session_date=started_at[:10],
+        )
         _write_preopen_readiness(
             cfg,
             status="running",
@@ -7548,6 +7575,30 @@ def _formal_history_compile_cache_namespace() -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", identity).strip(".-")
 
 
+def _formal_history_train_command() -> list[str]:
+    """Never mix a frozen service's packages with an unpinned root trainer."""
+    release = os.environ.get("STOCKAGENT_SERVICE_CODE_RELEASE")
+    if not release:
+        return [sys.executable, str(ROOT / "train.py")]
+    from stockagent.live.service_code_release import verify_frozen_source
+
+    try:
+        proof = verify_frozen_source(Path(release), ROOT)
+        manifest = json.loads(Path(proof["receipt"]).read_bytes())
+        files = manifest["code"]["files"]
+        required = {"train.py", "scripts/run_frozen_formal_history.py"}
+        missing = sorted(required - set(files))
+        if missing:
+            raise ValueError(f"release lacks frozen formal-history code: {missing}")
+    except (OSError, ValueError, KeyError, TypeError, RuntimeError) as exc:
+        raise BotUserError(
+            f"formal history requires a verified same-version trainer: {exc}. "
+            "Keep maintenance degraded until a compatible release is admitted."
+        ) from exc
+    return [sys.executable, str(ROOT / "scripts/run_frozen_formal_history.py"),
+            "--release", proof["receipt"], "--"]
+
+
 def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeStatus) -> bool:
     target_date = (
         getattr(status.data, "expected_latest_date", None)
@@ -7558,6 +7609,7 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
     latest_key = _formal_history_completed_date(cfg)
     if target_key and latest_key and latest_key >= target_key:
         return False
+    train_command = _formal_history_train_command()
     _preflight_formal_history_calendar(cfg)
     fold_id = cfg.fold_id
     if fold_id is None:
@@ -7575,8 +7627,7 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
     config_path = _resolve_repo_path(cfg.config_path) or Path(cfg.config_path)
     output_dir = _resolve_repo_path(cfg.output_dir) if cfg.output_dir else None
     command = [
-        sys.executable,
-        str(ROOT / "train.py"),
+        *train_command,
         "--config",
         str(config_path),
         "--mode",
@@ -7592,6 +7643,13 @@ def _run_formal_history_backfill(cfg: LiveMarketConfig, status: MarketRuntimeSta
     ]
     if output_dir is not None:
         command.extend(["--output-dir", str(output_dir)])
+    if _market_execution_mode(cfg) == "tw_day_trade":
+        # The isolated maintenance owner also reads this policy before source
+        # preparation. Keep one bounded policy parser and one canonical CLI.
+        from scripts.run_discord_artifact_maintenance import _current_history_year
+        history_year = _current_history_year()
+        if history_year is not None:
+            command.extend(["--inference-year", str(history_year)])
     print(
         f"[formal-history] market={cfg.market} latest={latest_key or 'none'} "
         f"target={target_key or 'unknown'} "

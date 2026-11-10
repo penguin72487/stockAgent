@@ -1,5 +1,621 @@
 # Data storage and synchronization contracts
 
+2026-11-10 daily deduplicated archives: C holds services and control; E holds
+incremental work, backup staging and enrolled overflow; D holds compressed
+dataset backups. Calendar starts are 03:00–07:00 Asia/Taipei, separate from
+initial migration catchup and the original trading stop. Ordinary history may
+retire only beneath a fixed validated complete inventory and the original research,
+service, dependency, generation and process protections. An older version
+with a file/symlink path absent from the current inventory remains protected.
+Keep that validated anchor and every actual current head. Bounded append-only
+manifest publication must be reconciled for new references at the final owner;
+changed/removed existing manifests still reject. The D-to-E mover joins the
+original retirement turn before publication leases, letting a reserved GC
+run after an admitted wave. This does not weaken any deletion gate. See the
+[phase and fair-turn evidence](../storage_archive_plan_and_fair_retirement_2026-11-10.md).
+Cross-path identical content and v3 base-union reuse never reconstruct history
+just to merge an increment. Retained old private encodings are staged before
+latest packages under the same placement owner. Do not park active raw files
+until the canonical readers can restore them. See the
+[daily archive contract](../storage_daily_deduplicated_archives_2026-11-10.md).
+
+2026-11-10 warm archive placement: the user permits frequently used datasets
+and service archives to remain on the enrolled E workspace when D is short of
+space. D retains immutable logical manifests/heads; its enrolled object names
+may resolve through one private local SQLite index to fixed E generations.
+Use the original source-hashed copier and publication/backup owners, commit
+the E location before a durable D unlink intent, and retain original content
+SHA, namespace, references and pins. Readers, backup export and original GC
+must all use this same routing; missing/changed E never falls back to C or a
+different D generation. Cold unlisted datasets remain on D. This does not
+grant remote export or represent NAS acceptance. See the
+[warm archive contract](../storage_warm_archive_placement_2026-11-10.md).
+
+2026-11-10 sealed-source capacity repair: logical path count is not the unique
+content memory bound. The existing inventory census may enroll an allowed
+host-private source without granting public or remote export. If a complete
+ordinary E encoding is larger than its original and lacks any install,
+temporary-authority or current-head-relief intent, its exact preparation may
+be superseded by a source-bound content-alias candidate. Preserve both until
+the candidate metadata and original source identities match under the same
+dataset owner; journal the atomic E directory exchange and retire only the
+replaced encoding's exact package generations. Keep its original preparation,
+checkpoint and inventory metadata. Private candidate activation uses the
+already supported local v3 reader and records no remote reader acceptance;
+public activation retains its separate remote-capability gate. The original
+D installer, research/dependency pins, guards and retirement owners remain
+authoritative. A fixed unique-content census limit is observed and cached by
+inventory, planner and bound identity instead of repeatedly scanning it.
+The checkpointed E-to-D installer may start until 08:00 on a protected session,
+with its original bounded owner still stopping at 08:00; other owners retain
+their own start runway. These are local packaging/scheduling changes, not
+independent D recovery, NAS acceptance or permission to remove pinned data.
+
+2026-11-10: source-local layout discovery must distinguish original virtual
+source provenance from the new physical encoding. A complete exact repack may
+retain `retained_source_contract` or `incremental_base` in its source selection;
+its sealed preparation, matching D install journal, source counts and committed
+publication receipt prove the new layout even after the old manifest retires.
+The versioned discovery cache must not repeatedly schedule that same content.
+Queued daily refresh and prepared SQLite references may follow a bounded chain
+of those exact physical transitions, preserving each prior SHA and snapshot ID.
+Never substitute a different observed database, a missing edge or an unevidenced
+latest head. Pending parent SQLite preparations are fixed dependency protections
+before the parent commits; repeat their check under the final retirement owner.
+Native Windows writer startup and finish waits have actual deadlines; retain
+sources and partials on unknown timeout without replaying input. These changes
+are reference/layout and liveness proofs, not an independent D recovery or NAS
+ACK. See [the blocker repairs](../storage_automated_migration_blocker_repairs_2026-11-10.md).
+
+2026-11-09: the automatic same-root private subset owner may compare only its
+three explicitly reviewed dataset pairs. Both fixed inventories, all target
+paths, original file SHA, mode and symlink metadata must match; the donor may
+contain additional files. A distinct target inventory and manifest preserve
+the original dataset identity while referencing the donor's existing private D
+objects. The donor's original source-hashed E preparation, D install journal,
+fixed object generations and source-local layout are required. Bybit's
+already-shared public hardlinks additionally require its exact committed
+cross-authority promotion journal, unchanged post-link generations and both
+original publication authorities. This is metadata comparison against prior
+source hashes, not a new payload stream, D recovery, NAS ACK or export grant.
+The existing private retirement owner independently checks current heads,
+references, pins, readers and locks; old and new lifecycles stay separately
+visible. If the target's existing lifecycle points at an earlier generation,
+wait for the original daily refresh to rebind it before another transition.
+See [the migration evidence](../storage_migration_autonomy_2026-11-09.md).
+
+2026-11-09: the user withdrew Vast pack-verification assistance while keeping
+training and its source/result transport. The optional pack-verification and
+speculative-spool policies are disabled, and the spool systemd unit and timer
+were removed. The historical Vast bulk/legacy backup-return units and five
+timer instances were also withdrawn; preserve their incomplete cohorts and
+receipts. The separate current training-result ingress and training source
+transport remain enrolled. Standard local reconstruction remains available. The retired
+remote cache contained 4,137 closed disposable pairs; their exact key locks,
+private proof identities and process references were checked before removal.
+This does not authorize removal of training data, D sources or NAS archives,
+or imply an independent recovery proof. See
+[the decommission evidence](../vast_verification_decommission_2026-11-09.md).
+
+2026-11-09: the enrolled Vast v3 edge reader has a pinned, code-only recovery
+bundle on the checked E workspace and an independent bounded timer. A missing
+bundle may be rebuilt only when all source and dependency hashes still match;
+remote recovery first checks the existing base owner and wrapper/control
+identity, verifies all transferred bytes before executing them, and takes the
+original edge operation lock. A different or changed release is never
+overwritten, and an intact reader with a missing index is observed rather than
+reinstalled. Reader capability, source payload hydration, D readback and NAS
+acceptance are distinct. The remote isolated scratch test did not exercise a
+whole-instance rebuild. See [the measured recovery](../storage_e_first_repack_2026-11-07.md#2026-11-09vast-固定讀取器的有界自動恢復).
+
+2026-11-08: the Vast artifact-discard consumer scan resolves an active
+training configuration with its normal control runtime first. If that
+runtime lacks a required Python module, it may use only a Python executable
+bound to the observed training PID and executable generation, loading that
+trainer's canonical checkout and preserving the resolved base-config and
+source fingerprints. A missing, changed, unreadable or nonmatching process,
+runtime or config remains a retirement veto. The process scan is a point-in-
+time observation and does not fence an independently launched future reader.
+The user has deferred online TRIM; this process-guard change does not enable it.
+See the [Vast cleanup and synchronization evidence](../storage_e_first_repack_2026-11-07.md#2026-11-08-vast-容量測試回收與同步恢復).
+
+2026-11-08: native Windows byte I/O attempts to enlarge its stdout pipe to
+1 MiB for long sequential reads, without shrinking an existing larger pipe.
+Unsupported or denied enlargement keeps the original pipe and all source,
+hash, capacity and failure checks. The measured improvement is limited to a
+synthetic long interop stream; no complete migration speedup is asserted.
+See the [pipe measurement](../storage_e_first_repack_2026-11-07.md#2026-11-08windows--wsl-原生位元組管線).
+
+2026-11-08: the explicitly named `bybit-source-stream-e-20261108-v1`
+stages the physical C source `service_data/stockagent-live/data_bybit` to E
+only while the catalog alias `data_bybit` still resolves to that exact source.
+The staging owner fences the original catalog and native minute/daily locks,
+checks its known independent repair/quality processes, and streams source SHA
+into its durable batch journal without destination payload readback. This is
+only a fixed staging generation: its 2026-11-08 receipt does not authorize a
+Bybit alias cutover, C deletion, D publication or NAS acceptance. The reviewed
+writer guards, native grain locks, publisher owner, immutable code-bound
+enrollment and namespace mutation fence are required before the existing
+handoff owner may switch the path; the registered original path and boot
+recovery remain unchanged. The index archive queue seals the retained C
+generation into E under the original locks before retiring its payload and
+publishing its separate `bybit` history to D. Its subsequent public-head
+comparison explicitly binds the original `data_bybit` catalog alias. Each
+of those stages has a separate receipt and none alone proves NAS acceptance.
+
+2026-11-08: the canonical Vast completed-return owner stages its payload on
+the enrolled E ext4 workspace and keeps its private control receipts on C.
+Admission checks physical and guest capacity, fences the E mount identity
+before/after transfer and before publication and cleanup, and keeps native
+nanosecond clocks distinct from the old DrvFS staging contract. An E copy or
+its D publication is not a NAS or independent recovery proof. While the
+user's explicit migration-time restore deferral is active, the existing
+publisher records its source-hashed D commit without a new independent D
+payload readback; preserve the remote source and mark the missing proof.
+Only after fixed-generation lineage and the existing peer-convergence gate
+pass may an unrestored return marker move durably from the bounded transport
+queue to the separate deferred-recovery queue. Identical interrupted markers
+are resumable; different generations fail closed. When deferral is lifted,
+the same owner restores them to available transport queue slots before the
+original recovery and remote-retirement gates. Do not treat the queue move,
+current capacity or peer sync as a restoration or deletion ACK.
+
+2026-11-08: the fixed `tw-minute-source-stream-e-20261108-v1` generation
+stages Shioaji raw minute files to E with one source SHA stream and durable
+batch journals; it does not add destination payload readback or a backup
+prerequisite. Once that exact staging receipt is complete, the existing source
+queue may automatically enroll the reviewed handoff. Its marker pins the raw
+writer and guard code, the handoff holds the original minute runner lock and
+both scoped workspace locks, and custom day-trade repair outputs remain
+independent. A stopped or changed source, missing E mount or changed code
+must not turn into a C fallback or permission to remove source files. The
+general boot handoff restores this raw alias; the trading-priority boot path
+remains limited to the existing research source. Staging, active alias, D
+publication and retirement remain separately reported. The actual handoff
+and later C reclamation still require their own owner receipts.
+
+2026-11-08: `tw-index-options-daily-stream-e-20261108-v1` stages the current
+option daily source to E with the original registered auxiliary lock and the
+known settlement/research writer process gates. The earlier fixed E generation
+remains evidence, not the current source. Staging alone does not enroll a
+handoff or authorize C retirement. This dataset's final-settlement file is read
+by the day-trade and TAIFEX services; an eventual cutover must independently
+prove their namespace access and trading-priority boot recovery, as well as
+fencing every relevant writer. Do not treat this copy as a service cutover.
+
+The narrower `tw-index-options-raw-stream-e-20261108-v1` raw subtree was later
+handed off by the original owner; the service settlement projection stays on
+C. The canonical final-settlement downloader now keeps its default service
+HTML receipt on that same C filesystem so an unavailable E raw mount does not
+block the trading bootstrap. Custom outputs inside the E raw subtree still
+take the original writer guard. The active handoff's versioned writer binding
+was upgraded under its existing owner and both original writer locks, with the
+old binding retained. The offline E-unavailable test is not a live API or
+whole-machine recovery acceptance. See the [migration evidence](../storage_e_first_repack_2026-11-07.md#2026-11-08-19041910選擇權原始歷史與服務結算資料分流).
+
+2026-11-08: the explicitly enrolled Yahoo market source uses its existing
+fixed E copy and the original source-handoff, source-hashed packaging and D
+publication owners. Known Yahoo-layout downloader, backfill, repair,
+materialization and quality-intent entrypoints hold a shared root writer lock;
+parallel writers remain possible. The handoff holds the C and E root locks
+exclusively, the Yahoo publication lock and an indexed namespace mutation
+fence, and refuses a writer that waited on an old lock inode. Before the first
+exchange and on each pre-exchange resume, enrollment binds the reviewed writer
+code SHA. A metadata-only generation check reuses the earlier fixed-copy proof;
+this does not add a new full destination payload readback or prove D/NAS
+recovery. Keep the retained C generation until its source-hashed E archive is
+sealed, and preserve trading-window admission and existing source owners.
+The explicitly enrolled CFTC pre-2000 and FRED crypto-macro working sources use
+the same fixed-copy handoff, while holding their original `state/collector.lock`
+on both C and E. Their existing closed/retained raw-source bindings and D pins
+remain authoritative; moving the local working source does not retire or
+replace the pinned cold history. The FRED generation remains private.
+
+2026-11-08: the explicitly enrolled `tw-minute-train-stream-e-20261108-v1`
+stages the current minute research generation to E under the original source
+owners. It hashes source bytes as they are streamed, persists a bounded batch
+with `syncfs` before committing its per-file journal, and resumes only its
+own identified incomplete files while retaining C. It deliberately performs
+no separate destination payload readback. The receipt and public progress
+must say so: an E stage is not a path cutover, D/NAS recovery, or permission
+to remove C. The exact older E copy remains separate. This mode is not
+automatically authorized for any other source or a future changed generation.
+
+2026-11-07 user-directed fast migration: for the exact fixed release processed
+by `stream_repack`, read the old D members once into source-local E archives,
+check their original SHA during that stream, and publish the new D encoding.
+Do not require a new backup, a separate D/NAS payload readback or a decompressed
+restore test before this migration's retirement. Inventory metadata is still
+checked, and this mode is not an independent recovery or NAS-acceptance proof.
+After the exact new manifest and installed generations are committed, the
+dedicated retirement owner may journal and remove that superseded old manifest,
+its matching historical heads, and only old objects with no other visible
+manifest references. Retain current heads, research/materialization pins and
+active process references; use the original publication, backup-cycle and
+replication locks and reconcile each interrupted exact unlink. Shared objects
+stay until their remaining references are retired. This exception does not
+authorize deleting live trading state or other sources under concurrent owners.
+For the explicitly enrolled Binance, OKX and Yahoo market datasets, the user's subsequent "migrate first and backfill gaps later"
+instruction also permits the explicitly enrolled fast latest-fixed selection.
+The original metadata comparison must cover every old public path, the newer
+fixed source must have a complete source-hashed E package and committed D
+generation, the public catalog must have no restricted subtree, and the
+enrollment must pin both the original public and private manifest SHA. A
+committed selection is one-time: if the public head later advances, never
+replace it again with that older private generation. Share its
+installed D objects through the canonical publication owners; preserve the
+exact old/new manifest IDs and changed-path worklist. This is selection of a
+newer source generation, not a semantic union: changed values and historical
+coverage remain explicitly unexamined. Its old generation may be retired by
+the original reference, research-pin, process and lock gates; report that old
+historical revisions may no longer be recoverable. When the same encoded object
+already exists in both authorities, the public manifest may reuse its original
+public name and the duplicate physical bytes remain explicitly reported until
+a separate safe deduplication. The existing retirement queue may consolidate
+such an exact, fixed object under both publication owners and the backup and
+replication locks: preserve the original promotion and installation receipts
+in a durable transaction journal, check their source-hashed object identities
+and process references, atomically share the object name, then record the
+post-link signatures in the canonical receipts. An interruption resumes from
+that journal; it is not a new payload readback or NAS acceptance. Do not grant
+this exception to another dataset without an explicit matching enrollment.
+If a latest-fixed promotion has already retired the original replacement, the
+history retirement owner may follow its exact pinned promotion, comparison,
+worklist and completed retirement journal to the surviving fixed successor.
+This evidence is an anchor for the existing history sweep, not permission to
+republish an older head or to claim value equality. Even if the public head has
+advanced since the promotion, preserve every current head and the fixed anchor;
+recheck the evidence, references, pins, processes and locks before unlinking.
+During this explicitly paused independent recovery, the catalog lifecycle may
+adopt a new contract without waiting for already-deferred releases: preserve
+the entire previous plan and progress, carry unchanged fixed bindings as
+deferred, and never label them independently recovered. If an old manifest is
+already unavailable, preserve its prior identity and historical status and
+requeue a fresh canonical binding; a missing proof or an identity mismatch is
+still an error. Changed contracts start a new pending scope. This exception is
+active only while the user's exact recovery-pause marker is present.
+The private Taiwan futures interfaces may also bind the exact committed index
+futures and native SQLite snapshots while that explicit pause is active. Such
+bindings remain labelled as recovery deferred. Publication rechecks the fixed
+dependencies under the shared publication lock; private retirement protects
+every fixed dependency of every extant futures manifest, including historical
+manifests, until its dependent manifest is retired. Later materialization must
+still validate each referenced component before claiming a usable source view.
+For enrolled public D-to-E streams and automatically discovered existing
+local-only private heads, the original snapshot may be protected by a durable
+pin in the existing materialized protection namespace while its long build
+releases the global publication lock. The source-local queue rotates bounded
+private-head batches and excludes FinLab, FinMind, TEJ, factorized and day-trade
+owners, including aliases whose original source path identifies those owners.
+The private root never grants public or NAS export. A positive current-parent
+SQLite dependency hint delays that exact state snapshot instead of building a
+redundant copy; the locked retirement owner's full historical dependency,
+pin, process and reference checks remain authoritative. An unrecognized
+dependency-like private metadata contract blocks deletion rather than guessing.
+`new_pack_layout` is a new-write policy, not proof that reused objects have the
+same layout. The queue checks the bounded manifest lineage and referenced
+object identities; an unknown or missing base remains a repack candidate.
+Keep the dataset writer lock,
+reacquire the global lock before installation, and recheck the fixed head and
+pin. Clear the pin only after successful publication notification; reconcile
+it on retries after a committed head. The independent retirement timer shares
+the same local retirement-queue owner with the existing repack scheduler and
+still obtains the canonical publication, backup and replication locks.
+If daily root refresh was armed against a prior physical encoding, it may
+rebind to a current exact repack only after checking its original manifest and
+snapshot identities, sealed preparation identity, installed object set, D
+manifest and matching original-owner receipt. Retry this check after a delayed
+receipt and fence the selected base again at publication. This fast path is
+not an independent D or NAS readback and never proves a semantic latest-source
+handoff; keep that separate evidence contract for changed source contents.
+When an old public source remains another publisher's current head, seal its
+source-hashed dataset on E but defer a new D install, since the old head keeps
+the original D objects live. Do not defer a previously started exact install
+or an E-only recovery whose original D objects were already removed. This is
+a temporary head-convergence wait, not authorization to delete another
+publisher's head or a claim that D publication has completed.
+For the fixed `stockagent-migration-core` legacy lab203 release identified by
+the original de-enrollment receipt and its one source-hashed E prepared
+identity, Penguin may publish a fitting successor without waiting for a peer
+that is no longer shared on the packed Syncthing folder. Recheck the exact
+sole original head, receipt, prepared identity and live folder participants
+both at admission and before committing the new head; unknown or changed
+topology fails closed. If D is too full, the existing E-first capacity owner
+may handle this exact sole lab203 head after the same admission and normal
+source pin, reference, reader and owner checks. Once unlink has begun, finish
+the journalled E-only recovery even if that topology later changes; the exact
+old head and prepared identity must still match. After the new D head commits,
+the original foreign-head handoff may withdraw this retired publisher's exact
+head only through the existing peer lease, pin, synchronization and recovery
+protocol. The normal retirement owner handles old objects separately. This
+exception is not an NAS receipt, a remote payload readback, or authorization
+for another release.
+For an already sealed foreign-head wait, the source-local queue may check the
+exact E prepared generation and foreign head metadata before starting the
+repacker again. If the head is unchanged it leaves the sealed item visible to
+the prepared installer and considers other datasets. A released head goes to
+the original worker; uncertain metadata uses the original retry path. The
+observation does not authorize a head change or an unlink.
+The source-local retirement timer may wake a cooled-down direct retirement
+early when a bounded metadata observation shows its exact old head has gone.
+The observation is only a scheduling hint; the original child rechecks the
+head, pin, process, catalog and owner locks. Unavailable observations retain
+the cooldown and do not authorize a mutation.
+When several previously pinned direct retirements are due, the same queue may
+read bounded exact E prepared identities and observe the existing protection
+set once for the batch. A fresh positive pin only postpones that exact release
+for a five-minute retry and is ignored after two minutes or on observation
+failure; it never proves absence of a pin or authorizes deletion. Other ready
+retirements continue, and every selected child still checks all references,
+pins, processes and locks. The hint is not a payload or recovery receipt.
+The source-local queue distinguishes a dataset's fixed manifest generations.
+If a discovery selects a newer generation while an older E source is sealed,
+keep both queue identities, report the older sealed generation as awaiting
+reconciliation and let the new generation advance. Never install the old
+generation over the newer head. An interrupted E-only recovery remains the
+highest priority even when another generation exists. The existing worker
+rechecks actual head, E metadata and owners; queue labels authorize no unlink.
+When the original trading-window admission allows maintenance, that timer
+drains at most sixteen ready retirements or three minutes of starting new work
+per invocation. Each item still has its own owners, retry clock and durable
+journal; a blocked item must not occupy every timer tick while others are ready.
+Within that owner, after four direct-retirement attempts, give one ready
+historical sweep a turn even when newly published direct work continues to
+arrive. Persist the bounded cursor and keep latest-fixed promotion and shared
+object transitions ahead of it; schedule larger direct source sizes first as
+a space-release heuristic, not as a claim about exclusive or reclaimable
+bytes. No scheduling turn waives the child's gates.
+When the exact just-recorded failure identifies the shared publication owner,
+probe its existing lock without creating it or retaining it: wait at most five
+seconds, check higher-priority handoffs during that wait, and otherwise yield
+to the normal timer. Other lock failures keep their own retry behavior.
+For several ready public retirements, this owner may cache a bounded map of
+their exact object names to catalog-named manifests in the E workspace. Build
+the map by one complete catalog scan and bind it to the fixed catalog identity
+and generation; a missing, incomplete, stale, or oversized cache falls back to
+the full scan. Cache preparation excludes only entries whose exact original
+queue identity is still within a finite retry window for the same retirement
+implementation; missing, invalid or changed hints are treated as ready. This
+is only a metadata optimization: the retirement still
+revisits catalog-omitted manifests, performs the fresh manifest census under
+the original publication lock, and rechecks current heads, pins, processes,
+generation and all other owner locks before any unlink. It supplies no new
+payload readback, independent recovery, or NAS-acceptance evidence.
+For a public history sweep, another fixed D manifest in the same dataset may
+provide positive evidence that its referenced objects must remain. The sweep
+collects at most four stable witnesses and scans the complete catalog for all
+unwitnessed objects; the catalog completeness gate still applies when there
+are no unwitnessed objects. Under the original final owner it rechecks witness
+identity and generation alongside the fresh manifest census, heads, pins,
+readers and journal. A witness authorizes retention only, never deletion, and
+does not establish independent recovery or NAS acceptance.
+Cross-authority streaming-pin resolution accepts the legacy manifest-SHA name
+and the current stage-scoped name only when its stage hash and exact manifest
+binding match the existing streaming-pin contract. A malformed or unresolved
+pin remains an error and never authorizes retirement.
+If an old public history-sweep anchor has disappeared without a verified
+successor, the original owner may report an empty history only when no journal
+is unfinished and the locked census finds exactly one valid current head and
+its sole manifest. Record the missing anchor and observed head distinctly;
+this is a no-unlink observation, not lineage, value equality, or recovery
+proof. Multiple manifests, ambiguous heads, or unfinished journals still fail
+closed and retain the original work.
+The final manifest census may batch up to 512 no-follow metadata checks with
+at most eight workers, preserving directory-order results and the same regular
+file, generation and reference checks. If a new pin makes the protection
+census incomplete, re-resolve exact pins in both authorities after the live
+public census; an unresolvable or malformed pin still blocks retirement.
+The private stream replaces its one existing local-only publisher head and
+must not notify or export the public transport. After its exact D commit, its
+private reference census may retire the superseded encoding and unpinned
+private histories with per-batch journals; public and private stream pins in
+the shared protection namespace must each resolve to their exact manifest.
+The running Shioaji capture and its C service directory are not part of this
+old D release retirement. A sealed E archive alone does not authorize the
+current D head or its still-referenced objects to be removed by this workflow.
+After that exact retirement, the same bounded owner may also retire older
+unpinned, non-head versions of this dataset, per the user's instruction that
+unused incremental versions need not be retained. Record the version, manifest
+and object identities, retain objects referenced by a remaining manifest, and
+preserve current heads, research pins and active readers. Older revisions may
+contain observations absent from the latest version; this choice does not
+claim their recovery or NAS backup and must be visible in the migration status.
+When D cannot fit the replacement yet, the same history owner may start this
+bounded historical-version retirement after the complete source-hashed E
+preparation, before installing it on D. Under the original locks, recheck that
+all prepared E generations still match and that the original D head is still
+current; this historical sweep never retires that head or objects it references.
+Record a separate resumable journal for this pre-install phase. If that does
+not free enough capacity, the separately journalled E-first current-head
+exception below may proceed only after its additional checks pass.
+`stockagent-prepared-stream-install.timer` independently selects a sealed E
+generation for installation when another dataset's long E build occupies the
+main queue. It invokes the same stream repacker and original dataset/global
+publication locks, checks the remaining encoded bytes plus the D write reserve,
+and uses a separate per-dataset progress journal. A busy owner, malformed
+candidate or capacity shortage must not prevent another ready generation from
+being considered. Only a matching durable publication receipt means committed;
+the two queue observations do not authorize a second installation of the same
+generation. The monitor reports the actual install phase and its own owner,
+instead of retaining an earlier capacity-blocked status.
+When a sealed build needs D capacity, the main build queue leaves any older
+unpinned-history sweep to the existing independent retirement timer. The
+retirement queue discovers the exact sealed generation, uses its one existing
+owner and the original locks, and honors the sweep's own retry clock; it must
+not select an entry still marked as running by an older build worker. A
+prepared-history sweep preserves the current D head and is displayed as a
+separate phase, not as direct retirement or D publication. The worker already
+running before this scheduling change may finish its old inline sweep first.
+For a capacity-blocked sealed generation, or a sealed generation waiting for
+another publisher's current head, the prepared installer may create a
+local-only temporary packed head directly over the existing E stage files,
+without copying or reading back payloads. Both the E volume and D mount guards
+apply. An interrupted `preparing` metadata journal resumes on the next cycle.
+This is a usable E view under the
+`temporary_e_authority.borrow` reader lock, not a D publication or automatic
+standard-reader switch. The sealed view alone does not authorize D removal. The
+stream installer must withdraw that exact view under an exclusive reader lock
+after its D replacement has committed and its installed generations match,
+then retire the E stage; interrupted metadata withdrawals resume by journal.
+Under the user's subsequent E-first instruction, the prepared installer may
+additionally reclaim this fixed current D head's exclusive objects before D
+installation if both E sealing and its temporary view are ready, the head is
+the single Penguin publisher, and the complete manifest-reference census,
+other research/materialization pins, active processes and original locks
+permit it. Its own exact stream pin remains; the original inventory, manifest
+and head metadata remain until the new D head commits. Journal each bounded
+batch and resume incomplete relief before allowing installation or E cleanup.
+Until D publication, ordinary reads of the old D version can fail; report that
+explicitly, preserve the sole E copy and do not call it D/NAS acceptance. This
+exception does not require a new backup or independent payload readback.
+The same E-first exception applies to the explicitly enrolled private stream
+datasets only when the sole fixed head retains its original publisher. The
+original public and private global owners, dataset publisher and installer
+locks all apply; census private manifest dependencies, formal study pins and
+active readers, and retain objects with additional hardlinks. Bind the E-only
+journal and completion receipt to the private authority, and give that exact
+generation the next available D writer until committed. After publication,
+the existing private retirement owner reconciles only removals recorded in the
+completed matching relief journal. This does not claim independent recovery,
+NAS acceptance or service readiness while the old D payload is unavailable.
+For a fixed legacy Vast bulk release blocked by a second D landing hardlink,
+the E-first owner may journal and remove only a landing name proven to be the
+same two-link inode as the original D blob, after matching the sealed E and
+original inventories, the exact bulk publication and receipt, and the original
+bulk coordinator, ingress, publication, install and process guards. This name
+removal alone reclaims no allocated bytes and leaves the D blob in place. The
+existing relief owner must then independently recheck current head, references,
+pins, processes and physical capacity before retiring the D object. Resume only
+durable exact unlink intents; changed or additional links stay. The bulk owner
+defers the matching scope while this migration journal exists; that deferral is
+neither remote retirement nor independent D/NAS recovery. See the [bulk landing
+handoff](../storage_e_first_repack_2026-11-07.md#2026-11-09舊-vast-回傳硬連結與-d-容量).
+After the exact replacement D head is committed, the original bulk coordinator
+may also retire its one or two exact recorded names for a whole received compressed carrier
+when the small ordered part plan is SHA-bound to the publication and replacement
+inventory, the original received inode predates that publication without later
+change, and the exact D install signatures, original owners, active-process and
+trading-priority gates pass. Capture only that bounded plan metadata while E is
+sealed, or select-read the small plan from its committed D pack; no full payload
+readback or extraction is added. Journal the exact names with
+durable intents and count allocated bytes once at the final unlink. The original
+transport completeness or failure labels remain unchanged; this is not proof
+that an incomplete incoming scope became complete, nor D/NAS independent recovery.
+The stream installer and the two handoff installers share a nonblocking
+`migration/cold-install-write-owner.lock` for D admission through head commit.
+They must acquire it only after E preparation, then remeasure D free space;
+E preparation and metadata work remain independent. This coordinates these
+three migration paths, not unrelated D writers; per-object reserve checks
+still apply. Once E-first relief has begun, both handoff queues give the next
+available D writer to that exact source until its D publication receipt exists;
+an already-running writer completes under its existing owner. A pre-existing
+process loads this change on its next run and must not be interrupted merely
+to obtain the new lock.
+For the fixed public `binance-public-archive` manifest
+`5288d22ed33fc707497278c7ce218b56b67a35b98277b7cab69542f01445cf35`
+and private `local-tw-index-derivatives-ticks` manifest
+`5e015fa56b850933a460a020095e837d8953e8307f9824afe1709a43fdcc0a21`,
+the user's released backup reserve permits these two exact migrations to
+borrow part of the earlier margin while keeping a 12 GiB D physical free-space floor.
+The prepared installer passes that exact scoped value through the immutable
+object installer to the Windows native binary writer; that writer also checks
+the floor during a long object write. All other generations, authorities and installers retain the
+32 GiB floor. This is not a guarantee that unrelated D writers cooperate;
+if they consume the margin the transaction must wait with its E packs and
+journal intact. Record actual head publication and retirement separately.
+For the separate public `binance` manifest
+`ce0f8747ca4da7b6f18184711a702d2a67e0fd81549f4384fc86e56aa77e28b8`,
+the same user-released backup reserve permits an 8 GiB floor while its
+temporary E-only generation returns to D. This one exact scope does not change
+the floor of any other generation; admission and native per-write checks remain.
+When a Windows sharing/permission error prevents unlinking one already-planned
+old object, finish the other exact objects in that same durable pending batch,
+fsync their directories, and retry the batch without marking it complete. A
+blocked manifest or history is not skipped: its references must be retired
+before any following objects. Unknown errors and changed generations still
+fail closed.
+For new native stream installs, bind the newly created empty incoming name and
+inode to the exact prepared-object journal before sending bytes. After an
+interrupted writer, the original installer may reconcile only that inode under
+the shared install and dataset owners, with process checks and a durable unlink
+intent, before remeasuring admission. A complete hardlinked target is retained;
+removing its incoming alias reclaims no allocation. The prepared queue may
+dispatch this exact reconciliation even if its previous free-space measurement
+was insufficient. Old partials without that binding are not swept by name.
+The source-local repack and prepared-install services may run for up to eight
+hours per invocation instead of restarting every 118 minutes. Their existing
+start admission remains; a bounded process-group wrapper stops a long or
+stalled child by 08:00 before the next verified or conservatively assumed
+Taiwan trading session. Already-running owners keep their current process; new
+unit definitions apply without forcibly restarting them. Completed pack and
+install journals remain the resume boundary. The worker also checks the
+wall-clock guard during progress so a suspended host returning during the
+protected interval yields promptly; use the official calendar, including an
+exceptional weekend session, and treat unknown calendar evidence as protected.
+The source-local repack owner may start the next fixed dataset immediately
+after recording a successful publication, up to four attempts or three minutes
+of starting work. Every dataset releases its original owner before the next;
+an idle queue, busy lock, retry or mismatch ends the batch and yields to the
+existing timer. Recheck the trading guard before each attempt. A time bound
+never interrupts the current dataset or overrides the outer trading deadline.
+After a WSL reboot, Linux `st_dev` can change for the same enrolled E, D or C
+service volume. Reuse an existing generation only when the volume identity
+guard succeeds and the remaining recorded inode, size, clocks and other
+generation fields match exactly. Unlocked, otherwise valid old capacity leases
+for the same root inode may be reaped after device renumbering; active or
+malformed leases still fail closed. The one-minute monitor guardian starts the
+existing observer only when it is absent; it does not restart an active owner.
+An obsolete public object name may have another hardlink in private history.
+Unlink only the selected public name after the same reference and process
+checks; do not unlink the private name. Count its removed logical bytes, but
+count no reclaimed allocation while another hardlink exists.
+
+For the six explicitly enrolled Coin Metrics, keyed public catalogs, crypto
+reference, Dune crypto, crypto ETF and crypto public context handoffs, the user authorized
+retirement of the retained C payload after source-hashed dataset packaging on
+E, without another backup or independent payload readback. Bind every source
+member to the fixed private D inventory and the original handoff copy index;
+hold the existing handoff/writer locks, reject active C readers, and journal
+each pending unlink before applying it. Keep the original C root and collector
+lock inode so the existing mount and boot owner still work. The E packages are
+not a new D head, an independent recovery, or NAS acceptance. An independent
+timer commits each sealed E package to the existing private D authority without
+public export and then journals removal of its exact E working copies. A third
+timer may retire the superseded private D encoding only after the new head,
+metadata reference census, research/reader checks and the existing private
+publication/backup locks permit it. A busy owner defers the operation; never
+force its lock. Do not generalize this enrollment to other providers without
+their own source/lock scope.
+
+The separately enrolled Frankfurter, Binance, Binance public archive and OKX
+retained C generations do not equal their current D manifests. Their index
+archive owner may seal those exact C generations on E directly against the
+fixed handoff SHA index, then journal retirement of their C payloads while
+retaining every specified original collector/quality lock. The active E
+collector keeps its own locks; the handoff owner fences alias changes. Respect
+the heavy-source trading window and preserve interrupted pack and unlink
+journals. The separate `handoff-index-d` owner may install a sealed E archive
+as a distinct local-only D private-history head for the same dataset and then
+retire that exact E staging generation. It does not replace the public D head,
+export the private snapshot, or imply that the different generations have been
+merged. Validate the source-index identity, every E and D install generation,
+and preserve both heads and all user-required pins; reconcile interrupted
+installs and E retirement. Actual merging and deduplication remain separate.
+
+2026-11-06 user-directed migration exception: pause the four recorded backup
+timers while the migration is underway, and do not require a new NAS ACK,
+destination re-read, or decompression test before handing off an individual
+old D object to E. The bounded `stockagent-d-cold-e-handoff` owner hashes the
+source while copying, durably writes the original encoded object and exact E
+generation, and only unlinks the exact D name when the canonical publisher,
+backup and replication locks, fresh manifest-reference check and process/FD
+checks permit it. It currently admits only objects unreferenced by every
+visible release manifest. E keeps the original object; this is a one-copy
+intermediate handoff, not an independent readback, a complete dataset repack,
+or authorization to remove a referenced object or the E copy. Journal every
+name and reconcile interrupted handoffs before proceeding. The earlier
+backup/restore conditions below continue to govern other deletion workflows.
+
 Read before publication, synchronization, materialization, migration, or cleanup. The destructive-operation gates below remain mandatory; reorganizing instructions does not authorize deletion.
 
 2026-11-02 placement update: services, ledgers, SQL and control indexes remain
@@ -11,6 +627,44 @@ Earlier C temporary/D transport placement examples describe older generations,
 not a direction to create new bulk work there. Historical fixed plans and D
 recovery identities remain unchanged. See
 [C/E/D layout and measured scope](../storage_c_e_d_layout_2026-11-02.md).
+
+The canonical source handoff owner explicitly enrolls the ETF, Coin Metrics,
+crypto public context, Dune crypto, keyed public catalog and crypto reference
+roots, plus Frankfurter FX, the Binance market workspace and the separately
+reviewed Binance public archive. Each retains its original `.download.lock`, fixed E
+copy and private per-source journal. Frankfurter's independent `official_v2`
+writer also retains and fences its own lock on both sides of the handoff.
+Binance additionally fences the existing 1m, 15m and daily grain locks on both
+source generations; its collector and daily materializer check the alias before
+and after acquiring the original writer lock. New Binance SHA scans start only
+outside the protected Taiwan session with an eight-hour opening runway, and
+in-flight scans yield between members before the opening window. Boot repair
+of an already exchanged alias remains available. This enrollment does not
+itself authorize C retirement or prove D/NAS acceptance.
+The public archive's original fixed E copy predates its writer lock. Only for
+that named source, both sides may add a pinned empty `.download.lock`; the
+supplemental proof is permitted only if the fixed index proves that name was
+absent. Preserve the original root inode,
+ownership and mode, compare every other source/E path with the unchanged index,
+and freshly hash all source and destination files before either exchange or
+resume. Recheck both root and lock generations through the full scan. A later
+copy that already indexes its lock keeps the normal exact-root verification.
+Verify complete C/E namespaces and full-file SHA
+under both original locks before exchanging the retained C directory for an
+immutable placeholder; attach the exact E inode in every pinned consumer mount
+namespace and independently read it back. Enrolled source collectors check the
+journal and E mount before starting and after acquiring the original lock;
+where a collector uses a supplied locked handle, its device and inode must
+still match the current `.download.lock`. The boot
+owner repairs journalled aliases; missing E or an incomplete exchange blocks
+writes instead of creating new C data. The source SHA-recheck counters are
+transient phase observations, not acceptance or permission to retire C. One
+blocked source must not prevent other enrolled sources from advancing.
+An identified `move_mount` ENOENT may be retried for the same namespace at
+most twice after a fresh census. Persistent or unrelated failures still block;
+never treat an unverified namespace as attached.
+Other source roots require their own reviewed writer, reader and boot contracts
+before enrollment; staging-copy receipts alone do not authorize a cutover.
 
 The original D-to-E sender placement owner may hand off its exactly identified,
 unreachable legacy transport bind in an inherited service namespace. Pin the
@@ -36,6 +690,30 @@ apart. Only `PublicationOwnerBusy` is a normal wait; admission/body errors count
 toward the original bounded retry budget. This observation never renews source
 progress or acceptance. Require the exact candidate/loaded code identity,
 preserved workflow chains, and unchanged PG/Temporal before reporting success.
+The sender/GC boundary returns to the same timer after 60 seconds of waiting,
+with every partial lock released, so placement/code eligibility is rechecked.
+An incomplete process-namespace census may be reobserved at most three times;
+only a complete fresh pass can qualify it. Persistent visibility errors block.
+The sender's cooperative wait records its purpose. A namespace cutover or a
+fresh, bounded drained-worker handoff may yield the next full catalog capture;
+independent retirement of old D transport names must not veto new backup waves.
+Keep this purpose through the timer's outer exception receipt. A wait on the
+independent SQL catalog owner must not pause a stream that cannot release that
+lock. Explicitly authorized active-worker reloads use the original code-only
+transaction, retained checkpoints and complete publication boundary; automatic
+timer handoffs keep their default drained behavior.
+Receipt ingestion remains first. This scheduling hint never bypasses actual
+mount/capacity, publication, recovery or retirement admission, never releases
+another owner's locks and never renews source or NAS acceptance clocks.
+
+The shared catalog export/restore row digest may sort unique leading metadata
+keys once when current SQL, host and visible cgroup headroom admit it. Confirm
+uniqueness in SQL ordering semantics as well as Python (including collation
+ties), retain every original column/canonical byte, and keep the original paged
+or full-order fallback for unknown memory, invalid keys or old restore capsules.
+An engineering resource observation never changes production limits or proves
+full export/NAS acceptance. Native complete-row measurements and deployment are
+in the C/E/D report above.
 
 Existing canonical D CAS objects of 64 MiB through the native reader's 8-GiB
 member bound may use its full-SHA Windows reader for immutable-name reuse.
@@ -111,8 +789,15 @@ coordinated code, config, test, and documentation change.
   persistent SSH RPC on the enrolled endpoint, defaulting to anonymous buffers.
   Explicit `remote_spool` enrollment may instead retain SHA-addressed compressed
   jobs in a private, disposable Vast compute cache with physical reserve,
-  per-object locks and seven-day retention. Only owned cache pairs may expire;
-  no source or training tree is retired. Speculative jobs have no inventory
+  per-object locks and seven-day normal retention. Explicitly enrolled pressure
+  recovery may retire a private disposable pair earlier only after the owner
+  resolves a fixed D release with complete independent reconstruction evidence,
+  freshly hashes the unchanged D object under the original shared retention
+  lease, acquires its remote per-object lock and checks process references.
+  Use a bounded 16 GiB source batch, preserve durable per-object intent/results,
+  and stop on an unknown remote outcome; report reclaimed cache bytes separately.
+  A speculative cache hit alone is not evidence that D was re-read. No source,
+  training tree or NAS copy is retired. Speculative jobs have no inventory
   acceptance. Reuse requires a fresh full D encoded SHA and unchanged source
   generations, a fresh remote encoded SHA, identical worker/helper code and boot,
   and the exact final inventory's ordered original SHA/size commitment. Return
@@ -124,6 +809,11 @@ coordinated code, config, test, and documentation change.
   The separately scheduled compute consumer reads already sealed CAS packs;
   it never publishes, adopts heads or replaces the original backup owner.
   See [the measured staging pipeline](../vast_pack_staging_pipeline_2026-11-01.md).
+  Speculative upload's native source stream has a 120-second inactivity bound,
+  including before its first byte; an outer SSH deadline cannot interrupt a
+  blocking source read. A timeout fails that exact job and closes only its
+  read-only child/RPC, retaining original D objects and durable completed proofs.
+  Never convert it into EOF, checksum success or a retry after partial output.
   A closed complete cohort may retain its original SHA/CRC computations only
   after a fresh full encoded-object SHA pass and unchanged object generations.
   Match the exact manifest, ordered original SHA/size commitments, worker,
@@ -150,6 +840,14 @@ coordinated code, config, test, and documentation change.
   authority is created; this is explicit full-recovery policy, not a default
   replacement for partial fetch, materialization or source retirement.
   See [cooperative verification](../cooperative_packed_verification_2026-10-31.md).
+- Cold backup census may list canonical CAS names through the same pass-local
+  no-follow directory FDs, avoiding a second file-type query for referenced
+  leaves. Every selected referenced object still receives its fresh signature;
+  every newly discovered unreferenced leaf still requires a regular-file
+  observation. Retain final ancestor/root rechecks and original noncanonical
+  namespace diagnostics. ENOTDIR from a no-follow symlink must not be treated
+  as an ordinary file. Name enumeration is neither content verification nor
+  source/NAS/retirement acceptance; scope timing claims to the measured step.
 - The user's 2026-10-31 placement separates produced artifacts from running
   services. Mutable ledgers/status, service caches and active worksets belong
   under the checkout's `service_data/`; `artifacts/` holds produced results and
@@ -170,13 +868,17 @@ coordinated code, config, test, and documentation change.
   These observations do not change raw capacities or application reserves. Offline
   VHD compaction is separate and never represented as an online resize/free-space
   equality. See [placement and backing capacity](../service_storage_layout_2026-10-31.md).
-- Storage roles follow the user's 2026-10-25 single-authority design: Penguin
-  C/WSL holds resumable increments, mutable control/SQL/ledger and bounded
-  active service/research worksets; D owns immutable source history. Existing
-  C histories remain protected until their canonical writers/readers have
-  switched and exact cold recovery and retirement gates pass. A role target
-  does not prove that old raw workspaces have migrated. See
-  [role and tier acceptance](../storage_roles_and_tiers_2026-10-25.md).
+- The user's 2026-11-04 placement supersedes the earlier C increment/D primary
+  recommendation: C/WSL keeps services, environments, mutable control/SQL and
+  execution ledgers; E owns downloaded data and preparation/verification work;
+  D retains sealed recoverable backups, with lab203/NAS off-host. Existing D
+  release bytes, identities and the canonical publication owner remain intact
+  during this transition. Existing C histories remain protected until their
+  canonical writers/readers have switched and recovery/retirement gates pass.
+  Large histories inside `service_data/` are not service dependencies by name.
+  A role target does not prove migration, source deletion or VHD compaction.
+  See [E primary placement and native capacity maintenance](../storage_e_primary_capacity_2026-11-04.md)
+  and [existing tier acceptance](../storage_roles_and_tiers_2026-10-25.md).
 - Storage monitoring keeps three clocks separate: each minute's metadata check,
   the original work counter/report, and fixed-version acceptance. A fresh
   `checked_at_utc` is a new status read, not a worker heartbeat, rate sample,
@@ -190,6 +892,19 @@ coordinated code, config, test, and documentation change.
   from a hidden tab. Source/ACK validity, capacity, pins and recovery gates
   retain their original rules. See
   [minute-clock evidence](../storage_automatic_continuation_2026-10-31.md).
+  A separately recorded provider exception observation may override a running
+  projection only while its exact intent/progress SHA and original parent/child
+  PID, start ticks and boot still match. Keep its observation clock distinct
+  from work and acceptance. New progress/processes/plans or accepted receipts
+  supersede it; never use it for retries, source mutation or deletion admission.
+  Optional recursive C/E classification yields during an enrolled provider
+  workspace handoff, while capacity/runtime/work observations continue. Bind
+  classification fingerprints to provider placement so the original observer
+  rechecks the changed layout after handoff, without a new census executor.
+  After accepted E copy/alias handoffs, bounded checks of enrolled retained C
+  roots report presence only. Missing names and copied logical bytes prove
+  neither C retirement nor freed allocation. Show pending retirement separately
+  without a finite ETA until its own owner/recovery/reference evidence exists.
 - The same minute observer projects the enrolled backup/return/maintenance
   timers and continuous lifecycle owner, fixed-version phase dependencies,
   service failures and observed kernel-lock waiters. Two bounded systemd
@@ -256,7 +971,19 @@ coordinated code, config, test, and documentation change.
   merely the same `st_dev` across bind mounts. Direct disposable deletion is
   reported separately from independent recovery/NAS acceptance; a re-created
   target is protected and cannot borrow the old disposal authorization.
-  The original source-replication owner may reuse a bounded four-field
+- The 2026-11-06 D workflow benchmark disposition applies that user's waiver
+  only to the two fixed, individually reviewed lists under
+  `configs/data_sync/d_workflow_trial_*_disposition_20261106.json`. The D
+  workspace is not the cold CAS: verify its original mount, preserve the
+  round's bound comparison receipt, and reuse the same process/config/inode,
+  pin, mutation-owner, quarantine and final-link gates. Never use this policy
+  to delete a cold CAS object, source dataset, NAS object, or new generation.
+  A partially unlinked quarantine may roll forward only when its surviving
+  paths and inodes match the fixed journal and consumers remain absent; report
+  earlier unmeasured freed blocks as unknown. A durable `unlink_finished`
+  journal permits recovery across final empty-directory removal. See
+  [migration evidence](../storage_migration_progress_2026-11-06.md).
+- The original source-replication owner may reuse a bounded four-field
   scheduling projection of completed local transport-retirement audits. Each
   hit rechecks inode/type/uid/link/size/mtime/ctime; changed or absent files
   invalidate reuse, and unfinished audits are not cached. This cache supplies
@@ -487,8 +1214,15 @@ coordinated code, config, test, and documentation change.
 - Bound publication metadata as well as payload buffers. Consume already
   validated prior-file reuse hints once and release their rows progressively.
   The shared `packed_metadata.MetadataRows` keeps small inventories in RAM and
-  spills larger ones to its own private disposable `/var/tmp` SQLite index,
-  with a bounded page cache and free-space floor. Do not spill to penguin's
+  spills larger ones to a private disposable SQLite index, with a bounded
+  page cache and free-space floor. On penguin with an enrolled E workspace,
+  new indexes use E's guarded `verify` role, with physical/guest admission and
+  at most one native backing recheck per minute. Missing or redirected E fails
+  closed; nodes without E enrollment keep `/var/tmp`. Existing live C indexes
+  finish under their original owner and are never moved while open. Explicit
+  failed-index retirement accepts either the original `/var/tmp` parent or the
+  still-enrolled E `verify` parent, preserving all original proofs below.
+  Do not spill to penguin's
   `/tmp` tmpfs or treat scratch indexes as authorities. Publication, full-file
   verification and full fetch reuse the streaming/indexed inventory; cap new
   ZIP member counts as well as payload bytes. First-baseline small files with
@@ -1665,6 +2399,15 @@ catalog credentials or hard-code an interpreter path.
   foreign targets and unknown partials. Reuse matching permissions without
   changing ctime; do not chmod another consumer's shared inode. These barriers
   establish the storage API contract, not physical power-loss or GPU acceptance.
+  The same owner registers every original and historical input recipe's exact
+  dataset, snapshot and manifest SHA in its monotonic rescue source-reference
+  registry before exposing a new specification or revision. Registration and
+  retention use the existing publication/retention inode. An absent source is
+  still registered so it is protected if restored; it does not block retirement
+  of unrelated sources or establish that its objects exist. Corrupt or missing
+  enabled registry metadata fails retention closed. The rescue cycle reports
+  its D-capacity wait separately from the timer heartbeat; it does not turn
+  this identity registry into payload, recovery, or NAS acceptance evidence.
   Keep bounded transport stderr private. Runtime proof `raw_readlink_v2` stores
   literal link targets; old unmarked proofs retain their original Path-normalized
   comparison rule without rewriting historical archives or metadata.
@@ -2852,6 +3595,23 @@ catalog credentials or hard-code an interpreter path.
   in-process rebuild retry or automatic early eviction. These remain
   cooperating-writer safeguards, not an OS quota or an accepted retention/GC
   policy. See [daily incremental evidence](../dashboard_daily_incremental_2026-10-20.md).
+- The protected day-trade source unit may use backup headroom for a bounded
+  official-symbol refresh: only the canonical live `data_tw_public/stocks`,
+  `tw_official_source_groups` parser cache and its explicit `merged` cache are
+  admitted, with at most 1 GiB requested growth per reservation and a 4 GiB
+  physical backing floor. The unit must opt in with
+  `STOCKAGENT_TW_DAY_TRADE_PRIORITY_SOURCE=1`; guest reserve remains 25 GiB,
+  all concurrent leases and actual backing capacity are still counted, and
+  every write retains its generation budget. Larger writes, other paths and
+  ordinary providers keep their existing floors. This restores the small
+  shared source dependency without authorizing an oversized Factorized build
+  or changing its source-generation contract.
+  The two already-enrolled protected Factorized prepared/panel roots use the
+  same 4 GiB physical emergency floor, following the user's trading-first
+  reservation policy. Their existing full generation growth budgets, namespace
+  caps, 25 GiB guest floor and concurrent leases remain mandatory; this is
+  permission to spend part of backup headroom, not permission to exceed actual
+  free backing capacity or to apply the exception to other paths.
 - Cache GC may delete only managed materialized versions.  It must never delete
   `/srv/stockagent-packed`, a canonical producer source, an active artifact, or
   an unmanaged directory. It must never act as cold-object GC. Former C cold

@@ -37,6 +37,13 @@ def test_private_signal_route_forwards_zero_target_display_filter() -> None:
     handler.path = "/api/signals?hide_zero_targets=true"
     handler.do_GET()
     assert responses[-1][0] == HTTPStatus.BAD_REQUEST
+    handler.path = "/api/signals?revision_scope=latest"
+    handler.do_GET()
+    assert responses[-1][0] == HTTPStatus.OK
+    assert calls[-1]["revision_scope"] == "latest"
+    handler.path = "/api/signals?revision_scope=old"
+    handler.do_GET()
+    assert responses[-1][0] == HTTPStatus.BAD_REQUEST
 
 
 def test_json_response_reports_preparation_and_serialization_timing() -> None:
@@ -68,6 +75,75 @@ def test_disconnected_dashboard_client_does_not_raise() -> None:
     handler._send(HTTPStatus.OK, b"{}\n", "application/json")
 
     assert handler.close_connection is True
+
+
+def test_status_and_summary_do_not_rehash_a_live_legacy_signal_prefix(tmp_path, monkeypatch):
+    from stockagent.live import paper_journal
+    server = object.__new__(DashboardServer)
+    server.state_dir = tmp_path
+    server.preopen_readiness_path = None
+    server.session_indexes_ready = threading.Event()
+    server.session_indexes_ready.set()
+    (tmp_path / "signals.jsonl").write_text("legacy append-only signals\n")
+    observed = []
+    def collect(**kwargs):
+        observed.append(kwargs["include_ledger_session_dates"])
+        return {}
+    monkeypatch.setattr(dashboard_server, "build_dashboard_snapshot", collect)
+    monkeypatch.setattr(dashboard_server, "build_dashboard_summary", collect)
+    server.snapshot()
+    server.summary()
+    assert observed == [False, False]
+    # Once canonical immutable append lineage is enrolled, complete counts
+    # remain available; the performance fix is not permanent count removal.
+    monkeypatch.setattr(paper_journal, "managed", lambda _path: True)
+    server.snapshot()
+    server.summary()
+    assert observed == [False, False, True, True]
+
+
+def test_status_avoids_display_only_order_fill_row_reads(tmp_path, monkeypatch):
+    server = object.__new__(DashboardServer)
+    server.state_dir = tmp_path
+    server.preopen_readiness_path = None
+    server.session_indexes_ready = threading.Event()
+    captured = {}
+    monkeypatch.setattr(dashboard_server, "build_dashboard_snapshot",
+                        lambda **kwargs: captured.update(kwargs) or {})
+    server.snapshot()
+    assert captured["include_order_fill_rows"] is False
+    assert captured["include_position_rows"] is False
+
+
+def test_indexing_one_legacy_source_does_not_block_another(tmp_path, monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from contextlib import contextmanager
+    from stockagent.live import tw_day_trade_dashboard as module
+
+    signals, marks = tmp_path / "signals.jsonl", tmp_path / "marks.jsonl"
+    signals.write_text('{"session_date":"2026-01-02"}\n')
+    marks.write_text('{"session_date":"2026-01-02"}\n')
+    started, release = threading.Event(), threading.Event()
+    original = module.open_paper_journal
+
+    @contextmanager
+    def reader(path, *args, **kwargs):
+        if path == signals:
+            started.set()
+            assert release.wait(timeout=4)
+        with original(path, *args, **kwargs) as stream:
+            yield stream
+
+    monkeypatch.setattr(module, "open_paper_journal", reader)
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first = pool.submit(module._ledger_session_index, signals)
+        try:
+            assert started.wait(timeout=2)
+            second = pool.submit(module._ledger_session_index, marks)
+            assert "2026-01-02" in second.result(timeout=2).spans
+        finally:
+            release.set()
+        assert "2026-01-02" in first.result(timeout=2).spans
 
 
 def test_dashboard_serves_fast_summary_while_large_indexes_warm(

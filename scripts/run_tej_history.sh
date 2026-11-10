@@ -17,7 +17,7 @@ export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 export MKL_NUM_THREADS="${MKL_NUM_THREADS:-1}"
 # Preserve acquisition headroom before the desktop owner starts. Its existing
 # per-query guest free-space gate continues to apply during a running session.
-until run_fintech_python "$tej_repo_root/scripts/check_acquisition_capacity.py" --path "$tej_repo_root"; do
+until run_fintech_python "$tej_repo_root/scripts/check_acquisition_capacity.py" --path "$tej_repo_root/data_tej"; do
   sleep 60
 done
 tej_python_bin="$(resolve_fintech_python)"

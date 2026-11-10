@@ -105,15 +105,19 @@ def require_collector_owner(source: Path, descriptor: int) -> None:
 def collector_owner(source: Path, dataset: str):
     """Use the same catalogued exclusive owner for manual and scheduled runs."""
     from scripts.publish_data_releases import _source_coordination_lock
+    from stockagent.data_sync import workspace_source_handoff
     source = source.absolute()
+    workspace_source_handoff.guard_path(source)
     source.mkdir(parents=True, exist_ok=True)
     source = _root(source)
     entry = {'dataset': dataset, 'source': str(source),
         'source_coordination_lock_scope': 'source_parent',
         'source_coordination_lock': f'{source.name}/{LOCK}'}
     with _source_coordination_lock(entry) as descriptor:
+        workspace_source_handoff.guard_path(source)
         require_collector_owner(source, descriptor)
         yield descriptor
+        workspace_source_handoff.guard_path(source)
         require_collector_owner(source, descriptor)
 
 

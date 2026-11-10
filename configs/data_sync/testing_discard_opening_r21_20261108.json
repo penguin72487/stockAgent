@@ -1,0 +1,16 @@
+{
+  "contract": "explicit-local-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "User authorized deletion of old performance-validation data; preserve the associated summary and failure receipts.",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/remaining_paths_a1_v31.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/remaining_paths_b1_v31.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/remaining_paths_b2_v31.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/remaining_paths_a2_v31.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/remaining_paths_control_v32.json", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/tw_opening_latest_standard_20261022/analysis_round21/remaining_paths_candidate_v32.json", "kind": "file", "reason": "benchmark"}
+  ],
+  "identity_sha256": "72da6c7091dc6a35265e295b7d6fd57104403be952ab04cc5ec6fe81f464163b"
+}

@@ -3818,7 +3818,9 @@ def load_prices_csv(
 ) -> PriceSnapshot:
     import polars as pl
 
-    frame = pl.read_csv(path)
+    # Security identifiers are text, even when every value happens to be
+    # numeric. Schema inference would silently turn e.g. 0050 into 50.
+    frame = pl.read_csv(path, infer_schema_length=0)
     columns = {name.lower(): name for name in frame.columns}
     symbol_col = columns.get("symbol") or columns.get("code") or columns.get("ticker")
     price_col = (
@@ -3866,11 +3868,15 @@ def load_prices_csv(
         )
         if column is not None
     ]
-    lookup = {
-        str(row[symbol_col]).strip(): row
-        for row in frame.select(value_columns).iter_rows(named=True)
-        if str(row[symbol_col]).strip()
-    }
+    lookup = {}
+    for row in frame.select(value_columns).iter_rows(named=True):
+        raw_symbol = row.get(symbol_col)
+        symbol = str(raw_symbol).strip() if raw_symbol is not None else ""
+        if not symbol:
+            continue
+        if symbol in lookup:
+            raise ValueError(f"duplicate prices CSV symbol: {symbol}")
+        lookup[symbol] = row
     prices = np.asarray(fallback_prices, dtype=np.float64).copy()
     available = np.zeros((len(symbols),), dtype=bool)
     open_prices = np.full((len(symbols),), np.nan, dtype=np.float64)

@@ -1,10 +1,41 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
+import fcntl
 
 import polars as pl
+import pytest
 
 from downloader import download_free_public_context as public
+from stockagent.data_sync.desync_snapshots import SnapshotError
+
+
+def test_downloader_holds_source_lock_and_checks_handoff_on_both_sides(tmp_path, monkeypatch):
+    calls = []
+    monkeypatch.setattr(public, 'parse_args', lambda: SimpleNamespace(output_dir=str(tmp_path)))
+    monkeypatch.setattr(public, 'guard_path', lambda path: calls.append(Path(path)))
+    def run(_args):
+        with (tmp_path / '.download.lock').open('a+') as handle:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        calls.append('capture')
+    monkeypatch.setattr(public, '_run', run)
+    public.main()
+    assert calls == [tmp_path, tmp_path, 'capture']
+
+
+def test_downloader_does_not_write_if_handoff_changes_while_locking(tmp_path, monkeypatch):
+    checks = iter((None, SnapshotError('mount changed')))
+    monkeypatch.setattr(public, 'parse_args', lambda: SimpleNamespace(output_dir=str(tmp_path)))
+    def guard(_path):
+        value = next(checks)
+        if value is not None:
+            raise value
+    monkeypatch.setattr(public, 'guard_path', guard)
+    monkeypatch.setattr(public, '_run', lambda _args: pytest.fail('collector wrote after alias changed'))
+    with pytest.raises(SnapshotError, match='mount changed'):
+        public.main()
 
 
 def _spec(adapter: str, dataset: str = "test") -> public.DatasetSpec:

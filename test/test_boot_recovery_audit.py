@@ -18,6 +18,7 @@ def scene(tmp_path, monkeypatch):
               'timer_schedule_findings': [], 'product_probes': {'health': 'blocked'}}
     units = {unit: {'ActiveState': 'active'} for unit in audit.PROFILES}
     failures = set()
+    monkeypatch.setattr(audit, 'prepare_windows_observer_environment', lambda: {'state': 'verified'})
     monkeypatch.setattr(audit, 'build_report', lambda **_: deepcopy(report))
     monkeypatch.setattr(audit, 'snapshot', lambda: deepcopy(units))
     monkeypatch.setattr(audit, 'control_verification_readiness', lambda _: {'required': False, 'ready': True})
@@ -38,6 +39,28 @@ def execute(scene):
     with pytest.raises(SystemExit) as exit:
         audit.main()
     return exit.value.code, json.loads((scene[3] / 'latest.json').read_text())
+
+
+def test_audit_uses_verified_bridge_without_copying_other_environment(monkeypatch):
+    from stockagent.data_sync import windows_cold_io
+    monkeypatch.setenv('WSL_INTEROP', '/run/WSL/1_interop')
+    monkeypatch.setenv('STOCKAGENT_AUDIT_TEST', 'original')
+    monkeypatch.setattr(windows_cold_io, '_windows_process_environment',
+        lambda: {'WSL_INTEROP': '/run/WSL/42_interop', 'STOCKAGENT_AUDIT_TEST': 'unrelated'})
+    assert audit.prepare_windows_observer_environment() == {'state': 'verified'}
+    assert audit.os.environ['WSL_INTEROP'] == '/run/WSL/42_interop'
+    assert audit.os.environ['STOCKAGENT_AUDIT_TEST'] == 'original'
+
+
+def test_failed_bridge_admission_preserves_failure_and_caller_environment(monkeypatch):
+    from stockagent.data_sync import windows_cold_io
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+    monkeypatch.setenv('WSL_INTEROP', '/run/WSL/1_interop')
+    def unavailable():
+        raise SnapshotError('no verified bridge')
+    monkeypatch.setattr(windows_cold_io, '_windows_process_environment', unavailable)
+    assert audit.prepare_windows_observer_environment() == {'state': 'unavailable', 'error_type': 'SnapshotError'}
+    assert audit.os.environ['WSL_INTEROP'] == '/run/WSL/1_interop'
 
 
 def test_closed_market_or_blocked_settlement_does_not_hide_infrastructure(scene):
@@ -84,6 +107,28 @@ def test_first_observation_is_preserved_per_userspace_lifetime(scene):
     execute(scene)
     assert len(list(scene[3].glob('first-*.json'))) == 2
     assert not list(scene[3].glob('*.tmp'))
+
+
+def test_explicitly_disabled_continuous_provider_lane_does_not_require_duplicate_owner(scene):
+    unit = 'stockagent-finmind-complement.service'
+    scene[1][unit] = {'LoadState': 'loaded', 'UnitFileState': 'disabled',
+                     'ActiveState': 'inactive', 'Result': 'success'}
+    code, result = execute(scene)
+    assert code == 0
+    assert result['boot_recovery']['inactive_disabled_provider_lanes'] == [unit]
+    assert result['boot_recovery']['production_owner_states'][unit]['ActiveState'] == 'inactive'
+
+
+@pytest.mark.parametrize('unit,state', [
+    ('stockagent-discord-bot.service', 'inactive'),
+    ('stockagent-finmind-complement.service', 'failed'),
+])
+def test_disabled_gateway_or_failed_provider_remains_a_boot_failure(scene, unit, state):
+    scene[1][unit] = {'LoadState': 'loaded', 'UnitFileState': 'disabled',
+                     'ActiveState': state, 'Result': 'exit-code' if state == 'failed' else 'success'}
+    code, result = execute(scene)
+    assert code == 75
+    assert unit in result['boot_recovery']['unavailable_critical_owners']
 
 
 @pytest.mark.parametrize('failure', [None, 'stale', 'future', 'degraded', 'no_registration', 'incomplete', 'disabled', 'public_policy', 'last_failed', 'last_deferred'])

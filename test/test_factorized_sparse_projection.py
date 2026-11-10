@@ -355,6 +355,57 @@ def test_resident_encoder_and_portfolio_graphs_preserve_pending_full_model_adjoi
     assert evidence['cuda_graph_runtime_inspection_ok'] and evidence['cuda_graph_root_count_local'] > 0
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA inference graphs')
+def test_date_view_inference_encoder_and_portfolio_graphs_match_eager(tmp_path, request):
+    import warnings
+    from torch._inductor.cudagraph_trees import get_container
+    # Match the selected live configs' use_tensor_cores=True inference setup,
+    # for both oracle and candidate, without leaking precision to other tests.
+    previous_precision = torch.get_float32_matmul_precision()
+    request.addfinalizer(lambda: torch.set_float32_matmul_precision(previous_precision))
+    torch.set_float32_matmul_precision('high')
+    # PyTorch 2.13 deliberately captures an empty allocator bootstrap graph
+    # inside catch_warnings(record=True). A suite-wide error filter otherwise
+    # raises inside that vendor setup. Restore strict warnings before running
+    # any actual model graph, and require real captured roots below.
+    with warnings.catch_warnings(record=True) as bootstrap:
+        warnings.simplefilter('always', UserWarning)
+        get_container(torch.cuda.current_device()).get_tree_manager()
+    assert all(str(row.message).startswith('The CUDA Graph is empty.') for row in bootstrap)
+    source = source_fixture(tmp_path).slice_dates(1, 9)
+    torch.manual_seed(137)
+    oracle = FinancialTransformerModel(lookback=2, num_features=28, num_symbols=4, d_model=32,
+        attention_mode='market_token', use_latent_factors=True, use_market_tokens=True,
+        temporal_layers=1, temporal_heads=4, cross_heads=4, num_latent_factors=2,
+        num_market_tokens=2, market_layers=1, head_hidden_dim=32,
+        dropout=0., input_dropout=0., candle_dropout=0., candle_projection_fp32=True,
+        portfolio_blocks_fp32=True, factorized_compact_projection=True,
+        factorized_sparse_projection=True, factorized_sparse_cache_bytes=1024**2,
+        factorized_input_compile=False, portfolio_output_mode='score_entmax_scale_separated_cash',
+        return_aux=False).cuda().eval()
+    candidate = deepcopy(oracle)
+    candidate.factorized_input_compile = True
+    candidate.factorized_cuda_graphs = True
+    candidate.factorized_portfolio_cuda_graphs = True
+    mask = torch.ones(4, 4, dtype=torch.bool, device='cuda')
+    with torch.inference_mode(), torch.autocast('cuda', dtype=torch.bfloat16):
+        for start in (0, 2, 0):
+            torch.compiler.cudagraph_mark_step_begin()
+            rows = np.arange(start, start + 5)
+            expected = oracle.forward_from_panel_slab(
+                FactorizedPanelSlab(source, rows, device='cuda'), mask).clone()
+            actual = candidate.forward_from_panel_slab(
+                FactorizedPanelSlab(source, rows, device='cuda'), mask).clone()
+            torch.testing.assert_close(actual, expected, rtol=3e-3, atol=1e-4)
+            assert torch.isfinite(actual).all()
+    from stockagent.training.trainer import _cuda_graph_capture_snapshot
+    snapshot = _cuda_graph_capture_snapshot(SimpleNamespace(training=SimpleNamespace(
+        financial_transformer=SimpleNamespace(factorized_cuda_graphs=True,
+                                              factorized_portfolio_cuda_graphs=True))))
+    assert snapshot['cuda_graph_runtime_inspection_ok']
+    assert snapshot['cuda_graph_root_count_local'] > 0
+
+
 @pytest.mark.parametrize('encoder_graphs', [False, True])
 @pytest.mark.skipif(not torch.cuda.is_available(), reason='requires CUDA graphs')
 def test_marked_annual_graph_replay_preserves_accumulated_leaf_gradients(tmp_path, encoder_graphs, *, replay_passes=2):

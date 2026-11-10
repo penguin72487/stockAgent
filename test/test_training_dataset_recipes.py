@@ -397,6 +397,80 @@ def test_explicit_hydration_uses_exact_version_not_newer_head(tmp_path):
     assert (source/'source.txt').read_text() == 'newer-source-v2'
 
 
+def test_persistent_research_build_pins_exact_inputs_for_retention(tmp_path):
+    from stockagent.data_sync.packed_retention import _local_protected_snapshot_ids
+    from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids
+    repo, source, cold, release, _, output = recipe_fixture(tmp_path)
+    materialized = tmp_path/'managed'
+    materialized.mkdir()
+    write_json(repo/'configs/data_sync/packed_retention.json', {
+        'schema_version': 1, 'sync_root': str(cold), 'materialized_root': str(materialized),
+        'archive_root': str(tmp_path/'archive'), 'backup_config': 'backup.json',
+        'state_dir': str(tmp_path/'state'), 'folder_id': 'fixture', 'required_peer_names': []})
+    status = recipes.refresh_recipes(repo=repo, sync_root=cold, output_root=output)
+    recipe = output/status['recipes'][0]['path']
+    kwargs = dict(repo=repo, sync_root=cold, input_paths={'source': str(source)}, parameters={},
+                  receipt_path=tmp_path/'research-receipt.json', output_root=tmp_path/'assembled',
+                  trial=False)
+    with pytest.raises(SnapshotError, match='requires the retention materialized root'):
+        recipes.build_recipe(recipe, **kwargs)
+    with pytest.raises(SnapshotError, match='configured retention roots'):
+        recipes.build_recipe(recipe, research_materialized_root=tmp_path, **kwargs)
+    result = recipes.build_recipe(recipe, research_materialized_root=materialized, **kwargs)
+    assert result['state'] == 'verified_builder_completed'
+    pin_root = Path(result['research_binding']['binding_path']).parent
+    binding = json.loads((pin_root/'research-binding.json').read_text())
+    assert binding['recipe_sha256'] == sha256_file(recipe) == sha256_file(pin_root/'recipe.json')
+    assert binding['input_bindings']['source']['snapshot_id'] == release.manifest['snapshot_id']
+    assert len(list(pin_root.glob('*.pin.json'))) == 1
+    protected, evidence, errors = _local_protected_snapshot_ids(
+        materialized, {release.manifest['snapshot_id']}, research_pin_root=tmp_path/'state/research-pins')
+    assert protected == {release.manifest['snapshot_id']} and evidence and not errors
+    assert release.manifest['snapshot_id'] not in _pinned_snapshot_ids(materialized)
+    (source/'source.txt').write_text('a newer daily version')
+    newer = publish_packed_snapshot(cold, 'source-package', source)
+    protected, _, errors = _local_protected_snapshot_ids(
+        materialized, {release.manifest['snapshot_id'], newer.manifest['snapshot_id']},
+        research_pin_root=tmp_path/'state/research-pins')
+    assert protected == {release.manifest['snapshot_id']} and not errors
+
+
+def test_failed_research_build_retains_input_pins_and_failure_receipt(tmp_path):
+    repo, source, cold, release, templates, output = recipe_fixture(tmp_path)
+    materialized = tmp_path/'managed'
+    materialized.mkdir()
+    write_json(repo/'configs/data_sync/packed_retention.json', {
+        'schema_version': 1, 'sync_root': str(cold), 'materialized_root': str(materialized),
+        'archive_root': str(tmp_path/'archive'), 'backup_config': 'backup.json',
+        'state_dir': str(tmp_path/'state'), 'folder_id': 'fixture', 'required_peer_names': []})
+    template = json.loads(templates.read_text())
+    template['recipes'][0]['steps'][0].append('--fail')
+    write_json(templates, template)
+    status = recipes.refresh_recipes(repo=repo, sync_root=cold, output_root=output)
+    receipt = tmp_path/'failed-research.json'
+    with pytest.raises(subprocess.CalledProcessError):
+        recipes.build_recipe(output/status['recipes'][0]['path'], repo=repo, sync_root=cold,
+            input_paths={'source': str(source)}, parameters={}, receipt_path=receipt,
+            output_root=tmp_path/'partial-output', trial=False, research_materialized_root=materialized)
+    result = json.loads(receipt.read_text())
+    assert result['state'] == 'failed' and result['research_binding']['pins'] == 1
+    binding = json.loads(Path(result['research_binding']['binding_path']).read_text())
+    assert binding['input_bindings']['source']['snapshot_id'] == release.manifest['snapshot_id']
+
+
+def test_trial_does_not_create_persistent_research_pins(tmp_path):
+    repo, source, cold, _, _, output = recipe_fixture(tmp_path)
+    status = recipes.refresh_recipes(repo=repo, sync_root=cold, output_root=output)
+    recipe = output/status['recipes'][0]['path']
+    materialized = tmp_path/'managed'
+    materialized.mkdir()
+    result = recipes.build_recipe(recipe, repo=repo, sync_root=cold,
+        input_paths={'source': str(source)}, parameters={}, receipt_path=tmp_path/'trial.json',
+        research_materialized_root=materialized)
+    assert result['state'] == 'verified_builder_completed' and 'research_binding' not in result
+    assert not (tmp_path/'state/research-pins').exists()
+
+
 def test_method_inventory_is_metadata_only_and_does_not_churn_unchanged_files(tmp_path):
     from scripts.inventory_training_dataset_recipes import inventory, declared_release_bindings
     repo, output = tmp_path/'repo', tmp_path/'methods'
@@ -453,6 +527,7 @@ def test_publication_shell_keeps_parsed_body_across_in_place_rollout(tmp_path, w
     original = Path(__file__).resolve().parents[1]/'scripts'/wrapper
     path.write_bytes(original.read_bytes())
     (scripts/'runtime_env.sh').write_text(
+        'ensure_enrolled_wsl_identity() { :; }\n'
         'run_fintech_python() { "$TEST_PYTHON" "$TEST_CHILD" "$@"; }\n')
     if wrapper == 'run_data_release.sh':
         (scripts/'run_training_dataset_recipes.sh').write_text(
@@ -520,6 +595,7 @@ def test_cache_publication_does_not_rebuild_unaffected_training_recipes(
     wrapper = scripts / "run_data_release.sh"
     wrapper.write_bytes((Path(__file__).resolve().parents[1] / "scripts/run_data_release.sh").read_bytes())
     (scripts / "runtime_env.sh").write_text(
+        'ensure_enrolled_wsl_identity() { :; }\n'
         'run_fintech_python() { return "$TEST_CHILD_STATUS"; }\n')
     (scripts / "run_training_dataset_recipes.sh").write_text(
         '#!/usr/bin/env bash\nprintf refreshed > "$TEST_POSTHOOK"\n')

@@ -105,7 +105,9 @@ def private_control_prefix() -> str:
     # Archive/control code and its packed reader must travel together. The
     # ephemeral checkout can predate the current verified-inventory API; using
     # its reader would make even a read-only inventory fail before admission.
-    for name, relative in (("stockagent.data_sync.packed_metadata", "stockagent/data_sync/packed_metadata.py"),
+    for name, relative in (("stockagent.storage_layout", "stockagent/storage_layout.py"),
+                           ("stockagent.service_layout", "stockagent/service_layout.py"),
+                           ("stockagent.data_sync.packed_metadata", "stockagent/data_sync/packed_metadata.py"),
                            ("stockagent.data_sync.packed_snapshots", "stockagent/data_sync/packed_snapshots.py"),
                            ("stockagent.data_sync.node_roles", "stockagent/data_sync/node_roles.py"),
                            ("stockagent.data_sync.testing_disposition", "stockagent/data_sync/testing_disposition.py"),
@@ -114,10 +116,13 @@ def private_control_prefix() -> str:
         code += f"m=types.ModuleType({name!r});m.__file__={'/root/stockAgent/' + relative!r};sys.modules[{name!r}]=m\n"
         code += f"exec({(ROOT / relative).read_text()!r},m.__dict__)\n"
     code += "archive_module = types.ModuleType('stockagent.data_sync.legacy_artifact_archive')\n"
-    code += "archive_module.__file__ = '/private-ssh-control/legacy_artifact_archive.py'\n"
+    # Preserve the canonical module location for repository-relative policy
+    # resolution. The code still comes only from authenticated SSH stdin.
+    code += "archive_module.__file__ = '/root/stockAgent/stockagent/data_sync/legacy_artifact_archive.py'\n"
     code += "sys.modules[archive_module.__name__] = archive_module\n"
     code += "exec(" + repr(canonical_archive) + ", archive_module.__dict__)\n"
     code += "control_module = types.ModuleType('stockagent.data_sync.remote_legacy_return')\n"
+    code += "control_module.__file__ = '/root/stockAgent/stockagent/data_sync/remote_legacy_return.py'\n"
     code += "sys.modules[control_module.__name__] = control_module\n"
     code += "exec(" + repr((ROOT / "stockagent/data_sync/remote_legacy_return.py").read_text()) + ", control_module.__dict__)\n"
     code += "from stockagent.data_sync.remote_legacy_return import *\n"

@@ -101,7 +101,7 @@ const SIGNAL_REASON_LABELS = {
   official_open_price_unavailable: "官方開盤價不可用",
   observed_09_01_minute_vwap_unavailable: "09:01 首分鐘成交價不可用",
   observed_09_01_minute_price_unavailable: "09:01 首分鐘成交價不可用",
-  price_limit_unavailable: "合法漲跌停價缺漏",
+  price_limit_unavailable: "價格界線未提供或不適用，不進場",
   entry_bracket_unavailable: "TP／SL 不完整，不進場",
   entry_bracket_invalid: "TP／SL 區間無效，不進場",
   entry_price_at_or_beyond_stop_loss: "市價已觸及或超出 SL，不進場",
@@ -118,6 +118,7 @@ const SIGNAL_REASON_LABELS = {
   outside_13_20_close_order_window: "未在 13:20 至 13:30 間完成模擬委託",
   waiting_valid_terminal_close_source: "等待有效收盤價後依不限容量假設平倉",
   counterfactual_official_open_price_fill_at_09_01: "09:01 開盤價重建",
+  counterfactual_official_open_when_0901_unavailable: "首分鐘資料缺漏・開盤價假設進場",
   counterfactual_observed_09_01_minute_vwap_fill: "09:01 首分鐘價重建",
   counterfactual_observed_09_01_minute_price_fill: "09:01 首分鐘價重建",
 };

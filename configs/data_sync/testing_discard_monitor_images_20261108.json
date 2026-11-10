@@ -1,0 +1,14 @@
+{
+  "contract": "explicit-local-testing-artifact-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "User authorized deletion of old performance-validation data; preserve the associated summary and failure receipts.",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {"base": "artifact", "relative": "operations/monitor_projection_20261026/finmind_monitor_date_tasks.sqlite3", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/monitor_projection_20261026/finmind_monitor_tasks.sqlite3", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/monitor_projection_20261026/queue_write_A.sqlite3", "kind": "file", "reason": "benchmark"},
+    {"base": "artifact", "relative": "operations/monitor_projection_20261026/queue_write_B.sqlite3", "kind": "file", "reason": "benchmark"}
+  ],
+  "identity_sha256": "e7a63f6df082fbea61bd7a42ca601526bf6d8f0a26b792a1f5eb88f443f114d1"
+}

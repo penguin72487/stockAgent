@@ -1,0 +1,36 @@
+{
+  "contract": "ablation_report_views_v1",
+  "views": [
+    {
+      "name": "live_test_years",
+      "mode": "test_year",
+      "split": "test",
+      "prefix": "reverse_test",
+      "output_subdir": "live_reports",
+      "scope_label": "First test year from each independent fold account"
+    },
+    {
+      "name": "root_test_years",
+      "mode": "mirror",
+      "source_view": "live_test_years",
+      "prefix": "reverse_test",
+      "output_subdir": ""
+    },
+    {
+      "name": "validation",
+      "mode": "completed",
+      "split": "val",
+      "prefix": "ofat_val",
+      "output_subdir": "",
+      "scope_label": "validation"
+    },
+    {
+      "name": "full_test_diagnostic",
+      "mode": "completed",
+      "split": "test",
+      "prefix": "ofat_test_diagnostic",
+      "output_subdir": "",
+      "scope_label": "full-horizon fold test (reset state)"
+    }
+  ]
+}

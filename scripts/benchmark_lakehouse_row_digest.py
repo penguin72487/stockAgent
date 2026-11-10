@@ -44,18 +44,27 @@ def engineering_reference_limits():
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--order', choices=('all', 'unique_keys', 'paged_keys'), required=True)
-    parser.add_argument('--memory-limit', choices=('512MB', '1GB', '2GB'), default='512MB')
+    parser.add_argument('--order', choices=('all', 'unique_keys', 'paged_keys', 'adaptive'), required=True)
+    parser.add_argument('--memory-limit', choices=('512MB', '1GB', '2GB', 'native'), default='512MB')
+    parser.add_argument('--current-native-resources', action='store_true',
+                        help='observe current native resources without restoring historical cgroup limits')
     parser.add_argument('--materialized-reference', action='store_true',
                         help='explicit engineering-only original full JSON/hash oracle; not a fair speed comparator')
     parser.add_argument('--page-mib', type=int, choices=(16, 32, 64), default=16)
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args(argv)
-    if args.output.exists() or not args.output.absolute().resolve().is_relative_to(Path('artifacts/benchmarks').resolve()):
+    output = args.output.absolute().resolve()
+    workspace = Path('/srv/stockagent-workspace/verify').resolve()
+    if (args.output.exists() or not (output.is_relative_to(Path('artifacts/benchmarks').resolve())
+            or args.current_native_resources and output.is_relative_to(workspace))):
         parser.error('a fresh private benchmark receipt is required')
     if args.materialized_reference and args.order != 'all':
         parser.error('the original reference requires the original ORDER BY ALL')
-    resource_limits = match_native_limits()
+    if args.memory_limit == 'native' and not args.current_native_resources:
+        parser.error('native SQL settings require current-native resource observation')
+    if args.current_native_resources and args.materialized_reference:
+        parser.error('current resource observation cannot change engineering reference limits')
+    resource_limits = limits() if args.current_native_resources else match_native_limits()
     if args.materialized_reference:
         resource_limits = engineering_reference_limits()
     owner = owner_identity()
@@ -77,10 +86,20 @@ def main(argv=None):
               'query_completed': False, 'native_owner': owner,
               'production_catalog_writes': 0, 'provider_calls': 0, 'production_service_controls': 0}
     try:
-        connection.execute('SET memory_limit=' + lakehouse.sql_text(args.memory_limit))
+        if args.memory_limit != 'native':
+            connection.execute('SET memory_limit=' + lakehouse.sql_text(args.memory_limit))
+        result['effective_memory_limit'] = connection.execute("SELECT current_setting('memory_limit')").fetchone()[0]
+        result['current_native_resources'] = args.current_native_resources
         result['snapshot_before'] = connection.execute("SELECT max(snapshot_id) FROM ducklake_snapshots('lake')").fetchone()[0]
         count, unique = connection.execute('SELECT count(*),count(DISTINCT (relative,sha256)) FROM lake.source_metadata').fetchone()
         result.update(expected_rows=count, unique_metadata_keys=unique)
+        if args.current_native_resources and args.order in {'all', 'unique_keys'}:
+            size = connection.execute('SELECT coalesce(sum(bytes),0) FROM lake.source_metadata').fetchone()[0]
+            available = next(int(line.split()[1])*1024 for line in Path('/proc/meminfo').read_text().splitlines()
+                             if line.startswith('MemAvailable:'))
+            result.update(raw_content_bytes=size, host_available_bytes=available)
+            if available < size * 8 + 8*1024**3:
+                raise ValueError('full metadata sort lacks independently measured RAM headroom')
         if args.order == 'unique_keys' and count != unique:
             raise ValueError('narrow ordering requires proven unique metadata keys')
         order = 'ALL' if args.order == 'all' else 'relative,sha256,bytes'
@@ -88,7 +107,21 @@ def main(argv=None):
         wall, cpu = time.perf_counter(), time.process_time()
         phase = 'execute_ordered_query'
         try:
-            if args.order == 'paged_keys':
+            if args.order == 'adaptive':
+                phase = 'consume_complete_adaptive_row_stream'
+                result['adaptive_sql'] = {'single_pass_sorts': 0, 'payload_page_sorts': 0}
+                class ObservedConnection:
+                    def execute(self, query, *parameters):
+                        if query == 'SELECT * FROM lake.source_metadata ORDER BY relative,sha256':
+                            result['adaptive_sql']['single_pass_sorts'] += 1
+                        elif query.startswith('SELECT * FROM lake.source_metadata WHERE relative'):
+                            result['adaptive_sql']['payload_page_sorts'] += 1
+                        connection.execute(query, *parameters)
+                        return self
+                    def __getattr__(self, name):
+                        return getattr(connection, name)
+                rows = paged_metadata_rows(ObservedConnection(), single_pass=True)
+            elif args.order == 'paged_keys':
                 phase = 'consume_complete_paged_row_stream'
                 rows = paged_metadata_rows(connection, maximum_bytes=args.page_mib*1024**2)
             else:

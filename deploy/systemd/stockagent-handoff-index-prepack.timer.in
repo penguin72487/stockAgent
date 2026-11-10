@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume opportunistic fixed-source E preparation
+
+[Timer]
+OnBootSec=5min
+OnUnitInactiveSec=2min
+AccuracySec=5s
+Unit=stockagent-handoff-index-prepack.service
+
+[Install]
+WantedBy=timers.target

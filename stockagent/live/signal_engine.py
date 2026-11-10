@@ -43,6 +43,7 @@ from stockagent.config import (
 )
 from stockagent.data.panel import (
     PANEL_CACHE_VERSION,
+    TW_MAX_ABS_DAILY_PRICE_LOG_RETURN,
     PanelData,
     build_panel,
     build_tail_panel,
@@ -787,7 +788,14 @@ def _live_panel_disk_backend_key(
     digest = hashlib.sha256(
         repr(payload).encode("utf-8")
     ).hexdigest()
-    return f"live-tail-v1:{digest}"
+    # Old tail panels could put a symbol's next *available* session's open on
+    # an earlier row. Only gap-consuming models need their cached base rebuilt;
+    # other services keep their existing cache and startup characteristics.
+    includes = panel_kwargs.get("feature_include") or ()
+    excludes = panel_kwargs.get("feature_exclude") or ()
+    version = ("live-tail-v2-aligned-gap" if DAY_TRADE_OPEN_GAP_FEATURE in includes
+               and DAY_TRADE_OPEN_GAP_FEATURE not in excludes else "live-tail-v1")
+    return f"{version}:{digest}"
 
 
 def _shared_live_panel_build(key, builder, progress_callback=None, *,
@@ -2837,6 +2845,7 @@ def _day_trade_live_model_window(
     opening_reference_policy: str = OPENING_OBSERVED_REFERENCE_POLICY,
     preopen_quote_priority: bool = False,
     defer_dense_overlay: bool = False,
+    counterfactual_official_open_session: str | None = None,
 ) -> tuple[np.ndarray | FactorizedLiveWindow, str, str, bool, np.ndarray]:
     """Build a same-session observation without inventing a completed daily bar.
 
@@ -2890,9 +2899,10 @@ def _day_trade_live_model_window(
             # a historical next-session open must never leak into its last row.
             closes = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
             usable = np.isfinite(last_trades) & (last_trades > 0) & np.isfinite(closes) & (closes > 0)
-            gap = np.zeros(panel.num_symbols, dtype=np.float32)
-            gap[usable] = np.log(last_trades[usable] / closes[usable]).astype(np.float32)
-            gap[~np.isfinite(gap) | (np.abs(gap) > .5)] = 0.
+            gap = np.zeros(panel.num_symbols, dtype=np.float64)
+            gap[usable] = np.log(last_trades[usable] / closes[usable])
+            gap[~np.isfinite(gap) | (np.abs(gap) > TW_MAX_ABS_DAILY_PRICE_LOG_RETURN)] = 0.
+            gap = gap.astype(np.float32)
             index = panel.feature_names.index(DAY_TRADE_OPEN_GAP_FEATURE)
             if getattr(base, "_stockagent_factorized_live_window", False):
                 base = base.with_last_feature(index, gap)
@@ -2939,20 +2949,33 @@ def _day_trade_live_model_window(
             f"prices={observed_prices_np.shape} expected={(panel.num_symbols,)}"
         )
     closes_np = np.asarray(panel.close_prices[panel_idx], dtype=np.float64)
+    # Training's opening-gap ABI uses the immediately preceding panel row's
+    # close and zero-fills when it is absent.  A last real trade from an older
+    # session remains a valid *price reference*, but is not a substitute gap
+    # denominator: a suspension or capital reduction can change the price basis.
     reference_closes = closes_np
-    if reference_policy == OPENING_PROVISIONAL_REFERENCE_POLICY:
-        reference_closes = np.where(np.isfinite(closes_np) & (closes_np > 0.0), closes_np, last_trades)
     observed_open = (
         np.isfinite(observed_prices_np)
         & (observed_prices_np > 0.0)
-        & np.isfinite(reference_closes)
-        & (reference_closes > 0.0)
     )
     if reference_policy == OPENING_PROVISIONAL_REFERENCE_POLICY:
         # This policy decouples decision time from the latest source receipt.
         # A prior-session or trial open must not become fresh merely because
         # the model now has an independently valid 09:00 decision clock.
-        observed_open &= tw_session_open_observed_mask(price_snapshot, session_date=decision_time[:10])
+        if counterfactual_official_open_session is None:
+            observed_open &= tw_session_open_observed_mask(price_snapshot, session_date=decision_time[:10])
+        else:
+            # A dated official daily row can identify that session's open in a
+            # retrospective scenario, but it cannot prove when the first
+            # print arrived. Never turn the date into a fake exchange clock.
+            if (not str(price_snapshot.source).startswith("csv:")
+                    or counterfactual_official_open_session != decision_time[:10]
+                    or price_snapshot.available_mask is None):
+                raise ValueError("counterfactual official open requires a same-session CSV observation mask")
+            available = np.asarray(price_snapshot.available_mask, dtype=bool)
+            if available.shape != (panel.num_symbols,):
+                raise ValueError("counterfactual official open availability shape mismatch")
+            observed_open &= available
     if observation == "latest_quote":
         # ``prices`` contains panel-close fallbacks for unresolved rows.  Only
         # provider-observed rows may enter a latest-quote inference.
@@ -3003,12 +3026,17 @@ def _day_trade_live_model_window(
     # is not a trade. The explicitly selected provisional policy can also use
     # that reference for unknown MODEL inputs, without acquiring a no-print
     # proof, source coverage or execution eligibility.
-    gap = np.zeros((panel.num_symbols,), dtype=np.float32)
-    gap[observed_open] = np.log(
-        observed_prices_np[observed_open] / reference_closes[observed_open]
-    ).astype(
-        np.float32,
-        copy=False,
+    # The cached training panel stores both next-session open and previous
+    # close as FP32 before the opening-gap calculation.  Preserve the source
+    # quote itself for execution/provenance, but use the same representation
+    # here; casting only the final logarithm gives different model input bits.
+    with np.errstate(over="ignore", invalid="ignore"):
+        model_observed_prices = observed_prices_np.astype(np.float32).astype(np.float64)
+    gap = np.zeros((panel.num_symbols,), dtype=np.float64)
+    computable_gap = (observed_open & np.isfinite(model_observed_prices) & (model_observed_prices > 0.0)
+                      & np.isfinite(reference_closes) & (reference_closes > 0.0))
+    gap[computable_gap] = np.log(
+        model_observed_prices[computable_gap] / reference_closes[computable_gap]
     )
     if observation == "session_open":
         no_print_proof = tw_session_no_open_print_mask(price_snapshot, session_date=decision_time[:10])
@@ -3016,11 +3044,12 @@ def _day_trade_live_model_window(
             policy=reference_policy, last_trades=last_trades,
             observed_open=observed_open, no_print_proof=no_print_proof))
             & ~observed_open & np.isfinite(last_trades) & (last_trades > 0.0))
-        base_prices = np.where(np.isfinite(closes_np) & (closes_np > 0.), closes_np, last_trades)
-        gap[carried] = np.log(last_trades[carried] / base_prices[carried]).astype(np.float32)
-    # Taiwan's ordinary daily limit is far below this bound. Extreme values
-    # indicate a stale quote, corporate action, or mismatched symbol mapping.
-    gap[~np.isfinite(gap) | (np.abs(gap) > 0.5)] = 0.0
+        carried &= np.isfinite(reference_closes) & (reference_closes > 0.0)
+        gap[carried] = np.log(last_trades[carried] / reference_closes[carried])
+    # Use the training panel's exact sanitizer, including exceptional
+    # instruments without ordinary limits; do not introduce a new live ABI.
+    gap[~np.isfinite(gap) | (np.abs(gap) > TW_MAX_ABS_DAILY_PRICE_LOG_RETURN)] = 0.0
+    gap = gap.astype(np.float32)
     if getattr(base, "_stockagent_factorized_live_window", False):
         window = base.with_last_feature(gap_idx, gap)
     elif defer_dense_overlay and not base.flags.writeable and base.flags.c_contiguous:
@@ -4357,6 +4386,8 @@ def generate_live_signal(
     _prefetched_quote: PrefetchedLiveQuote | None = None,
     _timing_sink: dict[str, Any] | None = None,
     _prepare_progressive_opening_input: bool = False,
+    _counterfactual_official_open_session: str | None = None,
+    _counterfactual_completed_source_evidence: dict[str, Any] | None = None,
 ) -> LiveSignalResult:
     from stockagent.live.market_config import SIGNAL_UPDATE_PROGRESSIVE
 
@@ -4400,6 +4431,40 @@ def generate_live_signal(
         day_trade_opening_reference_policy, observation=normalized_day_trade_observation)
     if reference_policy == OPENING_PROVISIONAL_REFERENCE_POLICY and execution_mode != "tw_day_trade":
         raise ValueError("provisional opening reference policy is restricted to TW day-trade models")
+    counterfactual_open = _counterfactual_official_open_session is not None
+    if counterfactual_open:
+        try:
+            replay_session = date.fromisoformat(str(_counterfactual_official_open_session))
+            replay_clock = datetime.fromisoformat(str(asof_date).replace("Z", "+00:00"))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("counterfactual opening requires a valid session and clock") from exc
+        if replay_clock.tzinfo is None:
+            replay_clock = replay_clock.replace(tzinfo=ZoneInfo("Asia/Taipei"))
+        replay_clock = replay_clock.astimezone(ZoneInfo("Asia/Taipei"))
+        now_taipei = datetime.now(ZoneInfo("Asia/Taipei"))
+        same_day_completed = (
+            replay_session == now_taipei.date()
+            and _counterfactual_completed_source_evidence is not None
+        )
+        if (execution_mode != "tw_day_trade" or normalized_day_trade_observation != "session_open"
+                or reference_policy != OPENING_PROVISIONAL_REFERENCE_POLICY
+                or str(price_source).strip().lower() != "csv" or prices_csv is None
+                or replay_clock.date() != replay_session
+                or replay_clock.time().replace(tzinfo=None) < datetime.min.time().replace(hour=9)
+                or (replay_session >= now_taipei.date() and not same_day_completed)
+                or publish_latest or preopen_quote_priority or _prefetched_quote is not None
+                or not live_output_dir
+                or str(signal_id or "") != f"{market}-counterfactual-official-open-{replay_session.isoformat()}"):
+            raise ValueError("counterfactual official open requires an isolated past-session paper CSV")
+        if same_day_completed:
+            from stockagent.live.tw_day_trade_completed_replay import verify_completed_open_sources
+            if not write:
+                raise ValueError("same-day counterfactual requires an isolated written paper artifact")
+            verify_completed_open_sources(
+                session=replay_session, observed_at=now_taipei, prices_csv=Path(prices_csv),
+                raw_root=Path(config.data.parquet_root).resolve().parent / "raw",
+                expected=_counterfactual_completed_source_evidence,
+            )
     if execution_mode == "tw_day_trade":
         # This model starts an independent daily cohort; the paper executor
         # owns FIFO inventory. Reporting may read existing prior rows, but
@@ -4560,7 +4625,10 @@ def generate_live_signal(
         prices_csv=prices_csv, yahoo_chunk_size=yahoo_chunk_size,
         tw_latest_quote_cache_seconds=tw_latest_quote_cache_seconds,
         tw_latest_quote_force_refresh=tw_latest_quote_force_refresh,
-        opening_reference_policy=reference_policy,
+        # The live provisional transport remains restricted to the canonical
+        # opening cache. An explicitly isolated historical CSV is read through
+        # the ordinary CSV reader and qualified separately below.
+        opening_reference_policy=(OPENING_OBSERVED_REFERENCE_POLICY if counterfactual_open else reference_policy),
     )
     request_prepared = time.perf_counter()
     pre_quote_local_prepare_steps = {
@@ -4703,6 +4771,7 @@ def generate_live_signal(
             model_observation=normalized_day_trade_observation,
             opening_reference_policy=reference_policy,
             preopen_quote_priority=preopen_quote_priority,
+            counterfactual_official_open_session=_counterfactual_official_open_session,
             defer_dense_overlay=((day_trade_signal_update_policy == SIGNAL_UPDATE_PROGRESSIVE
                                   or _prepare_progressive_opening_input)
                                  and runtime_device.type == "cuda"),
@@ -4719,9 +4788,9 @@ def generate_live_signal(
                 else np.zeros((panel.num_symbols,), dtype=bool)
             )
             if reference_policy == OPENING_PROVISIONAL_REFERENCE_POLICY:
-                # A raw positive open with no valid completed close cannot be
-                # applied as a model gap. Keep raw source coverage separate;
-                # never double-count it and a provisional model reference.
+                # Count an actual same-session open even when its prior close
+                # is absent: the training-compatible gap is then neutral, but
+                # the observed price must not be mislabeled as provisional.
                 observed_open = day_trade_observed_model_price
             day_trade_active_open_count = int(
                 np.count_nonzero(active_mask & observed_open)
@@ -5402,7 +5471,8 @@ def generate_live_signal(
                 "current_price": current_price_column[idx],
                 "open_price": opening_price_column[idx],
                 "model_input_price_basis": (
-                    normalized_day_trade_observation if day_trade_observed_model_price[idx]
+                    ("counterfactual_official_daily_open_no_intraday_clock" if counterfactual_open
+                     else normalized_day_trade_observation) if day_trade_observed_model_price[idx]
                     else "last_real_trade_provisional_source_unknown" if day_trade_provisional_reference_mask[idx]
                     else "last_real_trade_carried_no_first_print" if tw_session_no_print[idx]
                     and last_trade_column[idx] is not None
@@ -5571,6 +5641,10 @@ def generate_live_signal(
         "day_trade_model_observation": normalized_day_trade_observation,
         "day_trade_opening_reference_policy": reference_policy,
         "day_trade_opening_reference_policy_fingerprint": hashlib.sha256(reference_policy.encode()).hexdigest(),
+        "day_trade_open_gap_contract": (
+            "fp32_panel_prices_previous_close_zero_if_missing_log2_sanitizer_v2"
+            if execution_mode == "tw_day_trade" else None
+        ),
         "day_trade_policy_mask_contract": "exact_session_eligibility_before_forward_v1" if execution_mode == "tw_day_trade" else None,
         "day_trade_policy_eligibility": day_trade_policy_proof,
         "day_trade_historical_execution": (
@@ -5784,6 +5858,26 @@ def generate_live_signal(
             "historical_point_in_time_proven": False,
             "logical_feature_count": len(panel.feature_names),
         }
+    if counterfactual_open:
+        summary.update({
+            "counterfactual_signal_regeneration": True,
+            "simulation_only": True,
+            "production_order_possible": False,
+            "replay_effective_signal_at": resolved_asof,
+            "counterfactual_official_open_session": _counterfactual_official_open_session,
+            "counterfactual_open_clock_known": False,
+            "counterfactual_historical_revision_history_proven": False,
+            "price_timestamp": None,
+            "price_data_date": _counterfactual_official_open_session,
+            "opening_live_source_coverage_proven": False,
+            "opening_source_complete": None,
+            "opening_all_symbols_complete": None,
+            "opening_price_coverage_scope": "retrospective_daily_open_not_decision_time",
+            "counterfactual_lookahead_warning": (
+                "The official daily open was retrieved after the session; its first-print "
+                "time and availability at the hypothetical decision are not established."
+            ),
+        })
     from stockagent.live.opening_signal_revision import opening_input_fingerprint, revision_fields
     from stockagent.live.market_config import SIGNAL_UPDATE_ONCE, SIGNAL_UPDATE_PROGRESSIVE
     if day_trade_signal_update_policy != SIGNAL_UPDATE_ONCE:

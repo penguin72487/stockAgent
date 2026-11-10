@@ -43,7 +43,7 @@ def evaluate(
     local = observed.astimezone(TAIPEI)
     session = local.weekday() < 5
     calendar_evidence = "weekday_only"
-    if session and official_calendar_root is not None:
+    if official_calendar_root is not None:
         repo_root = Path(__file__).resolve().parents[1]
         if str(repo_root) not in sys.path:
             sys.path.insert(0, str(repo_root))
@@ -52,8 +52,8 @@ def evaluate(
         verified_session, calendar_evidence = verified_tw_stock_session_day(
             local.date(), parquet_root=official_calendar_root,
         )
-        # A missing or corrupt calendar is not proof of a holiday. Keep the
-        # critical opening window protected until official evidence exists.
+        # A scheduled makeup session can fall on a weekend. A missing or
+        # corrupt official calendar is not proof of a closure on any day.
         session = verified_session or not calendar_evidence.startswith(
             "official TWSE schedule as-of"
         )
@@ -91,12 +91,38 @@ def main() -> int:
     )
     if observed.tzinfo is None:
         observed = observed.replace(tzinfo=TAIPEI)
-    result = evaluate(
-        observed,
-        minimum_runway_minutes=args.minimum_runway_minutes,
-        protected_until=datetime_time.fromisoformat(args.protected_until),
-        official_calendar_root=args.official_calendar_root,
-    )
+    def canonical(minimum_runway_minutes=args.minimum_runway_minutes):
+        return evaluate(
+            observed,
+            minimum_runway_minutes=minimum_runway_minutes,
+            protected_until=datetime_time.fromisoformat(args.protected_until),
+            official_calendar_root=args.official_calendar_root,
+        )
+    repo_root = Path(__file__).resolve().parents[1]
+    if (args.observed_at is None and args.minimum_runway_minutes in (120, 20)
+            and args.protected_until == '13:30' and args.official_calendar_root is not None
+            and args.official_calendar_root.resolve() == (repo_root/'data_tw_public').resolve()
+            and not args.calendar_refresh and not args.session_status):
+        # Both storage runways share only the verified session decision.
+        # Retain the original cache's 120-minute identity; recompute the
+        # installer's 08:00 boundary instead of inheriting its 06:20 block.
+        if str(repo_root) not in sys.path:
+            sys.path.insert(0, str(repo_root))
+        try:
+            from scripts.storage_priority_cache import evaluate_cached
+        except ImportError:
+            result = canonical()
+        else:
+            result = evaluate_cached(observed.astimezone(TAIPEI), args.official_calendar_root,
+                                     lambda: canonical(120))
+            if args.minimum_runway_minutes == 20:
+                local = observed.astimezone(TAIPEI)
+                protected = bool(result['stock_session'] and
+                    datetime_time(8, 0) <= local.timetz().replace(tzinfo=None) < datetime_time(13, 30))
+                result = {**result, 'minimum_runway_minutes': 20, 'protected_start': '08:00:00',
+                          'protected': protected, 'allowed': not protected}
+    else:
+        result = canonical()
     if args.calendar_refresh:
         if args.official_calendar_root is None or args.session_status:
             raise ValueError("calendar-refresh requires its official calendar root and not session-status")

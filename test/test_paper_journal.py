@@ -150,6 +150,31 @@ def test_unenrolled_canonical_writer_does_not_create_format(tmp_path):
     assert set(paper_journal_generations(tmp_path)) == set(journal.FILENAMES)
 
 
+def test_compare_and_append_requires_the_exact_managed_parent(tmp_path):
+    path, pointer = seed(tmp_path, name="fills.jsonl")
+    original = path.read_bytes()
+    parent = {"head": pointer["head"], "size": len(original)}
+    journal.append_paper_journal(path, b'{"quantity":2000}\n', expected_parent=parent)
+    after = path.read_bytes()
+    assert after == original + b'{"quantity":2000}\n'
+    with pytest.raises(OSError, match="expected parent changed"):
+        journal.append_paper_journal(path, b'{"quantity":3000}\n', expected_parent=parent)
+    assert path.read_bytes() == after
+    with pytest.raises(ValueError, match="nonempty"):
+        journal.append_paper_journal(path, b"", expected_parent=parent)
+
+
+def test_compare_and_append_never_enrolls_or_mutates_legacy(tmp_path):
+    path = tmp_path / "fills.jsonl"
+    path.write_bytes(b'{"quantity":1000}\n')
+    before = path.read_bytes()
+    with pytest.raises(ValueError, match="enrolled"):
+        journal.append_paper_journal(path, b'{"quantity":2000}\n',
+                                     expected_parent={"head": {}, "size": len(before)})
+    assert path.read_bytes() == before
+    assert not journal.managed(path)
+
+
 @pytest.mark.parametrize("name", journal.FILENAMES)
 def test_all_six_canonical_append_owners_preserve_bytes_and_parent(tmp_path, name):
     path, first = seed(tmp_path, name=name)
@@ -320,6 +345,52 @@ def test_history_scope_rejects_relevant_committed_changes_during_read(tmp_path, 
             engine._persist(CLOCK + timedelta(seconds=1))
 
 
+def test_history_scope_retries_atomic_state_rename_against_a_new_receipt(tmp_path, monkeypatch):
+    from stockagent.live import tw_day_trade_service_sync as sync
+    engine = simulation.TwDayTradeSimulationEngine(tmp_path)
+    engine.state = state()
+    engine._persist(CLOCK)
+    original = sync._history_state_at_receipt
+    calls = []
+    def replace_while_capturing(root, receipt):
+        calls.append(receipt["state_revision"])
+        if len(calls) == 1:
+            engine._persist(CLOCK + timedelta(seconds=1))
+        return original(root, receipt)
+    monkeypatch.setattr(sync, "_history_state_at_receipt", replace_while_capturing)
+    with committed_paper_history_read_guard(tmp_path) as captured:
+        assert captured == {"product": "tw_day_trade", "enabled_markets": None}
+    assert len(calls) >= 3  # retry admission and independently verify on exit
+    assert calls[1] > calls[0]
+
+
+def test_history_scope_retry_never_accepts_a_new_mark_or_uncommitted_rewrite(tmp_path, monkeypatch):
+    from stockagent.live import tw_day_trade_service_sync as sync
+    engine = simulation.TwDayTradeSimulationEngine(tmp_path)
+    engine.state = state()
+    engine._persist(CLOCK)
+    original = sync._history_state_at_receipt
+    calls = []
+    def append_during_capture(root, receipt):
+        calls.append(receipt["state_revision"])
+        if len(calls) == 1:
+            journal.append_paper_journal(tmp_path / "marks.jsonl", b'{"equity_twd":1000}\n')
+            engine._persist(CLOCK + timedelta(seconds=1))
+        return original(root, receipt)
+    monkeypatch.setattr(sync, "_history_state_at_receipt", append_during_capture)
+    with pytest.raises(PaperReadChanged):
+        with committed_paper_history_read_guard(tmp_path):
+            pass
+
+    monkeypatch.setattr(sync, "_history_state_at_receipt", original)
+    before = engine.state_path.stat()
+    engine.state_path.write_bytes(engine.state_path.read_bytes())
+    os.utime(engine.state_path, ns=(before.st_atime_ns, before.st_mtime_ns))
+    with pytest.raises(PaperReadChanged):
+        with committed_paper_history_read_guard(tmp_path):
+            pass
+
+
 def test_history_scope_rejects_removed_immutable_head_and_owner_change(tmp_path):
     engine = simulation.TwDayTradeSimulationEngine(tmp_path)
     engine.state = state()
@@ -335,7 +406,9 @@ def test_history_scope_rejects_removed_immutable_head_and_owner_change(tmp_path)
             pass
     head.write_bytes(saved)
     engine._persist(CLOCK + timedelta(seconds=1))
-    with pytest.raises(PaperReadChanged, match="owner"):
+    # The generation fence may reject the uncommitted replacement before its
+    # changed owner is decoded; both outcomes remain fail-closed.
+    with pytest.raises(PaperReadChanged, match="owner|ahead"):
         with committed_paper_history_read_guard(tmp_path):
             value = json.loads(engine.state_path.read_bytes())
             value["engine_run_id"] = "new-owner"

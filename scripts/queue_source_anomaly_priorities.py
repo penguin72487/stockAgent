@@ -133,8 +133,13 @@ def enqueue(root: Path, audit: Path, *, live: bool, now: datetime, yahoo_report:
             grouped.setdefault(owner, []).append(item)
     receipts = []
     for owner, incoming in grouped.items():
-        with (owner / '.quality_priority.lock').open('a') as lock:
+        from stockagent.data_sync.bybit_workspace_guard import writer_guard as bybit_writer_guard
+        from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+        from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+        guard_path(owner)
+        with yahoo_writer_guard(owner), bybit_writer_guard(owner), (owner / '.quality_priority.lock').open('a') as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
+            guard_locked_path(owner, lock, lock_name='.quality_priority.lock')
             plan = load_plan(owner)
             existing = {r['request_id'] for r in plan['requests']}
             added = 0

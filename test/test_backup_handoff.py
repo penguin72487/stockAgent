@@ -32,6 +32,55 @@ def test_news_copy_handoff_is_closed_control_only_and_never_changes_worker(hando
     verify(root, proof['envelope_identity_sha256'])
 
 
+def test_content_alias_reader_handoff_is_closed_and_passes_isolated_contract(handoff_queue):
+    import json
+    import os
+    from scripts.publish_backup_handoff import STORAGE_CONTENT_ALIAS_FILES, STORAGE_CONTENT_ALIAS_NAME
+    queue = handoff_queue
+    proof = publish_handoff(queue, STORAGE_CONTENT_ALIAS_NAME, physical_transport_alias=queue.transport)
+    root = Path(proof['source_path'])
+    manifest = json.loads((root / 'handoff-manifest.json').read_bytes())
+    assert {row['relative'] for row in manifest['files']} == set(STORAGE_CONTENT_ALIAS_FILES)
+    assert len(STORAGE_CONTENT_ALIAS_FILES) == len(set(STORAGE_CONTENT_ALIAS_FILES))
+    assert all(name.endswith(('.py', '.md')) for name in STORAGE_CONTENT_ALIAS_FILES)
+    assert not manifest['replace_existing_worker'] and not manifest['automatic_execution_from_syncthing']
+    assert not queue.ledger_path.exists() and not proof['receiver_adapter_deployed']
+    verify(root, proof['envelope_identity_sha256'])
+    code = ('import sys;sys.path.insert(0,sys.argv[1]);import pytest;'
+            'raise SystemExit(pytest.main(["-q","test/test_packed_alias_v3.py"]))')
+    result = subprocess.run([sys.executable, '-I', '-B', '-c', code, str(root)], cwd=root,
+        env={**os.environ, 'PYTEST_DISABLE_PLUGIN_AUTOLOAD': '1'}, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize('version', [1, 2])
+def test_operations_runbook_uses_existing_control_channel_without_data_or_execution(handoff_queue, version):
+    import json
+    from scripts.publish_backup_handoff import (STORAGE_OPERATIONS_FILES, STORAGE_OPERATIONS_NAME,
+        STORAGE_OPERATIONS_V2_FILES, STORAGE_OPERATIONS_V2_NAME)
+    name = STORAGE_OPERATIONS_NAME if version == 1 else STORAGE_OPERATIONS_V2_NAME
+    files = STORAGE_OPERATIONS_FILES if version == 1 else STORAGE_OPERATIONS_V2_FILES
+    queue = handoff_queue
+    with (queue.state / 'owner.lock').open('a') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        result = publish_handoff(queue, name, physical_transport_alias=queue.transport)
+    root = Path(result['source_path'])
+    manifest = json.loads((root / 'handoff-manifest.json').read_bytes())
+    assert {row['relative'] for row in manifest['files']} == set(files)
+    assert all(path.endswith(('.md', '.py')) for path in files)
+    if version == 1:
+        assert all(path.startswith('docs/') and path.endswith('.md') for path in files)
+    else:
+        assert 'stockagent/control/lakehouse.py' in files and not any(path.endswith('.json') for path in files)
+    assert result['publication_scope'] == 'immutable_control_namespace_only'
+    assert not result['source_ledger_modified'] and not result['receiver_adapter_deployed']
+    assert not manifest['automatic_execution_from_syncthing'] and not manifest['replace_existing_worker']
+    assert not queue.ledger_path.exists()
+    verify(root, result['envelope_identity_sha256'])
+    with pytest.raises(ValueError, match='previously frozen'):
+        publish_handoff(queue, name, physical_transport_alias=queue.transport)
+
+
 def test_news_copy_scope_is_available_from_the_existing_cli():
     from scripts.publish_backup_handoff import NEWS_PRIVATE_NAME
     script = Path(__file__).resolve().parents[1] / 'scripts/publish_backup_handoff.py'
@@ -98,7 +147,7 @@ def test_storage_relay_handoff_contains_full_skill_contracts_and_reviewable_inst
     root = Path(proof['source_path'])
     manifest = json.loads((root / 'handoff-manifest.json').read_bytes())
     assert proof['source_files'] == len(STORAGE_RELAY_FILES) == len(set(STORAGE_RELAY_FILES))
-    assert sum(row['bytes'] for row in manifest['files']) < 1024**2
+    assert sum(row['bytes'] for row in manifest['files']) < 2 * 1024**2
     assert manifest['replace_existing_worker'] is False
     assert manifest['automatic_execution_from_syncthing'] is False
     assert 'upgrade_existing_service_driver' not in manifest
@@ -128,7 +177,7 @@ def test_rescue_handoff_is_metadata_only_complete_and_keeps_original_owner(hando
     root = Path(proof['source_path'])
     manifest = json.loads((root / 'handoff-manifest.json').read_bytes())
     assert proof['source_files'] == len(STORAGE_RESCUE_FILES) == len(set(STORAGE_RESCUE_FILES))
-    assert sum(row['bytes'] for row in manifest['files']) < 1024**2
+    assert sum(row['bytes'] for row in manifest['files']) < 2 * 1024**2
     assert not manifest['replace_existing_worker'] and not manifest['automatic_execution_from_syncthing']
     assert not queue.ledger_path.exists()
     assert all(not row['relative'].startswith(('artifacts/', 'data/', '.env')) for row in manifest['files'])

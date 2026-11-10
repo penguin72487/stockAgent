@@ -1,0 +1,236 @@
+{
+  "schema_version": 1,
+  "contract": "stockagent.workspace_source_staging_queue.v1",
+  "sources": [
+    {
+      "name": "tw-daytrade-close-rollback-e-20261108-v1",
+      "source": "service_data/live/official-close-settlement-kb2xdiof",
+      "marker": "receipt.json",
+      "budget_bytes": 68719476736,
+      "seed_hardlinks": false,
+      "copy_mode": "source_stream_no_readback"
+    },
+    {
+      "name": "tw-daytrade-atomic-repair-e-20261108-v1",
+      "source": "service_data/live/tw_day_trade_simulation.atomic-repair-fp8q78y4",
+      "marker": "promotion_receipt.json",
+      "budget_bytes": 103079215104,
+      "seed_hardlinks": false,
+      "copy_mode": "source_stream_no_readback"
+    },
+    {
+      "name": "tw-futures-prepared-e-primary-20261104-v1",
+      "source": "data_tw_index_futures/training_prepared",
+      "catalog_source": "data_tw_index_futures",
+      "marker": "tx_contract_days_audit_projection_20261030_v1/manifest.json",
+      "budget_bytes": 824633720832,
+      "seed_hardlinks": true,
+      "preserve_symlinks": true
+    },
+    {
+      "name": "tw-minute-train-stream-e-20261108-v1",
+      "source": "data_tw_minute/research_dataset",
+      "marker": "manifest.json",
+      "budget_bytes": 25769803776,
+      "seed_hardlinks": false,
+      "copy_mode": "source_stream_no_readback"
+    },
+    {
+      "name": "tw-minute-source-e-primary-20261104-v1",
+      "source": "data_tw_minute/shioaji_1m",
+      "marker": "download_summary.json",
+      "budget_bytes": 34359738368,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "tw-minute-source-stream-e-20261108-v1",
+      "source": "data_tw_minute/shioaji_1m",
+      "marker": "download_summary.json",
+      "budget_bytes": 34359738368,
+      "seed_hardlinks": false,
+      "copy_mode": "source_stream_no_readback"
+    },
+    {
+      "name": "bybit-source-stream-e-20261108-v1",
+      "source": "service_data/stockagent-live/data_bybit",
+      "catalog_source": "data_bybit",
+      "marker": "download_summary.json",
+      "budget_bytes": 68719476736,
+      "seed_hardlinks": false,
+      "copy_mode": "source_stream_no_readback"
+    },
+    {
+      "name": "tw-microstructure-train-e-primary-20261104-v1",
+      "source": "data_tw_microstructure/hft_dataset",
+      "marker": "manifest.json",
+      "budget_bytes": 8589934592,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "legacy-parquet-e-primary-20261104-v1",
+      "source": "data_parquet",
+      "marker": "README.md",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "public-economic-e-primary-20261104-v1",
+      "source": "data_public_economic",
+      "marker": "download_summary.json",
+      "budget_bytes": 8589934592,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "tw-index-options-daily-e-primary-20261104-v1",
+      "source": "data_tw_index_options_daily",
+      "marker": "manifest.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "tw-index-options-daily-stream-e-20261108-v1",
+      "source": "data_tw_index_options_daily",
+      "marker": "manifest.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": false,
+      "copy_mode": "source_stream_no_readback"
+    },
+    {
+      "name": "tw-index-options-raw-stream-e-20261108-v1",
+      "source": "data_tw_index_options_daily/raw",
+      "catalog_source": "data_tw_index_options_daily",
+      "marker": "annual/2001_opt.zip",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": false,
+      "copy_mode": "source_stream_no_readback"
+    },
+    {
+      "name": "binance-archive-e-primary-20261104-v1",
+      "source": "data_binance_archive",
+      "marker": "download_summary.json",
+      "budget_bytes": 137438953472,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "okx-e-primary-20261104-v1",
+      "source": "data_okx",
+      "marker": "1m/download_summary.json",
+      "budget_bytes": 68719476736,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "forex-frankfurter-e-primary-20261104-v1",
+      "source": "data_forex_frankfurter",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "news-training-local-e-primary-20261104-v1",
+      "source": "data_news",
+      "marker": "manifest.json",
+      "budget_bytes": 68719476736,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "yahoo-market-e-primary-20261104-v1",
+      "source": "data_yahoo",
+      "marker": "download_summary.json",
+      "budget_bytes": 68719476736,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "free-public-context-e-primary-20261104-v1",
+      "source": "data_free_public",
+      "marker": "download_summary.json",
+      "budget_bytes": 8589934592,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "cftc-legacy-pre2000-e-primary-20261104-v1",
+      "source": "data_cftc_legacy",
+      "marker": "manifest.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "forex-pepperstone-e-primary-20261104-v1",
+      "source": "data_peperstone",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "crypto-etf-history-e-primary-20261104-v1",
+      "source": "data_crypto_etf",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "keyed-public-catalogs-e-primary-20261104-v1",
+      "source": "data_keyed_public_catalogs",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "binance-market-e-primary-20261104-v1",
+      "source": "data_binance",
+      "marker": "download_summary.json",
+      "budget_bytes": 549755813888,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "crypto-reference-e-primary-20261104-v1",
+      "source": "data_crypto_reference",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "crypto-public-context-e-primary-20261104-v1",
+      "source": "data_crypto_historical_public",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "dune-crypto-e-primary-20261104-v1",
+      "source": "data_dune_crypto",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "fred-crypto-macro-e-primary-20261104-v1",
+      "source": "data_fred_crypto_macro",
+      "marker": "download_summary.json",
+      "budget_bytes": 4294967296,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "coinmetrics-community-e-primary-20261104-v1",
+      "source": "data_coinmetrics_community",
+      "marker": "download_summary.json",
+      "budget_bytes": 68719476736,
+      "seed_hardlinks": true
+    },
+    {
+      "name": "taifex-public-history-e-primary-20261104-v1",
+      "source": "data_taifex_public_history",
+      "marker": "manifest.json",
+      "budget_bytes": 137438953472,
+      "seed_hardlinks": true,
+      "preserve_symlinks": true
+    },
+    {
+      "name": "news-fulltext-bodies-e-primary-20261104-v1",
+      "source": "data_news_fulltext/bodies",
+      "catalog_source": "data_news_fulltext",
+      "marker": "20261027/20261027T171812670228Z-349dc38d.parquet",
+      "budget_bytes": 549755813888,
+      "seed_hardlinks": true
+    }
+  ]
+}

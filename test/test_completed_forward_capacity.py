@@ -232,6 +232,30 @@ def test_invalid_reservation_is_retained_not_silently_reaped(tmp_path, defect):
     assert (path.read_bytes(), path.stat()) == before
 
 
+def test_unlocked_old_device_reservation_is_reaped_after_remount(tmp_path):
+    path = _record(tmp_path)
+    value = json.loads(path.read_text())
+    value['root_device'] += 1
+    path.write_text(json.dumps(value))
+    status = capacity.capacity_status(tmp_path)
+    assert len(status['stale_reservations']) == 1 and path.exists()
+    with _reserve(tmp_path) as current:
+        assert current['stale_reaped'] == 1 and not path.exists()
+
+
+def test_locked_old_device_reservation_is_not_reaped_or_credited(tmp_path):
+    path = _record(tmp_path)
+    value = json.loads(path.read_text())
+    value['root_device'] += 1
+    path.write_text(json.dumps(value))
+    with path.open('rb') as active:
+        fcntl.flock(active, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(capacity.CapacityDeferred, match='invalid_reservation'):
+            with _reserve(tmp_path):
+                pytest.fail('device mismatch cannot grant credit to an active writer')
+        assert path.exists()
+
+
 @pytest.mark.parametrize("kind", ["directory", "symlink", "fifo"])
 def test_unknown_nonregular_entry_prevents_false_complete_capacity(tmp_path, kind):
     path = tmp_path / "unknown"

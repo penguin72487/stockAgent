@@ -196,6 +196,27 @@ class TejTrialAPI:
                 con.execute("UPDATE requests SET state='unknown_transport_outcome' WHERE id=?", (identifier,))
             raise TejAPIError("unknown_transport_outcome") from None
         if response.status != 200:
+            # Preserve bounded, credential-redacted provider diagnostics for
+            # later repair. A bare HTTP 400 cannot establish whether a cursor,
+            # filter or some other vendor constraint caused the rejection.
+            # This evidence is private and never changes retry/quota state.
+            try:
+                from downloader.http_transport import _sanitized_error_body
+                encoding = next((value for name, value in response.headers.items()
+                                 if name.casefold() == 'content-encoding'), 'identity').casefold()
+                preview = (_sanitized_error_body(response.body, url).decode('utf-8', errors='replace')
+                           if encoding in {'identity', ''} and len(response.body) <= 65536 else None)
+                if preview and self._key in preview:
+                    preview = None
+                atomic_write_json(self.root / 'diagnostics' / (identifier + '.http-error.json'), {
+                    'contract': 'tej_redacted_http_error_v1', 'request_id': identifier,
+                    'task_id': task_id, 'observed_at_utc': self.now().isoformat(),
+                    'http_status': response.status, 'response_bytes': len(response.body),
+                    'body_preview': preview, 'endpoint': sanitized_url(BASE + path),
+                    'credential_redaction': 'request_query_values_and_known_api_key',
+                })
+            except (OSError, ValueError, TypeError, UnicodeError):
+                pass  # Diagnostic failure never turns a rejected request into a success.
             with closing(connect(self.root)) as con, con:
                 con.execute("UPDATE requests SET state=?,actual_rows=0 WHERE id=?", ("http_" + str(response.status), identifier))
                 if response.status in {429, 503}:

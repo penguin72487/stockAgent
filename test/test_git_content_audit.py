@@ -16,6 +16,11 @@ from scripts import audit_git_content as content
     ".env", ".env.production", "test/fixtures/.env.local", "test/fixtures/private.key",
     "keys/certificate.p12", "nested/__pycache__/test.pyc", ".stignore",
     "model.pt", "state.sqlite", "timing.log", "scratch.tmp", ".DS_Store",
+    ".data_binance.pre-e-20261105-v1/.download.lock",
+    ".data_future_provider.pre-e-20990101-v2/receipt.json",
+    "stockagent-rate-limits-0/provider.state", "stockagent-rate-limits-1001/provider.state",
+    "service_data/stockagent-live/state.json", ".stversions/README.md~20261110",
+    ".codex_remote_perf/orig/stockagent/copied_source.py",
 ])
 def test_excludes_roles_not_needed_by_git(path):
     assert content.decision(path)["decision"] == "exclude"
@@ -29,6 +34,10 @@ def test_excludes_roles_not_needed_by_git(path):
     "services/dashboard/index.html", "deploy/syncthing/example.stignore",
     ".agents/skills/example/SKILL.md", ".vscode/settings.json", "data_processing.py",
     "test/fixtures/prices.parquet", "test/fixtures/archive/input.zip",
+    "docs/.data_move_notes.md", "stockagent/service_data/adapter.py",
+    "configs/stockagent-rate-limits-defaults.json", "test/fixtures/provider.state",
+    "test/fixtures/.data_provider.pre-e-example/receipt.json",
+    "stockagent-rate-limits-helper.py", ".data_provider.pre-e-notes.md",
 ])
 def test_keeps_source_templates_locks_and_small_fixtures(path):
     assert content.decision(path)["decision"] == "keep"
@@ -173,11 +182,20 @@ def test_output_cannot_follow_symlink_parent(repo, tmp_path):
 def test_repo_ignore_rules_do_not_hide_source_or_required_fixtures(repo):
     (repo / ".gitignore").write_bytes((Path(__file__).resolve().parents[1] / ".gitignore").read_bytes())
     ignored = ["data_new/x.parquet", "artifacts_trial/model.pt", "reports/one/report.html",
-               ".env.local", ".agents/skills/.skill-sync-backups/old/x.md", "model.pt"]
+               ".env.local", ".agents/skills/.skill-sync-backups/old/x.md", "model.pt",
+               ".data_binance.pre-e-20261105-v1/.download.lock",
+               ".data_future.pre-e-20990101-v2/receipt.json",
+               "stockagent-rate-limits-0/provider.state", "stockagent-rate-limits-1001/provider.state",
+               "service_data/stockagent-live/state.json", ".stversions/README.md~20261110",
+               ".codex_remote_perf/new/stockagent/copied_source.py"]
     kept = ["configs/data_sync/catalog.json", "stockagent/data/panel.py", "test/test_new.py",
             "test/fixtures/a.parquet", "test/fixtures/nested/a.zip", ".env.example", "uv.lock",
             "services/discord_bot/.env copy.example", "services/dashboard/index.html",
-            "deploy/syncthing/example.stignore", "data_processing.py"]
+            "deploy/syncthing/example.stignore", "data_processing.py", "package-lock.json",
+            "test/fixtures/provider.state", "docs/.data_move_notes.md",
+            "configs/stockagent-rate-limits-defaults.json", "stockagent/service_data/adapter.py",
+            "test/fixtures/.data_provider.pre-e-example/receipt.json",
+            "stockagent-rate-limits-helper.py", ".data_provider.pre-e-notes.md"]
     for name in ignored + kept:
         # Explicit file paths allow check-ignore to work without building test payload trees.
         path = repo / name
@@ -185,3 +203,29 @@ def test_repo_ignore_rules_do_not_hide_source_or_required_fixtures(repo):
         path.write_text("fixture\n")
         result = subprocess.run(["git", "-C", str(repo), "check-ignore", "--quiet", "--", name])
         assert (result.returncode == 0) == (name in ignored), name
+
+
+def test_ignored_runtime_state_is_still_rejected_if_force_staged(repo):
+    (repo / ".gitignore").write_bytes((Path(__file__).resolve().parents[1] / ".gitignore").read_bytes())
+    state = repo / "stockagent-rate-limits-0/provider.state"
+    state.parent.mkdir()
+    original = b"synthetic local limiter state\n"
+    state.write_bytes(original)
+    content.git(repo, "add", "--force", "--", str(state.relative_to(repo)))
+    report = content.audit(repo, staged=True)
+    assert report["tracked"][0]["decision"] == "exclude"
+    assert content.main(["--repo", str(repo), "--staged", "--check"]) == 1
+    assert state.read_bytes() == original
+
+
+def test_ignore_rule_does_not_untrack_or_delete_existing_runtime_state(repo):
+    state = repo / "stockagent-rate-limits-0/provider.state"
+    state.parent.mkdir()
+    state.write_text("synthetic local limiter state\n")
+    content.git(repo, "add", "--", str(state.relative_to(repo)))
+    content.git(repo, "commit", "-m", "legacy runtime state fixture")
+    before = content.git(repo, "ls-files", "--stage", "-z")
+    (repo / ".gitignore").write_bytes((Path(__file__).resolve().parents[1] / ".gitignore").read_bytes())
+    assert content.git(repo, "ls-files", "--stage", "-z") == before
+    assert state.read_text() == "synthetic local limiter state\n"
+    assert content.main(["--repo", str(repo), "--check"]) == 1

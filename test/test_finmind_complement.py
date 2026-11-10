@@ -58,6 +58,79 @@ def test_capacity_wait_rechecks_each_minute_and_reuses_sampler(tmp_path, monkeyp
     assert seen == [sampler, sampler, sampler] and delays == [60, 60]
 
 
+def test_capacity_wait_resumes_promptly_after_the_inflight_probe(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    waits = []
+    sampler = SimpleNamespace(root=tmp_path.absolute(), wait_for_refresh=lambda **kw: (
+        waits.append(kw['timeout_seconds']) or {'state': 'admitted'}))
+    monkeypatch.setattr(complement, 'AcquisitionCapacitySampler', lambda _root: sampler)
+    calls, delays = [], []
+
+    def cycle(_root, **_kwargs):
+        calls.append(1)
+        if len(calls) == 2:
+            raise KeyboardInterrupt
+        return {'state': 'disk_guard', 'capacity_admission': {
+            'state': 'deferred', 'reason': 'physical_backing_headroom_unconfirmed',
+            'probe_inflight': True,
+        }}
+
+    monkeypatch.setattr(complement, 'run_once', cycle)
+    monkeypatch.setattr(complement, 'wait_for_next_cycle', lambda _r, _s, delay, **_k: delays.append(delay))
+    assert complement.main(['--root', str(tmp_path), '--loop']) == 130
+    assert waits == [29] and delays == [0]
+
+
+def test_background_startup_keeps_summary_clock_and_does_not_scan(tmp_path, monkeypatch):
+    previous = {'state': 'batch_complete', 'observed_at_utc': '2026-11-08T01:02:03+00:00',
+                'series': {'Example': {'rows': 42}},
+                'last_task': {'dataset': 'Example', 'rows': 7}}
+    (tmp_path / 'status.json').write_text(json.dumps(previous))
+    monkeypatch.setattr(complement, 'task_status_aggregates',
+                        lambda *_a, **_k: pytest.fail('global aggregate on startup'))
+    status = complement._carried_status(tmp_path, state='running',
+                                        scope='background_pre_dispatch')
+    assert status['state'] == 'running'
+    assert status['status_scope'] == 'background_pre_dispatch'
+    assert status['status_aggregate_state'] == 'carried_previous_snapshot'
+    assert status['source_status_observed_at_utc'] == previous['observed_at_utc']
+    assert status['series'] == previous['series'] and status['last_task'] == previous['last_task']
+
+
+def test_background_capacity_wait_never_overrides_a_real_reserve():
+    from types import SimpleNamespace
+    calls = []
+    sampler = SimpleNamespace(wait_for_refresh=lambda **kw: (
+        calls.append(kw['timeout_seconds']) or {'state': 'admitted'}))
+    assert complement._background_transient_capacity(sampler, {
+        'state': 'deferred', 'reason': 'physical_backing_reserve', 'probe_inflight': True,
+    }) is None
+    assert calls == []
+    assert complement._background_transient_capacity(sampler, {
+        'state': 'deferred', 'reason': 'capacity_sample_expired', 'probe_inflight': True,
+    }) == {'state': 'admitted'}
+    assert calls == [29]
+
+
+def test_pipeline_capacity_recheck_resumes_only_after_both_reserves_are_proven(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    free = [complement.MIN_FREE_BYTES + 1]
+    monkeypatch.setattr(complement.shutil, 'disk_usage', lambda _: SimpleNamespace(free=free[0]))
+    calls = []
+    sampler = SimpleNamespace(sample=lambda: {'state': 'deferred', 'reason': 'capacity_sample_expired',
+                                               'probe_inflight': True},
+                              wait_for_refresh=lambda **kw: calls.append(kw) or {'state': 'admitted'})
+    assert complement._pipeline_capacity_recheck(tmp_path, sampler)['state'] == 'admitted'
+    assert calls == [{'timeout_seconds': 29}]
+    free[0] = complement.MIN_FREE_BYTES - 1
+    assert complement._pipeline_capacity_recheck(tmp_path, sampler)['reason'] == 'filesystem_reserve'
+    assert len(calls) == 1
+    free[0] = complement.MIN_FREE_BYTES + 1
+    sampler.sample = lambda: {'state': 'deferred', 'reason': 'physical_backing_reserve', 'probe_inflight': True}
+    assert complement._pipeline_capacity_recheck(tmp_path, sampler)['reason'] == 'physical_backing_reserve'
+    assert len(calls) == 1
+
+
 def test_exact_key_cli_holds_shared_worker_lock(tmp_path: Path, monkeypatch) -> None:
     calls = []
 

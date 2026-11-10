@@ -2,13 +2,14 @@
 from contextlib import closing
 from datetime import UTC, datetime, timedelta
 import json
+import os
 
 import pytest
 
 from downloader.artifact_io import atomic_write_json
 from downloader.tej_history import connect
 from downloader.tej_metadata_recovery import (
-    CONTRACT, RETRY_SCHEDULED, failed_plan_proof, metadata_recovery_policy,
+    CONTRACT, FILE_CLOCK_CONTRACT, RETRY_SCHEDULED, failed_plan_proof, metadata_recovery_policy,
     recover_failed_metadata,
 )
 from test_tej_history import registry
@@ -50,6 +51,57 @@ def test_changed_clock_validator_rechecks_only_local_evidence_cooldown(failed_me
     result = recover_failed_metadata(root, FreshBridge(), policy=metadata_recovery_policy(CONFIG))
     assert result["state"] == RETRY_SCHEDULED
     assert result["backoff_seconds"] == 60  # Local validator failures are not source failures.
+
+
+@pytest.mark.parametrize("offset,accepted", [(-0.208, True), (-5.0, True), (-5.1, False)])
+def test_prepared_file_clock_step_requires_bounded_unambiguous_source_proof(failed_metadata, offset, accepted):
+    _, root, task, prepared, outcome, *_ = failed_metadata
+    started = datetime.fromisoformat(task["attempted_at_utc"])
+    original = prepared.read_bytes(), outcome.read_bytes()
+    stamp = (started + timedelta(seconds=offset)).timestamp()
+    os.utime(prepared, (stamp, stamp))
+    if not accepted:
+        with pytest.raises(ValueError):
+            failed_plan_proof(root, task)
+        assert recover_failed_metadata(root, FreshBridge(), policy=metadata_recovery_policy(CONFIG)) is None
+        return
+    proof = failed_plan_proof(root, task)
+    assert proof['prepared'] == prepared and proof['file_clock_contract'] == FILE_CLOCK_CONTRACT
+    assert proof['prepared_file_clock_evidence']['outside_local_window_seconds'] < 0
+    result = recover_failed_metadata(root, FreshBridge(), policy=metadata_recovery_policy(CONFIG))
+    assert result['state'] == RETRY_SCHEDULED
+    assert (prepared.read_bytes(), outcome.read_bytes()) == original
+
+
+def test_early_prepared_file_rejects_overlapping_metadata_traffic(failed_metadata):
+    _, root, task, prepared, *_ = failed_metadata
+    started = datetime.fromisoformat(task['attempted_at_utc'])
+    stamp = (started - timedelta(seconds=0.2)).timestamp()
+    os.utime(prepared, (stamp, stamp))
+    with closing(connect(root)) as con, con:
+        con.execute("INSERT INTO traffic VALUES ('competing','discover',?,?,'failed')",
+                    ((started - timedelta(seconds=0.4)).isoformat(),
+                     (started + timedelta(seconds=1)).isoformat()))
+    with pytest.raises(ValueError, match='overlapping metadata traffic'):
+        failed_plan_proof(root, task)
+    bridge = FreshBridge()
+    assert recover_failed_metadata(root, bridge, policy=metadata_recovery_policy(CONFIG)) is None
+    assert bridge.calls == []
+
+
+def test_file_clock_validator_upgrade_rechecks_previous_local_failure(failed_metadata):
+    _, root, task, prepared, *_ = failed_metadata
+    started = datetime.fromisoformat(task['attempted_at_utc'])
+    stamp = (started - timedelta(seconds=0.2)).timestamp()
+    os.utime(prepared, (stamp, stamp))
+    old = {'contract': CONTRACT, 'state': 'metadata_evidence_requires_review',
+           'attempted_at_utc': task['attempted_at_utc'], 'failures': 473,
+           'next_check_at_utc': (datetime.now(UTC) + timedelta(minutes=15)).isoformat(),
+           'evidence_clock_contract': 'bounded_cross_clock_operation_window_v1'}
+    with closing(connect(root)) as con, con:
+        con.execute('INSERT INTO meta VALUES (?,?)', ('metadata_recovery.' + task['task_id'], json.dumps(old)))
+    result = recover_failed_metadata(root, FreshBridge(), policy=metadata_recovery_policy(CONFIG))
+    assert result['state'] == RETRY_SCHEDULED and result['backoff_seconds'] == 60
 
 
 class SkewedReadback(FreshBridge):

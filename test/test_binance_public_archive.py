@@ -5,8 +5,12 @@ from dataclasses import replace
 from http.client import IncompleteRead
 from io import BytesIO
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
+import sys
+from types import SimpleNamespace
 from zipfile import ZIP_DEFLATED, ZipFile
 
 import polars as pl
@@ -26,6 +30,69 @@ from downloader.download_binance_public_archive import (
     _record_state,
     _completed_etags,
 )
+
+
+def test_archive_writer_checks_placement_before_creating_a_source(tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_source_handoff as handoff
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+
+    root = tmp_path / 'unavailable' / 'data_binance_archive'
+    monkeypatch.setattr(archive, 'parse_args', lambda: SimpleNamespace(
+        output_root=root, lock_timeout_seconds=0))
+    monkeypatch.setattr(handoff, 'guard_path', lambda *_: (_ for _ in ()).throw(
+        SnapshotError('E workspace unavailable')))
+    monkeypatch.setattr(archive, '_run_locked', lambda *_: pytest.fail('provider work started'))
+    with pytest.raises(SnapshotError, match='E workspace unavailable'):
+        archive.main()
+    assert not root.exists()
+
+
+def test_archive_writer_holds_the_same_root_lock_for_the_complete_cycle(tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_source_handoff as handoff
+
+    root = tmp_path / 'data_binance_archive'
+    monkeypatch.setattr(archive, 'parse_args', lambda: SimpleNamespace(
+        output_root=root, lock_timeout_seconds=0))
+    monkeypatch.setattr(handoff, 'guard_path', lambda *_: None)
+    calls = []
+    monkeypatch.setattr(archive, '_run_locked', lambda *_: calls.append('ran') or 0)
+    with archive.exclusive_dataset_lock(root / '.download.lock', provider='test', timeout_seconds=0):
+        with pytest.raises(TimeoutError):
+            archive.main()
+    assert calls == []
+    assert archive.main() == 0
+    assert calls == ['ran']
+
+
+def test_archive_writer_rechecks_placement_after_acquiring_the_lock(tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_source_handoff as handoff
+    from stockagent.data_sync.desync_snapshots import SnapshotError
+
+    root = tmp_path / 'data_binance_archive'
+    monkeypatch.setattr(archive, 'parse_args', lambda: SimpleNamespace(
+        output_root=root, lock_timeout_seconds=0))
+    checks = []
+    def guard(path):
+        checks.append(path)
+        if len(checks) == 3:
+            raise SnapshotError('mount changed while acquiring lock')
+    monkeypatch.setattr(handoff, 'guard_path', guard)
+    monkeypatch.setattr(archive, '_run_locked', lambda *_: pytest.fail('provider work started'))
+    with pytest.raises(SnapshotError, match='mount changed'):
+        archive.main()
+    assert len(checks) == 3
+
+
+def test_standalone_archive_imports_placement_guard_without_provider_calls():
+    env = dict(os.environ)
+    env.pop('PYTHONPATH', None)
+    repo = Path(__file__).resolve().parents[1]
+    result = subprocess.run([sys.executable, 'downloader/download_binance_public_archive.py',
+        '--preflight-only', '--output-root', '/proc/stockagent-archive-import-check',
+        '--lock-timeout-seconds', '0'], cwd=repo, env=env, text=True,
+        capture_output=True, timeout=30)
+    assert result.returncode != 0 and 'FileNotFoundError' in result.stderr
+    assert 'ModuleNotFoundError' not in result.stderr
 
 
 def _object(*, granularity: str = "monthly", size: int = 100) -> ArchiveObject:

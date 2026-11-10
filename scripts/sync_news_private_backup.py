@@ -40,6 +40,8 @@ def main():
     policy = json.loads(fixed_bytes(args.policy.absolute()))
     validate_policy(policy, configuration)
     root = ROOT / policy["source_root"]
+    from stockagent.data_sync.workspace_source_handoff import guard_path, guard_locked_path
+    guard_path(root)
     for path in (root, args.plan.absolute(), args.progress.absolute()):
         if any(p.is_symlink() for p in (path, *path.parents)):
             raise ValueError("private news roots are redirected")
@@ -59,6 +61,7 @@ def main():
         except BlockingIOError:
             print(json.dumps({'state': 'original_news_builder_busy', 'retryable': True}), flush=True)
             raise SystemExit(75) from None
+        guard_locked_path(root, owner, lock_name='.build.lock')
         if args.plan.exists():
             plan = json.loads(fixed_bytes(args.plan.absolute()))
             validate_plan(plan, policy, configuration)

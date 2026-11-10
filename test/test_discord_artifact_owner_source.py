@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -6,6 +7,72 @@ import pytest
 from scripts import run_discord_artifact_maintenance as maintenance
 from scripts import run_discord_artifact_with_owner as wrapper
 from stockagent.live import service_code_release
+
+
+@pytest.fixture(autouse=True)
+def isolated_owner_environment(monkeypatch):
+    # Other owner tests use synthetic PID 37; keep proc I/O at this boundary.
+    monkeypatch.setattr(wrapper, "_read_owner_environ", lambda _pid: b"")
+
+
+def test_worker_model_runtime_uses_only_owner_allowlist_not_secrets(monkeypatch):
+    monkeypatch.setattr(wrapper, "_read_owner_environ", lambda _pid: (
+        b"SECRET=not-forwarded\0STOCKAGENT_SPARSE_ADJOINT_BACKEND=cusparse_csr_transpose\0"
+        b"STOCKAGENT_SPARSE_ADJOINT_ALGORITHM=6\0"))
+    assert wrapper._owner_model_environment(37) == {
+        "STOCKAGENT_SPARSE_ADJOINT_BACKEND": "cusparse_csr_transpose",
+        "STOCKAGENT_SPARSE_ADJOINT_ALGORITHM": "6"}
+
+
+@pytest.mark.parametrize("raw", [b"X" * (256 * 1024 + 1),
+    b"STOCKAGENT_SPARSE_ADJOINT_BACKEND=unknown\0",
+    b"STOCKAGENT_SPARSE_ADJOINT_ALGORITHM=7\0",
+    b"STOCKAGENT_SPARSE_ADJOINT_ALGORITHM=6\0STOCKAGENT_SPARSE_ADJOINT_ALGORITHM=0\0"])
+def test_worker_model_runtime_rejects_unbounded_or_ambiguous_owner(monkeypatch, raw):
+    monkeypatch.setattr(wrapper, "_read_owner_environ", lambda _pid: raw)
+    with pytest.raises(RuntimeError):
+        wrapper._owner_model_environment(37)
+
+
+def test_formal_history_workspace_mode_retains_canonical_entrypoint(monkeypatch):
+    from services.discord_bot import bot
+
+    monkeypatch.delenv("STOCKAGENT_SERVICE_CODE_RELEASE", raising=False)
+    assert bot._formal_history_train_command() == [bot.sys.executable, str(bot.ROOT / "train.py")]
+
+
+@pytest.mark.parametrize("missing", ["train.py", "scripts/run_frozen_formal_history.py"])
+def test_formal_history_rejects_legacy_release_with_missing_code(tmp_path, monkeypatch, missing):
+    from services.discord_bot import bot
+
+    receipt = tmp_path / "release.json"
+    files = {"train.py": "hash", "scripts/run_frozen_formal_history.py": "hash"}
+    files.pop(missing)
+    receipt.write_text(json.dumps({"code": {"files": files}}))
+    monkeypatch.setenv("STOCKAGENT_SERVICE_CODE_RELEASE", str(receipt))
+    monkeypatch.setattr(service_code_release, "verify_frozen_source", lambda *_: {"receipt": str(receipt)})
+    with pytest.raises(bot.BotUserError, match="verified same-version trainer") as error:
+        bot._formal_history_train_command()
+    assert missing in str(error.value)
+
+
+def test_formal_history_uses_verified_release_launcher(tmp_path, monkeypatch):
+    from services.discord_bot import bot
+
+    receipt = tmp_path / "release.json"
+    receipt.write_text(json.dumps({"code": {"files": {
+        "train.py": "hash", "scripts/run_frozen_formal_history.py": "hash",
+    }}}))
+    monkeypatch.setenv("STOCKAGENT_SERVICE_CODE_RELEASE", str(receipt))
+    calls = []
+    def verify(path, root):
+        calls.append((path, root))
+        return {"receipt": str(receipt)}
+    monkeypatch.setattr(service_code_release, "verify_frozen_source", verify)
+    command = bot._formal_history_train_command()
+    assert calls == [(receipt, bot.ROOT)]
+    assert command == [bot.sys.executable, str(bot.ROOT / "scripts/run_frozen_formal_history.py"),
+                       "--release", str(receipt), "--"]
 
 
 def test_worker_owner_command_pins_live_gateway_without_joining_its_cgroup(tmp_path, monkeypatch):
@@ -19,12 +86,14 @@ def test_worker_owner_command_pins_live_gateway_without_joining_its_cgroup(tmp_p
     verified = []
     monkeypatch.setattr(wrapper, "verify_owner_namespace", lambda *a, **k: verified.append((a, k)))
     monkeypatch.setattr(wrapper, "_verified_interop_for_maintenance", lambda: "/run/WSL/verified_interop")
+    monkeypatch.setenv("STOCKAGENT_SERVICE_CODE_RELEASE", "/unrelated/inherited/release.json")
     command, env = wrapper.owner_command(["--signal-cache-only"])
     assert verified
     assert command[:4] == ["nsenter", "--target", "37", "--mount"]
     assert "--join-cgroup" not in command and "--all" not in command
     assert command[-1] == "--signal-cache-only"
     assert env["STOCKAGENT_MAINTENANCE_RELEASE"] == str(receipt)
+    assert env["STOCKAGENT_SERVICE_CODE_RELEASE"] == str(receipt)
     assert env["STOCKAGENT_MAINTENANCE_OWNER_PID"] == "37"
     assert env["STOCKAGENT_MAINTENANCE_ENTRY_SHA256"] == wrapper._stable_entry_digest(entry)
     assert env["PYTHONDONTWRITEBYTECODE"] == "1"

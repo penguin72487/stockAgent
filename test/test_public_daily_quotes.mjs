@@ -39,6 +39,14 @@ for (const product of ["tw_day_trade", "tw_overnight"]) {
   });
 }
 
+test("unlimited exchange band and assumed full bracket are disclosed without fill claims", () => {
+  const html = view().positionRow({symbol: "009806", price_limit_band_kind: "recorded_system_band_without_daily_price_limit",
+    paper_bracket_full_cross_assumed: true, take_profit_price: 0.02, stop_trigger_price: 9999.9});
+  assert.match(html, /無每日漲跌幅限制/);
+  assert.match(html, /系統委託邊界推導，並非一般漲跌停/);
+  assert.match(html, /穿價後全數出場為模擬假設，非交易所或券商成交/);
+});
+
 test("daily source labels escape markup and hidden daily facts do not render", () => {
   const render = view();
   assert.equal(render.dailyReference({official_daily_quote: {...daily, open: null, close: null}}), "");

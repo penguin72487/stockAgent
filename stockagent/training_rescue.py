@@ -340,6 +340,111 @@ class Rescue:
         if shutil.disk_usage(self.cold).free < self.policy["reserve_bytes"]:
             raise RescueCapacityWait("D reserve reached; never fall back to C")
 
+    def _retention_protection_config(self):
+        from stockagent.data_sync import packed_retention
+        from stockagent.data_sync.cold_primary import _check_d_primary_mount
+        from stockagent.data_sync.desync_snapshots import SnapshotError
+        cfg = packed_retention.RetentionConfig.load(ROOT/'configs/data_sync/packed_retention.json', repo_root=ROOT)
+        cold = cfg.sync_root.absolute()
+        if self.cold != cold/'.local-state/training-rescue':
+            raise RescueError('fixed rescue source protection requires the enrolled D authority')
+        try:
+            _check_d_primary_mount(cold)
+        except SnapshotError as error:
+            raise RescueError('fixed rescue source D authority unavailable') from error
+        return cfg
+
+    def _protect_packed_sources(self, spec: dict) -> list[dict]:
+        """Protect enrolled fixed inputs before their spec or revision is visible."""
+        rows = spec.get('data_sources', [])
+        if not rows:
+            return []
+        from stockagent.data_sync import packed_snapshots, rescue_source_references
+        from stockagent.data_sync.desync_snapshots import SnapshotError
+
+        cfg = self._retention_protection_config()
+        cold = cfg.sync_root.absolute()
+        bindings = [{key: row[key] for key in ('dataset', 'snapshot_id', 'manifest_sha256')} for row in rows]
+        try:
+            # The registry contains only small local control metadata. It also
+            # records an absent source identity without claiming recovery.
+            return rescue_source_references.protect(cold, cfg.state_dir, bindings)
+        except packed_snapshots.PackedPublicationBusy as error:
+            raise BlockingIOError('packed publication owner busy; retry rescue enrollment') from error
+        except SnapshotError as error:
+            raise RescueError('fixed rescue source protection unavailable') from error
+
+    def reconcile_source_references(self) -> dict:
+        """Enroll original and recorded research revisions without reading payloads.
+
+        The caller holds the rescue owner. Each packed binding is retained
+        even when the named source is currently missing; that does not claim
+        that its data, runtime, or target recovery is available.
+        """
+        from stockagent.training_rescue_recipes import apply_input_recipe
+        from stockagent.training_rescue_worker import _prepared_control
+        from stockagent.data_sync import packed_snapshots
+
+        cfg = self._retention_protection_config()  # Missing D must not look like an empty revision set.
+        owner = cfg.sync_root/'.local-state/locks/publish-retention-global.lock'
+        if owner.is_symlink() or not owner.is_file():
+            raise RescueError('rescue source publication owner unavailable')
+        try:
+            with packed_snapshots._try_publication_lock(owner, shared=True):
+                pass  # Scheduling hint only; the commit reacquires this owner.
+        except packed_snapshots.PackedPublicationBusy as error:
+            raise BlockingIOError('packed publication owner busy; retry rescue source scan') from error
+        root = self.state/'runs'
+        if root.is_symlink() or (root.exists() and not root.is_dir()):
+            raise RescueError('rescue run namespace is redirected')
+        paths = sorted(root.glob('*/spec.json')) if root.is_dir() else []
+        if len(paths) > 128:
+            raise RescueError('rescue source reconciliation exceeds its run bound')
+        sources, signatures, revision_count = [], {}, 0
+        for path in paths:
+            path = absolute(str(path))
+            before = signature(path)
+            if not stat.S_ISREG(before[-1]) or before[2] > MAX_PREPARED_REFERENCE_BYTES:
+                raise RescueError('rescue enrollment metadata is not a bounded regular file')
+            base = self.spec(path.parent.name)
+            signatures[path] = before
+            sources.extend(base.get('data_sources', []))
+            # Keep every registered immutable research revision, not just the
+            # current moving pointer. New revisions are protected at creation.
+            revisions = self.cold/'input-recipes'/identifier(path.parent.name)
+            if revisions.is_symlink() or (revisions.exists() and not revisions.is_dir()):
+                raise RescueError('rescue input revision namespace is redirected')
+            files = sorted(revisions.glob('*.json')) if revisions.is_dir() else []
+            if len(files) > 128:
+                raise RescueError('rescue input revisions exceed their bound')
+            for revision_path in files:
+                revision_path = absolute(str(revision_path))
+                if not HASH.fullmatch(revision_path.stem):
+                    raise RescueError('rescue input revision identity is malformed')
+                before_revision = signature(revision_path)
+                effective = apply_input_recipe(base, _prepared_control(revision_path), revision_path.stem)
+                signatures[revision_path] = before_revision
+                sources.extend(effective.get('data_sources', []))
+                revision_count += 1
+        if any(signature(path) != before for path, before in signatures.items()):
+            raise RescueError('rescue source metadata changed during reconciliation')
+        if sources:
+            protected = self._protect_packed_sources({'data_sources': sources})
+        else:
+            from stockagent.data_sync import rescue_source_references
+            protected = rescue_source_references.load(cfg.state_dir)
+        if any(signature(path) != before for path, before in signatures.items()):
+            raise RescueError('rescue source metadata changed after reconciliation')
+        result = {'contract': 'stockagent.rescue_source_reconciliation.v1', 'state': 'completed',
+                  'run_count': len(paths), 'revision_count': revision_count,
+                  'declared_source_bindings': len(sources), 'protected_unique_bindings': len(protected),
+                  'fixed_bindings': protected,
+                  'observed_at_epoch': time.time(), 'source_objects_checked': False,
+                  'recovery_or_nas_acceptance_claimed': False}
+        atomic_json(self.state/'rescue-source-reference-completed.json', result)
+        atomic_json(self.state/'rescue-source-reference-status.json', result)
+        return result
+
     def path(self, run: str) -> Path:
         return self.state / "runs" / identifier(run)
 
@@ -412,6 +517,7 @@ class Rescue:
         self.input_capsule_objects(candidate)
         revision_sha = digest(revision)
         effective = apply_input_recipe(base, revision, revision_sha)
+        self._protect_packed_sources(effective)
         pointer = {"contract": "stockagent.training_input_recipe_pointer.v1", "revision_sha256": revision_sha,
                    "base_spec_sha256": digest(base)}
         previous = self._recipe_pointer(run)
@@ -462,6 +568,7 @@ class Rescue:
         path = self.path(run) / "spec.json"
         if path.exists() and json.loads(path.read_bytes()) != spec:
             raise RescueError("preserve the enrolled run contract; use a new ID for changed semantics")
+        self._protect_packed_sources(spec)
         atomic_json(path, spec)
         state = self.journal(run)
         self.record(run, state)

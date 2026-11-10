@@ -126,8 +126,9 @@ def test_denied_buffer_uses_existing_verified_streaming_fallback(tmp_path, monke
         assert selected == path
 
 
-@pytest.fixture
-def physically_full_pack(tmp_path, monkeypatch):
+@pytest.fixture(params=['without_e_workspace', 'with_e_workspace'])
+def physically_full_pack(tmp_path, monkeypatch, request):
+    from stockagent.data_sync import workspace_volume
     path = tmp_path / 'original.zip'
     payload = bytes(range(256)) * 8192
     with zipfile.ZipFile(path, 'x', compression=zipfile.ZIP_STORED) as archive:
@@ -138,9 +139,21 @@ def physically_full_pack(tmp_path, monkeypatch):
     monkeypatch.setattr(packed, '_native_pack_buffer_allowed',
                         lambda *_: pytest.fail('explicit no-memory read used a RAM buffer'))
     monkeypatch.setattr(packed.tempfile, 'TemporaryFile',
-                        lambda **_: pytest.fail('physical-capacity refusal allocated C scratch'))
+                        lambda **_: pytest.fail('physical-capacity refusal allocated scratch'))
+    enrollment = tmp_path/'workspace-enrollment.json'
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    if request.param == 'with_e_workspace':
+        enrollment.write_text('{}')
+        expected_scratch = tmp_path/'e-verify'
+        expected_scratch.mkdir()
+        def workspace_path(name, *, create=False):
+            assert name == 'verify' and create is True
+            return expected_scratch
+        monkeypatch.setattr(workspace_volume, 'path', workspace_path)
+    else:
+        expected_scratch = Path('/var/lib')
     def reject_scratch(selected, required):
-        assert selected == Path('/var/lib') and required == item['bytes'] + 32 * 1024**3
+        assert selected == expected_scratch and required == item['bytes'] + 32 * 1024**3
         raise native.WorkspaceCapacityDeferred('training return workspace lacks real physical free space')
     monkeypatch.setattr(native, 'admit_workspace', reject_scratch)
     return path, item, payload

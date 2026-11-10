@@ -63,8 +63,181 @@ def test_zero_volume_price_only_curve_exception_is_legacy_v1_only():
         [fill | {"fill_contract": REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL}],
         market="mode",
     )
+    fractional = _ImmutableMinuteInventory(
+        {"p": {"symbol": "2330"}},
+        [fill | {"fill_contract": LEGACY_REPLAY_FILL_CONTRACT_0901_FULL_COUNTERFACTUAL,
+                 "fill_at": "2026-10-28T09:01:00.000000+08:00"}],
+        market="mode",
+    )
     assert legacy.full_0901_price_entries == {"p"}
     assert current.full_0901_price_entries == set()
+    assert fractional.full_0901_price_entries == {"p"}
+
+
+def test_minute_inventory_compares_instants_not_iso_string_formats():
+    positions = {
+        name: {"position_id": name, "symbol": name, "side": "long"}
+        for name in ("same", "future", "offset")
+    }
+    base = {"purpose": "entry", "quantity": 1000, "price": 100.,
+            "fee_and_tax_twd": 0.}
+    events = [
+        {**base, "position_id": "same", "symbol": "same",
+         "clock": "2026-10-29T09:01:00.000000+08:00"},
+        {**base, "position_id": "future", "symbol": "future",
+         "clock": "2026-10-29T09:01:00.000001+08:00"},
+        {**base, "position_id": "offset", "symbol": "offset",
+         "clock": "2026-10-29T01:00:59.999999Z"},
+    ]
+    book = _ImmutableMinuteInventory(positions, events, market="a")
+    prices, times = {"same": 105.}, {"same": "2026-10-29T09:01:00+08:00"}
+    book.advance("2026-10-29T09:01:00+08:00", prices, times)
+    assert set(book.positions) == {"same", "offset"}
+    # A print at exactly the fill instant is not older just because the fill
+    # includes fractional seconds.
+    assert book.mark_price(book.positions["same"], prices, times) == 105.
+    book.advance("2026-10-29T09:01:00.000001+08:00", prices, times)
+    assert set(book.positions) == {"same", "future", "offset"}
+
+
+def test_minute_inventory_retains_journal_order_for_equal_instants():
+    position = {"position_id": "p", "symbol": "2330", "side": "long"}
+    common = {"position_id": "p", "symbol": "2330", "quantity": 1000,
+              "price": 100., "fee_and_tax_twd": 0.}
+    book = _ImmutableMinuteInventory({"p": position}, [
+        {**common, "purpose": "entry", "clock": "2026-10-29T09:01:00+08:00"},
+        {**common, "purpose": "entry_completion", "clock": "2026-10-29T01:01:00Z"},
+    ], market="a")
+    book.advance("2026-10-29T09:01:00+08:00", {}, {})
+    assert book.positions["p"]["signed_shares"] == 2000
+
+
+def test_minute_inventory_rejects_unqualified_clock():
+    position = {"position_id": "p", "symbol": "2330", "side": "long"}
+    fill = {"position_id": "p", "symbol": "2330", "purpose": "entry",
+            "quantity": 1000, "price": 100., "fee_and_tax_twd": 0.,
+            "clock": "2026-10-29T09:01:00"}
+    with pytest.raises(ValueError, match="timezone"):
+        _ImmutableMinuteInventory({"p": position}, [fill], market="a")
+
+
+def _native_same_second_exit_fixture():
+    common = {"position_id": "p", "symbol": "2241", "market": "a",
+              "session_date": "2026-11-05", "quantity": 1000,
+              "simulation_only": True, "simulation_replay": False,
+              "quote_at": "2026-11-05T13:00:54.302491+08:00"}
+    entry = {**common, "purpose": "entry", "price": 35., "fee_and_tax_twd": 9.975,
+             "clock": "2026-11-05T13:00:54.503061+08:00"}
+    exit = {**common, "purpose": "stop_loss", "price": 34.9,
+            "clock": "2026-11-05T13:00:54+08:00",
+            "fill_at": "2026-11-05T13:00:54+08:00",
+            "recorded_at": "2026-11-05T13:00:54+08:00",
+            "entry_fee_allocated_twd": 9.975, "net_pnl_twd": -172.2715}
+    position = {"position_id": "p", "symbol": "2241", "market": "a", "side": "long",
+                "session_date": "2026-11-05", "signed_shares": 0,
+                "entry_at": entry["clock"], "exit_at": exit["clock"],
+                "last_exit_at": "2026-11-05T13:00:54.513326+08:00",
+                "last_exit_quantity": 1000, "last_exit_price": 34.9,
+                "last_exit_quote_at": common["quote_at"], "exit_reason": "stop_loss"}
+    return position, entry, exit
+
+
+def test_native_exit_clock_uses_unique_archived_precision_without_changing_journal():
+    from copy import deepcopy
+    position, entry, exit = _native_same_second_exit_fixture()
+    originals = deepcopy((position, entry, exit))
+    book = _ImmutableMinuteInventory({"p": position}, [entry, exit], market="a")
+    book.advance("2026-11-05T13:00:54.503061+08:00", {}, {})
+    assert book.positions["p"]["signed_shares"] == 1000
+    book.advance("2026-11-05T13:00:54.513326+08:00", {}, {})
+    assert book.positions == {} and book.realized == pytest.approx(-172.2715)
+    assert len(book.fill_clock_resolutions) == 1
+    assert book.fill_clock_resolutions[0]["original_journal_changed"] is False
+    assert (position, entry, exit) == originals
+
+
+@pytest.mark.parametrize("damage", ["quantity", "price", "quote", "purpose", "outside_second", "explicit_fraction", "duplicate"])
+def test_native_exit_clock_refuses_unproven_or_ambiguous_precision(damage):
+    position, entry, exit = _native_same_second_exit_fixture()
+    if damage == "quantity": position["last_exit_quantity"] = 2000
+    elif damage == "price": position["last_exit_price"] = 34.95
+    elif damage == "quote": position["last_exit_quote_at"] = "other"
+    elif damage == "purpose": position["exit_reason"] = "different"
+    elif damage == "outside_second": position["last_exit_at"] = "2026-11-05T13:00:55.001000+08:00"
+    elif damage == "explicit_fraction": exit["clock"] = "2026-11-05T13:00:54.000001+08:00"
+    events = [entry, exit, dict(exit)] if damage == "duplicate" else [entry, exit]
+    book = _ImmutableMinuteInventory({"p": position}, events, market="a")
+    assert book.fill_clock_resolutions == []
+    with pytest.raises(RuntimeError, match="exit precedes a proven entry"):
+        book.advance("2026-11-05T13:01:00+08:00", {}, {})
+
+
+def _cash_gap_fixture():
+    from scripts.rebuild_tw_day_trade_minute_curves import recover_proven_cash_session_marks
+    days = ["2026-10-29", "2026-10-30", "2026-11-02"]
+    common = {"market": "mode", "initial_capital_twd": 1000.,
+              "cumulative_realized_net_pnl_twd": 0., "open_net_liquidation_pnl_twd": 0.,
+              "total_equity_twd": 1000., "open_position_count": 0}
+    rows = [{**common, "session_date": d, "minute": f"{d}T{clock}+08:00",
+             "recorded_at": f"{d}T{clock}:00+08:00"}
+            for d, clock in [(days[0], "09:01"), (days[0], "13:30"),
+                             (days[2], "09:01"), (days[2], "13:30")]]
+    kwargs = {"state": {"modes": {"mode": {"initial_capital_twd": 1000.}}},
+              "fill_rows": [], "activity_rows": [], "completed_sessions": days,
+              "expected_markets": {"mode"},
+              "reconstructed_at": datetime.fromisoformat("2026-11-10T06:00:00+08:00")}
+    return recover_proven_cash_session_marks, rows, kwargs
+
+
+def test_cash_gap_recovery_derives_cash_not_unobserved_market_trades():
+    function, rows, kwargs = _cash_gap_fixture()
+    result, proof = function(rows, {}, **kwargs)
+    derived = result[len(rows):]
+    assert len(derived) == proof["generated_rows"] == 270
+    assert derived[0]["minute"] == "2026-10-30T09:01+08:00"
+    assert derived[-1]["minute"] == "2026-10-30T13:30+08:00"
+    assert {r["total_equity_twd"] for r in derived} == {1000.}
+    assert all(r["open_position_count"] == 0 and not r["valuation_executable"] for r in derived)
+    assert all(r["reconstructed_at"].startswith("2026-11-10") for r in derived)
+    assert proof["source_price_or_execution_invented"] is False
+    assert proof["sessions"][0]["market_zero_volume_claimed"] is False
+    assert proof["sessions"][0]["missing_signal_replay_performed"] is False
+    assert result[:len(rows)] == rows
+
+
+def test_cash_gap_recovery_does_not_require_future_session_positions():
+    function, rows, kwargs = _cash_gap_fixture()
+    kwargs["fill_rows"] = [{"market": "mode", "session_date": "2026-11-03",
+                           "fill_at": "2026-11-03T09:00:01+08:00",
+                           "recorded_at": "2026-11-03T09:00:02+08:00",
+                           "purpose": "entry", "position_id": "future-unrelated"}]
+    result, proof = function(rows, {}, **kwargs)
+    assert proof["generated_rows"] == 270
+    assert result[:len(rows)] == rows
+    assert kwargs["fill_rows"][0]["position_id"] == "future-unrelated"
+
+
+def test_cash_gap_recovery_cannot_hide_past_activity_under_future_session_date():
+    function, rows, kwargs = _cash_gap_fixture()
+    kwargs["fill_rows"] = [{"market": "mode", "session_date": "2026-11-03",
+                           "fill_at": "2026-11-02T09:00:01+08:00",
+                           "recorded_at": "2026-11-02T09:00:02+08:00",
+                           "purpose": "entry", "position_id": "misdated-entry"}]
+    with pytest.raises(RuntimeError, match="no accepted position"):
+        function(rows, {}, **kwargs)
+
+
+@pytest.mark.parametrize("damage", ["activity", "fill", "wrong_anchor", "held_inventory", "partial_marks", "adjustment"])
+def test_cash_gap_recovery_fails_closed_without_complete_account_proof(damage):
+    function, rows, kwargs = _cash_gap_fixture()
+    if damage == "activity": kwargs["activity_rows"] = [{"market": "mode", "session_date": "2026-10-30"}]
+    elif damage == "fill": kwargs["fill_rows"] = [{"market": "mode", "session_date": "2026-10-30"}]
+    elif damage == "wrong_anchor": rows[1]["cumulative_realized_net_pnl_twd"] = 10.
+    elif damage == "held_inventory": rows[1]["open_position_count"] = 1
+    elif damage == "partial_marks": rows.append({**rows[0], "session_date": "2026-10-30", "minute": "2026-10-30T09:30+08:00"})
+    elif damage == "adjustment": kwargs["state"]["modes"]["mode"]["carry_cost_ledger"] = [{"amount_twd": 1}]
+    with pytest.raises(RuntimeError):
+        function(rows, {}, **kwargs)
 
 
 def test_maintenance_preflight_import_does_not_load_training_runtime() -> None:
@@ -115,6 +288,83 @@ def _finmind_valuation_fixture(root, *, rows=None):
     return obj, receipt
 
 
+def test_finmind_same_generation_is_fully_validated_once_not_per_symbol(tmp_path, monkeypatch):
+    import downloader.finmind_storage_objects as storage
+    base = {"date": "2026-01-02", "minute": "09:00:00", "open": 10.,
+            "high": 11., "low": 10., "close": 11., "volume": 1.}
+    symbols = ["2330", "2317", "00883B"]
+    _finmind_valuation_fixture(tmp_path, rows=[dict(base, stock_id=s) for s in symbols])
+    original, calls = storage.validate_parquet, []
+
+    def validate(*args):
+        calls.append(args)
+        return original(*args)
+
+    monkeypatch.setattr(storage, "validate_parquet", validate)
+    store = MinutePriceStore([], [], require_receipts=True, finmind_root=tmp_path)
+    for symbol in symbols[:2]:
+        assert store.prices(symbol, "2026-01-02")["2026-01-02T09:01+08:00"] == 11.
+    assert len(calls) == 1
+    assert store.finmind_read_metrics["validated_generation_reuses"] == 1
+    receipt = tmp_path / "receipts/TaiwanStockKBar/all/2026-01-02.json"
+    receipt.write_text(receipt.read_text() + " ")
+    with pytest.raises(RuntimeError, match="changed during reconstruction"):
+        store.prices(symbols[2], "2026-01-02")
+
+
+def test_optional_opening_backup_is_batched_across_native_day(tmp_path, monkeypatch):
+    import downloader.finmind_storage_objects as storage
+    root, local = tmp_path / "finmind", tmp_path / "local"
+    symbols = ["2330", "2317", "00883B"]
+    _finmind_valuation_fixture(root, rows=[{
+        "date": "2026-01-02", "minute": "09:00:00", "stock_id": s,
+        "open": 10., "high": 11., "low": 10., "close": 11., "volume": 1.} for s in symbols])
+    path = local / "trade_date=2026-01-02/data.parquet"
+    path.parent.mkdir(parents=True)
+    pl.DataFrame({"symbol": symbols, "date": [date(2026, 1, 2)] * 3,
+        "ts": [datetime(2026, 1, 2, 9, 2)] * 3, "Close": [12.] * 3, "Volume": [1.] * 3}).write_parquet(path)
+    store = MinutePriceStore([local], [], require_receipts=True, finmind_root=root,
+                             complete_opening_prices=True)
+    monkeypatch.setattr(store, "_verified_replay_source", lambda *args: True)
+    original, calls = storage.validate_parquet, []
+    monkeypatch.setattr(storage, "validate_parquet", lambda *args: calls.append(args) or original(*args))
+    store.prepare({s: {"2026-01-02"} for s in symbols})
+    assert store.finmind_read_metrics["subset_reads"] == 1
+    for symbol in symbols:
+        prices = store.prices(symbol, "2026-01-02")
+        assert prices["2026-01-02T09:01+08:00"] == 11.
+        assert prices["2026-01-02T09:02+08:00"] == 12.
+    assert len(calls) == 1 and store.finmind_read_metrics["subset_reads"] == 1
+
+
+def test_first_observed_bar_keeps_actual_completed_clock_and_never_creates_0901(tmp_path):
+    day = "2026-01-02"
+    raw = [{"date": day, "minute": clock, "stock_id": "00883B", "open": price,
+            "high": price, "low": price, "close": price, "volume": volume}
+           for clock, price, volume in [("09:00:00", 10., 0.), ("09:02:00", 12., 2.),
+                                         ("09:04:00", 13., 5.)]]
+    obj, _ = _finmind_valuation_fixture(tmp_path, rows=raw)
+    store = MinutePriceStore([], [], require_receipts=True, finmind_root=tmp_path)
+    first = store.first_observed_bar("00883B", day)
+    assert first["source_minute"] == day + "T09:03+08:00"
+    assert first["price"] == 12. and len(first["source_pins"]) == 2
+    assert day + "T09:01+08:00" not in store.prices("00883B", day)
+    first["price"] = 0.
+    assert store.first_observed_bar("00883B", day)["price"] == 12.
+    obj.write_bytes(b"source changed")
+    with pytest.raises(RuntimeError, match="changed during reconstruction"):
+        store.assert_sources_unchanged()
+
+
+def test_first_bar_valuation_rejects_unverified_or_execution_pinned_sources(tmp_path):
+    for kwargs in ({}, {"require_receipts": True, "replay_symbol_sources": {}}):
+        store = MinutePriceStore([], [], **kwargs)
+        with pytest.raises(ValueError, match="verified valuation sources"):
+            store.first_observed_bar("2330", "2026-01-02")
+    with pytest.raises(RuntimeError, match="no verified observed first bar"):
+        MinutePriceStore([], [], require_receipts=True).first_observed_bar("2330", "2026-01-02")
+
+
 @pytest.mark.parametrize("zone", [None, "UTC", "America/New_York"])
 def test_vector_minute_keys_equal_legacy_datetime_conversion(zone):
     import math
@@ -141,6 +391,35 @@ def test_vector_minute_keys_do_not_silently_accept_null_prices():
         MinutePriceStore._frame_prices(frame, "2026-01-02")
 
 
+@pytest.mark.parametrize("zone", [None, "UTC", "America/New_York"])
+@pytest.mark.parametrize("with_volume", [False, True])
+def test_batch_session_prices_equal_scalar_reader_with_ties_and_invalid_rows(zone, with_volume):
+    stamps = [datetime(2026, 1, 2 + i // 5, 1, i % 5, tzinfo=ZoneInfo("UTC"))
+              for i in range(10)]
+    stamps[1] = stamps[0]
+    stamps[6] = None
+    stamps = [(s.replace(tzinfo=None) if zone is None else s.astimezone(ZoneInfo(zone)))
+              if s is not None else None for s in stamps]
+    frame = pl.DataFrame({"date": [date(2026, 1, 2)] * 5 + [date(2026, 1, 3)] * 5,
+        "ts": pl.Series(stamps, dtype=pl.Datetime("ns", zone)),
+        "Close": [1., 2., float("nan"), 0., float("inf"), 3., 4., -1., 5., 6.]})
+    if with_volume:
+        frame = frame.with_columns(pl.Series("Volume", [1., 2., 1., 1., 1., 0., 1., 1., float("nan"), -1.]))
+    days = ["2026-01-03", "2026-01-02", "2026-01-05"]
+    assert MinutePriceStore._frame_prices_by_session(frame, days) == {
+        day: MinutePriceStore._frame_prices(frame, day) for day in days}
+
+
+def test_batch_session_prices_keep_unusual_schema_compatibility_and_null_errors():
+    frame = pl.DataFrame({"ts": [datetime(2026, 1, 2, 9, 1)], "Close": [10.]})
+    days = ["2026-01-02", "2026-01-03"]
+    assert MinutePriceStore._frame_prices_by_session(frame, days) == {
+        day: MinutePriceStore._frame_prices(frame, day) for day in days}
+    frame = frame.with_columns(pl.lit(None, dtype=pl.Float64).alias("Close"))
+    with pytest.raises(TypeError):
+        MinutePriceStore._frame_prices_by_session(frame, days)
+
+
 def test_local_finmind_valuation_fallback_retains_clock_and_never_assumes_shares(tmp_path):
     root = tmp_path / "finmind"
     obj, receipt = _finmind_valuation_fixture(root)
@@ -155,6 +434,58 @@ def test_local_finmind_valuation_fallback_retains_clock_and_never_assumes_shares
     obj.write_bytes(b"tampered")
     with pytest.raises(RuntimeError, match="source changed"):
         store.assert_sources_unchanged()
+
+
+def test_optional_opening_backup_fills_only_the_missing_minute(tmp_path, monkeypatch):
+    root = tmp_path / "finmind"
+    _finmind_valuation_fixture(root)
+    day = "2026-01-02"
+    later = {f"{day}T09:02+08:00": 99.}
+    for enabled in (False, True):
+        store = MinutePriceStore([tmp_path / "primary"], [], require_receipts=True,
+            finmind_root=root, complete_opening_prices=enabled)
+        monkeypatch.setattr(store, "_root_prices", lambda *_: dict(later))
+        prices = store.prices("00883B", day)
+        assert prices[f"{day}T09:02+08:00"] == 99.
+        assert (f"{day}T09:01+08:00" in prices) is enabled
+        assert f"{day}T13:30+08:00" not in prices
+        if enabled:
+            assert prices[f"{day}T09:01+08:00"] == 11.
+            assert store.opening_backup_records[("00883B", day)]["valuation_only"] is True
+            store.assert_sources_unchanged()
+
+
+def test_optional_backup_does_not_replace_a_primary_opening_observation(tmp_path, monkeypatch):
+    root = tmp_path / "finmind"
+    _finmind_valuation_fixture(root)
+    store = MinutePriceStore([tmp_path / "primary"], [], require_receipts=True,
+        finmind_root=root, complete_opening_prices=True)
+    monkeypatch.setattr(store, "_root_prices", lambda *_: {"2026-01-02T09:01+08:00": 10.})
+    assert store.prices("00883B", "2026-01-02")["2026-01-02T09:01+08:00"] == 10.
+    assert store.finmind_source_records == {} and store.opening_backup_records == {}
+
+
+def test_empty_optional_provider_receipt_is_not_zero_trade_or_a_price(tmp_path, monkeypatch):
+    root, day = tmp_path / "finmind", "2026-01-02"
+    receipt = root / "receipts/TaiwanStockKBar/all" / (day + ".json")
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(json.dumps({"status": "observed_empty", "dataset": "TaiwanStockKBar",
+                                  "data_id": "", "partition": day}))
+    store = MinutePriceStore([tmp_path / "primary"], [], require_receipts=True,
+        finmind_root=root, complete_opening_prices=True)
+    later = {f"{day}T09:02+08:00": 99.}
+    monkeypatch.setattr(store, "_root_prices", lambda *_: dict(later))
+    assert store.prices("00883B", day) == later and store.opening_backup_records == {}
+    store.assert_sources_unchanged()
+    receipt.write_text(receipt.read_text() + "\n")
+    with pytest.raises(RuntimeError, match="source changed"):
+        store.assert_sources_unchanged()
+
+
+def test_opening_backup_refuses_to_change_a_pinned_execution_source(tmp_path):
+    with pytest.raises(ValueError, match="not an execution-pinned replay"):
+        MinutePriceStore([], [], require_receipts=True, complete_opening_prices=True,
+                         replay_symbol_sources={})
 
 
 @pytest.mark.parametrize("broken", ["digest", "identity", "rows", "escape"])
@@ -389,6 +720,95 @@ def test_verified_minute_source_cannot_change_before_publication(tmp_path: Path)
         store.assert_sources_unchanged()
 
 
+def test_batch_chunk_lookup_resolves_source_root_once_and_fences_alias(tmp_path, monkeypatch):
+    first, second, alias = tmp_path / "first", tmp_path / "second", tmp_path / "alias"
+    first.mkdir()
+    second.mkdir()
+    alias.symlink_to(first, target_is_directory=True)
+    original, calls = Path.resolve, []
+
+    def resolve(path, *args, **kwargs):
+        if path == alias:
+            calls.append(path)
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    store = MinutePriceStore([alias], [])
+    for day in range(1, 29):
+        assert store._chunk_paths(alias, "2330", f"2026-01-{day:02}") == ()
+    assert len(calls) == 1
+    store.assert_sources_unchanged()
+    assert len(calls) == 2
+    alias.unlink()
+    alias.symlink_to(second, target_is_directory=True)
+    with pytest.raises(RuntimeError, match="path alias changed during reconstruction"):
+        store.assert_sources_unchanged()
+
+
+def test_cached_chunk_path_identity_does_not_authorize_a_retargeted_file(tmp_path):
+    first, second, alias = tmp_path / "first", tmp_path / "second", tmp_path / "alias"
+    first.write_bytes(b"original")
+    second.write_bytes(b"replacement")
+    alias.symlink_to(first)
+    store = MinutePriceStore([], [])
+    assert store._source_path_identity(alias) == str(first)
+    alias.unlink()
+    alias.symlink_to(second)
+    assert store._source_path_identity(alias) == str(first)
+    with pytest.raises(RuntimeError, match="path alias changed during reconstruction"):
+        store.assert_sources_unchanged()
+
+
+def _batch_verified_chunk_fixture(tmp_path, monkeypatch):
+    from downloader import download_shioaji_tw_minute_kbars as native
+    root = tmp_path / "local"
+    path = root / "minute_chunks/2330/2026-01-02_2026-01-04.parquet"
+    path.parent.mkdir(parents=True)
+    days = ["2026-01-02", "2026-01-03", "2026-01-04"]
+    pl.DataFrame({"date": [date.fromisoformat(day) for day in days],
+                  "ts": [datetime.fromisoformat(day + "T09:01") for day in days],
+                  "Close": [10., 11., 12.], "Volume": [1., 2., 3.]}).write_parquet(path)
+    path.with_suffix(".receipt.json").write_text(json.dumps({
+        "returned_dates": days, "output_receipt": {"path": str(path)}}))
+    validations = []
+    monkeypatch.setattr(native, "minute_receipt_valid",
+                        lambda *a, **k: validations.append((a, k)) or True)
+    return MinutePriceStore([root], [], require_receipts=True), path, days, validations
+
+
+def test_batch_chunk_metadata_checks_scale_with_files_not_requested_days(tmp_path, monkeypatch):
+    from collections import Counter
+    store, path, days, validations = _batch_verified_chunk_fixture(tmp_path, monkeypatch)
+    signatures, original = Counter(), store._source_signature
+
+    def signature(source):
+        signatures[source] += 1
+        return original(source)
+
+    monkeypatch.setattr(store, "_source_signature", signature)
+    store.prepare({"2330": set(days)})
+    assert len(validations) == 1
+    assert signatures == {path: 2, path.with_suffix(".receipt.json"): 2}
+    assert store._batch_chunk_dates is None
+    for day, expected in zip(days, [10., 11., 12.]):
+        assert store.prices("2330", day) == {f"{day}T09:01+08:00": expected}
+
+
+def test_batch_chunk_metadata_reuse_still_rejects_source_changed_while_decoding(tmp_path, monkeypatch):
+    store, path, days, _validations = _batch_verified_chunk_fixture(tmp_path, monkeypatch)
+    original = store._frame_prices_by_session
+
+    def decode(frame, dates):
+        values = original(frame, dates)
+        path.write_bytes(path.read_bytes() + b"changed after verified read")
+        return values
+
+    monkeypatch.setattr(store, "_frame_prices_by_session", decode)
+    with pytest.raises(RuntimeError, match="source changed during reconstruction"):
+        store.prepare({"2330": set(days)})
+    assert store._batch_chunk_dates is None
+
+
 def test_margin_revaluation_uses_exact_replay_pinned_partition(
     tmp_path: Path,
 ) -> None:
@@ -515,6 +935,45 @@ def test_endpoint_preflight_finds_wholly_absent_market_session() -> None:
                         "missing_clocks": ["09:01", "13:30"]}]
 
 
+def test_rebuild_main_rejects_a_wholly_absent_expected_day_before_source_reads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import rebuild_tw_day_trade_minute_curves as rebuilder
+
+    root = tmp_path / "ledger"
+    root.mkdir()
+    (root / "marks.jsonl").write_text("".join(
+        json.dumps({"session_date": day, "market": "fixture",
+                    "minute": f"{day}T{clock}+08:00"}) + "\n"
+        for day in ("2026-01-02", "2026-01-05") for clock in ("09:01", "13:30")
+    ), encoding="utf-8")
+    monkeypatch.setattr(sys, "argv", [
+        "rebuild", "--state-dir", str(root), "--start-date", "2026-01-02",
+        "--end-date", "2026-01-05", "--output-dir", str(tmp_path / "candidate"),
+        "--expected-session-date", "2026-01-02", "--expected-session-date", "2026-01-03",
+        "--expected-session-date", "2026-01-05", "--expected-market", "fixture",
+        "--simulation",
+    ])
+    monkeypatch.setattr(rebuilder.MinutePriceStore, "prepare", lambda *_: pytest.fail("must not load prices"))
+    with pytest.raises(RuntimeError, match="2026-01-03"):
+        rebuilder.main()
+
+
+def test_scoped_replayed_opening_repair_cannot_publish_directly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from scripts import rebuild_tw_day_trade_minute_curves as rebuilder
+
+    monkeypatch.setattr(sys, "argv", [
+        "rebuild", "--state-dir", str(tmp_path), "--start-date", "2026-01-02",
+        "--end-date", "2026-01-02", "--output-dir", str(tmp_path / "candidate"),
+        "--simulation", "--revalue-carried-marks", "--revalue-opening-marks",
+        "--repair-replayed-opening-endpoint", "fixture:2026-01-02", "--publish",
+    ])
+    with pytest.raises(ValueError, match="direct publication is forbidden"):
+        rebuilder.main()
+
+
 def test_endpoint_preflight_reuses_only_unchanged_complete_marks(tmp_path: Path) -> None:
     day = "2026-09-03"
     marks = tmp_path / "marks.jsonl"
@@ -629,7 +1088,8 @@ def test_maintenance_no_fetch_still_protects_live_publication(
     ))
     monkeypatch.setattr(maintenance, "_completed_scope", lambda _: ([day], {"test"}))
     monkeypatch.setattr(maintenance, "_tx_benchmark_source_state", lambda *a: {"ready": True})
-    monkeypatch.setattr(maintenance, "_stock_calendar_source_state", lambda *a: {"ready": True})
+    monkeypatch.setattr(maintenance, "_stock_calendar_source_state", lambda *a: {"ready": True, "sha256": "fixture"})
+    monkeypatch.setattr(maintenance, "_official_session_scope_state", lambda *a: {"ready": True, "sha256": "fixture"})
     monkeypatch.setattr(maintenance, "_validate_current", lambda *a, **k: None)
     monkeypatch.setattr(maintenance, "_inspect_strategy_price_provenance", lambda *a, **k: {
         "unverified_opening_rows": 1,
@@ -669,6 +1129,8 @@ def test_waiting_source_retry_never_skips_tx_preflight(tmp_path: Path, monkeypat
         fop_capture_root=tmp_path / "fop",
     ))
     monkeypatch.setattr(maintenance, "_completed_scope", lambda _: ([day], {"test"}))
+    monkeypatch.setattr(maintenance, "_stock_calendar_source_state", lambda *a: {"ready": True, "sha256": "fixture"})
+    monkeypatch.setattr(maintenance, "_official_session_scope_state", lambda *a: {"ready": True, "sha256": "fixture"})
     monkeypatch.setattr(maintenance.subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(
         AssertionError("unverified TX must not start a rebuilder")
     ))
@@ -707,6 +1169,46 @@ def test_maintenance_waits_for_calendar_before_expensive_rebuild(
     payload = json.loads(status.read_text())
     assert payload["status"] == "waiting_source"
     assert payload["failed_stage"] == "stock_session_calendar_preflight"
+    assert not (tmp_path / "output").exists()
+
+
+def test_calendar_scope_detects_a_wholly_unrecorded_official_session(monkeypatch, tmp_path: Path):
+    from scripts import maintain_tw_day_trade_minute_curves as maintenance
+
+    monkeypatch.setattr(maintenance, "_validated_taiex_session_dates", lambda *_: (
+        [date(2026, 10, 29), date(2026, 10, 30), date(2026, 11, 2)], "calendar-sha"))
+    result = maintenance._official_session_scope_state(tmp_path, ["2026-10-29", "2026-11-02"])
+    assert result["ready"] is False
+    assert result["missing_recorded_sessions"] == ["2026-10-30"]
+    assert result["sha256"] == "calendar-sha"
+
+
+def test_maintenance_does_not_treat_an_unrecorded_trading_day_as_complete(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    from scripts import maintain_tw_day_trade_minute_curves as maintenance
+
+    days = ["2026-10-29", "2026-11-02"]
+    (tmp_path / "marks.jsonl").write_text("".join(
+        json.dumps({"session_date": day, "market": "test", "minute": f"{day}T{clock}+08:00"}) + "\n"
+        for day in days for clock in ("09:01", "13:30")
+    ), encoding="utf-8")
+    status = tmp_path / "status.json"
+    monkeypatch.setattr(maintenance, "parse_args", lambda: SimpleNamespace(
+        state_dir=tmp_path, output_root=tmp_path / "output", status_path=status,
+        no_fetch=True, calendar_root=tmp_path / "calendar",
+    ))
+    monkeypatch.setattr(maintenance, "_completed_scope", lambda _: (days, {"test"}))
+    monkeypatch.setattr(maintenance, "_tx_benchmark_source_state", lambda *a: {"ready": True})
+    monkeypatch.setattr(maintenance, "_stock_calendar_source_state", lambda *a: {"ready": True, "sha256": "calendar-sha"})
+    monkeypatch.setattr(maintenance, "_validated_taiex_session_dates", lambda *_: (
+        [date(2026, 10, 29), date(2026, 10, 30), date(2026, 11, 2)], "calendar-sha"))
+    monkeypatch.setattr(maintenance, "_validate_current", lambda *a, **k: pytest.fail("must not validate a missing day"))
+    monkeypatch.setattr(maintenance.subprocess, "run", lambda *a, **k: pytest.fail("must not launch a rebuild"))
+    maintenance.main()
+    payload = json.loads(status.read_text())
+    assert payload["status"] == "waiting_unrecorded_official_sessions"
+    assert payload["official_scope"]["missing_recorded_sessions"] == ["2026-10-30"]
     assert not (tmp_path / "output").exists()
 
 
@@ -1496,6 +1998,22 @@ def test_flat_minutes_replay_late_and_partial_entries_without_future_basis(clock
     assert (endpoints, positions, fills) == original
 
 
+def test_flat_opening_counts_fill_with_zero_fractional_seconds(clocked_flat_book):
+    endpoints, positions, store, fills = clocked_flat_book
+    endpoints[0]["recorded_at"] = "2026-08-13T09:01:00+08:00"
+    fills[0]["fill_at"] = "2026-08-13T09:01:00.000000+08:00"
+    fills[4]["fill_at"] = "2026-08-13T13:30:00.000000+08:00"
+    fills[5]["fill_at"] = "2026-08-13T13:30:00.000000+08:00"
+    rows, stats = rebuild_strategy_marks(
+        endpoints, positions, store, fill_rows=fills,
+        start=date(2026, 8, 13), end=date(2026, 8, 13),
+        revalue_opening_marks=True,
+    )
+    assert len(rows) == 270 and stats["generated_rows"] == 270
+    assert rows[0]["open_position_count"] == 1
+    assert rows[-1] == endpoints[-1]
+
+
 @pytest.mark.parametrize("endpoint,field,value,message", [
     (0, "open_position_count", 2, "position count mismatch"),
     (1, "open_position_count", 1, "closing fill-book accounting disagrees"),
@@ -1884,6 +2402,28 @@ def test_price_provenance_reuse_requires_hash_checked_opening_coverage() -> None
         ) is None
 
 
+@pytest.mark.parametrize("bad_points", [None, [1], [["a", 1]], [["b", "2026-08-13T09:01+08:00"]],
+                                          [["a", "2026-08-13T09:02+08:00"]]])
+def test_cost_acceptance_never_becomes_complete_market_price_proof(bad_points):
+    scope = {"completed_session_dates": ["2026-08-13"], "expected_markets": {"a"}}
+    proof = {"required": True, "contract": "right_labelled_historical_last_trade_mark_v1",
+        "opening_marks_revalued_at_completed_minute": False,
+        "completed_session_dates": ["2026-08-13"], "points_per_session_mode": 270,
+        "validated_rows": 270, "unverified_historical_interior_rows": 0,
+        "provisional_opening_cost_valuation": {
+            "contract": "user_authorized_missing_0901_entry_cost_valuation_v1",
+            "market_observation_verified": False, "financial_journals_changed": False,
+            "verified_minute_points": 1, "points": [["a", "2026-08-13T09:01+08:00"]]}}
+    if bad_points is not None:
+        proof["provisional_opening_cost_valuation"]["points"] = bad_points
+        assert _proven_price_state_from_curve_validation(proof, **scope) is None
+    else:
+        result = _proven_price_state_from_curve_validation(proof, **scope)
+        assert result["audited_opening_rows"] == 0 and result["unverified_opening_rows"] == 1
+        assert result["authorized_provisional_opening_rows"] == 1
+        assert result["market_price_completeness_verified"] is False
+
+
 def test_stock_benchmark_minute_rebuild_preserves_tx_marks(tmp_path: Path) -> None:
     kbar_root = tmp_path / "kbars"
     for symbol, price in (("0050", 101.0), ("2330", 2_401.0)):
@@ -1978,3 +2518,27 @@ def test_history_rows_keep_minute_data_quality_fields(tmp_path: Path) -> None:
     assert history["fresh_trade_notional_coverage_ratio"] == 0.75
     assert history["last_trade_carried_position_count"] == 1
     assert history["valuation_executable"] is False
+
+
+def test_fast_session_calendar_preserves_cash_days_without_reading_signal_prefix(tmp_path, monkeypatch):
+    from stockagent.live import tw_day_trade_dashboard as dashboard
+    def forbidden(*_args, **_kwargs):
+        raise AssertionError("status dates must not parse or hash the signal ledger")
+    monkeypatch.setattr(dashboard, "_ledger_session_index", forbidden)
+    (tmp_path / "signals.jsonl").write_text("do not read this legacy stream\n")
+    archive = tmp_path / "position_history/2026-11-06/mode.json"
+    archive.parent.mkdir(parents=True)
+    archive.write_text('{"positions":[]}')
+    receipt = {"simulation_only": True, "production_order_possible": False,
+        "sessions": [{"session_date": day} for day in ("2026-11-02", "2026-11-03", "2026-11-05")]}
+    path = tmp_path / "rebuild_receipt.json"
+    path.write_text(json.dumps(receipt))
+    state = {"modes": {"mode": {"session_date": "2026-11-10"}}}
+    def dates():
+        return dashboard._available_session_dates(root=tmp_path, state=state,
+            observed=datetime.fromisoformat("2026-11-10T09:00:00+08:00"),
+            include_ledger_dates=False, include_benchmark_history_dates=False)
+    assert dates() == ["2026-11-10", "2026-11-06", "2026-11-05", "2026-11-03", "2026-11-02"]
+    receipt["sessions"].append({"session_date": "2026-11-09"})
+    path.write_text(json.dumps(receipt))
+    assert dates() == ["2026-11-10", "2026-11-09", "2026-11-06", "2026-11-05", "2026-11-03", "2026-11-02"]

@@ -26,6 +26,7 @@ def _packed(day, events, *, terminal):
         if field.name not in {
             "day", "marks", "exit_flat", "exit_price", "exit_capacity",
             "terminal_liquidation_price", "entry_path", "stop_hits",
+            "short_limit_up_penalty_per_share",
         }
     }
     # Noncontiguous views, empty days and unequal event counts are legitimate
@@ -40,6 +41,7 @@ def _packed(day, events, *, terminal):
         exit_price=prices,
         exit_capacity=torch.arange(events * 2, dtype=torch.float64)[::2],
         terminal_liquidation_price=vector.clone() if terminal else None,
+        short_limit_up_penalty_per_share=torch.tensor([0., 7.7, -0.], dtype=torch.float64),
     )
 
 
@@ -94,6 +96,30 @@ def test_transport_rejects_invalid_event_indices():
     bad = replace(source, exit_flat=torch.tensor([-1, 0, 3]))
     with pytest.raises(ValueError, match="invalid lossless"):
         PreparedDayTradeCarryBatch.from_packed_sessions((bad,), 1, event_compression=True)
+
+
+@pytest.mark.parametrize("invalid", [
+    torch.zeros(2, dtype=torch.float64),
+    torch.zeros(3, dtype=torch.float32),
+    torch.tensor([0., -1., 0.], dtype=torch.float64),
+    torch.tensor([0., float("nan"), 0.], dtype=torch.float64),
+    torch.tensor([0., float("inf"), 0.], dtype=torch.float64),
+])
+def test_packed_transport_rejects_invalid_short_limit_up_penalty(invalid):
+    source = replace(_packed(730000, 3, terminal=False),
+                     short_limit_up_penalty_per_share=invalid)
+    with pytest.raises(ValueError, match="invalid short limit-up penalty transport"):
+        PreparedDayTradeCarryBatch.from_packed_sessions((source,), 1, event_compression=False)
+
+
+def test_packed_transport_preserves_absent_penalty_and_rejects_mixed_policy():
+    with_penalty = _packed(730000, 3, terminal=False)
+    without = replace(with_penalty, short_limit_up_penalty_per_share=None)
+    batch = PreparedDayTradeCarryBatch.from_packed_sessions((without,), 1, event_compression=False)
+    assert batch.sessions(torch.device("cpu"))[0].short_limit_up_penalty_per_share is None
+    with pytest.raises(ValueError, match="mixes entry remainder policies"):
+        PreparedDayTradeCarryBatch.from_packed_sessions((without, with_penalty), 2,
+                                                       event_compression=False)
 
 
 def test_blocked_transport_rejects_negative_budget_and_preserves_source_autograd():

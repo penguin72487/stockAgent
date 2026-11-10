@@ -38,6 +38,56 @@ from stockagent.training.trainer import (
 )
 
 
+@pytest.mark.parametrize("field,active", [
+    ("futures_net_notional_cap", 0.), ("futures_beta_notional_cap", 0.),
+    ("futures_residual_signal_context", True), ("futures_joint_market_tokens", 8),
+])
+def test_new_inactive_futures_defaults_preserve_stock_model_identity_but_active_values_do_not(field, active):
+    from dataclasses import asdict
+    from stockagent.config import FinancialTransformerModelConfig
+    from stockagent.training.checkpoint_contract import _project_temporal_basis_model_config
+
+    current = asdict(FinancialTransformerModelConfig())
+    historical = {k: v for k, v in current.items() if k not in {
+        "futures_net_notional_cap", "futures_beta_notional_cap",
+        "futures_residual_signal_context", "futures_joint_market_tokens"}}
+    expected = _project_temporal_basis_model_config(historical)
+    assert _project_temporal_basis_model_config(current) == expected
+    assert _project_temporal_basis_model_config({**current, field: active}) != expected
+
+
+@pytest.mark.parametrize("scope", ["model", "inference", "resume", "artifact"])
+def test_sparse_full_row_predecessor_is_forward_only_not_resume_compatible(tmp_path, scope):
+    config = _config()
+    config.training.model_name = "financial_transformer"
+    config.training.financial_transformer.factorized_sparse_projection = True
+    expected = _checkpoint_manifest(_panel(), config)
+    previous = copy.deepcopy(expected)
+    previous["contracts"]["model"]["model"]["factorized_sparse_projection_contract"] = (
+        "full_schema_csr_fixed_row_fp32_forward_v3")
+    previous["fingerprints"]["model"] = trainer_module._stable_fingerprint(previous["contracts"]["model"])
+    kwargs = dict(checkpoint_path=tmp_path / "full_row_v3.pt", scope=scope)
+    if scope in {"model", "inference"}:
+        _validate_checkpoint_manifest({"experiment_manifest": previous}, expected, **kwargs)
+        previous["contracts"]["model"]["model"]["d_model"] += 1
+        previous["fingerprints"]["model"] = trainer_module._stable_fingerprint(previous["contracts"]["model"])
+    with pytest.raises(RuntimeError, match="model"):
+        _validate_checkpoint_manifest({"experiment_manifest": previous}, expected, **kwargs)
+
+
+def test_sparse_projection_rejects_mixed_source_date_view_contract(monkeypatch):
+    from dataclasses import asdict
+    from stockagent.config import FinancialTransformerModelConfig
+    from stockagent.data import factorized_sparse_rows
+    from stockagent.training.checkpoint_contract import _project_temporal_basis_model_config
+
+    values = asdict(FinancialTransformerModelConfig())
+    values["factorized_sparse_projection"] = True
+    monkeypatch.setattr(factorized_sparse_rows, "SPARSE_ROW_CONTRACT", "old_or_unknown")
+    with pytest.raises(RuntimeError, match="model/source date-view contract mismatch"):
+        _project_temporal_basis_model_config(values)
+
+
 def test_checkpoint_alignment_treats_weight_table_as_authoritative_universe(tmp_path: Path) -> None:
     panel = _panel()
     fold_dir = tmp_path / "fold_00"

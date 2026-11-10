@@ -632,6 +632,13 @@ def test_large_exact_batch_does_not_expand_to_the_entire_objects_tree(queue_root
         ("objects",), ("manifests/dataset",), ("heads/dataset",))
 
 
+def test_full_object_fallback_keeps_retired_history_paths():
+    paths = tuple(f'objects/blobs/{index:04d}.blob' for index in range(300))
+    history = 'head-history/heads/dataset/penguin/old.json'
+    groups = scan._scan_request_groups('dataset', (*paths, history), full_objects_scan=False)
+    assert groups == (('objects',), (history,), ('manifests/dataset',), ('heads/dataset',))
+
+
 def test_batch_retry_bad_receipt_retains_full_objects_fallback(queue_root: Path, scan_api) -> None:
     pending = queue_root / ".local-state/scan-pending/dataset.json"
     pending.parent.mkdir(parents=True)

@@ -1,0 +1,16 @@
+[Unit]
+Description=Restore the enrolled TW minute data alias before the trading service
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+Before=stockagent-workspace-source-handoff-boot.service stockagent-workspace-source-handoff.service stockagent-tw-day-trade-simulation.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/run_workspace_source_handoff.py --boot --priority-minute-boot'
+RemainAfterExit=yes
+TimeoutStartSec=20s
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

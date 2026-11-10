@@ -425,6 +425,126 @@ def test_remote_outage_does_not_hide_a_prior_preservation_failure(tmp_path, monk
     assert json.loads((batches[1] / "cache.organization-deferred.json").read_bytes())["source_deleted_by_failed_request"] is False
 
 
+def test_missing_manifest_does_not_abort_other_bulk_cohorts(tmp_path, monkeypatch):
+    monkeypatch.setattr(organizer, 'INCOMING', tmp_path)
+    batches = []
+    for number in range(2):
+        directory = tmp_path / f'20261006T00000{number}-abcdef012345'
+        directory.mkdir()
+        (directory / 'intent.json').write_text(json.dumps({
+            'authority_node_id': 'penguin', 'origin_node_id': 'vastai1T', 'scopes': ['cache']}))
+        (directory / 'cache.receipt.json').write_text(json.dumps({
+            'scope': 'cache', 'state': 'compressed_transport_received',
+            'completed_at_epoch': 1, 'compressed_sha256': 'a' * 64}))
+        batches.append(directory)
+    visited = []
+
+    def process(_args, directory, _receipt):
+        visited.append(directory)
+        if directory == batches[0]:
+            raise FileNotFoundError('superseded manifest missing')
+        return True
+
+    monkeypatch.setattr(organizer, 'organize', process)
+    assert organizer.run_batches(SimpleNamespace(batch=batches, watch=False)) == 2
+    assert visited == batches
+    status = json.loads((batches[0] / 'cache.organization-error.json').read_bytes())
+    assert status['state'] == 'source_preserved_organization_failed'
+    assert 'superseded manifest missing' in status['error']
+
+
+def test_bulk_organizer_waits_for_exact_local_migration_without_claiming_remote_retirement(tmp_path, monkeypatch):
+    monkeypatch.setattr(organizer.bulk_landing_alias_retirement, 'organizer_deferred', lambda *_: True)
+    monkeypatch.setattr(organizer, 'index_zstd', lambda *_a, **_kw: pytest.fail('unexpected old decode'))
+    receipt = {'scope': 'markets', 'compressed_sha256': 'a'*64}
+    assert not organizer.organize(SimpleNamespace(apply=True, retire=True), tmp_path, receipt)
+    status = json.loads((tmp_path/'markets.organization.json').read_bytes())
+    assert status['state'] == 'local_source_migration_reconciliation_pending'
+    assert status['independent_recovery_claimed'] is False and status['remote_delete_performed'] is False
+
+
+def test_bulk_organizer_keeps_completed_remote_status_when_removing_old_local_carrier(tmp_path, monkeypatch):
+    (tmp_path/'markets.organization.json').write_text(json.dumps({
+        'state': 'cold_preserved_retirement_audited', 'all_sources_retired': True}))
+    monkeypatch.setattr(organizer.bulk_landing_alias_retirement, 'organizer_deferred', lambda *_: True)
+    monkeypatch.setattr(organizer, 'retire_repacked_original_carrier', lambda *_: {
+        'state': 'completed', 'estimated_allocated_bytes_reclaimed': 123})
+    assert organizer.organize(SimpleNamespace(apply=True, retire=True), tmp_path,
+                              {'scope': 'markets', 'compressed_sha256': 'a'*64})
+    value = json.loads((tmp_path/'markets.organization.json').read_bytes())
+    assert value['state'] == 'cold_preserved_retirement_audited' and value['all_sources_retired'] is True
+    assert value['original_carrier_reclaimed_allocated_bytes'] == 123
+
+
+def test_busy_retry_does_not_erase_prior_completed_carrier_evidence(tmp_path, monkeypatch):
+    (tmp_path/'markets.organization.json').write_text(json.dumps({
+        'state': 'local_source_migration_reconciliation_pending', 'original_carrier_state': 'completed',
+        'original_carrier_reclaimed_allocated_bytes': 123}))
+    monkeypatch.setattr(organizer.bulk_landing_alias_retirement, 'organizer_deferred', lambda *_: True)
+    monkeypatch.setattr(organizer, 'retire_repacked_original_carrier', lambda *_: {'state': 'waiting_original_owner'})
+    assert not organizer.organize(SimpleNamespace(apply=True, retire=True), tmp_path,
+                                  {'scope': 'markets', 'compressed_sha256': 'a'*64})
+    value = json.loads((tmp_path/'markets.organization.json').read_bytes())
+    assert value['original_carrier_state'] == 'completed'
+    assert value['original_carrier_reclaimed_allocated_bytes'] == 123
+    assert value['original_carrier_last_attempt'] == 'waiting_original_owner'
+
+
+def test_original_carrier_scheduler_dry_runs_before_applying_and_yields_to_busy_owner(tmp_path, monkeypatch):
+    from scripts import run_bounded_storage_maintenance as maintenance
+    monkeypatch.setattr(maintenance, 'allowed_seconds', lambda *_: 1000)
+    monkeypatch.setattr(organizer.workspace_volume, 'configuration', lambda: {'mount_point': str(tmp_path)})
+    monkeypatch.setattr(organizer, 'metadata_path', lambda value: value)
+    calls = []
+    def retire(_directory, _receipt, **kwargs):
+        calls.append(kwargs['apply'])
+        return {'state': 'completed' if kwargs['apply'] else 'planned'}
+    monkeypatch.setattr(organizer.bulk_original_carrier_retirement, 'retire', retire)
+    args = SimpleNamespace(_coordinator_fd=7)
+    assert organizer.retire_repacked_original_carrier(args, tmp_path, {})['state'] == 'completed'
+    assert calls == [False, True]
+    def busy(*_a, **_kw):
+        raise SnapshotError('retirement owner busy: cycle.lock')
+    monkeypatch.setattr(organizer.bulk_original_carrier_retirement, 'retire', busy)
+    assert organizer.retire_repacked_original_carrier(args, tmp_path, {})['state'] == 'waiting_original_owner'
+
+
+def test_carrier_reclaim_summary_only_counts_completed_and_exposes_partial_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(organizer, 'received_batches', lambda: [tmp_path])
+    monkeypatch.setattr(organizer.workspace_volume, 'configuration', lambda: {'mount_point': str(tmp_path)})
+    def complete(_workspace, _batch, scope):
+        if scope == 'cache':
+            raise SnapshotError('invalid journal')
+        return 100 if scope == 'markets' else None
+    monkeypatch.setattr(organizer.bulk_original_carrier_retirement, 'completed_reclamation', complete)
+    monkeypatch.setattr(organizer.bulk_committed_landing_retirement, 'completed_reclamation',
+                        lambda _workspace, _batch, scope: (2, 200) if scope == 'cache' else None)
+    value = organizer.original_carrier_reclaim_summary()
+    assert value == {'original_carriers_reclaimed': 1, 'original_carrier_reclaimed_allocated_bytes': 100,
+                     'landing_parts_reclaimed': 2, 'landing_parts_reclaimed_allocated_bytes': 200,
+                     'original_carrier_summary_incomplete': True}
+
+
+def test_bulk_coordinator_keeps_completed_reclaim_total_while_running(tmp_path, monkeypatch):
+    import sys
+    monkeypatch.setattr(organizer, 'COORDINATOR_LOCK', tmp_path/'owner.lock')
+    monkeypatch.setattr(organizer, 'COORDINATOR_STATUS', tmp_path/'private/status.json')
+    monkeypatch.setattr(organizer, 'native_guard', lambda: None)
+    monkeypatch.setattr(organizer.socket, 'gethostname', lambda: 'penguin')
+    monkeypatch.setattr(organizer.shutil, 'disk_usage', lambda *_: SimpleNamespace(free=1024**3))
+    totals = {'original_carriers_reclaimed': 1, 'original_carrier_reclaimed_allocated_bytes': 100,
+              'original_carrier_summary_incomplete': False}
+    monkeypatch.setattr(organizer, 'original_carrier_reclaim_summary', lambda: totals)
+    def run(_args):
+        status = json.loads(organizer.COORDINATOR_STATUS.read_bytes())
+        assert status['state'] == 'checking_received_cohorts'
+        assert status['original_carrier_reclaimed_allocated_bytes'] == 100
+        return 75
+    monkeypatch.setattr(organizer, 'run_batches', run)
+    monkeypatch.setattr(sys, 'argv', ['organizer', '--apply', '--retire'])
+    assert organizer.main() == 75
+
+
 def test_busy_publication_owner_defers_without_ignoring_next_batch(tmp_path, monkeypatch):
     (tmp_path / "cache.original-index.json").write_text(json.dumps({"compressed_sha256": "a" * 64}))
     @contextmanager

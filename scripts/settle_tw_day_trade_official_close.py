@@ -106,6 +106,7 @@ def official_closes(raw_root: Path, day: date, *, exchanges=("twse", "tpex"), pi
                 prices[symbol] = {"symbol": symbol, "price": close, "official_date": str(day),
                                   "price_date": str(day), "price_basis": "official_session_close",
                                   "source": f"{exchange}_official_daily_close", "source_sha256": source["sha256"],
+                                  "source_path": source["path"],
                                   "raw_close": row[close_key], "official_row": row}
     return prices, sources
 

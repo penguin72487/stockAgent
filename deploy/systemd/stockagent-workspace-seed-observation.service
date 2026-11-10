@@ -1,0 +1,13 @@
+[Unit]
+Description=Observe enrolled E rsync seed progress without changing migration ownership
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/observe_workspace_seed_progress.py'
+TimeoutStartSec=45
+UMask=0077
+Nice=19
+IOSchedulingClass=idle

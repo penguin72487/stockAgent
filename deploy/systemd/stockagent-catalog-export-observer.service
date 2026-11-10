@@ -1,0 +1,10 @@
+[Unit]
+Description=Observe the existing StockAgent catalog export activity
+After=stockagent-temporal.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/bash /root/stockAgent/scripts/run_lakehouse_control.sh python /root/stockAgent/scripts/observe_lakehouse_export.py
+TimeoutStartSec=20
+Nice=10
+IOSchedulingClass=idle

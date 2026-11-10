@@ -22,6 +22,10 @@ from pathlib import Path
 from typing import Any, Iterable
 from zoneinfo import ZoneInfo
 
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 import polars as pl
 import requests
 
@@ -795,6 +799,12 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(args.output_root):
+        return _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args: argparse.Namespace) -> int:
     if args.batch_size <= 0:
         raise SystemExit("--batch-size must be positive")
     if args.requests_per_minute <= 0:

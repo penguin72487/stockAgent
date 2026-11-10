@@ -790,6 +790,10 @@ _REFRESH_SERVICE_SNAPSHOT_MAX_AGE_SECONDS: Final[int] = 180
 
 def _read_json(path: Path, default: Any = None) -> Any:
     from stockagent.live.dashboard_updates import read_json_snapshot
+    if 'data_taifex_public_history' in Path(path).parts:
+        from stockagent.live.taifex_snapshot_cache import _scope, read as read_taifex_snapshot
+        if _scope(path) is not None:
+            return read_taifex_snapshot(path, default)
     return read_json_snapshot(path, default)
 
 
@@ -4004,6 +4008,21 @@ def _finlab_receipt_file_exists(finlab_root: Path, data_path: str) -> bool:
 def _tej_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
     from stockagent.live.tej_dashboard import build_tej_public_status, METHOD
     status = build_tej_public_status(root, now=now)
+    catalog_only = status.get('state') == 'metadata_unavailable'
+    if catalog_only:
+        # The full status query has a bounded read budget. If it expires,
+        # keep the independently readable native catalog visible without
+        # presenting its old task counts as a current snapshot.
+        from contextlib import closing
+        import sqlite3
+        from stockagent.live.tej_dashboard import _read as read_tej_catalog
+        try:
+            with closing(read_tej_catalog(root / 'data_tej')) as con:
+                tables = [dict(row) for row in con.execute(
+                    'SELECT table_id,smart_id,name,category,phase,frequency FROM tables ORDER BY phase,category,name')]
+        except (sqlite3.Error, OSError, ValueError):
+            tables = []
+        status = {**status, 'tables': [{**table, 'state': 'metadata_unavailable'} for table in tables]}
     output = []
     for table in status.get("tables", []):
         state = table.get("state")
@@ -4016,18 +4035,18 @@ def _tej_sources(root: Path, *, now: datetime) -> list[dict[str, Any]]:
             "scope": "source_registry", "provider": "TEJ", "title": table["name"],
             "market_category": market, "update_owner": "TEJ Smart Wizard 下載器",
             "cadence": f"{table['frequency']} 查詢格點；原生頻率與發布規律待核對",
-            "status": "degraded" if state in {"needs_review", "stalled_requires_recovery", "empty_field_menu", "empty_query_axis_unverified"} else "updating" if state == "running" else "waiting",
-            "status_label": "查詢範圍完成；含來源空回，原生歷史與追新尚未驗證" if state == "query_scope_checked" else "查詢格點匯出完成；原生歷史與追新尚未驗證" if state == "query_grid_exported" else state,
+            "status": "degraded" if state in {"needs_review", "stalled_requires_recovery", "empty_field_menu", "empty_query_axis_unverified", "metadata_unavailable"} else "updating" if state == "running" else "waiting",
+            "status_label": "資料目錄可讀；詳細狀態暫不可用" if catalog_only else "查詢範圍完成；含來源空回，原生歷史與追新尚未驗證" if state == "query_scope_checked" else "查詢格點匯出完成；原生歷史與追新尚未驗證" if state == "query_grid_exported" else state,
             "rows": table.get("exported_rows"), "latest_at_utc": None,
             "data_through": None, "publishable": False, "automation_eligible": False,
             "acquisition_enabled": True, "registry_alias": False,
-            "record_stats": {"state": "receipt_profile_not_native_observations",
+            "record_stats": {"state": "metadata_unavailable" if catalog_only else "receipt_profile_not_native_observations",
                              "count": table.get("exported_rows"), "first": table.get("first_query_period"),
                              "last": table.get("last_query_period"), "basis": METHOD},
             "coverage": _coverage(table.get("exported_rows"), table.get("grid_rows"), unit="查詢格點", label="查詢格點匯出率，不是原生歷史完整率"),
-            "eta": _unknown_eta("blocked" if state == "needs_review" else "warming_up" if state == "running" else "waiting_schedule", table.get("eta_basis") or METHOD),
+            "eta": _unknown_eta("blocked" if state in {"needs_review", "metadata_unavailable"} else "warming_up" if state == "running" else "waiting_schedule", table.get("eta_basis") or METHOD),
             "freshness": {"state": "unknown", "age_seconds": None},
-            "detail": f"{table['smart_id']} · {table['fields']} 欄 · {table['phase']}；{METHOD}",
+            "detail": f"{table['smart_id']} · 欄位與詳細狀態暫不可讀 · {table['phase']}" if catalog_only else f"{table['smart_id']} · {table['fields']} 欄 · {table['phase']}；{METHOD}",
             "warnings": ["桌面限額與原生歷史發布時點未核實；原始授權值不對外提供。"],
             "detail_link": f"/tej/#features",
         })

@@ -79,6 +79,19 @@ def _native_source_lock_entries(entry: Mapping[str, Any]) -> list[dict[str, Any]
                 if directory.resolve() != directory or not directory.is_dir():
                     raise SnapshotError("canonical CEX writer directory is redirected")
                 locks.append((grain + "/.download.lock", original_root))
+    if (dataset == "tw-minute-train"
+            and source == REPO_ROOT / "data_tw_minute/research_dataset"):
+        # The scheduled backfill's runner lock remains the primary owner.
+        # Direct builders and repairs also share this root lock; taking both
+        # in that order prevents a writer from starting after process discovery.
+        locks.append((".download.lock", source))
+    if (dataset == "forex-pepperstone"
+            and source == REPO_ROOT / "data_peperstone"):
+        locks.append((".download.lock", source))
+    taifex_root = REPO_ROOT / "data_taifex_public_history"
+    if ((dataset == "taifex-public-history" and source == taifex_root)
+            or (dataset == "taifex-rule-history" and source == taifex_root / "rules")):
+        locks.append((".download.lock", taifex_root))
     research_roots = {
         "tw-public-research-wide-2014": "data_tw_public_research_wide_2014_v1",
         "tw-public-research-all-observed-2014-v3": "data_tw_public_research_all_observed_2014_v3",
@@ -221,6 +234,12 @@ def _source_coordination_lock(
     it must neither unlock nor close that descriptor on context exit.
     """
     configured = entry.get("source_coordination_lock")
+    def check_retained_workspace() -> None:
+        if entry.get("dataset") in {"cftc-legacy-pre2000", "fred-crypto-macro", "forex-pepperstone", "tw-minute-source-cold",
+                                     "taifex-public-history", "taifex-rule-history"}:
+            from stockagent.data_sync import workspace_source_handoff
+            workspace_source_handoff.guard_path(_source_path(entry))
+    check_retained_workspace()
     mode = entry.get("source_coordination_lock_mode", "exclusive")
     if mode not in {"exclusive", "shared_read"}:
         raise SnapshotError("invalid source coordination lock mode")
@@ -251,6 +270,7 @@ def _source_coordination_lock(
     existing_forward_owner = entry.get("completed_forward_key") is not None
 
     def check_existing_owner(descriptor: int | None = None) -> None:
+        check_retained_workspace()
         if not existing_forward_owner:
             return
         source = _source_path(entry).absolute()
@@ -371,12 +391,26 @@ def _load_catalog(path: Path, include_families: bool = False) -> list[dict[str, 
             raise SnapshotError(f"duplicate or empty catalog dataset: {dataset!r}")
         if "loose_threshold_bytes" in raw:
             _loose_threshold_bytes(raw)
+        if "pack_layout" in raw or "pack_target_bytes" in raw:
+            from stockagent.data_sync.packed_snapshots import (
+                MAX_SOURCE_PACK_TARGET_BYTES, PATH_HASH_PACK_LAYOUT, SOURCE_PACK_LAYOUTS,
+            )
+            layout = raw.get("pack_layout")
+            if not isinstance(layout, str) or layout not in {PATH_HASH_PACK_LAYOUT, *SOURCE_PACK_LAYOUTS}:
+                raise SnapshotError("catalog pack layout must be explicitly recognized")
+            target = raw.get("pack_target_bytes")
+            if "pack_target_bytes" in raw and (layout not in SOURCE_PACK_LAYOUTS or type(target) is not int
+                                               or not 1 <= target <= MAX_SOURCE_PACK_TARGET_BYTES):
+                raise SnapshotError("catalog source pack target is invalid")
+        if "large_file_layout" in raw and (not isinstance(raw["large_file_layout"], str)
+                or raw["large_file_layout"] not in {"chunked-v1", "whole-file-v1"}):
+            raise SnapshotError("catalog new large-file layout must be explicitly recognized")
         if "file_chunk_bytes" in raw:
             from stockagent.data_sync.packed_snapshots import MAX_FILE_CHUNK_BYTES
             count = raw["file_chunk_bytes"]
             if (type(count) is not int or not 1 <= count <= MAX_FILE_CHUNK_BYTES
-                    or raw.get("reader_contract") != "packed-v2-chunks"):
-                raise SnapshotError("chunk publication requires bounded bytes and explicit packed-v2-chunks readers")
+                    or raw.get("reader_contract") not in {"packed-v2-chunks", "packed-v3-content-alias"}):
+                raise SnapshotError("chunk publication requires bounded bytes and explicit packed-v2-chunks or packed-v3-content-alias readers")
         if "closed_source_contract" in raw:
             from stockagent.data_sync.closed_source import validate_catalog
             validate_catalog(raw)
@@ -668,6 +702,18 @@ def _publish_entry(
             if current != expected_inputs:
                 raise SnapshotError("Bybit materialization inputs changed before publication commit")
 
+    expected_previous = getattr(args, 'expected_previous_manifest_sha256', None)
+    if expected_previous is not None:
+        if not isinstance(expected_previous, str) or re.fullmatch('[0-9a-f]{64}', expected_previous) is None:
+            raise SnapshotError('expected previous manifest must be a lowercase SHA-256')
+        prior_guard = source_guard
+        def source_guard() -> None:
+            if prior_guard is not None:
+                prior_guard()
+            current = resolve_latest_packed(sync_root, str(entry['dataset']), require_objects=False)
+            if current.manifest_sha256 != expected_previous:
+                raise SnapshotError('expected previous manifest changed before publication commit')
+
     # Acquire before the final process/receipt check. A writer that starts
     # between an earlier status call and publication must not escape the gate.
     with _publication_source_locks(
@@ -765,6 +811,15 @@ def _publish_entry(
             node_id=args.node_id,
             loose_file_threshold_bytes=_loose_threshold_bytes(entry),
             pack_buckets=int(entry["pack_buckets"]),
+            pack_layout=entry.get("pack_layout"),
+            pack_target_bytes=entry.get("pack_target_bytes"),
+            large_file_layout=entry.get("large_file_layout"),
+            **({'require_previous_files_present': True}
+               if getattr(args, 'require_previous_files_present', False) else {}),
+            **({'merge_previous_missing_files': True}
+               if getattr(args, 'merge_previous_missing_files', False) else {}),
+            **({'expected_incremental_base': args.expected_incremental_base}
+               if getattr(args, 'expected_incremental_base', None) is not None else {}),
             **version_options,
             excluded_subtrees=[
                 str(value) for value in entry.get("excluded_subtrees", [])
@@ -843,7 +898,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sync-root", type=Path)
     parser.add_argument("--node-id")
     parser.add_argument(
-        "--reader-contract", choices=("packed-v1", "packed-v2-chunks"), default="packed-v1",
+        "--reader-contract", choices=("packed-v1", "packed-v2-chunks", "packed-v3-content-alias"), default="packed-v1",
         help="Explicit source-format rollout assertion. V2 shares unchanged large-file chunks; upgrade consumers first.",
     )
     parser.add_argument("--layout-output", type=Path,
@@ -862,6 +917,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--expected-bybit-input-signature", type=_parse_expected_bybit_signature,
         help="Bind Bybit publication to the refresh input metadata proof (JSON).",
+    )
+    parser.add_argument(
+        "--expected-previous-manifest-sha256",
+        help="Require a fixed current dataset manifest under the canonical publication lock.",
     )
     parser.add_argument(
         "--result-receipt", type=Path,
@@ -900,7 +959,8 @@ def main(argv: list[str] | None = None) -> int:
             if (args.dataset or args.all_ready or args.source_roots_only or args.sync_root is None
                     or args.migration_state is None or args.completed_forward_key
                     or args.source_lock_fd is not None or args.after_dataset
-                    or args.result_receipt or args.batch_progress_receipt or args.layout_output):
+                    or args.result_receipt or args.batch_progress_receipt or args.layout_output
+                    or args.expected_previous_manifest_sha256 is not None):
                 raise SnapshotError("migrate requires --sync-root and --migration-state, without publication selections")
             result = migrate_catalog(REPO_ROOT, args, _load_catalog(args.catalog.resolve()))
             print(json.dumps(result, ensure_ascii=False, indent=2))
@@ -909,6 +969,10 @@ def main(argv: list[str] | None = None) -> int:
             raise SnapshotError("--migration-state and --watch require migrate")
         if args.source_roots_only and (args.command != "publish" or not args.all_ready or args.dataset):
             raise SnapshotError("--source-roots-only requires publish --all-ready without an explicit dataset")
+        if args.expected_previous_manifest_sha256 is not None and (
+                args.command != 'publish' or not args.dataset or args.all_ready
+                or re.fullmatch('[0-9a-f]{64}', args.expected_previous_manifest_sha256) is None):
+            raise SnapshotError('expected previous manifest requires one dataset and a lowercase SHA-256')
         if args.completed_forward_key is not None:
             from stockagent.data_sync.completed_forward_publication import validate_key
             validate_key(args.completed_forward_key)

@@ -576,21 +576,28 @@ def _append_bytes(path: Path, body: bytes, *, expected_generation=None):
         os.close(fd)
 
 
-def append_paper_journal(path: Path, body: bytes):
+def append_paper_journal(path: Path, body: bytes, *, expected_parent=None):
     """Canonical exact-byte append, with recoverable intent for enrolled views.
 
     Legacy appends retain their format and single raw-file fsync. Managed
     appends persist immutable expected bytes BEFORE touching the projection.
-    A crash never causes an automatic retry/duplicate fill: explicit recovery
-    may only seal bytes already present, not write missing execution data.
+    An optional parent compare-and-set is checked under the journal write lock;
+    it is never available for an unenrolled legacy projection.
+    Representation recovery itself only seals bytes already present; it does
+    not create missing execution data. Any source-verified financial recovery
+    is a separate executor-owned operation, not an automatic journal retry.
     Financial state/commit/ACK remain the executor's separate responsibility.
     """
     path = Path(path)
     if type(body) is not bytes:
         raise TypeError("paper append requires immutable encoded bytes")
+    if not body and expected_parent is not None:
+        raise ValueError("journal parent comparison requires a nonempty append")
     if not body:
         return
     if not managed(path):
+        if expected_parent is not None:
+            raise ValueError("journal parent comparison requires an enrolled journal")
         _append_bytes(path, body)
         return
     if len(body) > MAX_APPEND_BYTES:
@@ -603,6 +610,13 @@ def append_paper_journal(path: Path, body: bytes):
         prior = JournalSnapshot(path)
         with _JournalReader(prior):
             pass
+        if expected_parent is not None and (
+                not isinstance(expected_parent, dict)
+                or set(expected_parent) != {"head", "size"}
+                or prior.head != expected_parent["head"]
+                or type(expected_parent["size"]) is not int
+                or prior.size != expected_parent["size"]):
+            raise OSError("journal expected parent changed before append")
         intent = _stage_append_intent(path, prior, body)
         if _pointer(path) != prior.pointer:
             raise OSError("journal parent changed before expected append")

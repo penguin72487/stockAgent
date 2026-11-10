@@ -220,9 +220,14 @@ def test_canonical_owner_executes_one_exact_check_before_accepted_renewal(tmp_pa
 
 @pytest.mark.parametrize('due_release', [False, True])
 @pytest.mark.parametrize('ordinary_blocked', [False, True])
-def test_finite_option_owner_yields_only_foreign_history(tmp_path, monkeypatch, due_release, ordinary_blocked):
+@pytest.mark.parametrize('paused', [False, True])
+@pytest.mark.parametrize('stale_probe', [False, True])
+def test_finite_option_owner_yields_only_foreign_history(tmp_path, monkeypatch, due_release, ordinary_blocked, paused, stale_probe):
     from types import SimpleNamespace
     from downloader import finmind_integrity
+    from downloader import paused_provider_owners
+    monkeypatch.setattr(paused_provider_owners, 'explicitly_paused',
+                        lambda _: frozenset({'complement'}) if paused else frozenset())
 
     key = ('TaiwanOptionDaily', 'TEO', 'history')
     account = dict(tier='Free', official_requests_per_hour=600, provider_used_in_hour=0,
@@ -275,15 +280,17 @@ def test_finite_option_owner_yields_only_foreign_history(tmp_path, monkeypatch, 
               'guard_kind': ORDINARY_CAPACITY_BLOCKED if ordinary_blocked else 'ordinary_admitted'}
     capacity = SimpleNamespace(root=tmp_path.absolute(),
                                initial_sample=lambda **_kw: sample,
-                               sample=lambda: sample)
+                               sample=lambda: ({'state':'deferred', 'reason':'capacity_sample_expired'}
+                                               if stale_probe else sample))
     result = worker.run_once(tmp_path, max_requests=1, required_keys=(key,),
                              capacity_sampler=capacity, finite_option_priority=True,
                              finite_option_validate=lambda: validated.append(True))
     assert validated and observed_plans
     assert observed_plans[0]['preempted_foreign_history_requests'] == 2
     assert observed_plans[0]['upcoming_requests'] == 10
-    assert observed_plans[0]['ready_requests'] == int(due_release)
-    blocked = due_release and not ordinary_blocked
+    assert observed_plans[0]['ready_requests'] == int(due_release and not paused)
+    assert observed_plans[0]['reserve_requests'] == 10 + int(due_release)
+    blocked = due_release and not ordinary_blocked and not paused
     assert result['state'] == ('incremental_reserve' if blocked else 'batch_complete')
     assert fetched == ([] if blocked else [key])
     with worker._db(tmp_path / 'queue.sqlite3') as conn:

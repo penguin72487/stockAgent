@@ -50,6 +50,31 @@
         throw new Error("訊號筆數不完整");
       }
     }
+    const reference = data.preopen_reference || {modes: [], rows: []};
+    if (!Array.isArray(reference.modes) || !Array.isArray(reference.rows)) throw new Error("盤前參考格式錯誤");
+    const referenceModes = new Map(), referenceCounts = new Map(), referenceSeen = new Set();
+    for (const mode of reference.modes) {
+      if (!mode || !modes.has(mode.market) || modes.get(mode.market).status !== "waiting"
+          || referenceModes.has(mode.market) || typeof mode.label !== "string"
+          || !/^\d{4}-\d{2}-\d{2}$/.test(mode.price_data_date || "")
+          || !Number.isSafeInteger(mode.target_count) || mode.target_count < 0
+          || !/^[a-f0-9]{32}$/.test(mode.public_signal_key || "") || !mode.signal_ready_at) {
+        throw new Error("盤前參考版本錯誤");
+      }
+      referenceModes.set(mode.market, mode);
+    }
+    for (const row of reference.rows) {
+      const mode = referenceModes.get(row?.market), key = `${row?.market}\u0000${row?.symbol}`;
+      if (!mode || row.public_signal_key !== mode.public_signal_key || referenceSeen.has(key)
+          || typeof row.symbol !== "string" || !row.symbol || typeof row.target_weight !== "number"
+          || !Number.isFinite(row.target_weight) || row.target_weight === 0
+          || row.side !== (row.target_weight > 0 ? "long" : "short")) throw new Error("盤前參考資料錯誤");
+      referenceSeen.add(key);
+      referenceCounts.set(row.market, (referenceCounts.get(row.market) || 0) + 1);
+    }
+    for (const mode of reference.modes) {
+      if ((referenceCounts.get(mode.market) || 0) !== mode.target_count) throw new Error("盤前參考筆數不完整");
+    }
     return data;
   }
 
@@ -80,7 +105,19 @@
     }
     rows.sort((a, b) => Math.abs(b.target_weight) - Math.abs(a.target_weight)
       || a.market.localeCompare(b.market) || a.symbol.localeCompare(b.symbol));
-    return {session_date: incoming.session_date, modes, rows};
+    return {session_date: incoming.session_date, modes, rows,
+      preopen_reference: incoming.preopen_reference || {modes: [], rows: []}};
+  }
+
+  function emptyMessage(current, error) {
+    if (error) return error;
+    if (!current) return "正在讀取已發布訊號…";
+    if (!current.session_date) return "交易日尚未驗收，暫無可顯示的訊號";
+    if (!current.modes.length) return "目前沒有啟用的訊號模式";
+    const published = current.modes.filter((mode) => mode.status === "published" && !mode.stale).length;
+    if (published === current.modes.length) return "已發布的模式目前沒有非零目標";
+    if (published) return "已發布的模式沒有非零目標；其餘模式尚未可用";
+    return "本交易日的訊號尚未產生或無法核對，將自動重試";
   }
 
   function init() {
@@ -95,6 +132,22 @@
     const $ = Dashboard.byId, esc = Dashboard.escapeHtml, setHtml = Dashboard.setTrustedHtml;
     const fetchSnapshot = Dashboard.createFetch({timeoutMs: 4000});
     let current = null, etag = "", error = "", visible = 100;
+    let scheduler = null, retryTimer = null, retryAttempts = 0;
+    function scheduleRecovery() {
+      const incomplete = !!error || (current?.modes || []).some((mode) => mode.status === "unavailable");
+      if (!incomplete) {
+        retryAttempts = 0;
+        if (retryTimer !== null && typeof global.clearTimeout === "function") global.clearTimeout(retryTimer);
+        retryTimer = null;
+        return;
+      }
+      if (retryTimer !== null || retryAttempts >= 3 || typeof global.setTimeout !== "function") return;
+      retryTimer = global.setTimeout(() => {
+        retryTimer = null;
+        retryAttempts += 1;
+        scheduler?.run();
+      }, 2000);
+    }
     const displayTime = (value) => {
       const parsed = new Date(value);
       return Number.isFinite(parsed.getTime())
@@ -107,13 +160,19 @@
       return `${value < 0 ? "−" : "+"}${magnitude.toFixed(2)}%`;
     };
     function render() {
-      const modes = current?.modes || [], rows = current?.rows || [];
+      const modes = current?.modes || [], reference = current?.preopen_reference || {modes: [], rows: []};
+      const references = new Map(reference.modes.map((mode) => [mode.market, mode]));
+      const rows = [...(current?.rows || []).map((row) => ({...row, preopenReference: false})),
+        ...reference.rows.map((row) => ({...row, preopenReference: true}))]
+        .sort((a, b) => Math.abs(b.target_weight) - Math.abs(a.target_weight));
       const byMarket = new Map(modes.map((mode) => [mode.market, mode]));
       const summary = modes.map((mode) => {
         const version = mode.revision_index == null ? "" : `版本 ${mode.revision_index} · `;
         const phase = mode.completed_session_calculation ? "盤後計算 · " : "";
+        const ref = references.get(mode.market);
         const text = mode.status === "published" ? `已發布 · ${phase}${version}${displayTime(mode.signal_ready_at)} · ${mode.target_count} 筆`
           : mode.stale ? `更新失敗，延用上一版 · ${phase}${version}${displayTime(mode.signal_ready_at)}`
+          : ref ? `盤前參考 · ${ref.price_data_date} 收盤 · ${ref.target_count} 筆；等待今日訊號`
           : mode.status === "waiting" ? "等待今日訊號"
           : mode.status === "calendar_unverified" ? "交易日曆尚未驗收" : "訊號暫時無法核對";
         return `<div><span>${esc(mode.label)}</span><strong>${esc(text)}</strong></div>`;
@@ -126,12 +185,13 @@
       const button = $("published-signal-more");
       button.classList.toggle("hidden", rows.length <= visible);
       const html = rows.slice(0, visible).map((row) => {
-        const mode = byMarket.get(row.market);
+        const mode = row.preopenReference ? references.get(row.market) : byMarket.get(row.market);
+        if (row.preopenReference) return `<tr><td><strong>${esc(mode.label)}</strong><small>盤前參考 · ${esc(mode.price_data_date)} 收盤 · 非今日訊號</small></td><td><strong>${esc(row.symbol)}</strong><small>${esc(row.name || "")} · ${row.side === "long" ? "多" : "空"}</small></td><td><strong>${esc(percent(row.target_weight))}</strong></td></tr>`;
         const revision = (mode.completed_session_calculation ? "盤後計算 · " : "")
           + (mode.revision_index == null ? "" : `版本 ${mode.revision_index} · `);
         return `<tr data-public-signal-key="${esc(row.public_signal_key)}"><td><strong>${esc(mode.label)}</strong><small>${mode.stale ? "上一版 · " : ""}${esc(revision)}${esc(displayTime(mode.signal_ready_at))}</small></td><td><strong>${esc(row.symbol)}</strong><small>${esc(row.name || "")} · ${row.side === "long" ? "多" : "空"}</small></td><td><strong>${esc(percent(row.target_weight))}</strong></td></tr>`;
       }).join("");
-      setHtml("published-signal-body", html || `<tr><td colspan="3">${esc(error || (current ? "目前沒有可顯示的當日非零訊號" : "正在讀取已發布訊號…"))}</td></tr>`);
+      setHtml("published-signal-body", html || `<tr><td colspan="3">${esc(emptyMessage(current, error))}</td></tr>`);
     }
     async function refresh() {
       try {
@@ -142,6 +202,7 @@
           sharedSnapshot = current; sharedError = error;
           render();
           notify();
+          scheduleRecovery();
           return;
         }
         const data = await Dashboard.readJsonResponse(response, {expectedRoot: "object"});
@@ -156,14 +217,15 @@
       sharedSnapshot = current; sharedError = error;
       render();
       notify();
+      scheduleRecovery();
     }
     $("published-signal-more").addEventListener("click", () => { visible += 100; render(); });
-    const scheduler = Dashboard.scheduleRefresh(refresh, {
+    scheduler = Dashboard.scheduleRefresh(refresh, {
       intervalMs: 60000, cadenceFromLastStart: true, refreshOnVisible: "overdue",
     });
     $("force-refresh")?.addEventListener("click", () => scheduler.run());
   }
 
-  global.StockAgentPublishedSignals = Object.freeze({validate, merge, init, getSnapshot});
+  global.StockAgentPublishedSignals = Object.freeze({validate, merge, init, getSnapshot, emptyMessage});
   init();
 })(globalThis);

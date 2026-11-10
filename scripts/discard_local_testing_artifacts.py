@@ -22,7 +22,8 @@ sys.path.insert(0, str(ROOT))
 from stockagent.data_sync import artifact_discard as discard
 from stockagent.data_sync.artifact_discard import write_discard_receipt as atomic_write_json
 from downloader.artifact_io import atomic_write_bytes
-from stockagent.data_sync.testing_disposition import LOCAL_TESTING_CONTRACT, load_policy, real, target_path
+from stockagent.data_sync.testing_disposition import (D_WORKFLOW_TESTING_CONTRACT, LOCAL_COPY_CONTRACTS,
+                                                     load_policy, real, target_path)
 from scripts.retire_local_offline_artifacts import COMMON_OWNER
 
 CONTRACT = 'stockagent.local_testing_cleanup.v1'
@@ -33,7 +34,7 @@ COMPARISON_RECEIPTS = (
     'optimization_acceptance_readback.json', 'source_disposition.json', 'acceptance.json',
     'comparison.json', 'summary.json', 'summary.csv', 'abba-receipt.json', 'receipt.json',
     'owner_final_acceptance.json', 'owner_snapshot_acceptance.json', 'full_sql_complete_pair.json',
-    'fixture.json', 'immutable-inputs.json', 'current-all-file-actual-open-count-control.json',
+    'fixture.json', 'immutable-inputs.json', 'current-all-file-actual-open-count-control.json', 'collection.json',
 )
 
 
@@ -69,7 +70,7 @@ def retain_small_receipts(source: Path, destination: Path) -> None:
 
 def cycle(policy_path: Path, state: Path, *, apply: bool, repo: Path = ROOT) -> dict:
     policy = load_policy(policy_path)
-    if policy['contract'] != LOCAL_TESTING_CONTRACT:
+    if policy['contract'] not in LOCAL_COPY_CONTRACTS:
         raise ValueError('only an explicit local performance-copy disposition is allowed')
     state = real(state.absolute())
     state.mkdir(parents=True, mode=0o700, exist_ok=True)
@@ -149,6 +150,20 @@ def cycle(policy_path: Path, state: Path, *, apply: bool, repo: Path = ROOT) -> 
                     with real(COMMON_OWNER).open('a') as mutation_owner:
                         fcntl.flock(mutation_owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
                         discard.restore_unchanged_discard_quarantine(policy, target, **options)
+                    terminal = json.loads(journal.read_bytes())
+                    result = terminal.get('result') if terminal.get('state') == 'discarded' else None
+                    if (policy['contract'] in LOCAL_COPY_CONTRACTS and isinstance(result, dict)
+                            and result.get('target') == target and result.get('deleted') is True
+                            and result.get('policy_identity_sha256') == policy['identity_sha256']
+                            and type(result.get('reclaimed_allocated_bytes')) is int
+                            and result['reclaimed_allocated_bytes'] >= 0):
+                        if source.exists() or source.is_symlink():
+                            results.append(dict(target_key=key, state='protected', reason='target_recreated',
+                                                relative=target['relative'], deleted=False))
+                        else:
+                            results.append(dict(result, target_key=key, relative=target['relative']))
+                        publish('checking_exact_targets')
+                        continue
                 plan = discard.discard_target(policy, target, **options)
                 if plan.get('blockers'):
                     result = dict(state='protected', reason='current_consumer_or_type_gate',

@@ -79,10 +79,24 @@ def _finlab_partition(item: dict) -> tuple[str, date]:
             else _finlab_stock_partition(item))
 
 
-def finlab_futures_candidates(con: sqlite3.Connection, now: datetime) -> list[tuple[str, date]]:
-    """Read existing finite intents; the native intraday owner still admits each call."""
+def finlab_futures_candidates(con: sqlite3.Connection, now: datetime, *,
+                              prefer_request_ids: tuple[str, ...] = ()) -> list[tuple[str, date]]:
+    """Read existing intents; optional exact-request preference changes order only."""
+    if (not isinstance(prefer_request_ids, tuple) or len(set(prefer_request_ids)) != len(prefer_request_ids)
+            or any(not isinstance(value, str) or re.fullmatch(r'[0-9a-f]{64}', value) is None
+                   for value in prefer_request_ids)):
+        raise ValueError('Preferred requests require unique exact request identities')
     result = []
-    for raw in active_keys(con, now):
+    keys = active_keys(con, now)
+    if prefer_request_ids and has_intents(con):
+        placeholders = ','.join('?' for _ in prefer_request_ids)
+        preferred = [row[0] for row in con.execute(
+            "SELECT task_key FROM provider_query_intents WHERE created_at_utc<=? AND expires_at_utc>? "
+            f"AND request_id IN ({placeholders}) GROUP BY task_key ORDER BY MIN(created_at_utc),task_key",
+            (now.isoformat(), now.isoformat(), *prefer_request_ids))]
+        selected = set(preferred)
+        keys = preferred + [key for key in keys if key not in selected]
+    for raw in keys:
         try:
             values = json.loads(raw)
             if isinstance(values, list) and len(values) == 2:

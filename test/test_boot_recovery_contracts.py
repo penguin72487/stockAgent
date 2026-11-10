@@ -48,6 +48,18 @@ def test_windows_public_gateway_does_not_block_or_kill_wsl_bootstrap() -> None:
     assert "-StartWhenAvailable" in installer
 
 
+def test_minute_source_recovery_has_bounded_priority_without_stopping_trading() -> None:
+    unit = _read('deploy/systemd/stockagent-minute-source-handoff-boot.service')
+    consumer = _read('deploy/systemd/stockagent-minute-source-handoff-consumer.conf')
+    assert '--boot --priority-minute-boot' in unit
+    assert 'TimeoutStartSec=20s' in unit
+    assert 'Before=stockagent-workspace-source-handoff-boot.service' in unit
+    assert 'stockagent-tw-day-trade-simulation.service' in unit
+    assert 'Wants=stockagent-minute-source-handoff-boot.service' in consumer
+    assert 'After=stockagent-minute-source-handoff-boot.service' in consumer
+    assert 'Requires=stockagent-minute-source-handoff-boot.service' not in consumer
+
+
 def test_expensive_recovery_jobs_are_timer_only_and_staggered() -> None:
     service_paths = (
         "deploy/systemd/stockagent-taifex-futures-daily.service.in",
@@ -112,8 +124,10 @@ def test_expensive_recovery_jobs_are_timer_only_and_staggered() -> None:
     assert "--schema-grouped-sec-views" in compaction_service
     assert "--archive-idle-only --incremental-source-audit" in compaction_service
     assert "--minimum-runway-minutes 45 --protected-until 13:35" in compaction_service
-    assert "MemoryHigh=2816M" in compaction_service
-    assert "MemoryMax=3G" in compaction_service
+    # The selected 2026-10-27 resource policy removes hard memory ceilings;
+    # source-idle/runway gates still protect the opening path above.
+    assert "MemoryHigh=infinity" in compaction_service
+    assert "MemoryMax=infinity" in compaction_service
     assert "--max-source-files 32768" in compaction_service
     minute_timer = _read(
         "deploy/systemd/stockagent-shioaji-minute-backfill.timer.in"

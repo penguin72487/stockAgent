@@ -21,6 +21,9 @@ def isolated_worker(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     emissions: list[dict] = []
     bot = runner._load_discord_bot()
     monkeypatch.setenv("STOCKAGENT_ARTIFACT_BACKFILL_STATUS_PATH", str(status_path))
+    # Retry lifecycle tests do not inherit the node's live deployment policy.
+    # The enabled-year admission contract has its own explicit fixtures/tests.
+    monkeypatch.setenv("STOCKAGENT_FORMAL_HISTORY_SCOPE_POLICY", str(tmp_path / "absent-scope.json"))
     monkeypatch.setattr(bot, "_rotate_error_log_if_needed", lambda: None)
     monkeypatch.setattr(bot, "_opening_critical_work_pending", lambda: False)
     monkeypatch.setattr(bot, "_interactive_signal_work_pending", lambda: False)
@@ -111,6 +114,146 @@ def test_capacity_wait_preserves_error_evidence_without_false_inference_failure(
     assert job.get("failure_attempt", 0) == 0 and job["next_retry_at"]
     assert status["maintenance_run"]["status"] == "waiting_source"
     assert not any(row.get("status") in {"ready", "failed", "complete"} for row in emissions)
+
+
+def test_capacity_retries_back_off_without_incrementing_model_failures(isolated_worker, monkeypatch):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    status_path, _ = isolated_worker
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: "same-source")
+    monkeypatch.setattr(runner, "_backing_capacity_hint", lambda _required: ("blocked", None))
+    calls = []
+
+    def unavailable(_):
+        calls.append(1)
+        raise CapacityDeferred("physical_backing_reserve", physical_free_bytes=10,
+                               required_bytes_including_reserve=100 + len(calls))
+
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", unavailable)
+    for expected in (60, 120, 240, 480, 900, 900):
+        assert runner.run_once() == 0
+        payload = json.loads(status_path.read_text())
+        job = payload["jobs"]["market"]
+        assert job["status"] == "waiting_source" and job.get("failure_attempt", 0) == 0
+        assert job["retry_delay_seconds"] == expected
+        assert job["capacity_wait_attempt"] == len(calls)
+        assert job["capacity_workspace_was_blocked"] is True
+        assert job["error_details"]["physical_free_bytes"] == 10
+        job["next_retry_at"] = (datetime.now().astimezone() - timedelta(seconds=1)).isoformat()
+        status_path.write_text(json.dumps(payload))
+    assert len(calls) == 6
+
+
+@pytest.mark.parametrize("trigger", ["capacity_recovered", "source_changed"])
+def test_capacity_wait_can_recover_early_only_through_canonical_worker(isolated_worker, monkeypatch, trigger):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    status_path, _ = isolated_worker
+    source = {"hint": "first"}
+    capacity = {"value": ("blocked", None)}
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: source["hint"])
+    monkeypatch.setattr(runner, "_backing_capacity_hint", lambda _required: capacity["value"])
+    calls = []
+
+    def infer(_):
+        calls.append(1)
+        if len(calls) == 1:
+            raise CapacityDeferred("physical_backing_reserve", required_bytes_including_reserve=100)
+        return None
+
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", infer)
+    assert runner.run_once() == 0
+    job = json.loads(status_path.read_text())["jobs"]["market"]
+    assert job["capacity_wait_contract"] == runner.CAPACITY_WAIT_CONTRACT
+    assert datetime.fromisoformat(job["next_retry_at"]) > datetime.now().astimezone()
+    # Still-blocked or unknown capacity with an unchanged source does not run inference.
+    capacity["value"] = ("unknown", None)
+    assert runner.run_once() == 0
+    assert len(calls) == 1
+    if trigger == "capacity_recovered":
+        capacity["value"] = ("available", 100)
+    else:
+        source["hint"] = "new-source"
+    assert runner.run_once() == 0
+    assert len(calls) == 2
+    assert json.loads(status_path.read_text())["jobs"]["market"]["status"] == "ready"
+
+
+def test_capacity_early_hint_never_overrides_opening_priority(isolated_worker, monkeypatch):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    status_path, _ = isolated_worker
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: "same")
+    capacity = {"value": ("blocked", None)}
+    monkeypatch.setattr(runner, "_backing_capacity_hint", lambda _: capacity["value"])
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", lambda _: (
+        (_ for _ in ()).throw(CapacityDeferred("physical_backing_reserve", required_bytes_including_reserve=100))))
+    assert runner.run_once() == 0
+    before = json.loads(status_path.read_text())["jobs"]["market"]
+    capacity["value"] = ("available", 100)
+    monkeypatch.setattr(runner.discord_bot, "_opening_critical_work_pending", lambda: True)
+    assert runner.run_once() == 0
+    assert json.loads(status_path.read_text())["jobs"]["market"] == before
+
+
+def test_capacity_recovery_observes_one_sample_for_distinct_thresholds(monkeypatch):
+    now = datetime.now().astimezone()
+    deadline = (now + timedelta(minutes=10)).isoformat()
+    jobs = {}
+    for key, required in (("a", 100), ("b", 150), ("c", 200)):
+        jobs[key] = {"key": key, "status": "waiting_source", "error_type": "CapacityDeferred",
+                     "next_retry_at": deadline, "capacity_wait_contract": runner.CAPACITY_WAIT_CONTRACT,
+                     "capacity_workspace_was_blocked": True, "capacity_source_hint": "same",
+                     "error_details": {"reason": "physical_backing_reserve",
+                                       "required_bytes_including_reserve": required}}
+    calls = []
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: "same")
+    monkeypatch.setattr(runner, "_backing_capacity_hint",
+                        lambda required: (calls.append(required) or ("available", 150)))
+    assert set(runner._capacity_recovered_jobs(jobs, observed=now)) == {"a", "b"}
+    assert calls == [100]
+
+
+def test_capacity_wait_survives_an_unavailable_source_hint(isolated_worker, monkeypatch):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    status_path, _ = isolated_worker
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: None)
+    capacity = {"value": ("blocked", None)}
+    monkeypatch.setattr(runner, "_backing_capacity_hint", lambda _: capacity["value"])
+    calls = []
+
+    def infer(_):
+        calls.append(1)
+        if len(calls) == 1:
+            raise CapacityDeferred("physical_backing_reserve", required_bytes_including_reserve=100)
+        return None
+
+    monkeypatch.setattr(runner.discord_bot, "_run_artifact_backfill_sync", infer)
+    assert runner.run_once() == 0
+    assert json.loads(status_path.read_text())["jobs"]["market"]["capacity_source_hint"] is None
+    capacity["value"] = ("available", 100)
+    assert runner.run_once() == 0
+    assert len(calls) == 2
+
+
+def test_capacity_schedule_does_not_overwrite_a_changed_job(isolated_worker, monkeypatch):
+    from stockagent.data_sync.completed_forward_capacity import CapacityDeferred
+
+    status_path, _ = isolated_worker
+    bot = runner.discord_bot
+    monkeypatch.setattr(runner, "_capacity_source_hint", lambda: "same")
+    bot._begin_artifact_backfill("market", "market")
+    waiting = bot._finish_artifact_backfill("market", "market", status="waiting_source",
+        exc=CapacityDeferred("physical_backing_reserve", required_bytes_including_reserve=100))
+
+    def changed(_required):
+        bot._finish_artifact_backfill("market", "market", status="ready")
+        return "blocked", None
+
+    monkeypatch.setattr(runner, "_backing_capacity_hint", changed)
+    assert runner._schedule_capacity_wait("market", waiting, {}) == waiting
+    assert json.loads(status_path.read_text())["jobs"]["market"]["status"] == "ready"
 
 
 @pytest.mark.parametrize("state", ["failed", "ready", "running"])

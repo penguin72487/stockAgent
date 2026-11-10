@@ -766,7 +766,7 @@ def reparse_batch(conn, root: Path, *, started: float, max_documents: int, max_s
     return attempted, succeeded
 
 
-def main(argv=None) -> int:
+def _main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output-dir', type=Path, default=Path('data_taifex_public_history/rules'))
     parser.add_argument('--start-year', type=int, default=1997)
@@ -916,6 +916,12 @@ def main(argv=None) -> int:
             # A successfully audited resumable batch is not a whole-history
             # completion claim. Failed work stays queued; all-index failure fails.
             return 0 if report['counts']['index_years_complete'] else 1
+
+
+def main(argv=None) -> int:
+    from stockagent.data_sync.taifex_workspace_guard import cli_writer_guard
+    with cli_writer_guard(argv, default_output='data_taifex_public_history/rules'):
+        return _main(argv)
 
 
 if __name__ == '__main__':

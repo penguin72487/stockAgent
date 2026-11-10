@@ -1,15 +1,16 @@
 [Unit]
-Description=Resume three fixed private control preparations from C to E
+Description=Resume four fixed private control preparations from C to E
 Requires=stockagent-e-workspace-mount.service
 After=stockagent-e-workspace-mount.service
 
 [Service]
 Type=oneshot
 WorkingDirectory=/root/stockAgent
-ExecCondition=/usr/bin/bash -c 'for key in 5c3dcaf868ff5171b478326e 3e8c4f4eb26d2d9c57d63414 9d30fe6d7e1b3d5d033d18ad; do test -f /var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/$$key/complete.json || exit 0; done; exit 1'
+ExecCondition=/usr/bin/bash -c 'for key in 5c3dcaf868ff5171b478326e 3e8c4f4eb26d2d9c57d63414 9d30fe6d7e1b3d5d033d18ad; do test -f /var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a/workspace-relocation/$$key/complete.json || exit 0; done; test -f /var/lib/stockagent/lakehouse-control/dataset-versions/operations/7fa3bf9d5be100aa-c113544519884b839486d655bbbe3d66/workspace-relocation/1cadf944abb9cf863ff3f0c9/complete.json || exit 0; exit 1'
 ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/relocate_private_sqlite_scratch.py --operation /var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a --dataset local-tw-public --controls-sha256 6cbcb45473dfe97ed2627f244af0406d89dcbe8809b71939b5b2c32f9b396618'
 ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/relocate_private_sqlite_scratch.py --operation /var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a --dataset local-tw-index-futures --controls-sha256 e03d7b26d3f07dd714db8087356c9098f0c2b6c8ce2fd3548fe18e0e24f32394'
 ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/relocate_private_sqlite_scratch.py --operation /var/lib/stockagent/lakehouse-control/dataset-versions/operations/a957e7326156aa54-4a2d31b61cdf45b6964cf4aa5c06fc7a --dataset local-openbb --controls-sha256 7c152fec673dbedadab34264dfc431b36765f4f17361118432f26c399d0eaf3d'
+ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/relocate_private_sqlite_scratch.py --operation /var/lib/stockagent/lakehouse-control/dataset-versions/operations/7fa3bf9d5be100aa-c113544519884b839486d655bbbe3d66 --dataset finlab-research --controls-sha256 c109782cf06edb7cbf6a45ac0f53a3bf9e28bfeec9729b7e45016da87684a933'
 SuccessExitStatus=75
 TimeoutStartSec=infinity
 UMask=0077

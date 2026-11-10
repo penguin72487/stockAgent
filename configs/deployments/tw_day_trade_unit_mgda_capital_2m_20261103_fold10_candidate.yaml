@@ -1,0 +1,22 @@
+# Disabled deployment candidate for the exact 2026-11-03 2M research run.
+# The original generated config is from the source-verified E prestage. This is
+# still a disabled candidate, not proof of cold backup or production readiness.
+# Its remote SHA256 was fb6365fbdd14ec63297a2f87850a68e8d143d91da1fa1ab943cd29240321d6fc.
+base_config: /srv/stockagent-workspace/restore/completed-return-staging/1080930381086c7312e42d065d5df049e5f8f23a77d50cd4d745136d25b1f222/ingress-staging/vastai1T/artifact-auto-training-1a385d89ef07093c/artifacts/markets/tw_day_trade_unit_mgda_capital_limitup_20261103_v1/_capacity/capital__twd_2000000/attempt-00/training/generated_config_20261103_084544.yaml
+data:
+  # 2025 is input context; the requested public replay begins in 2026.
+  panel_start_date: '2025-01-01'
+  parquet_root: /srv/stockagent-live/data_tw_public/stocks
+  tw_public_feature_path: /srv/stockagent-live/data_tw_public/features/tw_public_stock_daily.parquet
+  day_trade_inference_public_feature_path: /srv/stockagent-live/data_tw_public/features/tw_public_stock_daily.parquet
+  day_trade_minute_execution_root: data_tw_minute/research_dataset
+  factorized_feature_manifest: /root/stockAgent/artifacts/data_preparation/tw_factorized_scale_cash_live_v1/current/factorized_manifest.json
+  panel_cache_root: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/base
+  day_trade_minute_execution_cache_dir: /root/stockAgent/artifacts/cache/tw_factorized_scale_cash_live_v1/physical-source
+  live_tail_panel_rows: 48
+  factorized_host_cache_bytes: 2147483648
+walk_forward:
+  expected_first_year: 2025
+  split_start_year: 2026
+runner:
+  mode: infer

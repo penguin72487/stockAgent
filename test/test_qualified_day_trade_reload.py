@@ -12,6 +12,72 @@ from scripts import reload_tw_day_trade_services_if_flat as reload
 NOW = datetime(2026, 10, 15, 10, 15, tzinfo=ZoneInfo("Asia/Taipei"))
 
 
+@pytest.mark.parametrize("changed,expected", [
+    ({"scripts/serve_tw_day_trade_dashboard.py"}, True),
+    (set(reload.READ_MODEL_MEMBERS), True),
+    ({"stockagent/live/quote_provider.py"}, False),
+    ({"scripts/run_tw_day_trade_simulation.py"}, False),
+    ({"stockagent/live/tw_day_trade_simulation.py"}, False),
+    (set(), False),
+    (set(reload.READ_MODEL_MEMBERS) | {"stockagent/models/factory.py"}, False),
+])
+def test_read_model_restart_requires_exact_verified_nonexecution_delta(tmp_path, monkeypatch, changed, expected):
+    from stockagent.live import service_code_release
+    members = set(reload.READ_MODEL_MEMBERS) | {"stockagent/live/quote_provider.py",
+        "scripts/run_tw_day_trade_simulation.py", "stockagent/live/tw_day_trade_simulation.py",
+        "stockagent/models/factory.py"}
+    before = {name: "a" * 64 for name in members}
+    after = {name: ("b" if name in changed else "a") * 64 for name in members}
+    paths = tmp_path / "previous.json", tmp_path / "candidate.json"
+    for path, files in zip(paths, (before, after)):
+        path.write_text(json.dumps({"code": {"files": files}}))
+    verified = []
+    monkeypatch.setattr(service_code_release, "verify_frozen_source", lambda path, _: verified.append(path))
+    proof = reload.engine_read_model_scope(*paths)
+    assert proof["eligible"] is expected
+    assert verified == list(paths)
+    assert reload.engine_read_model_scope(None, paths[1])["eligible"] is False
+    if expected:
+        assert proof["all_signal_history_bytes_verified"] is False
+        assert set(proof["financial_journals"]) == {"events.jsonl", "orders.jsonl", "fills.jsonl"}
+    after["new-unreviewed-file.py"] = "c" * 64
+    paths[1].write_text(json.dumps({"code": {"files": after}}))
+    assert reload.engine_read_model_scope(*paths)["eligible"] is False
+
+
+@pytest.mark.parametrize("journal", ["signals.jsonl", "marks.jsonl", "benchmark_marks.jsonl"])
+@pytest.mark.parametrize("damage", ["rewrite", "append", "replace"])
+def test_ui_only_generation_fence_rejects_every_projection_change(tmp_path, journal, damage):
+    path = tmp_path / journal
+    path.write_text("original bytes\n")
+    proof = reload.journal_generation_fence(tmp_path, (journal,))
+    reload.verify_journal_generation_fence(tmp_path, proof)
+    if damage == "rewrite":
+        path.write_text("modified bytes\n")
+    elif damage == "append":
+        with path.open("a") as handle:
+            handle.write("new row\n")
+    else:
+        replacement = tmp_path / "replacement"
+        replacement.write_bytes(path.read_bytes())
+        replacement.replace(path)
+    with pytest.raises(RuntimeError, match="protected journal generation"):
+        reload.verify_journal_generation_fence(tmp_path, proof)
+
+
+def test_ui_only_generation_fence_also_protects_immutable_head(tmp_path):
+    from stockagent.live.paper_journal import HEADS, publish_snapshot
+    path = tmp_path / "signals.jsonl"
+    path.write_text('{"signal":"original"}\n')
+    publish_snapshot(path, operation="seed")
+    proof = reload.journal_generation_fence(tmp_path, (path.name,))
+    assert proof["immutable_layout"]
+    with (tmp_path / HEADS / (path.name + ".json")).open("a") as handle:
+        handle.write(" ")
+    with pytest.raises(RuntimeError, match="protected journal generation"):
+        reload.verify_journal_generation_fence(tmp_path, proof)
+
+
 @pytest.fixture(autouse=True)
 def no_host_deployment_state(monkeypatch):
     from stockagent.live import service_code_release
@@ -39,6 +105,52 @@ def receipts():
             "production_order_possible": False, "ledger_integrity_ready": True, "state_revision": 100,
             "modes": {"tw_day_trade_100m": {"signal_id": "immutable"}}}
     return state, bot, sync
+
+
+def test_candidate_engine_mode_probe_accepts_only_real_exact_mode_specs(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from stockagent.live import service_code_release
+
+    calls = []
+    def probe(release, root, arguments, *, timeout):
+        calls.append((release, root, arguments, timeout))
+        payload = {"modes": [{"market": "a", "capital": 2_000_000.0},
+                             {"market": "b", "capital": 10_000_000.0}], "errors": {}}
+        return SimpleNamespace(returncode=0, stdout="STOCKAGENT_ENGINE_MODE_PROBE=" + json.dumps(payload), stderr="")
+    monkeypatch.setattr(service_code_release, "run_in_namespace", probe)
+    result = reload.verify_engine_release_mode_specs(tmp_path / "release.json", repo_root=tmp_path,
+        expected_capitals={"b": 10_000_000, "a": 2_000_000})
+    assert result["status"] == "passed"
+    assert result["ledger_opened"] is result["native_readiness_claimed"] is False
+    assert calls[0][2][-2] == str(tmp_path / "services/discord_bot/markets")
+    assert calls[0][3] == 90
+
+
+@pytest.mark.parametrize("payload", [
+    {"modes": [], "errors": {"a": "AttributeError: incompatible TradingConfig"}},
+    {"modes": [{"market": "a", "capital": 1_000_000}], "errors": {}},
+    {"modes": [{"market": "a", "capital": 2_000_000}, {"market": "a", "capital": 2_000_000}], "errors": {}},
+    {"modes": [{"market": "a", "capital": True}], "errors": {}},
+    {"modes": [{"market": "a", "capital": 2_000_000}], "errors": {"b": "unavailable"}},
+])
+def test_candidate_engine_mode_probe_rejects_schema_or_mode_mismatch(monkeypatch, tmp_path, payload):
+    from types import SimpleNamespace
+    from stockagent.live import service_code_release
+    monkeypatch.setattr(service_code_release, "run_in_namespace", lambda *_args, **_kw:
+        SimpleNamespace(returncode=0, stdout="STOCKAGENT_ENGINE_MODE_PROBE=" + json.dumps(payload), stderr=""))
+    with pytest.raises(ValueError, match="candidate engine"):
+        reload.verify_engine_release_mode_specs(tmp_path / "release.json", repo_root=tmp_path,
+                                                expected_capitals={"a": 2_000_000})
+
+
+def test_candidate_engine_mode_probe_rejects_process_failure(monkeypatch, tmp_path):
+    from types import SimpleNamespace
+    from stockagent.live import service_code_release
+    monkeypatch.setattr(service_code_release, "run_in_namespace", lambda *_args, **_kw:
+        SimpleNamespace(returncode=1, stdout="", stderr="module mismatch"))
+    with pytest.raises(ValueError, match="before restart.*module mismatch"):
+        reload.verify_engine_release_mode_specs(tmp_path / "release.json", repo_root=tmp_path,
+                                                expected_capitals={"a": 2_000_000})
 
 
 def test_ack_preflight_waits_for_a_real_fresh_heartbeat_without_extending_ttl(monkeypatch):
@@ -115,7 +227,7 @@ def test_every_interactive_job_state_prevents_cutover(field):
 
 
 @pytest.mark.parametrize("change", ["stale_bot", "future_sync", "missing_mode", "malformed_mode",
-                                    "unknown_shares", "pending_commit", "divergence", "wrong_signal",
+                                    "unknown_shares", "pending_commit", "research_pending", "divergence", "wrong_signal",
                                     "broker_enabled", "warming", "maintenance_running",
                                     "missing_identity", "ledger_unaccepted", "sync_broker_enabled"])
 def test_ambiguous_or_unsafe_evidence_fails_closed(change):
@@ -133,6 +245,8 @@ def test_ambiguous_or_unsafe_evidence_fails_closed(change):
         mode["positions"]["2330"]["signed_shares"] = .5
     elif change == "pending_commit":
         mode["entry_retry_pending_commit"] = True
+    elif change == "research_pending":
+        mode["research_terminal_pending_commit"] = {}
     elif change == "divergence":
         mode["ledger_state_divergence"] = {"difference": 1}
     elif change == "wrong_signal":
@@ -167,6 +281,112 @@ def test_engine_still_requires_offsession_flat_and_no_pending_orders():
         reload.reload_plan(state, bot, sync, now=closed, discord_only=False)
     mode["pending_entry_orders"].clear()
     assert len(reload.reload_plan(state, bot, sync, now=closed, discord_only=False)["services"]) == 2
+
+
+@pytest.mark.parametrize("damage", [None, "missing_event", "wrong_quantity", "open", "not_completed", "pending_total"])
+def test_previous_terminal_order_inventory_requires_the_existing_full_event_proof(tmp_path, damage):
+    from test_tw_day_trade_flat_opening_repair import _settled_terminal_orders
+    state, bot, sync = receipts()
+    mode, event = _settled_terminal_orders()
+    state["enabled_markets"] = ["m"]
+    state["modes"] = {"m": mode}
+    bot["mode_signal_ids"] = {"m": mode["signal_id"]}
+    sync["modes"] = {"m": {"signal_id": mode["signal_id"]}}
+    observed = datetime(2026, 10, 8, 14, tzinfo=ZoneInfo("Asia/Taipei"))
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = observed.isoformat()
+    events = tmp_path / "events.jsonl"
+    if damage == "wrong_quantity": event["cancelled"][1]["shares"] += 1000
+    if damage == "open": mode["positions"] = {"p": {"signed_shares": 1000}}
+    if damage == "not_completed": mode["execution_evidence_complete"] = False
+    if damage == "pending_total": mode["pending_reduction_shares"] = 1000
+    events.write_text("" if damage == "missing_event" else json.dumps(event) + "\n")
+    if damage:
+        with pytest.raises(ValueError, match="nonflat|pending orders"):
+            reload.reload_plan(state, bot, sync, now=observed, engine_only=True, events_path=events)
+    else:
+        plan = reload.reload_plan(state, bot, sync, now=observed, engine_only=True, events_path=events)
+        assert plan["pending_orders"] == plan["nonflat_count"] == 0
+        assert plan["retained_terminal_orders"] == 3
+
+
+@pytest.mark.parametrize("damage", [None, "missing_event", "wrong_quantity", "future_settlement",
+    "open", "pending_total", "no_execution_proof", "unconsumed_signal", "naive_clock",
+    "filled_reduction_progress", "filled_reduction_sequence", "filled_reduction_signal",
+    "late_reduction_signal", "price_guard_reason", "price_guard_contract", "price_guard_clock"])
+def test_same_day_terminal_orders_need_settlement_and_exact_evidence(tmp_path, damage):
+    from test_tw_day_trade_flat_opening_repair import _settled_terminal_orders
+    from stockagent.live.tw_day_trade_simulation import ENTRY_PRICE_GUARD_CONTRACT
+    state, bot, sync = receipts()
+    mode, event = _settled_terminal_orders()
+    mode["engine_status"] = "session_flat_after_exit"
+    signal = mode["signal_id"]
+    mode["pending_reduction_orders"]["1101"] = {
+        "status": "filled", "remaining_shares": 0, "requested_shares": 1000,
+        "sequence": 1, "signal_at": mode["signal_at"],
+    }
+    mode["signal_reductions"] = {"1101": {"requested_shares": 1000, "filled_shares": 1000}}
+    mode["pending_entry_orders"]["2318"] = {
+        "status": "cancelled_entry_price_guard", "sizing_pending": False,
+        "remaining_shares": 1000, "entry_price_guard_contract": ENTRY_PRICE_GUARD_CONTRACT,
+        "last_wait_reason": "entry_price_at_or_beyond_take_profit", "rejected_entry_price": 110.,
+        "cancelled_at": "2026-10-07T13:19:15+08:00", "last_quote_at": "2026-10-07T13:19:14+08:00",
+        "position": {"market": "m", "symbol": "2318", "session_date": "2026-10-07",
+                     "signal_id": signal, "signal_at": mode["signal_at"], "side": "long",
+                     "take_profit_price": 110., "stop_trigger_price": 90.},
+    }
+    state["enabled_markets"], state["modes"] = ["m"], {"m": mode}
+    bot["mode_signal_ids"], sync["modes"] = {"m": signal}, {"m": {"signal_id": signal}}
+    observed = datetime(2026, 10, 7, 14, tzinfo=ZoneInfo("Asia/Taipei"))
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = observed.isoformat()
+    events = tmp_path / "events.jsonl"
+    if damage == "wrong_quantity": event["cancelled"][1]["shares"] += 1000
+    if damage == "future_settlement": mode["closing_auction_settled_at"] = "2026-10-07T14:01:00+08:00"
+    if damage == "open": mode["positions"] = {"p": {"signed_shares": 1000}}
+    if damage == "pending_total": mode["pending_reduction_shares"] = 1000
+    if damage == "no_execution_proof": mode["execution_evidence_complete"] = False
+    if damage == "unconsumed_signal": mode["processed_signal_ids"] = []
+    if damage == "naive_clock": mode["closing_auction_settled_at"] = "2026-10-07T13:30:01"
+    if damage == "filled_reduction_progress": mode["signal_reductions"]["1101"]["filled_shares"] = 0
+    if damage == "filled_reduction_sequence": mode["pending_reduction_orders"]["1101"]["sequence"] = 0
+    if damage == "filled_reduction_signal": mode["pending_reduction_orders"]["1101"]["signal_at"] = "2026-10-06T13:19:00+08:00"
+    if damage == "late_reduction_signal":
+        mode["signal_at"] = "2026-10-07T13:21:00+08:00"
+        for order in mode["pending_reduction_orders"].values(): order["signal_at"] = mode["signal_at"]
+    guard = mode["pending_entry_orders"]["2318"]
+    if damage == "price_guard_reason": guard["last_wait_reason"] = "invented"
+    if damage == "price_guard_contract": guard["entry_price_guard_contract"] = "unknown"
+    if damage == "price_guard_clock": guard["last_quote_at"] = "2026-10-07T14:01:00+08:00"
+    events.write_text("" if damage == "missing_event" else json.dumps(event) + "\n")
+    before = deepcopy((state, bot, sync))
+    if damage:
+        with pytest.raises(ValueError, match="nonflat|pending orders"):
+            reload.reload_plan(state, bot, sync, now=observed, engine_only=True, events_path=events)
+    else:
+        plan = reload.reload_plan(state, bot, sync, now=observed, engine_only=True, events_path=events)
+        assert plan["pending_orders"] == plan["nonflat_count"] == 0
+        assert plan["retained_terminal_orders"] == 5
+    assert (state, bot, sync) == before
+
+
+@pytest.mark.parametrize("damage", ["missing_event", "no_execution_proof", "pending_reductions"])
+def test_journal_backed_cutover_cannot_bypass_failed_mode_proof_for_entry_only(tmp_path, damage):
+    from test_tw_day_trade_flat_opening_repair import _settled_terminal_orders
+    state, bot, sync = receipts()
+    mode, event = _settled_terminal_orders()
+    mode["engine_status"] = "session_flat_after_exit"
+    mode["pending_reduction_orders"] = {}
+    mode["pending_entry_orders"].pop("2317")
+    state["enabled_markets"], state["modes"] = ["m"], {"m": mode}
+    bot["mode_signal_ids"] = {"m": mode["signal_id"]}
+    sync["modes"] = {"m": {"signal_id": mode["signal_id"]}}
+    observed = datetime(2026, 10, 7, 14, tzinfo=ZoneInfo("Asia/Taipei"))
+    bot["updated_at"] = bot["engine_published_at"] = sync["published_at"] = observed.isoformat()
+    if damage == "no_execution_proof": mode["execution_evidence_complete"] = False
+    if damage == "pending_reductions": mode["pending_reduction_shares"] = 1000
+    events = tmp_path / "events.jsonl"
+    events.write_text("" if damage == "missing_event" else json.dumps(event) + "\n")
+    with pytest.raises(ValueError, match="pending orders"):
+        reload.reload_plan(state, bot, sync, now=observed, engine_only=True, events_path=events)
 
 
 @pytest.mark.parametrize("change", [None, "working", "unknown_contract", "wrong_reason", "inside_price",
@@ -592,7 +812,7 @@ def test_control_wait_uses_existing_lease_and_never_restarts_when_busy(tmp_path,
                                     "heartbeat_boundary_after_prefix",
                                     "code_changed_during_start", "pinned_changed_during_start", "pin_install_failed",
                                     "source_update_pending", "engine_workspace_changed"])
-def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only, pinned, engine_pinned):
+def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(tmp_path, monkeypatch, failure, engine_only, code_only, pinned, engine_pinned, read_model_only=False):
     from contextlib import contextmanager, nullcontext
     from types import SimpleNamespace
     from scripts import audit_tw_day_trade_restart as audit
@@ -641,6 +861,14 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
         pinned_entry = cache.file_identity(reload.REPO_ROOT / "services/discord_bot/bot.py")
         path = tmp_path / "release.json"
         engine_path = tmp_path / "engine-release.json"
+        if read_model_only:
+            state["modes"]["tw_day_trade_100m"]["initial_capital_twd"] = 100_000_000.0
+            paths[0].write_text(json.dumps(state))
+            monkeypatch.setattr(reload, "engine_read_model_scope", lambda *a, **k:
+                {"eligible": True, "previous_release": str(engine_path),
+                 "all_signal_history_bytes_verified": False})
+            monkeypatch.setattr(reload, "verify_engine_release_mode_specs",
+                                lambda *a, **k: {"status": "passed"})
         monkeypatch.setattr(service_code_release, "DROP_IN", tmp_path / "code.conf")
         monkeypatch.setattr(service_code_release, "ENGINE_DROP_IN", tmp_path / "engine-code.conf")
         monkeypatch.setattr(service_code_release, "configured_release",
@@ -698,7 +926,7 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     monkeypatch.setattr(tw_public_source_guard, "live_tw_public_source_read_guard", source_guard)
     real_prefix = audit.prefix_sha256
     def prefix(path, size):
-        if len(prefix_calls) < (6 if engine_pinned else 3):
+        if len(prefix_calls) < (6 if engine_pinned and not read_model_only else 3):
             assert source_held[0] or source_exempt, "data-reading reload must admit the source before scanning"
         prefix_calls.append((path, size))
         return real_prefix(path, size)
@@ -739,6 +967,8 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
             handle.write("native engine continued\n")
         if failure == "prefix_changed":
             (tmp_path / "fills.jsonl").write_text("corrupted ledger\n")
+        if failure == "signal_generation_changed":
+            (tmp_path / "signals.jsonl").write_text("changed un-hashed signals\n")
 
     monkeypatch.setattr(reload, "owner", owner)
     monkeypatch.setattr(reload.subprocess, "run", restart)
@@ -770,8 +1000,15 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
     ticks = iter((0., 2.))
     monkeypatch.setattr(reload.time, "monotonic", lambda: next(ticks))
     output = tmp_path / "applied.json"
+    plan_event_paths = []
+    real_reload_plan = reload.reload_plan
+    def inspect_plan(*args, **kwargs):
+        plan_event_paths.append(kwargs.get("events_path"))
+        return real_reload_plan(*args, **kwargs)
+    monkeypatch.setattr(reload, "reload_plan", inspect_plan)
     monkeypatch.setattr("sys.argv", ["reload", "--engine-only" if engine_only else "--discord-only", "--apply", "--timeout-seconds", "1",
-                                    "--output", str(output), *(["--code-admission-only"] if code_only else [])])
+                                    "--output", str(output), *(["--code-admission-only"] if code_only else []),
+                                    *(["--engine-source-release", str(engine_path)] if read_model_only else [])])
     accepted = failure is None or ((failure == "accounting_changed" or preflight_mismatch) and not engine_only)
     accepted = accepted or (not code_only and failure in {"reported_current_code", "journal_fatal", "journal_pending"})
     accepted = accepted or failure in {"slow_prefix_check", "heartbeat_boundary_after_prefix"}
@@ -798,6 +1035,7 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
         assert result["status"] == "blocked" and "unit preview" in result["error"]
         return
     assert len(restarts) == 1 and result["restart_requested"]
+    assert plan_event_paths[:2] == [tmp_path / "events.jsonl", tmp_path / "events.jsonl"]
     assert result["status"] == (("accepted_code_admission_only" if code_only else "accepted")
                                 if accepted else "failed_after_restart")
     if (failure == "code_changed_during_start" and not pinned
@@ -821,7 +1059,9 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
         if engine_pinned:
             assert result["native_engine_code_namespace"]["readonly_mounts_verified"]
             assert result["engine_code_drop_in_installed"] is True
-            assert set(result["ledger_inputs"]) == set(FILENAMES)
+            assert set(result["ledger_inputs"]) == (set(reload.FINANCIAL_JOURNALS) if read_model_only else set(FILENAMES))
+            if read_model_only:
+                assert set(result["protected_journal_generations"]["files"]) == set(FILENAMES) - set(reload.FINANCIAL_JOURNALS)
             assert installs[-1][1] == {"role": "engine"}
         assert result["inventory_restored_exactly"] is engine_only
         assert result["protected_before"] == result["protected_after"]
@@ -830,6 +1070,14 @@ def test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
             assert result["new_discord_run_id"] == ("100-old-bot" if pinned else "old-bot")
             assert result["native_warmup"]["model_cache_resident_ready"] is False
         assert audit.verify_prefix(tmp_path, {"inputs": result["ledger_inputs"]}) == result["ledger_prefixes"]
+
+
+@pytest.mark.parametrize("failure", [None, "prefix_changed", "signal_generation_changed",
+                                   "protected_changed", "accounting_changed", "source_update_pending"])
+def test_ui_only_reload_retains_financial_prefix_state_and_owner_gates(tmp_path, monkeypatch, failure):
+    test_apply_restarts_only_selected_owner_and_requires_independent_acceptance(
+        tmp_path, monkeypatch, failure, engine_only=True, code_only=False,
+        pinned=True, engine_pinned=True, read_model_only=True)
 
 
 def code_drift_receipts():

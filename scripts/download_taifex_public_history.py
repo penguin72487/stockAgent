@@ -1315,7 +1315,7 @@ def _merge_range_dataset(
     })
 
 
-def main() -> int:
+def _main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--output-dir", default="data_taifex_public_history")
     parser.add_argument(
@@ -1529,6 +1529,12 @@ def main() -> int:
     _write_json(root / "progress.json", progress)
     print(json.dumps(manifest, ensure_ascii=False, indent=2), flush=True)
     return 0 if phase_execution_state == "complete" else 1
+
+
+def main() -> int:
+    from stockagent.data_sync.taifex_workspace_guard import cli_writer_guard
+    with cli_writer_guard(default_output='data_taifex_public_history'):
+        return _main()
 
 
 if __name__ == "__main__":

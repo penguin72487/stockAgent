@@ -165,7 +165,8 @@ def check_finlab_futures(*, physical=False, c=None):
     try:
         valid = (source.resolve(strict=True) == source and target.resolve(strict=True) == target
                  and not source.is_symlink() and not target.is_symlink() and source.is_dir()
-                 and target.is_dir() and target.is_mount() and target.samefile(source))
+                 and target.is_dir() and target.samefile(source)
+                 and _mount_info(target)['target'] == str(target))
     except OSError:
         valid = False
     if not valid:

@@ -25,6 +25,7 @@ import pyarrow.parquet as pq
 
 from downloader.artifact_io import atomic_write_bytes, atomic_write_json, atomic_write_parquet, sha256_file
 from downloader.common import load_env_file
+from downloader.dataset_lock import exclusive_dataset_lock
 from downloader.operation_timing import OperationTiming
 from downloader.download_keyed_public_catalogs import (
     CatalogError, RequestBudget, SafeCatalogTransport, _redact_value,
@@ -32,6 +33,7 @@ from downloader.download_keyed_public_catalogs import (
 from downloader.public_economic_sources import (
     EconomicJob, core_jobs, current_moi_job, moi_season_jobs, parse_economic_json, parse_moi_zip, request_url,
 )
+from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTRACT_VERSION = 2
@@ -286,6 +288,9 @@ def _acquire(job: EconomicJob, root: Path, credentials: dict[str, str], budget: 
 
 def run_provider(provider: str, root: Path, credentials: dict[str, str], *, max_requests: int,
                  max_bytes: int, min_free_bytes: int, recheck_credentials: bool = False) -> dict:
+    if provider not in PROVIDERS:
+        raise ValueError('unknown economic provider')
+    guard_path(root)
     root.mkdir(parents=True, exist_ok=True)
     budget = RequestBudget(max_requests)
     with (root / f".{provider}.lock").open("a") as lock:
@@ -293,6 +298,8 @@ def run_provider(provider: str, root: Path, credentials: dict[str, str], *, max_
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return {"provider": provider, "state": "worker_active"}
+        # An old descriptor must not write through a newly exchanged alias.
+        guard_locked_path(root, lock, lock_name=f'.{provider}.lock')
         jobs = [j for j in core_jobs() if j.provider == provider]
         if provider == "moi":
             catalog_path = root / "catalog" / "moi_seasons.json"
@@ -360,9 +367,12 @@ def main(argv=None) -> int:
                            recheck_credentials=args.recheck_credentials), dict.fromkeys(args.providers)))
     # Summary is assembled from all provider files, including providers not
     # selected in a targeted repair run. It is not a global completeness claim.
-    summary = {"schema_version": CONTRACT_VERSION, "updated_at_utc": now().isoformat(),
-               "history_complete": False, "providers": [read_json(args.output_root / "status" / f"{p}.json") for p in PROVIDERS]}
-    atomic_write_json(args.output_root / "download_summary.json", summary)
+    guard_path(args.output_root)
+    with exclusive_dataset_lock(args.output_root / '.download.lock', provider='public_economic_summary'):
+        guard_path(args.output_root)
+        summary = {"schema_version": CONTRACT_VERSION, "updated_at_utc": now().isoformat(),
+                   "history_complete": False, "providers": [read_json(args.output_root / "status" / f"{p}.json") for p in PROVIDERS]}
+        atomic_write_json(args.output_root / "download_summary.json", summary)
     print(json.dumps({"providers": [{k: r.get(k) for k in ["provider", "state", "requests", "planned_datasets", "acquired_datasets"]} for r in results]}, ensure_ascii=False))
     return 0
 

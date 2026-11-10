@@ -98,6 +98,12 @@ def verified_chunk_rows(root, objects, rows):
         return list(jobs)
     for row in rows:
         extents = _prepare(row, objects)
+        if extents is not None:
+            from stockagent.data_sync import packed_snapshots as packed
+            from stockagent.data_sync.packed_object_placement import is_archive_path
+            if any(is_archive_path(packed._read_object_path(root, objects[digest]['relpath']))
+                   for digest, _size in extents):
+                extents = None  # The exact mixed-volume byte reader owns it.
         if extents is None:
             if jobs:
                 yield from flush()

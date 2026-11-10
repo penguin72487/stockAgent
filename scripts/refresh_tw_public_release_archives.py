@@ -37,6 +37,10 @@ SCRIPTS = {
 }
 
 
+class SourceUpdateLockBusy(RuntimeError):
+    """The source writer is busy; retry without making any provider calls."""
+
+
 def _money_recent_pages(root: Path, *, full_index: bool) -> int:
     if full_index:
         return 0
@@ -91,7 +95,7 @@ def _source_update_lock(root: Path, *, wait_seconds: float = 120.0):
                 break
             except BlockingIOError as exc:
                 if time.monotonic() - started >= wait_seconds:
-                    raise RuntimeError(
+                    raise SourceUpdateLockBusy(
                         "Taiwan public source update remained busy after "
                         f"{wait_seconds:g} seconds; retry later"
                     ) from exc
@@ -237,8 +241,14 @@ def main() -> int:
         print(json.dumps({"full_index": full_index, "commands": commands},
                          ensure_ascii=False, indent=2))
         return 0
-    with _source_update_lock(root):
-        _refresh(root, commands)
+    try:
+        with _source_update_lock(root):
+            _refresh(root, commands)
+    except SourceUpdateLockBusy as exc:
+        # Only the lock-acquisition timeout is retryable at the service layer.
+        # Source and reconciliation failures must retain their original status.
+        print(str(exc), file=sys.stderr)
+        return 75
     return 0
 
 

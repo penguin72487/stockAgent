@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume Shioaji validation cache rebind without blocking the original publisher
+
+[Timer]
+OnBootSec=90
+OnUnitInactiveSec=300
+AccuracySec=1
+Unit=stockagent-shioaji-validation-cache-rebind.service
+
+[Install]
+WantedBy=timers.target

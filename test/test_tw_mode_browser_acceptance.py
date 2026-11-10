@@ -67,6 +67,12 @@ def test_native_public_signal_request_keeps_the_query_separator():
     assert parsed.path == "/tw-day-trade/api/signals"
     assert parse_qs(parsed.query) == {"mode": ["new"], "date": ["2026-02-25"],
                                      "offset": ["0"], "limit": ["1"]}
+    latest = _signal_url("https://example.test/tw-day-trade/", market="new",
+                         day="2026-02-25", revision_scope="latest")
+    assert parse_qs(urlsplit(latest).query)["revision_scope"] == ["latest"]
+    with pytest.raises(ValueError, match="revision scope"):
+        _signal_url("https://example.test/tw-day-trade/", market="new",
+                    day="2026-02-25", revision_scope="unknown")
 
 
 def _payload():
@@ -82,6 +88,12 @@ def test_public_boundary_and_private_policy_are_independently_accepted():
     proof = _verify_signal_boundary(_payload(), market="new", day="2026-02-25", private_features=True)
     assert proof["total"] == 2757
     assert proof["private_feature_policy_verified"] is True
+    with pytest.raises(ValueError, match="revision scope"):
+        _verify_signal_boundary(_payload() | {"revision_scope": "all"},
+                                market="new", day="2026-02-25", revision_scope="latest")
+    latest = _verify_signal_boundary(_payload() | {"revision_scope": "latest"},
+                                     market="new", day="2026-02-25", revision_scope="latest")
+    assert latest["revision_scope"] == "latest"
 
 
 def test_public_research_boundary_requires_a_visible_pit_caveat():

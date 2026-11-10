@@ -1,0 +1,346 @@
+{
+  "contract": "explicit-d-workflow-testing-copy-discard-v1",
+  "authority_node_id": "penguin",
+  "origin_node_id": "penguin",
+  "authorization": "使用者明確同意刪除舊效能驗證資料；逐一固定已完成比較的舊試驗工作副本，保留比較結果、驗收收據、正式冷庫及 NAS。",
+  "decision": "discard_without_preservation",
+  "targets": [
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_1_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_2_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_3_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_4_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_5_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_6_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_7_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round20/trial_8_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/A1",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/A4",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/A6",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/A7",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/B2",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/B3",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/B5",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round25/trials/B8",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/A1",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/A4",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/A6",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/A7",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/B2",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/B3",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/B5",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round27/trials/B8",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_1_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_2_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_3_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_4_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_5_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_6_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_7_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round31/trial_8_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_1_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_2_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_3_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_4_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_5_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_6_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_7_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round37/trial_8_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_0_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_1_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_2_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_3_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_4_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_5_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_6_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round69/full_trial_7_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_0_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_1_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_2_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_3_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_4_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_5_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_6_baseline",
+      "kind": "directory",
+      "reason": "benchmark"
+    },
+    {
+      "base": "d-workflow-benchmark",
+      "relative": "benchmarks/round89/full_trial_7_candidate",
+      "kind": "directory",
+      "reason": "benchmark"
+    }
+  ],
+  "identity_sha256": "7a77b7a288b975c30065198f90bb515dd3c25268f31d6a315f7fe4479e72fb09"
+}

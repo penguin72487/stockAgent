@@ -816,6 +816,12 @@ def _attach_funding_total_return(
 
 def main() -> None:
     args = parse_args()
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard
+    with writer_guard(args.input_dir, args.funding_dir, args.output_dir):
+        _run_with_workspace_guard(args)
+
+
+def _run_with_workspace_guard(args) -> None:
     started = datetime.now(timezone.utc)
     input_dir = Path(args.input_dir)
     funding_dir = Path(args.funding_dir)

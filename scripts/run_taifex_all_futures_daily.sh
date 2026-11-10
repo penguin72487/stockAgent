@@ -51,13 +51,25 @@ run_fintech_python "$repo_root/scripts/download_taifex_futures_final_settlement_
   --output-dir "$repo_root/data_tw_futures/final_settlement_v1" \
   --refresh-current
 
+# The membership source is independent of the fixed training-panel layout.
+# Capture its result before attempting that build so a full model layout cannot
+# prevent source acquisition, and a membership failure cannot suppress a build.
+membership_rc=0
+run_fintech_python "$repo_root/scripts/download_taifex_contract_codes.py" \
+  --output "$repo_root/data_tw_futures/taifex_contract_codes.csv" \
+  --stock-futures-only || membership_rc=$?
+
+portfolio_rc=0
 run_fintech_python "$repo_root/scripts/build_taifex_futures_portfolio_daily.py" \
   --source "$repo_root/data_tw_index_futures/all_futures_daily_sessions.parquet" \
   --official-product-codes "$repo_root/data_tw_futures/taifex_contract_codes.csv" \
-  --output-root "$repo_root/data_tw_futures/taifex_portfolio_daily_v4"
+  --output-root "$repo_root/data_tw_futures/taifex_portfolio_daily_v4" || portfolio_rc=$?
 
-# Read-only dashboard enrichment has a separate acceptance gate. A failure is
-# visible in maintenance status, but must not prevent the canonical panel build.
-run_fintech_python "$repo_root/scripts/download_taifex_contract_codes.py" \
-  --output "$repo_root/data_tw_futures/taifex_contract_codes.csv" \
-  --stock-futures-only
+if (( membership_rc != 0 )); then
+  echo "[taifex-futures-daily] stock-futures membership refresh failed: exit $membership_rc" >&2
+fi
+if (( portfolio_rc != 0 )); then
+  echo "[taifex-futures-daily] portfolio panel refresh failed: exit $portfolio_rc" >&2
+  exit "$portfolio_rc"
+fi
+exit "$membership_rc"

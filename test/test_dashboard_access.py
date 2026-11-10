@@ -58,7 +58,7 @@ def test_html_projection_removes_private_cards_before_delivery_and_does_not_muta
         assert b'href="' + slug + b'"' in owner
     assert public.count(b'class="dashboard-card ') == 2
     assert owner.count(b'class="dashboard-card ') == 11
-    assert b'dashboard-core.js?v=15' in public
+    assert b'dashboard-core.js?v=20' in public
     assert b'access-v2' not in public
 
 

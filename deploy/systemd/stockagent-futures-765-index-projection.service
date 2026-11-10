@@ -1,0 +1,16 @@
+[Unit]
+Description=Project the fixed futures 765 E copy index without moving source data
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+ConditionPathExists=!/srv/stockagent-workspace/verify/tw-futures-universe765-e-projection-20261108-v1.json
+
+[Service]
+Type=oneshot
+WorkingDirectory=/root/stockAgent
+ExecStart=/usr/bin/bash -c 'source /root/stockAgent/scripts/runtime_env.sh && run_fintech_python /root/stockAgent/scripts/project_futures_725_workspace_index.py --scope 765'
+SuccessExitStatus=75
+TimeoutStartSec=infinity
+UMask=0077
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=7

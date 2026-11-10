@@ -1,7 +1,10 @@
 [Unit]
 Description=Refresh Taiwan official macro release originals and reconcile PIT features
 Wants=network-online.target time-sync.target
-After=network-online.target time-sync.target local-fs.target
+After=network-online.target time-sync.target local-fs.target stockagent-tw-public-official-catalogs.service
+# Lock contention can last for a full catalog run.  Retry the explicitly
+# classified contention exit without exhausting a start limit.
+StartLimitIntervalSec=0
 
 [Service]
 Type=oneshot
@@ -15,6 +18,9 @@ ExecCondition=/usr/bin/bash __REPO_ROOT__/scripts/run_outside_tw_opening_resourc
 # the protected opening window again. A one-shot preflight would silently skip
 # the entire 07:00 release when the eligibility watcher briefly owns it.
 ExecStart=/usr/bin/bash -lc 'source scripts/runtime_env.sh && run_fintech_python scripts/refresh_tw_public_release_archives.py --output-dir /srv/stockagent-live/data_tw_public --auto-full-sunday'
+Restart=no
+RestartForceExitStatus=75
+RestartSec=5s
 Nice=15
 CPUWeight=10
 IOWeight=10

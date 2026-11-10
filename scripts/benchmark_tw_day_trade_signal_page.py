@@ -143,8 +143,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--start-date", required=True)
     parser.add_argument("--end-date", required=True)
     parser.add_argument("--mode", default="all", help="Exact dashboard mode filter; all retains the full universe")
+    parser.add_argument("--offset", type=int, default=0, help="Measure this zero-based result offset")
     parser.add_argument("--limit", type=int, default=100)
     parser.add_argument("--hide-zero-targets", action="store_true")
+    parser.add_argument("--revision-scope", choices=("all", "latest"), default="all")
     parser.add_argument(
         "--public-price-root", type=Path,
         help="Also measure exact public quote enrichment, disclosure and JSON encoding; no network",
@@ -164,6 +166,8 @@ def main(argv: list[str] | None = None) -> int:
         help="Required for a narrow probe; obtain from the baseline result",
     )
     args = parser.parse_args(argv)
+    if args.offset < 0:
+        parser.error("offset must be non-negative")
     if (
         not args.cache_dir.is_dir()
         or args.cache_dir == Path(".")
@@ -196,6 +200,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("a narrow summary probe cannot measure the public full page")
     if args.probe_narrow_summary and args.mode != "all":
         parser.error("the diagnostic narrow summary probe does not implement mode filtering")
+    if args.probe_narrow_summary and args.revision_scope != "all":
+        parser.error("the diagnostic narrow summary probe does not implement revision filtering")
+    if args.probe_narrow_summary and args.offset:
+        parser.error("the diagnostic narrow summary probe does not implement pagination")
     quote_source = None
     quote_before = None
     if args.public_price_root is not None:
@@ -223,8 +231,10 @@ def main(argv: list[str] | None = None) -> int:
             start_date=args.start_date,
             end_date=args.end_date,
             mode=args.mode,
+            offset=args.offset,
             limit=args.limit,
             hide_zero_targets=args.hide_zero_targets,
+            revision_scope=args.revision_scope,
             timing_ms=stages,
             _allow_narrow_projection=not args.legacy_full_projection,
         )
@@ -286,7 +296,10 @@ def main(argv: list[str] | None = None) -> int:
         "start_date": args.start_date,
         "end_date": args.end_date,
         "mode": args.mode,
+        "offset": args.offset,
+        "limit": args.limit,
         "hide_zero_targets": args.hide_zero_targets,
+        "revision_scope": args.revision_scope,
         "total": result.get("total"),
         "returned": result.get("returned"),
         "source_rows_scanned": result.get("source_rows_scanned"),

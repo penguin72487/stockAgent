@@ -45,6 +45,42 @@ run_fintech_python scripts/rebuild_tw_day_trade_minute_curves.py \
 品質位元依序表示舊價、歷史回補、缺價。它是無損欄位精簡，不是每 2,000 點抽樣；
 每條線在所選期間第一個有效點重新設為 0%，帳本絕對權益不變。舊客戶端仍可使用預設抽樣介面。
 
+## 新增獨立模式與今年範圍
+
+`--add-mode` 是新增獨立帳戶，保留既有模式；與上面的既有模式替換不同。
+新增模式或 `--candidate-preflight` 未指定 `--start-date` 時，預設從台北
+當年第一個有官方日曆收據的已完成交易日計算，資料不足則停止；例如
+2026 年為 01/02。指定 `--start-date` 時使用明確日期，不會自動刪除舊年
+原始資料、正式帳本或回復點。模型所需的前期輸入仍須保留。
+
+200 萬候選可先做唯讀檢查；這個指令不是上架：
+
+```bash
+source scripts/runtime_env.sh
+run_fintech_python scripts/switch_tw_day_trade_strategy.py plan \
+  --candidate-preflight \
+  --market-config configs/deployments/candidates/tw_day_trade_unit_mgda_2m_20261103.yaml \
+  --expected-initial-capital 2000000
+```
+
+當研究成本、資料、帳本遷移或服務驗收尚未通過時，必須維持 disabled；
+不能刪除預檢防護來讓模式出現在公網。詳細證據見
+[200 萬獨立模擬候選](tw_day_trade_unit_mgda_2m_candidate_2026-11-04.md)。
+
+既有模式若只有完整交易日的估值遺漏，可在 `--add-mode` 的 `plan`／
+`apply` 明確指定 `--recover-retained-cash-curve-gaps`。此選項只接受
+官方已完成範圍內、非首尾、當天完全沒有 marks 的日子；原始成交、
+委託及事件必須證明無帳戶活動，前收、後開與完整 fill book 必須相符，
+且不推論任何企業行動或額外成本。符合者補 270 個有重建時鐘的現金
+**估值**，不生成訊號或成交、不表示市場零成交，也不把漏跑策略寫成
+成功交易。部分缺失、仍有持倉或證據相矛盾仍停止。
+
+這個路徑只在私人同檔案系統 candidate 中合成：保留原 marks before-image
+與來源 hash；新增模式已獨立驗證的曲線逐列不變，既有模式的財務日誌
+前綴不變。promotion 另從原前綴核對最後採用的端點、現金點、全模式
+270 分鐘及基準；不能直接 `--publish` 到 live。這不是放寬研究成本、
+資料完整性、空倉、原子交換、暖機或公網驗收條件。
+
 ## 日常接口
 
 先預覽，不修改資料：

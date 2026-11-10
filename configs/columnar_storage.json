@@ -34,6 +34,10 @@
     "attempted_source_budget_per_activity": 1,
     "pending_source_priority": ["finlab-research", "finmind-free"],
     "completed_cycle_interval_seconds": 86400,
+    "whole_root_refresh_interval_seconds": 86400,
+    "daily_merge_window": {"timezone": "Asia/Taipei", "start_hour": 3, "end_hour": 7},
+    "ordinary_history_retention": "current-and-research-pins",
+    "ordinary_history_migration_catchup": true,
     "busy_retry_seconds": 60,
     "state_directory": "dataset-versions"
   },

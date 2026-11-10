@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -71,6 +72,19 @@ def test_refresh_waits_for_transient_source_lock(
         assert attempts == 3
 
 
+def test_lock_timeout_retries_without_refreshing_sources(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(sys, "argv", ["refresh", "--output-dir", str(tmp_path)])
+    monkeypatch.setattr(refresh, "_refresh", lambda *_args: pytest.fail("source called"))
+
+    def busy(_root: Path):
+        raise refresh.SourceUpdateLockBusy("source lock busy")
+
+    monkeypatch.setattr(refresh, "_source_update_lock", busy)
+    assert refresh.main() == 75
+
+
 def test_refresh_rechecks_opening_guard_after_lock_and_releases_on_reject(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
 ) -> None:
@@ -97,6 +111,9 @@ def test_service_waits_inside_producer_before_running_archive() -> None:
     assert "ExecCondition=/usr/bin/flock -n" not in service
     assert "--minimum-runway-minutes 45" in service
     assert "refresh_tw_public_release_archives.py" in service
+    assert "After=network-online.target time-sync.target local-fs.target stockagent-tw-public-official-catalogs.service" in service
+    assert "RestartForceExitStatus=75" in service
+    assert "StartLimitIntervalSec=0" in service
     assert "ReadWritePaths=__REPO_ROOT__/artifacts /srv/stockagent-live/data_tw_public /srv/stockagent-live/.locks" in service
 
 

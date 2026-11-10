@@ -14,7 +14,8 @@ def workspace(tmp_path):
     root = tmp_path / "repo"
     root.mkdir()
     subprocess.run(["git", "init", "-q", str(root)], check=True)
-    for name in ("stockagent/live/example.py", "downloader/example.py", "scripts/example.sh", release.ENTRYPOINT):
+    for name in ("stockagent/live/example.py", "downloader/example.py", "scripts/example.sh",
+                 release.ENTRYPOINT, release.FORMAL_HISTORY_ENTRYPOINT):
         path = root / name
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# original source\n")
@@ -54,6 +55,63 @@ def test_workspace_edits_do_not_invalidate_or_mutate_pinned_source(workspace):
     assert (receipt.parent / "source/services/discord_bot/.env").read_bytes() == b""
     assert all(not any(part.startswith("data_") for part in target.relative_to(workspace).parts)
                for _, target, _ in bindings)
+
+
+def test_frozen_formal_history_uses_sealed_trainer_and_canonical_paths(workspace, monkeypatch, capsys):
+    from scripts import run_frozen_formal_history as runner
+
+    trainer = workspace / "train.py"
+    trainer.write_text("import json, pickle, sys\nclass Example: pass\n"
+                       "assert pickle.loads(pickle.dumps(Example())).__class__ is Example\n"
+                       "print(json.dumps({'file': __file__, 'argv': sys.argv}))\n")
+    receipt = prepare(workspace)
+    frozen = receipt.parent / "source/train.py"
+    assert frozen.read_bytes() == trainer.read_bytes()
+    trainer.write_text("raise AssertionError('mutable workspace trainer was executed')\n")
+    monkeypatch.setattr(runner, "ROOT", workspace)
+    monkeypatch.setattr(runner.sys, "argv", ["runner", "--release", str(receipt), "--", "--mode", "infer",
+                                            "--multi-gpu-strategy", "none", "--start-fold", "11"])
+    monkeypatch.setattr(runner.sys, "path", list(runner.sys.path))
+    monkeypatch.delenv("WORLD_SIZE", raising=False)
+    runner.main()
+    output = capsys.readouterr().out.splitlines()
+    assert "verified frozen train.py sha256=" in output[0]
+    payload = json.loads(output[-1])
+    assert payload["file"] == str(trainer)
+    assert payload["argv"] == [str(trainer), "--mode", "infer", "--multi-gpu-strategy", "none", "--start-fold", "11"]
+
+
+def test_legacy_release_remains_verifiable_but_cannot_supply_frozen_trainer(workspace, monkeypatch):
+    from scripts import run_frozen_formal_history as runner
+
+    original = release.source_members
+    monkeypatch.setattr(release, "source_members",
+                        lambda root: [name for name in original(root) if name != "train.py"])
+    receipt = prepare(workspace)
+    assert release.verify_frozen_source(receipt, workspace)["receipt"] == str(receipt)
+    with pytest.raises(ValueError, match="lacks a frozen train.py"):
+        runner._verified_entrypoint(receipt, workspace)
+
+
+@pytest.mark.parametrize("arguments", [
+    ["--mode", "train", "--multi-gpu-strategy", "none"],
+    ["--mode", "infer", "--mode", "train", "--multi-gpu-strategy", "none"],
+    ["--mode", "infer", "--multi-gpu-strategy", "distributed_data_parallel"],
+    ["--mode=infer", "--multi-gpu-strategy", "none"],
+])
+def test_frozen_formal_history_rejects_training_and_relaunch(arguments):
+    from scripts import run_frozen_formal_history as runner
+
+    with pytest.raises(ValueError, match="frozen formal history requires"):
+        runner._validate_inference_arguments(arguments)
+
+
+def test_frozen_formal_history_rejects_distributed_environment(monkeypatch):
+    from scripts import run_frozen_formal_history as runner
+
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    with pytest.raises(ValueError, match="single-process"):
+        runner._validate_inference_arguments(["--mode", "infer", "--multi-gpu-strategy", "none"])
 
 
 def test_explicit_overlay_preserves_compatible_base_and_excludes_unrelated_research(workspace):
@@ -421,6 +479,29 @@ def test_namespace_probe_rechecks_verification_inputs_after_execution(workspace,
         release.run_in_namespace(code, workspace, ["-c", "pass"], verification_inputs=receipt)
 
 
+@pytest.mark.parametrize("change", ["bytecode", "contents"])
+def test_namespace_probe_rechecks_frozen_source_after_execution(workspace, monkeypatch, change):
+    receipt = prepare(workspace)
+    target = receipt.parent / "source/stockagent/live/example.py"
+
+    def run(command, **kwargs):
+        if change == "bytecode":
+            # A privileged process outside the namespace can write despite
+            # mode bits; the probe must never bless the changed tree.
+            target.parent.chmod(0o755)
+            (target.parent / "unexpected.pyc").write_bytes(b"unexpected")
+            target.parent.chmod(0o555)
+        else:
+            target.chmod(0o644)
+            target.write_text("# mutated while probe ran\n")
+            target.chmod(0o444)
+        return subprocess.CompletedProcess(command, 0, stdout="{}", stderr="")
+
+    monkeypatch.setattr(release.subprocess, "run", run)
+    with pytest.raises(RuntimeError, match="frozen source changed during namespace probe"):
+        release.run_in_namespace(receipt, workspace, ["-c", "pass"])
+
+
 @pytest.mark.parametrize("change", ["contents", "added", "bytecode", "deleted", "writable", "symlink", "hardlink", "bundle"])
 def test_actual_pinned_source_drift_still_fails_closed(workspace, change):
     receipt = prepare(workspace)
@@ -742,7 +823,7 @@ def test_launcher_does_not_start_bot_after_failed_pinned_boot_check(workspace, p
     assert ("native-bot-would-start" in result.stdout) is not pinned
 
 
-@pytest.mark.parametrize("unscoped", [False, True])
+@pytest.mark.parametrize("unscoped", [False, True, "trainer"])
 def test_real_private_mount_survives_workspace_edits_and_is_readonly(workspace, unscoped):
     capability = subprocess.run(["unshare", "--mount", "--propagation", "private", "true"],
                                 capture_output=True)
@@ -762,9 +843,11 @@ def implementation_identity():
     root=Path(__file__).resolve().parents[2]
     return [file_identity(root/'stockagent/live/example.py')]
 """
-    if unscoped:
+    if unscoped is True:
         (workspace / "outside.py").write_text("# mutable unpinned inference dependency\n")
         body = body.replace("stockagent/live/example.py", "outside.py")
+    elif unscoped == "trainer":
+        body = body.replace("stockagent/live/example.py", "train.py")
     frozen_module.write_text(body)
     receipt = prepare(workspace)
     if unscoped:
@@ -774,6 +857,7 @@ def implementation_identity():
     before = release.namespace_identity(receipt, workspace)
     assert before["readonly_verified"] is True
     (workspace / "stockagent/live/example.py").write_text("# edited outside namespace\n")
+    (workspace / "train.py").write_text("# changed workspace trainer must not be used\n")
     replacement = workspace / "services/discord_bot/replacement.py"
     replacement.write_text("# atomically replaced outside namespace\n")
     replacement.replace(workspace / release.ENTRYPOINT)

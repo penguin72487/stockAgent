@@ -8,11 +8,14 @@ expired, manifest-backed trees that are not pinned or in use.
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import errno
+import itertools
 import json
 import math
 import os
 import shutil
+import stat
 import time
 import uuid
 from pathlib import Path
@@ -464,12 +467,34 @@ def _reference_path_frontier(targets):
     for name in sorted(str(target) for target in targets):
         if not roots or not name.startswith(roots[-1] + os.sep):
             roots.append(name)
-    return set(roots), tuple(name + os.sep for name in roots), tuple(" " + name for name in roots)
+    return set(roots)
+
+
+def _reference_path_matches(value: str, frontier: set[str]) -> bool:
+    """Test exact names and each component ancestor without scanning every target."""
+    cleaned = value.removesuffix(" (deleted)")
+    if cleaned in frontier:
+        return True
+    position = cleaned.find(os.sep, 1)
+    while position != -1:
+        if cleaned[:position] in frontier:
+            return True
+        position = cleaned.find(os.sep, position + 1)
+    return False
+
+
+def _maps_could_reference(maps: str, lines: list[str], common: str | None) -> bool:
+    """Conservative negative filter; all positives still use original targets."""
+    if common is None:
+        return False
+    prefix = " " + common.rstrip(os.sep) + os.sep
+    return prefix in maps or any(line.endswith(" " + common) for line in lines)
 
 
 def process_references_many(targets: Iterable[Path], *, limit: int = 20,
                             inode_keys: set[tuple[int, int]] | None = None,
-                            include_current_process: bool = False) -> list[str]:
+                            include_current_process: bool = False,
+                            immutable_regular_paths: bool = False) -> list[str]:
     """Return bounded positive references; unreadable live scope raises, not [].
 
     This is a fresh observation, not a lease or an exhaustive per-key pin list.
@@ -478,14 +503,38 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
 
     if type(limit) is not int or limit <= 0:
         raise ValueError("process-reference limit must be a positive integer")
-    targets = tuple(sorted({target.resolve() for target in targets}))
+    if type(immutable_regular_paths) is not bool:
+        raise ValueError('immutable regular path mode must be an explicit boolean')
     inode_keys = set(inode_keys or ())
+    if immutable_regular_paths:
+        # Large packed-object plans commonly contain thousands of files in a
+        # few hundred shared directories. Resolve each parent once, while
+        # checking every leaf without following symlinks. Callers still own
+        # the publication lock and must recheck generations before unlink.
+        targets = tuple(sorted({Path(target) for target in targets}))
+        if any(not path.is_absolute() or '..' in path.parts for path in targets):
+            raise SnapshotError('packed process-reference path must be absolute')
+        parents = {path.parent for path in targets}
+        for parent in parents:
+            if parent.resolve(strict=True) != parent:
+                raise SnapshotError('packed process-reference parent is redirected')
+        def identity(path):
+            info = path.lstat()
+            if not stat.S_ISREG(info.st_mode):
+                raise SnapshotError('packed process-reference leaf is not a regular file')
+            return info.st_dev, info.st_ino
+        pending = iter(targets)
+        with ThreadPoolExecutor(max_workers=16, thread_name_prefix='process-ref-metadata') as pool:
+            while batch := tuple(itertools.islice(pending, 128)):
+                inode_keys.update(pool.map(identity, batch))
+    else:
+        targets = tuple(sorted({target.resolve() for target in targets}))
     if not targets and not inode_keys:
         return []
-    frontier, prefixes, map_suffixes = _reference_path_frontier(targets)
+    frontier = _reference_path_frontier(targets)
+    common = os.path.commonpath(tuple(frontier)) if frontier else None
     def matches_path(value):
-        cleaned = value.removesuffix(" (deleted)")
-        return cleaned in frontier or cleaned.startswith(prefixes)
+        return _reference_path_matches(value, frontier)
 
     references: list[str] = []
     own_pid = os.getpid()
@@ -555,8 +604,7 @@ def process_references_many(targets: Iterable[Path], *, limit: int = 20,
                     references.append(f"pid={pid}:maps-inode:{key[0]}:{key[1]}")
                     if len(references) >= limit:
                         return references
-        if not (any(prefix + os.sep in maps for prefix in map_suffixes)
-                or any(line.endswith(map_suffixes) for line in map_lines)):
+        if not _maps_could_reference(maps, map_lines, common):
             continue
         for target in targets:
             target_text = str(target)

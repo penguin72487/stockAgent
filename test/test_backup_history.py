@@ -2,6 +2,7 @@
 from copy import deepcopy
 import hashlib
 import json
+import threading
 
 import pytest
 
@@ -153,6 +154,62 @@ def test_corrupt_historical_head_is_not_accepted_as_provenance(history):
     path.write_text('{}')
     catalog = capture_catalog(cold, config)
     assert any(r["relative"].startswith("head-history/") for r in catalog["metadata_errors"])
+
+
+def _write_historical_head(cold, release):
+    from stockagent.data_sync.packed_snapshots import PACKED_HEAD_SCHEMA_VERSION
+    body = {"schema_version": PACKED_HEAD_SCHEMA_VERSION, "dataset": release.manifest["dataset"],
+            "node_id": release.manifest["publisher"]["node_id"], "snapshot_id": release.manifest["snapshot_id"],
+            "hlc": release.manifest["hlc"], "manifest_relpath": release.manifest_path.relative_to(cold).as_posix(),
+            "manifest_sha256": release.manifest_sha256}
+    raw = json.dumps(body).encode()
+    path = cold / "head-history/heads/prices/penguin" / (hashlib.sha256(raw).hexdigest() + ".json")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(raw)
+    return path
+
+
+def test_parallel_historical_heads_overlap_without_changing_catalog(history, monkeypatch):
+    from stockagent.data_sync import backup_stream as module
+    cold, policy, _, _, _, old, current = history
+    paths = [_write_historical_head(cold, release) for release in (old, current)]
+    serial = capture_catalog(cold, policy, metadata_workers=1)
+    original = module.PinnedObjectSignatures.read_metadata
+    barrier, seen, mutex = threading.Barrier(2, timeout=5), [], threading.Lock()
+
+    def observed(reader, relative):
+        if relative.startswith('head-history/heads/'):
+            with mutex:
+                seen.append(relative)
+                wait = len(seen) <= 2
+            if wait:
+                barrier.wait()
+        return original(reader, relative)
+
+    monkeypatch.setattr(module.PinnedObjectSignatures, 'read_metadata', observed)
+    parallel = capture_catalog(cold, policy, metadata_workers=4)
+    assert set(seen) == {path.relative_to(cold).as_posix() for path in paths}
+    assert {k: v for k, v in parallel.items() if k != 'observed_at_utc'} == {
+        k: v for k, v in serial.items() if k != 'observed_at_utc'}
+
+
+@pytest.mark.parametrize('damage', ['invalid_json', 'wrong_identity', 'symlink'])
+def test_parallel_historical_head_retains_failures(history, damage):
+    cold, policy, _, _, _, old, current = history
+    _write_historical_head(cold, old)
+    path = _write_historical_head(cold, current)
+    if damage == 'invalid_json':
+        path.write_text('{broken')
+    elif damage == 'wrong_identity':
+        path.write_text('{}')
+    else:
+        path.unlink()
+        path.symlink_to(current.manifest_path)
+    serial = capture_catalog(cold, policy, metadata_workers=1)
+    parallel = capture_catalog(cold, policy, metadata_workers=4)
+    assert any(row['relative'].startswith('head-history/') for row in serial['metadata_errors'])
+    assert {k: v for k, v in parallel.items() if k != 'observed_at_utc'} == {
+        k: v for k, v in serial.items() if k != 'observed_at_utc'}
 
 
 def test_captured_heads_remain_original_observations_after_publication_advances(history, tmp_path):

@@ -28,6 +28,12 @@ from scripts.build_bybit_crypto_public_daily_features import (  # noqa: E402
 
 
 def build(daily_root: Path, output_path: Path) -> dict[str, object]:
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard
+    with writer_guard(daily_root, output_path):
+        return _build_with_workspace_guard(daily_root, output_path)
+
+
+def _build_with_workspace_guard(daily_root: Path, output_path: Path) -> dict[str, object]:
     started_at = datetime.now(timezone.utc)
     started = time.perf_counter()
     files = sorted(daily_root.glob("*_features.parquet"))

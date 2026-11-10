@@ -434,12 +434,22 @@ def main() -> None:
     if end < start:
         raise ValueError(f"invalid date range: {start}..{end}")
     output_dir = args.output_dir.resolve()
+    repo_root = SCRIPT_DIR.parent
+    if str(repo_root) not in sys.path:
+        sys.path.insert(0, str(repo_root))
+    from stockagent.data_sync.workspace_source_handoff import guard_locked_path, guard_path
+    guard_path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     lock_handle = (output_dir / ".download.lock").open("a+", encoding="utf-8")
     try:
         fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except BlockingIOError:
         raise SystemExit(f"another updater owns {output_dir / '.download.lock'}")
+    try:
+        guard_locked_path(output_dir, lock_handle)
+    except BaseException:
+        lock_handle.close()
+        raise
 
     observed_at = _utc_now()
     transport = ResilientHttpTransport(

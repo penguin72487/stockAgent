@@ -18,6 +18,73 @@ from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.packed_metadata import MetadataRows
 
 
+@pytest.fixture(autouse=True)
+def isolated_scratch(tmp_path, monkeypatch):
+    """Semantic tests never write to the host's enrolled workspace."""
+    from stockagent.data_sync import packed_metadata as metadata, workspace_volume
+    root = tmp_path / 'metadata-scratch'
+    root.mkdir()
+    monkeypatch.setattr(metadata, 'METADATA_SCRATCH_ROOT', root)
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', tmp_path / 'not-enrolled')
+    return root
+
+
+def test_spill_uses_enrolled_e_and_retains_native_reserve(tmp_path, monkeypatch):
+    from stockagent.data_sync import workspace_volume
+    enrollment = tmp_path / 'enrollment.json'
+    enrollment.write_text('{}')
+    verify = tmp_path / 'e-verify'
+    verify.mkdir()
+    admissions = []
+    reserve = 32 * 1024**3
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    monkeypatch.setattr(workspace_volume, 'configuration', lambda: {'minimum_free_bytes': reserve})
+    monkeypatch.setattr(workspace_volume, 'admit', lambda amount, **_: admissions.append(amount))
+    monkeypatch.setattr(workspace_volume, 'path', lambda kind, **_: verify if kind == 'verify' else None)
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        rows.extend([record('b'), record('a')])
+        scratch = Path(rows._scratch.name)
+        assert scratch.parent == verify and rows._scratch_reserve == reserve
+        assert [r['path'] for r in rows] == ['a', 'b']
+        assert admissions == [0]
+        rows._check_space()
+        assert admissions == [0]  # No per-row native probe.
+        rows._next_physical_check = 0
+        rows._check_space()
+        assert admissions == [0, 0]
+    assert not scratch.exists()
+
+
+@pytest.mark.parametrize('broken_enrollment', [False, True])
+def test_enrolled_e_admission_failure_never_creates_a_c_index(tmp_path, monkeypatch, isolated_scratch, broken_enrollment):
+    from stockagent.data_sync import workspace_volume
+    enrollment = tmp_path / 'enrollment.json'
+    if broken_enrollment:
+        enrollment.symlink_to(tmp_path / 'missing')
+    else:
+        enrollment.write_text('{}')
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    monkeypatch.setattr(workspace_volume, 'configuration', lambda: {'minimum_free_bytes': 32 * 1024**3})
+    def refuse(*_, **__):
+        raise SnapshotError('missing or changed enrolled E')
+    monkeypatch.setattr(workspace_volume, 'admit', refuse)
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        with pytest.raises(SnapshotError, match='enrolled E'):
+            rows.extend([record('a'), record('b')])
+        assert rows._db is None and rows._scratch is None
+    assert not list(isolated_scratch.iterdir())
+
+
+def test_spill_stops_before_crossing_its_local_reserve(monkeypatch):
+    from stockagent.data_sync import packed_metadata as metadata
+    from types import SimpleNamespace
+    monkeypatch.setattr(metadata.shutil, 'disk_usage', lambda _: SimpleNamespace(free=255 * 1024**2))
+    with MetadataRows(dict, dict, memory_rows=1) as rows:
+        with pytest.raises(OSError, match='free-space reserve'):
+            rows.extend([record('a'), record('b')])
+        assert rows._scratch is None
+
+
 @pytest.fixture
 def failed_metadata_index(tmp_path, monkeypatch):
     from stockagent.data_sync import packed_metadata as metadata
@@ -58,6 +125,21 @@ def test_explicit_superseded_metadata_index_can_be_planned_and_retired(failed_me
     assert result['source_data_files_deleted'] == result['cold_objects_deleted'] == 0
     assert json.loads(receipt.read_text()) == result
     assert attempt.exists()  # All provenance and operation journals survive.
+
+
+def test_e_index_retirement_uses_original_provenance_without_space_admission(failed_metadata_index, monkeypatch, tmp_path):
+    from stockagent.data_sync import workspace_volume
+    metadata, scratch, attempt, receipt = failed_metadata_index
+    monkeypatch.setattr(metadata, 'METADATA_SCRATCH_ROOT', tmp_path / 'legacy-var-tmp')
+    enrollment = tmp_path / 'enrollment.json'
+    enrollment.write_text('{}')
+    monkeypatch.setattr(workspace_volume, 'ENROLLMENT', enrollment)
+    monkeypatch.setattr(workspace_volume, 'path', lambda kind: scratch.parent if kind == 'verify' else None)
+    def no_write_admission(*_, **__):
+        raise AssertionError('retiring an exact disposable index must not demand free space')
+    monkeypatch.setattr(workspace_volume, 'admit', no_write_admission)
+    plan = metadata.plan_failed_metadata_scratch(scratch, attempt)
+    assert metadata.retire_failed_metadata_scratch(plan, receipt)['state'] == 'retired'
 
 
 @pytest.mark.parametrize('defect', ['extra_member','shared','symlink','wrong_schema','unknown_origin','same_owner'])
@@ -285,7 +367,7 @@ def test_object_path_cursor_can_be_closed_by_metadata_owner():
 
 
 @pytest.mark.parametrize("limit", [1, 100])
-def test_index_preserves_sorted_rows_mutations_groups_and_hints(limit):
+def test_index_preserves_sorted_rows_mutations_groups_and_hints(limit, isolated_scratch):
     with MetadataRows(dict, dict, memory_rows=limit) as rows:
         rows.extend([record("雪"), record("a"), record("é"), record("zero", size=0)])
         rows.sort(key=lambda row: row["path"])
@@ -301,7 +383,7 @@ def test_index_preserves_sorted_rows_mutations_groups_and_hints(limit):
         assert rows.take_file_hint("missing") is None
         scratch = Path(rows._scratch.name) if rows.spilled else None
         if scratch:
-            assert scratch.parent == Path("/var/tmp") and scratch.stat().st_mode & 0o777 == 0o700
+            assert scratch.parent == isolated_scratch and scratch.stat().st_mode & 0o777 == 0o700
     if scratch:
         assert not scratch.exists()
 
@@ -502,12 +584,12 @@ def test_spilled_complete_pipeline_matches_ram_and_preserves_all_versions(tmp_pa
     # The canonical all-file verifier must never request a full Python list.
     def forbid_load(*_):
         pytest.fail("all-file verification must stream its one inventory")
-    monkeypatch.setattr(packed, "_load_inventory", forbid_load)
-    for cold, release in ((tmp_path / "ram", ram), (tmp_path / "disk", disk)):
-        proof = packed.verify_packed_snapshot(cold, release, reconstruct_all=True)
-        assert proof["independently_reconstructed_files"] == 15
-        assert proof["independently_reconstructed_bytes"] == release.manifest["source"]["logical_bytes"]
-    monkeypatch.undo()
+    with monkeypatch.context() as streaming_check:
+        streaming_check.setattr(packed, "_load_inventory", forbid_load)
+        for cold, release in ((tmp_path / "ram", ram), (tmp_path / "disk", disk)):
+            proof = packed.verify_packed_snapshot(cold, release, reconstruct_all=True)
+            assert proof["independently_reconstructed_files"] == 15
+            assert proof["independently_reconstructed_bytes"] == release.manifest["source"]["logical_bytes"]
     monkeypatch.setattr(packed, "METADATA_MEMORY_ROWS", 2)
     before = disk.manifest_sha256
     noop = packed.publish_packed_snapshot(tmp_path / "disk", "test", original, **opts)

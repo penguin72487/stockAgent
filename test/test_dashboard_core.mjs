@@ -885,6 +885,47 @@ test("responsive labels are idempotent for unchanged table headers and rows", ()
   assert.equal(counts.writes, 0);
 });
 
+test("dynamic table regions are keyboard accessible and named without replacing explicit semantics", () => {
+  const {core} = loadCore();
+  const {table} = responsiveFixture();
+  const attributes = new Map();
+  let writes = 0;
+  const region = {
+    hasAttribute: name => attributes.has(name),
+    setAttribute(name, value) { writes++; attributes.set(name, value); },
+  };
+  table.closest = selector => selector === ".table-scroll,.table-wrap" ? region : null;
+  table.querySelector = () => ({textContent: "  來源取得進度  "});
+  core.enhanceResponsiveTable(table);
+  assert.equal(attributes.get("tabindex"), "0");
+  assert.equal(attributes.get("role"), "region");
+  assert.equal(attributes.get("aria-label"), "來源取得進度");
+  core.enhanceResponsiveTable(table);
+  assert.equal(writes, 3);
+  attributes.delete("aria-label");
+  attributes.set("aria-labelledby", "explicit-heading");
+  core.enhanceResponsiveTable(table);
+  assert.equal(attributes.has("aria-label"), false);
+  assert.equal(attributes.get("aria-labelledby"), "explicit-heading");
+  assert.equal(writes, 3);
+});
+
+test("scroll-only tables still receive an accessible unnamed-region fallback", () => {
+  const {core} = loadCore();
+  const {table} = responsiveFixture();
+  const attributes = new Map();
+  const region = {
+    hasAttribute: name => attributes.has(name),
+    setAttribute: (name, value) => attributes.set(name, value),
+  };
+  table.dataset.responsive = "scroll";
+  table.closest = selector => selector === ".table-scroll,.table-wrap" ? region : null;
+  table.querySelector = () => null;
+  assert.equal(core.enhanceResponsiveTable(table), false);
+  assert.equal(attributes.get("tabindex"), "0");
+  assert.equal(attributes.get("aria-label"), "表格明細，可捲動");
+});
+
 test("a single-cell mutation visits only its responsive row, while a header change updates all rows", () => {
   let observe;
   const {core} = loadCore({

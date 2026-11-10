@@ -94,6 +94,83 @@ def test_actual_first_print_supersedes_carried_model_reference():
     assert observed[1] and window[-1, 1, 0] == pytest.approx(np.log(52./51.))
 
 
+def test_counterfactual_daily_open_uses_session_date_without_fabricating_clock():
+    data, quotes = panel(), snapshot()
+    quotes.source = "csv:/isolated/official_open.csv"
+    quotes.timestamp = None
+    quotes.timestamps_ms = None
+    quotes.exchange_timestamps_ms = None
+    quotes.no_open_print_timestamps_ms = None
+    window, _, _, live, observed = signals._day_trade_live_model_window(
+        data, panel_idx=2, lookback=3, price_snapshot=quotes,
+        resolved_asof="2026-10-22T09:00:00+08:00", source_timezone="Asia/Taipei",
+        opening_reference_policy=signals.OPENING_PROVISIONAL_REFERENCE_POLICY,
+        counterfactual_official_open_session="2026-10-22",
+    )
+    assert live
+    np.testing.assert_array_equal(observed, [True, False, False, False])
+    assert window[-1, 0, 0] == pytest.approx(np.log(103. / 102.))
+    assert window[-1, 1, 0] == pytest.approx(np.log(49. / 51.))
+    assert window[-1, 2, 0] == pytest.approx(np.log(60. / 62.))
+    assert quotes.timestamps_ms is None and quotes.exchange_timestamps_ms is None
+
+
+@pytest.mark.parametrize("source,session", [
+    ("csv:/isolated/official_open.csv", "2026-10-21"),
+    ("twse_tpex:mis", "2026-10-22"),
+])
+def test_counterfactual_open_rejects_mismatched_session_or_non_csv(source, session):
+    quotes = snapshot()
+    quotes.source = source
+    with pytest.raises(ValueError, match="same-session CSV"):
+        signals._day_trade_live_model_window(
+            panel(), panel_idx=2, lookback=3, price_snapshot=quotes,
+            resolved_asof="2026-10-22T09:00:00+08:00", source_timezone="Asia/Taipei",
+            opening_reference_policy=signals.OPENING_PROVISIONAL_REFERENCE_POLICY,
+            counterfactual_official_open_session=session,
+        )
+
+
+def test_live_provisional_transport_still_rejects_csv(tmp_path):
+    with pytest.raises(ValueError, match="canonical TW opening cache"):
+        signals._price_snapshot(
+            source="csv", symbols=["2330"], fallback_prices=np.array([100.]),
+            parquet_root=tmp_path, prices_csv=tmp_path / "prices.csv", yahoo_chunk_size=1,
+            require_official_tw_session_open=True,
+            opening_model_reference_policy=signals.OPENING_PROVISIONAL_REFERENCE_POLICY,
+        )
+
+
+@pytest.mark.parametrize("change", [
+    {"price_source": "tw"},
+    {"publish_latest": True},
+    {"live_output_dir": None},
+    {"signal_id": "normal-live-signal"},
+    {"asof_date": "2020-01-03T09:00:00+08:00"},
+    {"asof_date": "2020-01-02T08:59:59+08:00"},
+    {"_counterfactual_official_open_session": "2999-01-02", "asof_date": "2999-01-02T09:00:00+08:00",
+     "signal_id": "test-counterfactual-official-open-2999-01-02"},
+])
+def test_counterfactual_open_rejects_nonisolated_or_nonhistorical_requests(
+    tmp_path, monkeypatch, change,
+):
+    monkeypatch.setattr(signals, "loaded_implementation_identity", lambda: None)
+    monkeypatch.setattr(signals, "load_config", lambda *_a, **_kw:
+                        SimpleNamespace(data=SimpleNamespace(), trading=SimpleNamespace(execution_mode="tw_day_trade")))
+    monkeypatch.setattr(signals, "require_live_feature_source", lambda *_a: None)
+    kwargs = {
+        "market": "test", "price_source": "csv", "prices_csv": tmp_path / "open.csv",
+        "live_output_dir": tmp_path / "private", "publish_latest": False,
+        "signal_id": "test-counterfactual-official-open-2020-01-02",
+        "asof_date": "2020-01-02T09:00:00+08:00",
+        "_counterfactual_official_open_session": "2020-01-02",
+        "day_trade_opening_reference_policy": signals.OPENING_PROVISIONAL_REFERENCE_POLICY,
+    }
+    kwargs.update(change)
+    with pytest.raises(ValueError, match="isolated past-session paper CSV"):
+        signals.generate_live_signal(**kwargs)
+
+
 @pytest.mark.parametrize("volume", [None, 0., np.nan, -1., np.inf])
 def test_missing_or_invalid_volume_cannot_prove_last_trade(volume):
     data = panel()
@@ -130,6 +207,52 @@ def test_missing_panel_close_uses_real_trade_as_carry_gap_denominator():
         panel_idx=2, lookback=3, price_snapshot=quotes,
         resolved_asof=quotes.timestamp, source_timezone="Asia/Taipei")
     assert not observed[1] and window[-1, 1, 0] == 0.
+
+
+@pytest.mark.parametrize("policy", [signals.OPENING_OBSERVED_REFERENCE_POLICY,
+                                  signals.OPENING_PROVISIONAL_REFERENCE_POLICY])
+def test_suspension_then_real_open_is_observed_but_uses_training_missing_gap(policy):
+    from stockagent.data.panel import _append_day_trade_open_gap_feature
+
+    data, quotes = panel(), snapshot()
+    # A 25% share reduction followed a halt: the last trade belongs to an
+    # older price basis. Its availability does not prove yesterday's close.
+    data.close_prices[:, 0] = [81.3, np.nan, np.nan]
+    data.daily_volumes[:, 0] = [10., 0., 0.]
+    data.alive_mask[:, 0] = [True, False, False]
+    quotes.open_prices[0] = 102.5
+    window, _, _, _, observed = signals._day_trade_live_model_window(
+        data, panel_idx=2, lookback=3, price_snapshot=quotes,
+        resolved_asof=quotes.timestamp, source_timezone="Asia/Taipei",
+        opening_reference_policy=policy)
+    training = SimpleNamespace(open_prices=np.array([[np.nan], [102.5]]),
+        close_prices=np.array([[np.nan], [101.5]]),
+        features=np.zeros((2, 1, 1), dtype=np.float32),
+        feature_names=["baseline"], content_fingerprints=None)
+    _append_day_trade_open_gap_feature(training)
+    assert observed[0]  # A missing denominator does not erase a real opening quote.
+    assert window[-1, 0, 0] == training.features[0, 0, -1] == 0.0
+    assert signals._last_completed_trade_reference(data, 2)[0][0] == 81.3
+
+
+@pytest.mark.parametrize("opening", [170.0, 200.0, 200.001, 210.0])
+def test_live_opening_gap_matches_training_sanitizer_and_precision(opening):
+    from stockagent.data.panel import _append_day_trade_open_gap_feature
+
+    data, quotes = panel(), snapshot()
+    data.close_prices[2, 0] = 100.0
+    quotes.open_prices[0] = opening
+    window, _, _, _, observed = signals._day_trade_live_model_window(
+        data, panel_idx=2, lookback=3, price_snapshot=quotes,
+        resolved_asof=quotes.timestamp, source_timezone="Asia/Taipei",
+        opening_reference_policy=signals.OPENING_PROVISIONAL_REFERENCE_POLICY)
+    training = SimpleNamespace(open_prices=np.array([[np.nan], [opening]]),
+        close_prices=np.array([[100.0], [opening]]),
+        features=np.zeros((2, 1, 1), dtype=np.float32),
+        feature_names=["baseline"], content_fingerprints=None)
+    _append_day_trade_open_gap_feature(training)
+    assert observed[0]
+    assert window[-1, 0, 0] == training.features[0, 0, -1]
 
 
 def test_missing_latest_day_is_not_evidence_of_delisting_or_loss_of_last_trade():

@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume safe retirement of superseded private D encodings
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=5s
+Unit=stockagent-handoff-private-retirement.service
+
+[Install]
+WantedBy=timers.target

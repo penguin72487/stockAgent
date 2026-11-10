@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry interrupted source-owned packed-head handoffs
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-foreign-head-recovery.service
+
+[Install]
+WantedBy=timers.target

@@ -30,6 +30,29 @@ def test_request_scope_and_invalid_receipts_fail_closed():
                                 _status(name, now, expiry, state='invalid_local_receipt'))
 
 
+@pytest.mark.parametrize('dataset,partition,accepted', [
+    ('tw_minute:3059', '2026-11-09', True),
+    ('tw_minute:00707R', '2026-11-09', True),
+    ('tw_minute:', '2026-11-09', False),
+    ('tw_minute:3059/other', '2026-11-09', False),
+    ('tw_minute:3059', '2026-02-30', False),
+    ('tw_tick:3059', '2026-11-09', False),
+    ('tw_futures_minute:TX_202611', '2026-11-09', False),
+])
+def test_stock_handoff_only_accepts_explicit_valid_stock_minute_scope(dataset, partition, accepted):
+    now = datetime(2026, 11, 9, tzinfo=UTC)
+    identifier, expiry = 'a' * 64, now + timedelta(days=1)
+    def reader(root, name, now):
+        result = _status(name, now, expiry, dataset=dataset)
+        result['items'][0]['key'] = json.dumps([dataset, partition])
+        return result
+    if accepted:
+        assert handoff.request_summary([identifier], now, reader=reader, family='stock')['active_waiting'] == 1
+    else:
+        with pytest.raises(ValueError):
+            handoff.request_summary([identifier], now, reader=reader, family='stock')
+
+
 def test_predecessor_identity_handles_pid_reuse_and_zombie(tmp_path):
     proc = tmp_path / '123'
     proc.mkdir()
@@ -78,6 +101,34 @@ def test_handoff_waits_for_predecessor_then_uses_canonical_owner(tmp_path, monke
     assert doc['states'] == {'downloaded_unverified_for_pit': 1}
 
 
+def test_stock_handoff_waits_for_the_existing_owner_and_uses_same_guarded_drain(tmp_path, monkeypatch):
+    now = [datetime(2026, 11, 9, tzinfo=UTC)]
+    expiry, identifier = now[0] + timedelta(hours=1), 'b' * 64
+    state, events = ['pending_existing_owner'], []
+    pin = tmp_path / 'pin'
+    pin.write_text('stable')
+    monkeypatch.setattr(handoff, 'OWNER_FILES', (pin,))
+    def sleep(seconds):
+        events.append('wait_for_existing_owner')
+        now[0] += timedelta(seconds=seconds)
+    def reader(root, name, now):
+        return _status(name, now, expiry, state=state[0], dataset='tw_minute:3059')
+    def owner(passes, *, kind, capacity_wait):
+        events.append('canonical_owner')
+        assert passes == 32 and kind == 'tw_minute' and capacity_wait()
+        state[0] = 'downloaded_unverified_for_pit'
+        return 0, {'state': 'no_more_actionable_in_pass'}
+    progress = tmp_path / 'progress.json'
+    result = handoff.run([identifier], 123, 42, progress, now=lambda: now[0], sleep=sleep,
+        reader=reader, process=lambda pid: 42 if not events else None, drain_owner=owner,
+        headroom=lambda deadline, *, still_valid: still_valid(), family='stock')
+    assert result == 0 and events == ['wait_for_existing_owner', 'canonical_owner']
+    payload = json.loads(progress.read_text())
+    assert payload['family'] == 'stock' and payload['data_completeness_claim'] is False
+    with pytest.raises(ValueError, match='family'):
+        handoff.run([identifier], 123, 42, progress, family='stock', futures_workspace_only=True)
+
+
 def test_workspace_handoff_pins_storage_and_passes_only_the_workspace_mode(tmp_path, monkeypatch):
     now = datetime(2026, 11, 3, tzinfo=UTC)
     expiry = now + timedelta(hours=1)
@@ -101,6 +152,31 @@ def test_workspace_handoff_pins_storage_and_passes_only_the_workspace_mode(tmp_p
     result = json.loads(progress.read_text())
     assert code == 0 and result['futures_workspace_only'] is True
     assert str(storage_pin) in result['source_sha256']
+
+
+def test_workspace_handoff_passes_only_registered_preferred_requests(tmp_path, monkeypatch):
+    now = datetime(2026, 11, 3, tzinfo=UTC)
+    expiry = now + timedelta(hours=1)
+    pin = tmp_path / 'owner'
+    pin.write_text('stable')
+    monkeypatch.setattr(handoff, 'OWNER_FILES', (pin,))
+    monkeypatch.setattr(handoff, 'WORKSPACE_FILES', ())
+    requested, preferred = 'a'*64, 'b'*64
+    state = ['pending_existing_owner']
+    def owner(passes, *, kind, capacity_wait, futures_workspace_only, preferred_futures_request_ids):
+        assert futures_workspace_only and preferred_futures_request_ids == (preferred,)
+        assert capacity_wait()
+        state[0] = 'downloaded_unverified_for_pit'
+        return 0, {'state': 'no_more_actionable_in_pass'}
+    code = handoff.run([requested, preferred], 123, 42, tmp_path/'progress.json', now=lambda: now,
+        reader=lambda root, name, now: _status(name, now, expiry, state=state[0]),
+        process=lambda pid: None, drain_owner=owner,
+        headroom=lambda deadline, *, still_valid, sample: still_valid(), futures_workspace_only=True,
+        preferred_futures_request_ids=(preferred,))
+    assert code == 0
+    with pytest.raises(ValueError, match='unique registered'):
+        handoff.run([requested], 123, 42, tmp_path/'other.json', futures_workspace_only=True,
+                    preferred_futures_request_ids=(preferred,))
 
 
 def test_capacity_wait_cannot_authorize_a_request_after_expiry(tmp_path, monkeypatch):

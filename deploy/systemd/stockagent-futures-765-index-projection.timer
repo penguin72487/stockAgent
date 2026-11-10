@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the fixed futures 765 E metadata index projection
+
+[Timer]
+OnBootSec=4min
+OnUnitInactiveSec=1min
+AccuracySec=1s
+Unit=stockagent-futures-765-index-projection.service
+
+[Install]
+WantedBy=timers.target

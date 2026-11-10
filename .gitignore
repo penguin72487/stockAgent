@@ -255,6 +255,10 @@ data_bybit_prepacked_20260926/*
 # Git stores reproducible software, not node-local payloads or exported views.
 # Root anchoring preserves configs/data_sync, stockagent/data and test fixtures.
 /data_*/
+# Retained originals from the explicitly enrolled temporary E provider move.
+/.data_finlab.pre-e-20261103/
+/.data_finmind.pre-e-20261103/
+/.data_tej.pre-e-20261103/
 /artifacts_*/
 /reports/
 /.stignore
@@ -296,3 +300,11 @@ Thumbs.db
 *.swp
 *.swo
 *.tmp
+.data_crypto_etf.pre-e-20261104-v1/*
+
+# Node-local retained originals and generated state, never portable source.
+# Directory-only/root-scoped rules preserve configs, fixtures and lockfiles.
+/.data_*.pre-e-*/
+/stockagent-rate-limits-*/
+/.stversions/
+/.codex_remote_perf/

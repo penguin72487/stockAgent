@@ -21,6 +21,7 @@ import hashlib
 import heapq
 import io
 import json
+import logging
 import math
 import os
 from pathlib import Path
@@ -87,7 +88,7 @@ from stockagent.live.tw_day_trade_service_sync import (
     paper_journal_generations,
     read_json_object,
 )
-from stockagent.live.paper_mode_snapshot import MANIFEST_KEY, expand_paper_state
+from stockagent.live.paper_mode_snapshot import CONTRACT as MODE_SNAPSHOT_CONTRACT, MANIFEST_KEY, expand_paper_state
 from stockagent.live.paper_journal import managed as _managed_journal, open_paper_journal, snapshot_of
 
 
@@ -129,6 +130,10 @@ class _LedgerLineCount:
 
 _LINE_COUNT_CACHE: dict[Path, _LedgerLineCount] = {}
 _LINE_COUNT_LOCK = threading.Lock()
+_LINE_COUNT_BACKGROUND_LOCK = threading.Lock()
+_LINE_COUNT_BACKGROUND_PENDING: set[Path] = set()
+_LINE_COUNT_BACKGROUND_RETRY_AFTER: dict[Path, float] = {}
+_SIGNAL_LINE_COUNT_SYNC_MAX_BYTES = 16 * 1024**2
 _TAIL_CACHE: dict[
     tuple[Any, ...], tuple[tuple[int, ...], list[dict[str, Any]]]
 ] = {}
@@ -191,6 +196,7 @@ class _SignalPageCacheEntry:
     source_rows: tuple[dict[str, Any], ...]
     overlay_signature: str
     feature_checked_at: float
+    record_count_extra: int = 0
 
 
 _SIGNAL_PAGE_CACHE: dict[tuple[Any, ...], _SignalPageCacheEntry] = {}
@@ -268,9 +274,9 @@ if not _NATIVE_HISTORY_POINTS:
 
 _HISTORY_POINT_FIELDS: Final[tuple[str, ...]] = tuple(_HistoryPoint.__annotations__)
 _HISTORY_POINT_KEYS: Final[frozenset[str]] = frozenset(_HISTORY_POINT_FIELDS)
-_HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 3
+_HISTORY_PROJECTION_CACHE_SCHEMA_VERSION: Final[int] = 4
 _HISTORY_PROJECTION_CACHE_MAX_COMPRESSED_BYTES: Final[int] = 64 * 1024 * 1024
-_HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 4
+_HISTORY_SESSION_PROJECTION_SCHEMA_VERSION: Final[int] = 5
 _HISTORY_SESSION_PROJECTION_MAX_COMPRESSED_BYTES: Final[int] = 4 * 1024 * 1024
 _HISTORY_PROJECTION_WORK: dict[Path, dict[str, Any]] = {}
 _HISTORY_PROJECTION_WORK_LOCK = threading.Lock()
@@ -279,7 +285,13 @@ _COLUMNAR_LEDGER_MIN_BYTES: Final[int] = 256 * 1024
 _COLUMNAR_LEDGER_MAX_BYTES: Final[int] = 256 * 1024 * 1024
 _COLUMNAR_LEDGER_WRITE_BUFFER_BYTES: Final[int] = 8 * 1024 * 1024
 _DETAIL_SESSION_PROJECTION_VERSION: Final[int] = 2
-_DETAIL_SESSION_PROJECTION_MAX_BYTES: Final[int] = 32 * 1024 * 1024
+# A full, row-group-streamed progressive session can exceed the older 32 MiB
+# single-buffer output while remaining small relative to its multi-GiB source.
+# This is a private cache read bound, not a limit on ledger/session content.
+_DETAIL_SESSION_PROJECTION_MAX_BYTES: Final[int] = 128 * 1024 * 1024
+_DETAIL_SESSION_PROJECTION_INTERMEDIATE_MAX_BYTES: Final[int] = 256 * 1024 * 1024
+_DETAIL_SESSION_PROJECTION_ROW_GROUP_ROWS: Final[int] = 65_536
+_LATEST_SIGNAL_SESSION_CONTRACT: Final[str] = "latest_signal_per_session_mode_symbol_v1"
 _HISTORY_MARK_COLUMN_TYPES: Final[dict[str, str]] = {
     "session_date": "string", "market": "string", "benchmark_id": "string",
     "minute": "string", "recorded_at": "string", "initial_capital_twd": "float",
@@ -296,6 +308,9 @@ _SIGNAL_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "bid": "float",
     "counterfactual_open_replay": "bool",
     "counterfactual_0901_price_fill": "bool",
+    "historical_open_fallback_fill": "bool",
+    "recorded_at_basis": "string",
+    "replay_generated_at": "string",
     "counterfactual_overnight_replay": "bool",
     "day_trade_eligible": "bool",
     "exchange_quote_at": "string",
@@ -346,7 +361,7 @@ _SIGNAL_PAGE_NARROW_COLUMNS: Final[tuple[str, ...]] = (
 # projection. The canonical summary treats them as unknown, not zero prices;
 # it must not discard a complete shard and fall back to a truncated raw tail.
 _SIGNAL_PAGE_REQUIRED_COLUMNS: Final[frozenset[str]] = frozenset({
-    "execution_price", "filled_shares", "filled_weight", "market", "reason",
+    "filled_shares", "filled_weight", "market", "reason",
     "requested_shares", "session_date", "signal_id", "sizing_open_price",
     "status", "symbol", "target_weight",
 })
@@ -356,6 +371,9 @@ _EVENT_PAGE_COLUMN_TYPES: Final[dict[str, str]] = {
     "fee_and_tax_twd": "float",
     "fill_at": "string",
     "fill_contract": "string",
+    "historical_open_fallback_fill": "bool",
+    "recorded_at_basis": "string",
+    "replay_generated_at": "string",
     "filled_quantity": "int",
     "gross_fee_and_tax_twd": "float",
     "gross_pnl_twd": "float",
@@ -696,12 +714,13 @@ def build_dashboard_revision(
     discord_markets_field: str = "day_trade_markets",
     discord_engine_revision_field: str = "engine_state_revision",
     now: datetime | None = None,
+    _engine_receipt: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Return the tiny cross-service commit/ack state used for fast polling."""
 
     observed = (now or datetime.now(timezone.utc)).astimezone(timezone.utc)
     root = Path(state_dir)
-    engine = load_service_sync(root)
+    engine = dict(_engine_receipt) if _engine_receipt is not None else load_service_sync(root)
     if engine is None:
         try:
             status = _object(root / "status.json")
@@ -1146,10 +1165,14 @@ def _signal_valuation_position(position: Mapping[str, Any]) -> dict[str, Any]:
     fields = (
         "position_id", "market", "session_date", "symbol", "signal_id",
         "filled_shares", "signed_shares", "entry_price", "entry_at",
+        "historical_open_fallback_fill", "recorded_at_basis", "replay_generated_at",
         "last_mark_price", "last_mark_quote_source", "last_quote_at", "last_complete_net_pnl_twd",
         "realized_net_pnl_twd", "unrealized_net_pnl_twd", "total_net_pnl_twd",
         "reconciled_total_net_pnl_twd", "net_pnl_twd", "valuation_stale",
         "exit_price", "exit_at", "exit_exchange_at", "last_exit_price", "last_exit_at",
+        "nontrade_settlement_contract", "nontrade_settlement_shares", "nontrade_accounting_at",
+        "nontrade_reference_observed_at", "nontrade_reference_before_entry", "nontrade_reference_time_unknown",
+        "nontrade_assumed_exit_fee_twd", "nontrade_settlement_net_pnl_twd", "execution_realized_net_pnl_twd",
     )
     return {"contract": "signal_ledger_valuation_v1",
             **{field: safe[field] for field in fields if field in safe}}
@@ -2037,6 +2060,42 @@ def _projected_ledger_schema(pl: Any, projected_schema: Mapping[str, str] | None
     return {field: types[kind] for field, kind in projected_schema.items()}
 
 
+def _ledger_span_batches(handle: Any, start: int, end: int, *, batch_bytes: int = 4 << 20):
+    """Read complete NDJSON records with bounded block I/O, not per-row seeks.
+
+    A progressive session can be many GiB. Calling tell/readline/tell for each
+    row costs millions of Python and file-position operations before the native
+    decoder even sees its bytes. Preserve exact span/order/line limits while
+    finding batch boundaries in native byte operations. This never truncates a
+    session, reads into another span, or treats an incomplete record as valid.
+    """
+    if not 0 <= start <= end or batch_bytes <= 0:
+        raise ValueError("invalid ledger span or batch size")
+    handle.seek(start)
+    remaining, tail = end - start, b""
+    while remaining:
+        size = min(batch_bytes, remaining)
+        block = handle.read(size)
+        if len(block) != size:
+            raise ValueError("dashboard ledger span was truncated")
+        remaining -= size
+        combined = tail + block
+        boundary = combined.rfind(b"\n") + 1
+        if boundary:
+            payload, tail = combined[:boundary], combined[boundary:]
+            # Batches smaller than the per-line ceiling are safe by size.
+            # Only a long carried record needs the more expensive line check.
+            if len(payload) > _MAX_LEDGER_LINE_BYTES and max(map(len, payload.split(b"\n"))) >= _MAX_LEDGER_LINE_BYTES:
+                raise ValueError("dashboard ledger line is too large")
+            yield payload
+        else:
+            tail = combined
+        if len(tail) >= _MAX_LEDGER_LINE_BYTES:
+            raise ValueError("dashboard ledger line is too large")
+    if tail:
+        raise ValueError("dashboard ledger span ends with an incomplete record")
+
+
 def _columnar_ledger_frame(
     source: Path,
     *,
@@ -2094,23 +2153,10 @@ def _columnar_ledger_frame(
             # complete-line batches before retaining them, never the full raw
             # multi-GiB payload or a silently truncated tail.
             frames = []
-            pending: list[bytes] = []
-            pending_bytes = 0
             with open_paper_journal(Path(source), "rb") as handle:
                 for start, end, _ in selected_spans:
-                    handle.seek(start)
-                    while handle.tell() < end:
-                        line = handle.readline(min(_MAX_LEDGER_LINE_BYTES + 1, end - handle.tell()))
-                        if not line.endswith(b"\n") or len(line) > _MAX_LEDGER_LINE_BYTES:
-                            raise ValueError(f"dashboard ledger span is invalid: {source}")
-                        pending.append(line)
-                        pending_bytes += len(line)
-                        if pending_bytes >= 4 << 20:
-                            frames.append(read_frame(io.BytesIO(b"".join(pending))))
-                            pending.clear()
-                            pending_bytes = 0
-            if pending:
-                frames.append(read_frame(io.BytesIO(b"".join(pending))))
+                    for payload in _ledger_span_batches(handle, start, end):
+                        frames.append(read_frame(io.BytesIO(payload)))
             frame = pl.concat(frames, how="diagonal_relaxed", rechunk=False)
         elif needs_bounded_tail:
             cache_root = str(
@@ -2338,6 +2384,147 @@ def _projected_ledger_session_frame(
     return frame
 
 
+def _materialize_projected_ledger_session_bounded(
+    source: Path, *, index: _LedgerSessionIndex, session_date: str,
+    projected_schema: Mapping[str, str], diagnostic: dict[str, Any] | None = None,
+) -> bool:
+    """Build a receipted full-session shard without retaining all rows in RAM.
+
+    This is the same complete session projection, not a recent-tail substitute.
+    Fixed-schema row groups are streamed to a private temporary file, then
+    columns that were null for the entire session are removed as in the
+    existing reader. The source generation and spans remain fenced at publish.
+    """
+    def rejected(reason: str, **details: Any) -> bool:
+        if diagnostic is not None:
+            diagnostic.update(reason=reason, **details)
+        logging.getLogger(__name__).warning(
+            "bounded signal session projection unavailable: day=%s reason=%s details=%s",
+            session_date, reason, details,
+        )
+        return False
+
+    spans = index.spans.get(session_date)
+    root = _detail_session_projection_root(source, projected_schema)
+    if not spans or root is None:
+        return rejected("missing_spans_or_cache")
+    try:
+        import polars as pl
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+    except ImportError:
+        return rejected("columnar_runtime_unavailable")
+
+    expected_generation = (
+        index.device, index.inode, index.observed_size, index.modified_ns, index.changed_ns,
+    )
+    lock = _shared_query_lock(("bounded_session_projection", source.resolve(), session_date))
+    with lock:
+        if _validated_projected_ledger_session_file(
+            source, index=index, session_date=session_date, projected_schema=projected_schema,
+        ) is not None:
+            return True
+        try:
+            if metadata_signature(source.stat()) != expected_generation:
+                return rejected("source_generation_changed_before_read")
+            root.mkdir(parents=True, exist_ok=True)
+            schema = _projected_ledger_schema(pl, projected_schema)
+            populated: set[str] = set()
+            rows = 0
+            with tempfile.TemporaryFile(dir=root) as temporary:
+                writer = None
+                pending_tables: list[Any] = []
+                pending_rows = 0
+
+                def flush_pending() -> None:
+                    nonlocal pending_rows
+                    if pending_tables:
+                        writer.write_table(pa.concat_tables(pending_tables))
+                        pending_tables.clear()
+                        pending_rows = 0
+
+                try:
+                    with open_paper_journal(source, "rb") as handle:
+                        if metadata_signature(os.fstat(handle.fileno())) != expected_generation:
+                            return rejected("source_generation_changed_at_open")
+                        for start, end in spans:
+                            for payload in _ledger_span_batches(handle, start, end, batch_bytes=16 << 20):
+                                frame = pl.read_ndjson(
+                                    io.BytesIO(payload), schema=schema, infer_schema_length=None,
+                                    batch_size=4096, low_memory=True, rechunk=False,
+                                )
+                                if not frame.height:
+                                    continue
+                                populated.update(column for column, count in zip(
+                                    frame.columns, frame.null_count().row(0), strict=True,
+                                ) if count < frame.height)
+                                table = frame.to_arrow()
+                                if writer is None:
+                                    writer = pq.ParquetWriter(temporary, table.schema, compression="zstd")
+                                pending_tables.append(table)
+                                pending_rows += frame.height
+                                rows += frame.height
+                                if pending_rows >= _DETAIL_SESSION_PROJECTION_ROW_GROUP_ROWS:
+                                    flush_pending()
+                                    if temporary.tell() > _DETAIL_SESSION_PROJECTION_INTERMEDIATE_MAX_BYTES:
+                                        return rejected("temporary_projection_exceeds_limit",
+                                                        bytes=temporary.tell(), rows=rows)
+                        if metadata_signature(os.fstat(handle.fileno())) != expected_generation:
+                            return rejected("source_generation_changed_during_read")
+                    flush_pending()
+                finally:
+                    if writer is not None:
+                        writer.close()
+                if not rows or not populated or temporary.tell() > _DETAIL_SESSION_PROJECTION_INTERMEDIATE_MAX_BYTES:
+                    return rejected("empty_or_oversized_temporary_projection",
+                                    bytes=temporary.tell(), rows=rows)
+                temporary.seek(0)
+                original = pq.ParquetFile(temporary)
+                columns = [column for column in schema if column in populated]
+                selected_schema = pa.schema([original.schema_arrow.field(column) for column in columns])
+                result = io.BytesIO()
+                with pq.ParquetWriter(result, selected_schema, compression="zstd") as selected:
+                    for group in range(original.num_row_groups):
+                        selected.write_table(original.read_row_group(group, columns=columns))
+                        if result.tell() > _DETAIL_SESSION_PROJECTION_MAX_BYTES:
+                            return rejected("final_projection_exceeds_limit", bytes=result.tell(), rows=rows)
+                encoded = result.getvalue()
+            if not 0 < len(encoded) <= _DETAIL_SESSION_PROJECTION_MAX_BYTES:
+                return rejected("invalid_final_projection_size", bytes=len(encoded), rows=rows)
+            updated = _ledger_session_index(source, recorded_at_fallback=False)
+            if (updated is None or metadata_signature(source.stat()) != expected_generation
+                    or (updated.device, updated.inode) != (index.device, index.inode)
+                    or updated.lineage != index.lineage or updated.spans.get(session_date) != spans):
+                return rejected("source_generation_changed_before_publish")
+            _atomic_private_bytes(root / f"{session_date}.parquet", encoded)
+            receipt = {
+                "schema_version": _DETAIL_SESSION_PROJECTION_VERSION,
+                "source": str(source.resolve()),
+                "source_identity": [index.device, index.inode],
+                "source_observed_size": index.observed_size,
+                "source_modified_ns": index.modified_ns,
+                "source_changed_ns": index.changed_ns,
+                "source_lineage": index.lineage,
+                "spans": [list(span) for span in spans],
+                "parquet_sha256": hashlib.sha256(encoded).hexdigest(),
+                "rows": rows,
+            }
+            _atomic_private_bytes(root / f"{session_date}.json", json.dumps(
+                receipt, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"))
+            verified = _validated_projected_ledger_session_file(
+                source, index=index, session_date=session_date, projected_schema=projected_schema,
+            ) is not None
+            if not verified:
+                return rejected("published_projection_readback_failed")
+            if diagnostic is not None:
+                diagnostic.update(reason="verified", bytes=len(encoded), rows=rows)
+            return True
+        except (OSError, TypeError, ValueError, pl.exceptions.PolarsError, pa.ArrowException) as exc:
+            # Small sessions may use the exact fallback; no incomplete shard is published.
+            return rejected("projection_exception", error_type=type(exc).__name__)
+
+
 def _projected_file_signature(path: Path) -> tuple[int, int, int, int, int] | None:
     try:
         stat = path.stat()
@@ -2346,12 +2533,99 @@ def _projected_file_signature(path: Path) -> tuple[int, int, int, int, int] | No
     return stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns
 
 
+def _latest_signal_session_frame(
+    source: Path, *, day: str, full_path: Path, full_signature: tuple[int, int, int, int, int],
+    full_sha256: str, full_rows: int,
+) -> Any | None:
+    """Reuse the exact last decision per mode from one verified full shard."""
+    import polars as pl
+
+    root = _detail_session_projection_root(source, _SIGNAL_PAGE_COLUMN_TYPES)
+    if root is None:
+        return None
+    root = root / "latest-decisions-v1"
+    parquet_path, receipt_path = root / f"{day}.parquet", root / f"{day}.json"
+    schema_identity = hashlib.sha256(json.dumps(
+        [_LATEST_SIGNAL_SESSION_CONTRACT, _SIGNAL_PAGE_NARROW_COLUMNS,
+         sorted(_SIGNAL_PAGE_COLUMN_TYPES.items())], separators=(",", ":"),
+    ).encode()).hexdigest()
+    expected = {"contract": _LATEST_SIGNAL_SESSION_CONTRACT, "day": day,
+                "source": str(source.resolve()), "full_sha256": full_sha256,
+                "full_rows": full_rows, "schema_sha256": schema_identity}
+
+    def load() -> Any | None:
+        try:
+            if receipt_path.is_symlink() or parquet_path.is_symlink():
+                return None
+            receipt = json.loads(receipt_path.read_bytes())
+            if not isinstance(receipt, dict) or any(receipt.get(key) != value for key, value in expected.items()):
+                return None
+            before = _projected_file_signature(parquet_path)
+            if before is None or not 0 < before[2] <= _DETAIL_SESSION_PROJECTION_MAX_BYTES:
+                return None
+            body = parquet_path.read_bytes()
+            if (_projected_file_signature(parquet_path) != before
+                    or hashlib.sha256(body).hexdigest() != receipt.get("parquet_sha256")
+                    or _projected_file_signature(full_path) != full_signature):
+                return None
+            frame = pl.read_parquet(io.BytesIO(body))
+            if (frame.height != receipt.get("rows") or not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(frame.columns)
+                    or "__projection_row" not in frame.columns):
+                return None
+            return frame
+        except (OSError, TypeError, ValueError, pl.exceptions.PolarsError):
+            return None
+
+    lock = _shared_query_lock(("latest_signal_session", source.resolve(), day, full_signature))
+    with lock:
+        cached = load()
+        if cached is not None:
+            return cached
+        try:
+            if _projected_file_signature(full_path) != full_signature:
+                return None
+            current = pl.scan_parquet(full_path).with_row_index("__projection_row")
+            if current.select(pl.len()).collect().item() != full_rows:
+                return None
+            current_schema = current.collect_schema()
+            typed = _projected_ledger_schema(pl, _SIGNAL_PAGE_COLUMN_TYPES)
+            current = current.select(
+                (pl.col(column).cast(typed[column], strict=True) if column in current_schema
+                 else pl.lit(None, dtype=typed[column]).alias(column))
+                if column != "__projection_row" else pl.col(column)
+                for column in _SIGNAL_PAGE_NARROW_COLUMNS
+            )
+            latest_ids = current.group_by(["session_date", "market"], maintain_order=True).agg(
+                pl.col("signal_id").last()
+            )
+            frame = current.join(
+                latest_ids, on=["session_date", "market", "signal_id"],
+                how="inner", maintain_order="left",
+            ).unique(subset=["session_date", "market", "symbol"], keep="last", maintain_order=True).collect()
+            if _projected_file_signature(full_path) != full_signature:
+                return None
+            buffer = io.BytesIO()
+            frame.write_parquet(buffer, compression="zstd")
+            body = buffer.getvalue()
+            if not 0 < len(body) <= _DETAIL_SESSION_PROJECTION_MAX_BYTES:
+                return None
+            _atomic_private_bytes(parquet_path, body)
+            receipt = {**expected, "rows": frame.height, "parquet_sha256": hashlib.sha256(body).hexdigest()}
+            _atomic_private_bytes(receipt_path, json.dumps(
+                receipt, sort_keys=True, separators=(",", ":"),
+            ).encode("utf-8"))
+            return load()
+        except (OSError, TypeError, ValueError, pl.exceptions.PolarsError):
+            return None
+
+
 def _narrow_signal_page_projection(
     source: Path,
     *,
     index: _LedgerSessionIndex,
     selected_session_dates: list[str],
     mode: str = "all",
+    revision_scope: str = "all",
 ) -> tuple[Any, dict[str, tuple[Path, tuple[int, int, int, int, int]]], Any, int] | None:
     """Load only fields used by the full-history filter, audit and top-K."""
 
@@ -2359,6 +2633,8 @@ def _narrow_signal_page_projection(
         import polars as pl
 
         paths: dict[str, tuple[Path, tuple[int, int, int, int, int]]] = {}
+        rows_by_day: dict[str, int] = {}
+        hashes_by_day: dict[str, str] = {}
         expected_rows = 0
         for day in selected_session_dates:
             spans = index.spans.get(day, ())
@@ -2372,8 +2648,10 @@ def _narrow_signal_page_projection(
             )
             if validated is None:
                 return None
-            path, _, rows, signature = validated
+            path, encoded, rows, signature = validated
             paths[day] = (path, signature)
+            rows_by_day[day] = rows
+            hashes_by_day[day] = hashlib.sha256(encoded).hexdigest()
             expected_rows += rows
         if not paths:
             return None
@@ -2390,14 +2668,32 @@ def _narrow_signal_page_projection(
         # Keep the original row indices for exact top-K rehydration. Exclude
         # other modes before materializing their millions of narrow rows;
         # counts still validate the complete receipted session projection.
-        if scoped:
+        if scoped and revision_scope != "latest":
             if lazy.select(pl.len()).collect().item() != expected_rows:
                 return None
-            lazy = lazy.filter(pl.col("market").fill_null("") == selected_mode)
-        frame = lazy.select(
-            column for column in _SIGNAL_PAGE_NARROW_COLUMNS
-            if column in full_schema
-        ).collect()
+        if revision_scope == "latest" and _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(full_schema):
+            # Each date/mode is independent. Reduce one session at a time so
+            # obsolete intraday revisions from many days are never resident
+            # together. Keep original row indices for exact rehydration.
+            latest_frames = []
+            for day, (path, signature) in paths.items():
+                current = _latest_signal_session_frame(
+                    source, day=day, full_path=path, full_signature=signature,
+                    full_sha256=hashes_by_day[day], full_rows=rows_by_day[day],
+                )
+                if current is None:
+                    return None
+                if scoped:
+                    current = current.filter(pl.col("market").fill_null("") == selected_mode)
+                latest_frames.append(current)
+            frame = pl.concat(latest_frames, how="diagonal_relaxed", rechunk=False)
+        else:
+            if scoped:
+                lazy = lazy.filter(pl.col("market").fill_null("") == selected_mode)
+            frame = lazy.select(
+                column for column in _SIGNAL_PAGE_NARROW_COLUMNS
+                if column in full_schema
+            ).collect()
         # These descriptors repeat across thousands of rows per session. Keep
         # ordering keys as strings, but dictionary-encode the non-ordering
         # identity/status fields only inside this transient narrow frame.
@@ -2406,7 +2702,7 @@ def _narrow_signal_page_projection(
             for column in ("signal_id", "reason", "status")
             if column in frame.columns
         )
-        if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(frame.columns) or (not scoped and frame.height != expected_rows) or not all(
+        if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(frame.columns) or (not scoped and revision_scope != "latest" and frame.height != expected_rows) or not all(
             _projected_file_signature(path) == signature
             for path, signature in paths.values()
         ):
@@ -2425,6 +2721,7 @@ def _rehydrate_narrow_signal_page(
     page_keys: list[dict[str, Any]],
     paths: Mapping[str, tuple[Path, tuple[int, int, int, int, int]]],
     full_schema: Any,
+    memory_frames: Mapping[str, Any] | None = None,
 ) -> list[dict[str, Any]] | None:
     """Read complete rows only for the selected top-K, preserving page order."""
 
@@ -2436,17 +2733,18 @@ def _rehydrate_narrow_signal_page(
     try:
         import polars as pl
 
+        memory_frames = memory_frames or {}
         by_date: dict[str, list[int]] = {}
         for key in page_keys:
             day = str(key.get("session_date") or "")[:10]
             index = int(key["__projection_row"])
-            if day not in paths:
+            if day not in paths and day not in memory_frames:
                 return None
             by_date.setdefault(day, []).append(index)
         selected = pl.concat(
             [
-                pl.scan_parquet(paths[day][0])
-                .with_row_index("__projection_row")
+                (pl.scan_parquet(paths[day][0]).with_row_index("__projection_row")
+                 if day in paths else memory_frames[day].lazy())
                 .filter(pl.col("__projection_row").is_in(indices))
                 for day, indices in by_date.items()
             ],
@@ -3306,13 +3604,16 @@ def _line_count(path: Path) -> int:
     observed = path.stat()
     generation = _tail_file_signature(observed)
     key = path.resolve()
-    with _LINE_COUNT_LOCK:
+    # A large journal prefix verification must not serialize line counts for
+    # unrelated order, fill, mark or other product journals.
+    with _shared_query_lock(("ledger_line_count", key)):
         cache_root = str(os.environ.get(_LEDGER_SESSION_INDEX_CACHE_ENV) or "").strip()
         persistent_path = None
         if cache_root and Path(cache_root).is_dir():
             digest = hashlib.sha256(str(key).encode("utf-8")).hexdigest()
             persistent_path = Path(cache_root) / f"ledger-line-count-v2-{digest}.json"
-        cached = _LINE_COUNT_CACHE.get(key)
+        with _LINE_COUNT_LOCK:
+            cached = _LINE_COUNT_CACHE.get(key)
         if cached is None and persistent_path is not None:
             try:
                 payload = json.loads(persistent_path.read_bytes())
@@ -3343,7 +3644,8 @@ def _line_count(path: Path) -> int:
                     if (_tail_file_signature(os.fstat(handle.fileno())) != generation
                             or _tail_file_signature(path.stat()) != generation):
                         raise OSError("line-count source changed during cache admission")
-                    _LINE_COUNT_CACHE[key] = cached
+                    with _LINE_COUNT_LOCK:
+                        _LINE_COUNT_CACHE[key] = cached
                     return cached.count
                 if cached.generation[:2] == generation[:2] and cached.generation[2] <= generation[2]:
                     if snapshot is not None and snapshot.extends(cached.journal_head, cached.generation[2]):
@@ -3369,7 +3671,8 @@ def _line_count(path: Path) -> int:
                 raise OSError("line-count source changed during read")
             result = _LedgerLineCount(generation, count, digest.hexdigest() if digest is not None else None,
                                       snapshot.head["sha256"] if snapshot is not None else None)
-        _LINE_COUNT_CACHE[key] = result
+        with _LINE_COUNT_LOCK:
+            _LINE_COUNT_CACHE[key] = result
         if persistent_path is not None:
             temporary = persistent_path.with_name(
                 f".{persistent_path.name}.{os.getpid()}.tmp"
@@ -3398,6 +3701,53 @@ def _line_count(path: Path) -> int:
                 except OSError:
                     pass
         return count
+
+
+def _signal_page_record_count(path: Path) -> int | None:
+    """Do not stall a complete signal page for a cold, global line count.
+
+    A count is returned only when it is exact for the observed file and, for
+    managed journals, the immutable head. Expensive legacy prefix verification
+    stays in the canonical counter, asynchronously and once per source.
+    """
+    if not path.is_file():
+        return _line_count(path)
+    generation = _tail_file_signature(path.stat())
+    if generation[2] <= _SIGNAL_LINE_COUNT_SYNC_MAX_BYTES:
+        return _line_count(path)
+    key = path.resolve()
+    with _LINE_COUNT_LOCK:
+        cached = _LINE_COUNT_CACHE.get(key)
+    if cached is not None and cached.generation == generation:
+        with open_paper_journal(path, "rb") as handle:
+            snapshot = snapshot_of(handle)
+            if (_tail_file_signature(os.fstat(handle.fileno())) == generation
+                    and _tail_file_signature(path.stat()) == generation
+                    and ((snapshot is None and cached.journal_head is None)
+                         or (snapshot is not None and cached.journal_head == snapshot.head["sha256"]))):
+                return cached.count
+    with _LINE_COUNT_BACKGROUND_LOCK:
+        if (key not in _LINE_COUNT_BACKGROUND_PENDING
+                and time.monotonic() >= _LINE_COUNT_BACKGROUND_RETRY_AFTER.get(key, 0.0)):
+            _LINE_COUNT_BACKGROUND_PENDING.add(key)
+
+            def build_count() -> None:
+                try:
+                    _line_count(path)
+                except (OSError, ValueError) as exc:
+                    logging.getLogger(__name__).warning("signal ledger count remains unavailable: %s", type(exc).__name__)
+                    with _LINE_COUNT_BACKGROUND_LOCK:
+                        _LINE_COUNT_BACKGROUND_RETRY_AFTER[key] = time.monotonic() + 30.0
+                finally:
+                    with _LINE_COUNT_BACKGROUND_LOCK:
+                        _LINE_COUNT_BACKGROUND_PENDING.discard(key)
+
+            try:
+                threading.Thread(target=build_count, name="signal-ledger-line-count", daemon=True).start()
+            except RuntimeError:
+                _LINE_COUNT_BACKGROUND_PENDING.discard(key)
+                _LINE_COUNT_BACKGROUND_RETRY_AFTER[key] = time.monotonic() + 30.0
+    return None
 
 
 def _timestamp(value: object) -> datetime:
@@ -3822,6 +4172,8 @@ def _session_projection_payload(
         ),
         key=lambda row: (float(row["timestamp_seconds"]), str(row["series_id"])),
     )
+    delayed_events = sum(row.get("valuation_source") == "source_pinned_delayed_auction_event_v1"
+                         for row in historical_rows)
     coverage = [
         value
         for row in historical_rows
@@ -3878,6 +4230,8 @@ def _session_projection_payload(
                 "cumulative_return_fraction": last["cumulative_return_fraction"],
                 "cumulative_return_pct": last["cumulative_return_pct"],
                 "point_count": len(rows),
+                "delayed_auction_event_points": sum(
+                    row.get("valuation_source") == "source_pinned_delayed_auction_event_v1" for row in rows),
                 "expected_points_per_session": points_per_session,
             }
         )
@@ -3889,7 +4243,8 @@ def _session_projection_payload(
         "minute_series": series_payload,
         "series_summary": series_summary,
         "historical": {
-            "replay_points": len(historical_rows),
+            "replay_points": len(historical_rows) - delayed_events,
+            "delayed_auction_event_points": delayed_events,
             "carried_price_points": sum(
                 int(row.get("last_trade_carried_position_count") or 0) > 0
                 for row in historical_rows
@@ -4114,7 +4469,7 @@ def _merge_history_session_shards(
     axis: list[int] = []
     series_parts: dict[str, dict[str, Any]] = {}
     summaries: dict[str, list[Mapping[str, Any]]] = {}
-    replay_points = carried_points = missing_points = 0
+    replay_points = carried_points = missing_points = delayed_event_points = 0
     coverage_values: list[float] = []
     coverage_minima: list[float] = []
     contracts: set[str] = set()
@@ -4149,6 +4504,7 @@ def _merge_history_session_shards(
             summaries.setdefault(str(summary["series_id"]), []).append(summary)
         historical = shard.get("historical") or {}
         replay_points += int(historical.get("replay_points") or 0)
+        delayed_event_points += int(historical.get("delayed_auction_event_points") or 0)
         carried_points += int(historical.get("carried_price_points") or 0)
         missing_points += int(historical.get("missing_price_points") or 0)
         coverage_values.extend(
@@ -4211,6 +4567,7 @@ def _merge_history_session_shards(
         expected_per_session = int(first["expected_points_per_session"])
         expected_points = expected_per_session * len(session_counts)
         point_count = sum(session_counts.values())
+        delayed_count = sum(int(part.get("delayed_auction_event_points") or 0) for part in parts)
         range_summary.append(
             {
                 "series_id": series_id,
@@ -4240,11 +4597,12 @@ def _merge_history_session_shards(
                 "period_return_fraction": period_return,
                 "period_return_pct": period_return * 100.0,
                 "point_count": point_count,
+                "delayed_auction_event_points": delayed_count,
                 "session_point_counts": session_counts,
                 "expected_minute_points": expected_points,
                 "expected_points_per_session": expected_per_session,
                 "minute_coverage_ratio": (
-                    point_count / expected_points if expected_points else None
+                    (point_count - delayed_count) / expected_points if expected_points else None
                 ),
             }
         )
@@ -4302,6 +4660,7 @@ def _merge_history_session_shards(
         "period_return_basis": "selected_range_first_visible_mark",
         "range_summary": range_summary,
         "historical_minute_replay_points": replay_points,
+        "historical_delayed_auction_event_points": delayed_event_points,
         "historical_minute_carried_price_points": carried_points,
         "historical_minute_missing_price_points": missing_points,
         "historical_minute_min_fresh_trade_notional_coverage_ratio": (
@@ -5172,6 +5531,50 @@ def _attach_execution_records(
     }
 
 
+def _provisional_opening_cost_issues(root: Path) -> list[dict[str, Any]]:
+    """Expose assumptions as warnings, never publish private source/cost rows."""
+    try:
+        recovery = (_object(root / "rebuild_receipt.json").get("retained_curve_recovery") or {})
+    except FileNotFoundError:
+        return []
+    except (OSError, ValueError, json.JSONDecodeError):
+        return [{"severity": "warning", "scope": "historical_valuation", "market": None,
+            "code": "historical_valuation_evidence_unavailable", "title": "歷史估值說明暫不可讀",
+            "detail": "歷史回放收據暫不可讀；不能據此宣稱來源完整。", "count": 1}]
+    if not isinstance(recovery, Mapping):
+        return [{"severity": "warning", "scope": "historical_valuation", "market": None,
+            "code": "historical_valuation_evidence_unavailable", "title": "歷史估值說明格式異常",
+            "detail": "歷史回放收據格式異常；不能據此宣稱來源完整。", "count": 1}]
+    targets = recovery.get("provisional_opening_cost_valuation_targets") or []
+    groups: dict[tuple[str, str], set[str]] = {}
+    for item in targets:
+        if (isinstance(item, list) and len(item) == 3
+                and all(isinstance(value, str) for value in item)):
+            market, day, symbol = item
+            groups.setdefault((market, day), set()).add(symbol)
+    issues = [{"severity": "warning", "scope": "historical_valuation", "market": market,
+        "code": "provisional_opening_cost_valuation", "title": f"{day} 09:01 暫定成本估值",
+        "detail": (f"{', '.join(sorted(symbols))} 缺少當時行情，該分鐘僅按原帳本進場成本暫定估值；"
+                   "保留原成交與實際記錄時間，不是可成交報價，來源補齊後結果可能改變。"),
+        "count": len(symbols), "observed_at": f"{day}T09:01:00+08:00"}
+        for (market, day), symbols in sorted(groups.items())]
+    first_bar_groups: dict[tuple[str, str], set[tuple[str, str]]] = {}
+    for item in recovery.get("provisional_opening_first_bar_references") or []:
+        if (isinstance(item, Mapping) and all(isinstance(item.get(k), str)
+                for k in ("market", "session_date", "symbol", "source_minute"))):
+            first_bar_groups.setdefault((item["market"], item["session_date"]), set()).add(
+                (item["symbol"], item["source_minute"]))
+    for (market, day), references in sorted(first_bar_groups.items()):
+        clocks = ", ".join(f"{symbol} {minute[11:16]}" for symbol, minute in sorted(references))
+        issues.append({"severity": "warning", "scope": "historical_valuation", "market": market,
+            "code": "provisional_opening_first_bar_valuation", "title": f"{day} 09:01 首個成交棒暫定估值",
+            "detail": (f"{clocks}：缺少 09:01 成交棒，採當日已驗證來源的第一個成交棒估值；"
+                       "含較晚的事後觀測，不是 09:01 當時行情、可成交報價或補造成交。"
+                       "原成交及實際記錄時間不變，來源補齊後結果可能改變。"),
+            "count": len(references), "observed_at": min(m for _, m in references)})
+    return issues
+
+
 def _operational_issues(
     *,
     modes: list[dict[str, Any]],
@@ -5285,8 +5688,8 @@ def _operational_issues(
         ),
         "price_limit_unavailable": (
             "error",
-            "漲跌停價格缺漏",
-            "缺少該交易日合法價格界線，未建立持倉。",
+            "價格界線未提供或不適用",
+            "未取得可驗證的當日價格界線，或該商品不適用漲跌幅限制；無法建立本策略的 TP／SL，未建立或增加該筆新持倉；既有持倉不因此被移除。",
         ),
         "entry_bracket_unavailable": (
             "error", "TP／SL 缺漏，已拒絕進場",
@@ -5328,6 +5731,32 @@ def _operational_issues(
     for mode in modes:
         market = str(mode.get("market") or "") or None
         label = str(mode.get("label") or market or "模式")
+        if mode.get("simulation_replay") is True and mode.get("provisional_minute_source_coverage") is True:
+            add(
+                severity="warning", scope="replay", market=market,
+                code="provisional_minute_source_coverage",
+                title=f"{label} 暫定回放，分鐘來源可能不完整",
+                detail=("只依已觀測成交價格模擬；缺少分鐘不推定有成交。"
+                        "缺口期間估值沿用先前觀測，取得獨立資料後結果可能改變；"
+                        "這不是券商成交。"),
+                observed_at=mode.get("source_signal_at"),
+            )
+        elif mode.get("cumulative_provisional_minute_source_coverage") is True:
+            add(
+                severity="warning", scope="replay", market=market,
+                code="cumulative_provisional_minute_source_coverage",
+                title=f"{label} 累積績效包含暫定歷史",
+                detail=("先前回放的分鐘來源可能不完整；其假設仍影響累積權益，"
+                        "即使今日不再是回放，結果也可能改變；這不是券商成交。"),
+                observed_at=mode.get("provisional_history_from"),
+            )
+        nontrade_count = int(mode.get("nontrade_settlement_count") or 0)
+        if nontrade_count:
+            add(severity="warning", scope="replay", market=market,
+                code="nontrade_book_settlement", title=f"{label} 非成交假設帳面結算",
+                detail=(f"{nontrade_count} 筆部位以最後觀測成交價估算帳面結算及假設成本；"
+                        "這不是模擬成交、券商成交或交易所成交，績效可能改變。"),
+                count=nontrade_count, observed_at=mode.get("closing_auction_settled_at"))
         settlement = mode.get("manual_close_settlement")
         if isinstance(settlement, Mapping):
             last_prices = settlement.get("last_traded_prices") or []
@@ -5588,6 +6017,7 @@ def _available_session_dates(
     cache_signature: tuple[Any, ...] = (
         mode_dates,
         tuple((filename, signature(root / filename)) for filename in tracked_filenames),
+        signature(root / "rebuild_receipt.json"),
         position_history_dates,
         overnight_position_history_dates,
         signature(overnight_history_path),
@@ -5604,6 +6034,19 @@ def _available_session_dates(
     for raw_mode in (state.get("modes") or {}).values():
         if isinstance(raw_mode, Mapping) and raw_mode.get("session_date"):
             dates.add(str(raw_mode["session_date"])[:10])
+    # The accepted replay calendar includes cash-only sessions as well as
+    # traded days. Status/date discovery must not hash a many-GiB signal prefix
+    # on every append; actual detail readers keep their strict journal fences.
+    if (root / "rebuild_receipt.json").is_file():
+        replay = _object(root / "rebuild_receipt.json")
+        if replay.get("simulation_only") is True and replay.get("production_order_possible") is False:
+            for session in replay.get("sessions") or ():
+                raw_date = session.get("session_date") if isinstance(session, Mapping) else None
+                try:
+                    parsed = datetime_date.fromisoformat(str(raw_date))
+                except (TypeError, ValueError):
+                    continue
+                dates.add(parsed.isoformat())
     if include_ledger_dates:
         for filename in tracked_ledgers:
             # Core execution ledgers carry an explicit session_date and their
@@ -6241,11 +6684,15 @@ def build_dashboard_history_snapshot(
         # their available trading dates.
         available_session_dates.add(session_date)
         if series_type == "strategy" and not strategy_clock_valid:
+            delayed_event = (valuation_source == "source_pinned_delayed_auction_event_v1"
+                             and bool(historical_minute_replay)
+                             and datetime.fromtimestamp(timestamp_seconds, TAIPEI).time() == datetime_time(13, 33))
             # Signal publication can happen during 09:00, but the canonical
-            # right-labelled strategy curve is exactly 09:01..13:30.  Keeping
-            # a 09:00 point for only the live session makes the latest day use
-            # a different grain from every completed replay.
-            return
+            # regular curve remains 09:01..13:30. An explicitly source-pinned
+            # delayed close is a separate 13:33 event, not a fabricated 13:31
+            # or 13:32 minute, nor a backdated 13:30 value.
+            if not delayed_event:
+                return
         return_fraction, return_pct = _capital_return(
             initial_capital_value, total_equity_value
         )
@@ -6465,6 +6912,8 @@ def build_dashboard_history_snapshot(
         rows = [row for row in rows if row.timestamp_seconds >= cutoff]
 
     historical_rows = [row for row in rows if row.historical_minute_replay]
+    delayed_event_points = sum(row.valuation_source == "source_pinned_delayed_auction_event_v1"
+                               for row in historical_rows)
     fresh_coverage = [
         value
         for row in historical_rows
@@ -6525,6 +6974,8 @@ def build_dashboard_history_snapshot(
             else 271
         )
         expected_minute_points = points_per_session * len(session_point_counts)
+        delayed_count = sum(row.valuation_source == "source_pinned_delayed_auction_event_v1"
+                            for row in series_rows)
         range_summary.append(
             {
                 "series_id": series_id,
@@ -6550,11 +7001,12 @@ def build_dashboard_history_snapshot(
                 "period_return_fraction": period_return_fraction,
                 "period_return_pct": period_return_pct,
                 "point_count": len(series_rows),
+                "delayed_auction_event_points": delayed_count,
                 "session_point_counts": session_point_counts,
                 "expected_minute_points": expected_minute_points,
                 "expected_points_per_session": points_per_session,
                 "minute_coverage_ratio": (
-                    len(series_rows) / expected_minute_points
+                    (len(series_rows) - delayed_count) / expected_minute_points
                     if expected_minute_points
                     else None
                 ),
@@ -6626,7 +7078,8 @@ def build_dashboard_history_snapshot(
         "cumulative_return_basis": "initial_capital_cumulative_total_equity",
         "period_return_basis": "selected_range_first_visible_mark",
         "range_summary": range_summary,
-        "historical_minute_replay_points": len(historical_rows),
+        "historical_minute_replay_points": len(historical_rows) - delayed_event_points,
+        "historical_delayed_auction_event_points": delayed_event_points,
         "historical_minute_carried_price_points": sum(
             int(row.last_trade_carried_position_count or 0) > 0
             for row in historical_rows
@@ -7415,6 +7868,9 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "entry_quote_at",
         "entry_price",
         "entry_price_source",
+        "historical_open_fallback_fill",
+        "recorded_at_basis",
+        "replay_generated_at",
         "inventory_basis_price",
         "odd_lot_execution_policy",
         "share_replacement_contract",
@@ -7430,6 +7886,7 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "stop_trigger_price",
         "price_limit_offset_ticks",
         "bracket_price_policy",
+        "bracket_cross_evidence",
         "fill_guaranteed",
         "take_profit_order_status",
         "stop_order_status",
@@ -7477,6 +7934,24 @@ def _safe_position(position: Mapping[str, Any]) -> dict[str, Any]:
         "inventory_session_date",
     )
     row = {key: position.get(key) for key in allowed if key in position}
+    nontrade = position.get("nontrade_settlement")
+    if (isinstance(nontrade, Mapping)
+            and nontrade.get("contract") == "last_observed_trade_nonexecution_book_settlement_v1"
+            and nontrade.get("simulated_fill") is False
+            and nontrade.get("broker_fill") is False and nontrade.get("exchange_fill") is False):
+        reference = nontrade.get("reference") if isinstance(nontrade.get("reference"), Mapping) else {}
+        row.update({"nontrade_settlement_contract": nontrade["contract"],
+                    "nontrade_settlement_shares": nontrade.get("quantity"),
+                    "nontrade_accounting_at": nontrade.get("accounting_at"),
+                    "nontrade_reference_observed_at": reference.get("reference_observed_at"),
+                    "nontrade_reference_before_entry": nontrade.get("reference_before_simulated_entry"),
+                    "nontrade_reference_time_unknown": reference.get("source_clock_basis") == "official_daily_close_last_trade_time_unknown",
+                    "nontrade_assumed_exit_fee_twd": nontrade.get("assumed_exit_fee_and_tax_twd"),
+                    "nontrade_settlement_net_pnl_twd": nontrade.get("net_pnl_twd")})
+        realized_total = _finite_float(position.get("realized_net_pnl_twd"))
+        estimated = _finite_float(nontrade.get("net_pnl_twd"))
+        if realized_total is not None and estimated is not None:
+            row["execution_realized_net_pnl_twd"] = realized_total - estimated
     completion = position.get("manual_entry_completion")
     if isinstance(completion, Mapping):
         row["entry_completion_contract"] = completion.get("contract")
@@ -7894,6 +8369,10 @@ class DashboardSnapshotChanged(OSError):
     """A snapshot crossed an incomplete/replaced engine commit; retry a new view."""
 
 
+class _CapturedSnapshotUnsupported(Exception):
+    """Use the existing strict reader for a legacy or mode-object layout."""
+
+
 def _snapshot_commit_identity(payload: Mapping[str, Any] | None, *, state: bool = False) -> tuple:
     payload = payload or {}
     return (payload.get("engine_run_id"), payload.get("state_revision"),
@@ -7921,6 +8400,69 @@ def _snapshot_input_generations(paths: tuple[Path, ...]) -> tuple:
     return tuple(generations)
 
 
+def _capture_committed_snapshot_inputs_once(root: Path) -> tuple[dict, dict, dict]:
+    """Capture state/status from one durable receipt using pinned file handles.
+
+    A later atomic replacement cannot change a captured inode. Require the
+    receipt's full device/inode/size/mtime/ctime identities both before and
+    after reading; mutable or manifest-backed inputs still fail closed.
+    """
+    receipt = load_service_sync(root)
+    if not isinstance(receipt, dict):
+        raise DashboardSnapshotChanged("durable captured snapshot is unavailable")
+    if "durability_ack" not in receipt or receipt.get("state_storage_contract") == MODE_SNAPSHOT_CONTRACT:
+        raise _CapturedSnapshotUnsupported("use the strict reader for this storage layout")
+    if (not isinstance(receipt.get("durability_ack"), dict) or receipt.get("state_storage_contract") is not None
+            or receipt.get("simulation_only") is not True or receipt.get("production_order_possible") is not False
+            or not isinstance(receipt.get("projection_generations"), dict)
+            or not isinstance(receipt.get("journal_generations"), dict)):
+        raise DashboardSnapshotChanged("durable captured snapshot is unavailable")
+    opened = []
+    limits = {"state.json": 128 * 1024 * 1024, "status.json": 2 * 1024 * 1024}
+    try:
+        for name, maximum in limits.items():
+            fd = os.open(root / name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+            stream = os.fdopen(fd, "rb")
+            opened.append((name, stream))
+            info = os.fstat(stream.fileno())
+            if (not stat_module.S_ISREG(info.st_mode) or info.st_size > maximum
+                    or list(metadata_signature(info)) != receipt["projection_generations"].get(name)):
+                raise DashboardSnapshotChanged("projection differs from captured commit")
+        values = {}
+        for name, stream in opened:
+            signature = receipt["projection_generations"][name]
+            raw = stream.read(limits[name] + 1)
+            if len(raw) != signature[2] or list(metadata_signature(os.fstat(stream.fileno()))) != signature:
+                raise DashboardSnapshotChanged("captured projection changed while reading")
+            value = private_json.loads(raw)
+            if (not isinstance(value, dict) or MANIFEST_KEY in value
+                    or value.get("simulation_only") is not True
+                    or value.get("production_order_possible") is not False):
+                raise DashboardSnapshotChanged("captured projection has unsupported state storage")
+            values[name] = value
+        _require_snapshot_commit(values["state.json"], values["status.json"], receipt)
+        return receipt, values["state.json"], values["status.json"]
+    except (OSError, ValueError, TypeError, UnicodeError) as error:
+        if isinstance(error, DashboardSnapshotChanged):
+            raise
+        raise DashboardSnapshotChanged("captured projection could not be verified") from error
+    finally:
+        for _, stream in opened:
+            stream.close()
+
+
+def _capture_committed_snapshot_inputs(root: Path) -> tuple[dict, dict, dict]:
+    """Bounded retry while the writer replaces the receipt and projections."""
+    for attempt in range(16):
+        try:
+            return _capture_committed_snapshot_inputs_once(root)
+        except DashboardSnapshotChanged:
+            if attempt == 15:
+                raise
+            time.sleep(0.02)
+    raise AssertionError("bounded capture retry exhausted")  # pragma: no cover
+
+
 def build_dashboard_snapshot(
     *,
     state_dir: Path,
@@ -7939,6 +8481,7 @@ def build_dashboard_snapshot(
     discord_markets_field: str = "day_trade_markets",
     discord_engine_revision_field: str = "engine_state_revision",
     require_committed_revision: bool = False,
+    captured_commit_as_of: bool = False,
 ) -> dict[str, Any]:
     root = Path(state_dir)
     def opening_attempts() -> list[dict[str, Any]]:
@@ -7961,10 +8504,23 @@ def build_dashboard_snapshot(
     # receipts/metadata; it neither locks the executor nor reparses state twice.
     commit_paths = (root / "state.json", root / "status.json") + (
         (Path(preopen_readiness_path),) if preopen_readiness_path is not None else ())
-    commit_receipt = load_service_sync(root) if require_committed_revision else None
-    commit_generations = _snapshot_input_generations(commit_paths) if require_committed_revision else ()
-    state = _object(root / "state.json")
-    status = _object(root / "status.json")
+    captured = bool(require_committed_revision and captured_commit_as_of)
+    if captured:
+        try:
+            commit_receipt, state, status = _capture_committed_snapshot_inputs(root)
+        except _CapturedSnapshotUnsupported:
+            captured = False
+    if captured:
+        # State/status are pinned by their open descriptors; preopen remains a
+        # separately-owned pathname and must stay unchanged across projection.
+        checked_paths = commit_paths[2:]
+        commit_generations = _snapshot_input_generations(checked_paths)
+    else:
+        commit_receipt = load_service_sync(root) if require_committed_revision else None
+        checked_paths = commit_paths
+        commit_generations = _snapshot_input_generations(checked_paths) if require_committed_revision else ()
+        state = _object(root / "state.json")
+        status = _object(root / "status.json")
     commit_identity = (
         _require_snapshot_commit(state, status, commit_receipt)
         if require_committed_revision else None)
@@ -7989,6 +8545,7 @@ def build_dashboard_snapshot(
         discord_markets_field=discord_markets_field,
         discord_engine_revision_field=discord_engine_revision_field,
         now=observed,
+        _engine_receipt=commit_receipt if captured else None,
     )
     if require_committed_revision and (
         service_sync.get("state_revision") != commit_identity[1]
@@ -8037,7 +8594,7 @@ def build_dashboard_snapshot(
     commit_age = max(0.0, (observed - commit_updated).total_seconds())
     state_revision = int(state.get("state_revision") or 0)
     status_revision = int(status.get("state_revision") or 0)
-    engine_receipt = load_service_sync(root)
+    engine_receipt = commit_receipt if captured else load_service_sync(root)
     sync_revision = int((engine_receipt or {}).get("state_revision") or 0)
     state_run_id = str(state.get("engine_run_id") or "")
     status_run_id = str(status.get("engine_run_id") or "")
@@ -8240,6 +8797,9 @@ def build_dashboard_snapshot(
                 "cumulative_realized_net_pnl_twd": mode.get(
                     "cumulative_realized_net_pnl_twd"
                 ),
+                "cumulative_nontrade_settlement_net_pnl_twd": mode.get("cumulative_nontrade_settlement_net_pnl_twd"),
+                "nontrade_settlement_count": mode.get("nontrade_settlement_count", 0),
+                "nontrade_settlement_shares": mode.get("nontrade_settlement_shares", 0),
                 "cumulative_commission_rebate_accrued_twd": mode.get(
                     "cumulative_commission_rebate_accrued_twd"
                 ),
@@ -8270,6 +8830,12 @@ def build_dashboard_snapshot(
                 "current_eligibility_coverage": mode.get("current_eligibility_coverage")
                 or {},
                 "simulation_replay": bool(mode.get("simulation_replay", False)),
+                "provisional_minute_source_coverage": bool(mode.get("simulation_replay")
+                    and mode.get("provisional_minute_source_coverage")),
+                "cumulative_provisional_minute_source_coverage": (
+                    mode.get("cumulative_provisional_minute_source_coverage") is True
+                ),
+                "provisional_history_from": mode.get("provisional_history_from"),
                 "replay_basis": mode.get("replay_basis"),
                 "replay_source": mode.get("replay_source"),
                 "counterfactual_open_replay": bool(
@@ -8656,6 +9222,9 @@ def build_dashboard_snapshot(
             mode["simulation_replay"] = bool(
                 (signal_event or {}).get("simulation_replay", False)
             )
+            mode["provisional_minute_source_coverage"] = bool(
+                (signal_event or {}).get("provisional_minute_source_coverage", False)
+            )
             mode["replay_basis"] = (signal_event or {}).get("replay_basis")
             mode["counterfactual_open_replay"] = bool(
                 (signal_event or {}).get("counterfactual_open_replay", False)
@@ -8690,6 +9259,7 @@ def build_dashboard_snapshot(
                     "initial_capital_twd",
                     "total_equity_twd",
                     "cumulative_realized_net_pnl_twd",
+                    "cumulative_nontrade_settlement_net_pnl_twd",
                     "open_net_liquidation_pnl_twd",
                     "open_position_count",
                     "stale_position_count",
@@ -8721,6 +9291,7 @@ def build_dashboard_snapshot(
                 mode["closing_auction_settled_at"] = None
             else:
                 mode["total_equity_twd"] = None
+                mode["cumulative_nontrade_settlement_net_pnl_twd"] = None
                 mode["return_fraction"] = None
                 mode["return_pct"] = None
                 mode["open_position_count"] = 0
@@ -8779,6 +9350,17 @@ def build_dashboard_snapshot(
             )
             if historical is not None:
                 benchmark.update(historical)
+
+    # Session-specific settlement warnings follow the selected position rows,
+    # not a stale count left in the latest account after a day rollover.
+    for mode in modes:
+        selected_nontrade = [position for position in positions
+            if str(position.get("market") or "") == str(mode.get("market") or "")
+            and str(position.get("session_date") or "") == selected_session_date
+            and position.get("nontrade_settlement_contract")]
+        mode["nontrade_settlement_count"] = len(selected_nontrade)
+        mode["nontrade_settlement_shares"] = sum(int(position.get("nontrade_settlement_shares") or 0)
+                                                  for position in selected_nontrade)
 
     execution_records = _attach_execution_records(
         modes=modes,
@@ -8864,6 +9446,7 @@ def build_dashboard_snapshot(
         preopen=preopen,
         observed=preopen_observed,
     )
+    operational_issues.extend(_provisional_opening_cost_issues(root))
     if malformed_opening_attempt_rows:
         operational_issues.append({
             "severity": "warning",
@@ -8972,16 +9555,23 @@ def build_dashboard_snapshot(
     )
     events = events[-min(maximum_event_rows, 2_000):] if maximum_event_rows > 0 else []
 
-    if require_committed_revision and (
-        _snapshot_input_generations(commit_paths) != commit_generations
-        or _snapshot_commit_identity(load_service_sync(root)) != commit_identity
-        or (journal_generations is not None
-            and paper_journal_generations(root) != journal_generations)
-    ):
-        raise DashboardSnapshotChanged("dashboard commit changed during snapshot projection")
+    if require_committed_revision:
+        latest_receipt = load_service_sync(root)
+        latest_identity = _snapshot_commit_identity(latest_receipt)
+        if captured:
+            owner_valid = (latest_identity[0] == commit_identity[0]
+                           and type(latest_identity[1]) is int and latest_identity[1] >= commit_identity[1]
+                           and type(latest_identity[2]) is int and latest_identity[2] >= commit_identity[2]
+                           and (latest_identity[1] > commit_identity[1] or latest_identity[2] == commit_identity[2]))
+        else:
+            owner_valid = latest_identity == commit_identity
+        if (_snapshot_input_generations(checked_paths) != commit_generations or not owner_valid
+                or (journal_generations is not None and paper_journal_generations(root) != journal_generations)):
+            raise DashboardSnapshotChanged("dashboard commit changed during snapshot projection")
 
     return {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
+        **({"_captured_commit_as_of": True} if captured else {}),
         "generated_at_utc": observed.isoformat(timespec="seconds"),
         "health": health,
         "source_updated_at": source_updated_at,
@@ -9262,6 +9852,7 @@ def _detail_query_lock(name: str, arguments: Mapping[str, Any]) -> Any:
             ("session_date", None), ("start_date", None), ("end_date", None),
             ("mode", ""), ("symbol", ""), ("status", "all"),
             ("hide_zero_targets", False),
+            ("revision_scope", "all"),
             ("offset", 0), ("limit", 250), ("maximum_scan_rows", 100_000),
         )
     )))
@@ -9283,6 +9874,91 @@ def _singleflight_detail_page(builder):
     return wrapped
 
 
+def _latest_committed_signal_rows(root: Path, state: Mapping[str, Any], *, day: str,
+                                  mode: str, maximum_scan_rows: int) -> list[dict[str, Any]] | None:
+    """Read complete current decisions, not every superseded opening revision.
+
+    Stop only after every selected committed mode's declared symbol count was
+    found under its exact immutable signal ID. A bounded tail is NOT proof of
+    completeness: missing/invalid identities or counts retain the full reader.
+    The caller's ordinary committed-paper guard remains mandatory at the API.
+    """
+    targets = {}
+    enabled = state.get("enabled_markets")
+    for market, item in (state.get("modes") or {}).items():
+        if (enabled is not None and market not in enabled) or (mode and mode != "all" and market != mode):
+            continue
+        if not isinstance(item, Mapping) or str(item.get("session_date") or "") != day:
+            return None
+        signal_id, count = item.get("signal_id"), item.get("target_symbol_count")
+        if not isinstance(signal_id, str) or not signal_id or type(count) is not int or count <= 0:
+            return None
+        targets[str(market)] = (signal_id, count)
+    if not targets or sum(count for _, count in targets.values()) > maximum_scan_rows:
+        return None
+    path = root / "signals.jsonl"
+    before = metadata_signature(path.stat())
+    rows: dict[tuple[str, str], dict[str, Any]] = {}
+    counts = {market: 0 for market in targets}
+    scanned = 0
+    decoder = _ProjectionDecoder() if _NATIVE_HISTORY_POINTS else None
+    with open_paper_journal(path, "rb") as handle:
+        if metadata_signature(os.fstat(handle.fileno())) != before:
+            raise DashboardSnapshotChanged("signal journal changed before latest-decision read")
+        cursor, remainder = before[2], b""
+        handle.seek(max(0, cursor - 1))
+        if cursor and handle.read(1) != b"\n":
+            return None
+        while cursor > 0 and scanned < maximum_scan_rows:
+            size = min(1 << 20, cursor)
+            cursor -= size
+            handle.seek(cursor)
+            chunk = handle.read(size)
+            if len(chunk) != size:
+                raise DashboardSnapshotChanged("signal journal truncated during latest-decision read")
+            lines = (chunk + remainder).split(b"\n")
+            remainder = lines[0] if cursor else b""
+            if len(remainder) > _MAX_LEDGER_LINE_BYTES:
+                raise ValueError("dashboard ledger line is too large")
+            for line in reversed(lines[1:] if cursor else lines):
+                if not line.strip():
+                    continue
+                if len(line) > _MAX_LEDGER_LINE_BYTES:
+                    raise ValueError("dashboard ledger line is too large")
+                scanned += 1
+                if decoder is not None:
+                    try:
+                        row = decoder.decode(line)
+                    except _ProjectionDecodeError:
+                        # Preserve the canonical JSON extensions (for example
+                        # NaN diagnostics) and ordinary corruption errors.
+                        row = json.loads(line)
+                else:
+                    row = json.loads(line)
+                if isinstance(row, dict):
+                    market = row.get("market")
+                    target = targets.get(market)
+                    if (target is not None and row.get("session_date") == day
+                            and row.get("signal_id") == target[0]):
+                        symbol = row.get("symbol")
+                        if not isinstance(symbol, str) or not symbol:
+                            return None
+                        key = (market, symbol)
+                        if key not in rows:
+                            rows[key] = row
+                            counts[market] += 1
+                            if counts[market] > target[1]:
+                                return None
+                        if all(counts[m] == count for m, (_, count) in targets.items()):
+                            if (metadata_signature(os.fstat(handle.fileno())) != before
+                                    or metadata_signature(path.stat()) != before):
+                                raise DashboardSnapshotChanged("signal journal changed during latest-decision read")
+                            return list(reversed(rows.values()))
+                if scanned >= maximum_scan_rows:
+                    break
+    return None
+
+
 @_singleflight_detail_page
 def build_dashboard_signal_page(
     *,
@@ -9294,6 +9970,7 @@ def build_dashboard_signal_page(
     symbol: str = "",
     status: str = "all",
     hide_zero_targets: bool = False,
+    revision_scope: str = "all",
     offset: int = 0,
     limit: int = 250,
     maximum_scan_rows: int = 100_000,
@@ -9315,6 +9992,8 @@ def build_dashboard_signal_page(
         raise ValueError("offset must be non-negative")
     if not 1 <= limit <= 1_000:
         raise ValueError("limit must be between 1 and 1000")
+    if revision_scope not in {"all", "latest"}:
+        raise ValueError("revision_scope must be all or latest")
     root = Path(state_dir)
     state = _object(root / "state.json")
     superseded_signals = _committed_scoped_repair_superseded_signals(state)
@@ -9331,6 +10010,7 @@ def build_dashboard_signal_page(
                 str(raw_mode.get("session_date") or ""),
                 str(raw_mode.get("initial_capital_twd") or ""),
                 str(raw_mode.get("signal_source_path") or ""),
+                str(raw_mode.get("signal_id") or ""),
                 str(raw_mode.get("target_symbol_count") or ""),
             )
             for market, raw_mode in (state.get("modes") or {}).items()
@@ -9419,10 +10099,15 @@ def build_dashboard_signal_page(
         signal_stat.st_ctime_ns,
         formal_signal_signature,
         tuple(selected_session_dates),
+        # Equal trading-day sets do not imply equal response envelopes:
+        # a holiday boundary must retain the user's exact selected dates.
+        selected_start_date,
+        selected_end_date,
         normalized_mode,
         normalized_symbol,
         normalized_status,
         hide_zero_targets,
+        revision_scope,
         int(offset),
         int(limit),
         int(maximum_scan_rows),
@@ -9439,6 +10124,10 @@ def build_dashboard_signal_page(
     mark_stage("cache_lookup")
     if cached_entry is not None:
         overlays_changed = overlay_signature != cached_entry.overlay_signature
+        resolved_record_count = (
+            _signal_page_record_count(signal_path)
+            if cached_entry.payload.get("record_count_pending") else None
+        )
         rows = (
             _overlay_signal_page_rows(
                 cached_entry.source_rows, current_position_overlays, futures_catalog
@@ -9453,7 +10142,7 @@ def build_dashboard_signal_page(
             or observed_monotonic - cached_entry.feature_checked_at
             >= _SIGNAL_FEATURE_PAGE_CHECK_INTERVAL_SECONDS
         )
-        if not overlays_changed and not check_features:
+        if not overlays_changed and not check_features and resolved_record_count is None:
             mark_stage("cache_hit")
             return dict(cached_entry.payload)
         refreshed_drivers = (
@@ -9465,6 +10154,9 @@ def build_dashboard_signal_page(
             "rows": rows,
             "feature_drivers_by_signal": refreshed_drivers,
         }
+        if resolved_record_count is not None:
+            updated_page["record_count"] = resolved_record_count + cached_entry.record_count_extra
+            updated_page["record_count_pending"] = False
         updated_entry = _SignalPageCacheEntry(
             payload=updated_page,
             source_rows=cached_entry.source_rows,
@@ -9473,6 +10165,7 @@ def build_dashboard_signal_page(
                 observed_monotonic if check_features
                 else cached_entry.feature_checked_at
             ),
+            record_count_extra=cached_entry.record_count_extra,
         )
         with _SIGNAL_PAGE_CACHE_LOCK:
             if _SIGNAL_PAGE_CACHE.get(cache_key) is cached_entry:
@@ -9486,19 +10179,50 @@ def build_dashboard_signal_page(
     narrow_projection_paths: dict[
         str, tuple[Path, tuple[int, int, int, int, int]]
     ] = {}
+    narrow_memory_frames: dict[str, Any] = {}
     narrow_full_schema: Any | None = None
     narrow_source_rows: int | None = None
     # Latest-day progressive signals can contain hundreds of full-universe
     # revisions. Date selection is cheap above, but a capped raw-row read here
     # both loses revisions and allocates huge Python objects for a tiny page.
     # Latest and historical dates share the same complete session projections.
-    if not selected_session_dates:
+    latest_rows = (
+        _latest_committed_signal_rows(root, state, day=latest_state_date,
+            mode=normalized_mode, maximum_scan_rows=maximum_scan_rows)
+        if _allow_narrow_projection and revision_scope == "latest" and latest_state_date in selected_session_dates
+        and not formal_signal_path.is_file() else None)
+    latest_session_only = latest_rows is not None and selected_session_dates == [latest_state_date]
+    if latest_session_only:
+        rows_by_session = {latest_state_date: latest_rows}
+        import polars as pl
+
+        polars_module = pl
+        signal_frame = pl.from_dicts(latest_rows, schema=_projected_ledger_schema(pl, _SIGNAL_PAGE_COLUMN_TYPES), strict=False)
+        if signal_frame.height:
+            signal_frame = signal_frame.drop(column for column, count in zip(
+                signal_frame.columns, signal_frame.null_count().row(0), strict=True)
+                if count == signal_frame.height)
+        if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(signal_frame.columns):
+            # Legacy/incomplete rows keep the existing strict JSON semantics;
+            # do not synthesize execution facts just to satisfy a vectorized
+            # summary, and do not turn a verified latest decision into a 500.
+            signal_frame = None
+            polars_module = None
+        signal_projection_complete = True
+    elif not selected_session_dates:
         rows_by_session = {}
     else:
         signal_index = _ledger_session_index(
             signal_path,
             recorded_at_fallback=False,
         )
+        if latest_rows is not None and signal_index is not None and metadata_signature(signal_stat) != (
+            signal_index.device, signal_index.inode, signal_index.observed_size,
+            signal_index.modified_ns, signal_index.changed_ns,
+        ):
+            # The current decision and historical index must share one source
+            # generation. Fall back to the ordinary fenced reader on a race.
+            latest_rows = None
         selected_spans = (
             sorted(
                 (start, end, session_date)
@@ -9512,20 +10236,89 @@ def build_dashboard_signal_page(
             _allow_narrow_projection
             and signal_index is not None
             and not formal_signal_path.is_file()
-            and offset + limit <= 1_000
+            # Latest-decision projections are already reduced per session;
+            # later pages must not fall back to the full revision archive.
+            and (revision_scope == "latest" or offset + limit <= 1_000)
         ):
+            projection_dates = (
+                [day for day in selected_session_dates if day != latest_state_date]
+                if latest_rows is not None else selected_session_dates
+            )
             narrow = _narrow_signal_page_projection(
                 signal_path,
                 index=signal_index,
-                selected_session_dates=selected_session_dates,
+                selected_session_dates=projection_dates,
                 mode=normalized_mode,
+                revision_scope=revision_scope,
             )
+            large_projection = any(
+                sum(end - start for start, end in signal_index.spans.get(day, ()))
+                > _COLUMNAR_LEDGER_MAX_BYTES for day in projection_dates
+            )
+            if narrow is None and (latest_rows is not None or large_projection):
+                # After a cold restart or ledger replacement, only stale
+                # shards need rebuilding. Bound their memory; when a verified
+                # latest decision is available it needs no full-day shard.
+                rebuilt = False
+                for day in projection_dates:
+                    if not signal_index.spans.get(day):
+                        continue
+                    if _validated_projected_ledger_session_file(
+                        signal_path, index=signal_index, session_date=day,
+                        projected_schema=_SIGNAL_PAGE_COLUMN_TYPES,
+                    ) is None:
+                        if not _materialize_projected_ledger_session_bounded(
+                            signal_path, index=signal_index, session_date=day,
+                            projected_schema=_SIGNAL_PAGE_COLUMN_TYPES,
+                        ):
+                            break
+                        rebuilt = True
+                else:
+                    if rebuilt:
+                        narrow = _narrow_signal_page_projection(
+                            signal_path, index=signal_index, selected_session_dates=projection_dates,
+                            mode=normalized_mode, revision_scope=revision_scope,
+                        )
+                if narrow is None and large_projection:
+                    # A failed bounded build must not immediately fall through
+                    # to the unbounded full-width reader for a multi-GiB day.
+                    # The gateway reports a retryable error, not partial data.
+                    raise RuntimeError("complete historical signal projection is not ready")
             if narrow is not None:
                 signal_frame, narrow_projection_paths, narrow_full_schema, narrow_source_rows = narrow
                 import polars as pl
 
                 polars_module = pl
-                signal_projection_complete = True
+                if latest_rows is not None:
+                    latest_frame = pl.from_dicts(
+                        latest_rows, schema=_projected_ledger_schema(pl, _SIGNAL_PAGE_COLUMN_TYPES),
+                        strict=False,
+                    )
+                    if latest_frame.height:
+                        latest_frame = latest_frame.drop(column for column, count in zip(
+                            latest_frame.columns, latest_frame.null_count().row(0), strict=True)
+                            if count == latest_frame.height)
+                    if not _SIGNAL_PAGE_REQUIRED_COLUMNS.issubset(latest_frame.columns):
+                        # Sparse legacy records retain the full canonical path.
+                        signal_frame = None
+                        latest_rows = None
+                        narrow_projection_paths = {}
+                        narrow_full_schema = None
+                        narrow_source_rows = None
+                    else:
+                        latest_frame = latest_frame.with_row_index("__projection_row")
+                        narrow_memory_frames[latest_state_date] = latest_frame
+                        merged_schema = dict(narrow_full_schema)
+                        for column, dtype in latest_frame.schema.items():
+                            merged_schema.setdefault(column, dtype)
+                        narrow_full_schema = merged_schema
+                        latest_narrow = latest_frame.select(
+                            column for column in _SIGNAL_PAGE_NARROW_COLUMNS
+                            if column in latest_frame.columns
+                        )
+                        signal_frame = pl.concat([signal_frame, latest_narrow], how="diagonal_relaxed")
+                        narrow_source_rows += latest_frame.height
+                signal_projection_complete = signal_frame is not None
         # The recent-row cap is not a history contract. Exact per-session
         # projections let range queries include every canonical signal while
         # an append to one day invalidates only that day's derived shard.
@@ -9662,6 +10455,25 @@ def build_dashboard_signal_page(
                 )
             )
             current_rows = current_rows[-maximum_scan_rows:]
+    if revision_scope == "latest" and not latest_session_only:
+        # Historical views still use the complete, source-verified projection;
+        # choose revisions BEFORE symbol/status filters, so a filter cannot
+        # resurrect an old target that disappeared in a newer decision.
+        if signal_frame is not None:
+            pl = polars_module
+            latest_ids = signal_frame.group_by(["session_date", "market"], maintain_order=True).agg(
+                pl.col("signal_id").last())
+            signal_frame = signal_frame.join(latest_ids,
+                on=["session_date", "market", "signal_id"], how="inner", maintain_order="left")
+            signal_frame = signal_frame.unique(subset=["session_date", "market", "symbol"],
+                keep="last", maintain_order=True)
+        else:
+            ids = {(row.get("session_date"), row.get("market")): row.get("signal_id") for row in current_rows}
+            current = {}
+            for row in current_rows:
+                if row.get("signal_id") == ids[(row.get("session_date"), row.get("market"))]:
+                    current[(row.get("session_date"), row.get("market"), row.get("symbol"))] = row
+            current_rows = list(current.values())
     mark_stage("source_projection")
 
     def included(row: Mapping[str, Any]) -> bool:
@@ -9846,6 +10658,7 @@ def build_dashboard_signal_page(
             tuple(sorted(enabled_markets)) if enabled_markets is not None else None,
             tuple(sorted(superseded_signals)),
             tuple(sorted(capitals.items())),
+            revision_scope,
         )
         with _SIGNAL_RANGE_SUMMARY_CACHE_LOCK:
             cached_summary = _SIGNAL_RANGE_SUMMARY_CACHE.get(summary_key)
@@ -9981,6 +10794,7 @@ def build_dashboard_signal_page(
             filtered_total = len(filtered)
 
     source_page = (
+        [] if filtered_frame is not None and offset >= filtered_total else
         filtered_frame.top_k(
             min(offset + limit, filtered_total),
             by=[
@@ -10005,7 +10819,7 @@ def build_dashboard_signal_page(
     )
     if narrow_projection_paths:
         complete_page = _rehydrate_narrow_signal_page(
-            source_page, narrow_projection_paths, narrow_full_schema
+            source_page, narrow_projection_paths, narrow_full_schema, narrow_memory_frames
         )
         current_stat = signal_path.stat()
         if complete_page is None or metadata_signature(current_stat) != (
@@ -10013,13 +10827,18 @@ def build_dashboard_signal_page(
             signal_index.observed_size, signal_index.modified_ns, signal_index.changed_ns,
         ):
             # A derived shard changed between validation and page assembly.
-            # Rebuild through the original complete-history route, never
-            # return a mixed or partial page.
+            # A bounded retry must not turn a source race into an unbounded
+            # multi-GiB full-width read. The gateway can retry the committed
+            # view; no mixed or partial page is returned.
+            if large_projection or latest_rows is not None:
+                raise DashboardSnapshotChanged("signal projection changed during page assembly")
+            # Small legacy sources retain the original compatibility path.
             return build_dashboard_signal_page(
                 state_dir=state_dir,
                 session_date=session_date,
                 start_date=start_date,
                 end_date=end_date,
+                revision_scope=revision_scope,
                 mode=mode,
                 symbol=symbol,
                 status=status,
@@ -10053,10 +10872,13 @@ def build_dashboard_signal_page(
         rows=page,
     )
     mark_stage("page")
+    signal_record_count = _signal_page_record_count(signal_path) if revision_scope == "all" else None
+    record_count_extra = max(formal_signal_record_count, formal_signal_total)
     payload = {
         "schema_version": DASHBOARD_SCHEMA_VERSION,
         "simulation_only": True,
         "production_order_possible": False,
+        "revision_scope": revision_scope,
         "session_date": selected_end_date,
         "start_date": selected_start_date,
         "end_date": selected_end_date,
@@ -10073,10 +10895,9 @@ def build_dashboard_signal_page(
             source_rows_scanned >= maximum_scan_rows and not signal_projection_complete
             or formal_signal_total > len(formal_rows)
         ),
-        "record_count": (
-            _line_count(root / "signals.jsonl")
-            + max(formal_signal_record_count, formal_signal_total)
-        ),
+        "record_count": (signal_record_count + record_count_extra
+                         if signal_record_count is not None else None),
+        "record_count_pending": signal_record_count is None and revision_scope == "all",
         "direction_summary_scope": "current_signal_id_per_mode",
         "direction_summary": direction_summary,
         "opening_execution_audit_scope": "bounded_recent_signal_rows_per_mode"
@@ -10096,6 +10917,7 @@ def build_dashboard_signal_page(
             source_rows=tuple(base_rows),
             overlay_signature=overlay_signature,
             feature_checked_at=time.monotonic(),
+            record_count_extra=record_count_extra,
         )
     mark_stage("payload_cache")
     return dict(payload)
@@ -10293,6 +11115,8 @@ def build_dashboard_event_page(
         root.resolve(),
         tuple(available_session_dates),
         tuple(selected_session_dates),
+        selected_start_date,
+        selected_end_date,
         tuple(sorted(enabled_markets)) if enabled_markets is not None else None,
         normalized_mode,
         normalized_symbol,
@@ -10336,6 +11160,9 @@ def build_dashboard_event_page(
         "simulation_replay",
         "replay_basis",
         "fill_contract",
+        "historical_open_fallback_fill",
+        "recorded_at_basis",
+        "replay_generated_at",
         "depth_assumption",
     )
 
@@ -10800,6 +11627,7 @@ def build_dashboard_summary(
         maximum_event_rows=500,
         maximum_mark_rows=4_000,
         include_position_rows=False,
+        include_order_fill_rows=False,
         include_ledger_session_dates=include_ledger_session_dates,
     )
     keys = (

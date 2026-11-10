@@ -242,6 +242,189 @@ def test_local_testing_policy_does_not_claim_vast_origin(tmp_path):
         local_testing_policy(tmp_path, origin_node_id='vastai1T')
 
 
+def d_workflow_policy(tmp_path, relative='benchmarks/round69/full_trial_0_baseline/reported_metrics.csv'):
+    from stockagent.data_sync.testing_disposition import D_WORKFLOW_TESTING_CONTRACT
+    body = dict(contract=D_WORKFLOW_TESTING_CONTRACT, authority_node_id='penguin', origin_node_id='penguin',
+                authorization='user explicitly discards old performance validation work copies',
+                decision='discard_without_preservation', targets=[dict(base='d-workflow-benchmark',
+                    relative=relative, kind='file', reason='benchmark')])
+    path = tmp_path / 'd-workflow-policy.json'
+    path.write_text(json.dumps({**body, 'identity_sha256': d.identity(body)}))
+    return d.load_policy(path)
+
+
+@pytest.mark.parametrize('relative', [
+    'benchmarks', 'benchmarks/round69/full_trial_0_baseline/comparison.json',
+    'benchmarks/round69/source/reported_metrics.csv',
+    'benchmarks/round999/full_trial_0_baseline/reported_metrics.csv',
+    'benchmarks/round69/full_trial_0_baseline/../reported_metrics.csv',
+    'objects/blobs/00/reported_metrics.csv',
+])
+def test_d_workflow_policy_is_confined_to_exact_disposable_trial_metrics(tmp_path, relative):
+    with pytest.raises(SnapshotError):
+        d_workflow_policy(tmp_path, relative)
+
+
+def test_d_workflow_discard_keeps_summary_and_refuses_cold_cas(setup, tmp_path, monkeypatch):
+    from stockagent.data_sync import testing_disposition as disposition
+    _, _, args = setup
+    workspace = tmp_path / 'd-workflow' / 'artifacts'
+    monkeypatch.setattr(disposition, 'D_WORKFLOW_TESTING_ROOT', workspace)
+    guards = []
+    monkeypatch.setattr(d, '_guard_d_workflow_copy', lambda policy, cold, target: guards.append((policy['contract'], cold)))
+    p = d_workflow_policy(tmp_path)
+    target = p['targets'][0]
+    metrics = workspace / target['relative']
+    metrics.parent.mkdir(parents=True)
+    metrics.write_bytes(b'disposable metrics')
+    summary = metrics.parent.parent / 'comparison.json'
+    summary.write_bytes(b'preserved completion evidence')
+    plan = d.discard_target(p, target, **args)
+    assert not plan['blockers'] and metrics.exists()
+    result = d.discard_target(p, target, **args, apply=True, expected_plan_identity=plan['identity_sha256'])
+    assert result['deleted'] and not metrics.exists() and summary.read_bytes() == b'preserved completion evidence'
+    assert len(guards) == 3 and not d.manifest_discarded({}, p)
+    with pytest.raises(SnapshotError, match='cannot discard cold objects'):
+        d.cold_discard_plan(args['cold_root'], p, materialized_root=args['materialized_root'])
+
+
+def test_d_workflow_discard_fails_closed_when_mount_guard_fails(setup, tmp_path, monkeypatch):
+    p = d_workflow_policy(tmp_path)
+    _, _, args = setup
+    def reject(*_args):
+        raise SnapshotError('D mount not verified')
+    monkeypatch.setattr(d, '_guard_d_workflow_copy', reject)
+    with pytest.raises(SnapshotError, match='D mount not verified'):
+        d.discard_target(p, p['targets'][0], **args)
+
+
+def test_d_workflow_directory_needs_stable_comparison_evidence(tmp_path, monkeypatch):
+    from stockagent.data_sync import cold_primary, testing_disposition as disposition
+    monkeypatch.setattr(cold_primary, '_check_d_primary_mount', lambda root: None)
+    monkeypatch.setattr(disposition, 'D_WORKFLOW_TESTING_ROOT', tmp_path / 'd-artifacts')
+    p = d_workflow_policy(tmp_path)
+    target = {'base': 'd-workflow-benchmark', 'relative': 'benchmarks/round69/full_trial_0_baseline',
+              'kind': 'directory', 'reason': 'benchmark'}
+    summary = disposition.D_WORKFLOW_TESTING_ROOT / 'benchmarks/round69/comparison.json'
+    summary.parent.mkdir(parents=True)
+    with pytest.raises(FileNotFoundError):
+        d._guard_d_workflow_copy(p, tmp_path / 'cold', target)
+    summary.write_text('{"state":"completed"}')
+    first = d._guard_d_workflow_copy(p, tmp_path / 'cold', target)
+    summary.write_text('{"state":"changed"}')
+    assert d._guard_d_workflow_copy(p, tmp_path / 'cold', target) != first
+    summary.write_text('{}')
+    with pytest.raises(SnapshotError, match='evidence is empty'):
+        d._guard_d_workflow_copy(p, tmp_path / 'cold', target)
+
+
+@pytest.mark.parametrize('unexpected', [False, True])
+def test_d_workflow_partial_quarantine_resumes_only_exact_remaining_names(setup, tmp_path, monkeypatch, unexpected):
+    from stockagent.data_sync import testing_disposition as disposition
+    _, _, args = setup
+    workspace = tmp_path / 'd-workflow' / 'artifacts'
+    monkeypatch.setattr(disposition, 'D_WORKFLOW_TESTING_ROOT', workspace)
+    monkeypatch.setattr(d, '_guard_d_workflow_copy', lambda *a: {'sha256': 'fixed'})
+    monkeypatch.setattr(d, '_pinned_snapshot_ids', lambda *a: set())
+    body = dict(contract=disposition.D_WORKFLOW_TESTING_CONTRACT, authority_node_id='penguin', origin_node_id='penguin',
+        authorization='user approved old trial copies', decision='discard_without_preservation',
+        targets=[dict(base='d-workflow-benchmark', relative='benchmarks/round69/full_trial_0_baseline',
+                      kind='directory', reason='benchmark')])
+    policy_path = tmp_path / 'policy-partial.json'
+    policy_path.write_text(json.dumps({**body, 'identity_sha256': d.identity(body)}))
+    policy = d.load_policy(policy_path)
+    target = policy['targets'][0]
+    source = workspace / target['relative']
+    source.mkdir(parents=True)
+    (source/'first').write_bytes(b'one')
+    (source/'second').write_bytes(b'two')
+    dry = d.discard_target(policy, target, **args)
+    plan = {k:v for k,v in dry.items() if k not in {'state', 'deleted'}}
+    quarantine_parent = source.parent/'.stockagent-testing-quarantine-test'
+    quarantine_parent.mkdir()
+    quarantine = quarantine_parent/source.name
+    source.rename(quarantine)
+    journal = args['state_root']/(d.identity(target)+'.json')
+    d.write_discard_receipt(journal, {'state':'quarantined', 'plan':plan, 'quarantine':str(quarantine)})
+    (quarantine/'first').unlink()
+    if unexpected:
+        (quarantine/'unknown').write_bytes(b'not authorized')
+        with pytest.raises(SnapshotError, match='unplanned names'):
+            d.restore_unchanged_discard_quarantine(policy, target, **args)
+        assert (quarantine/'unknown').exists() and (quarantine/'second').exists()
+    else:
+        assert d.restore_unchanged_discard_quarantine(policy, target, **args)
+        result = json.loads(journal.read_bytes())['result']
+        assert not source.exists() and not quarantine.exists() and result['resumed_partial']
+        assert result['prior_reclaimed_allocated_bytes_unknown'] is True
+
+
+@pytest.mark.parametrize('crash_point', ['empty_root', 'parent_only', 'both_removed'])
+def test_d_workflow_finished_unlink_journal_survives_final_directory_cleanup(setup, tmp_path, monkeypatch, crash_point):
+    from stockagent.data_sync import testing_disposition as disposition
+    _, _, args = setup
+    workspace = tmp_path / 'd-workflow' / 'artifacts'
+    monkeypatch.setattr(disposition, 'D_WORKFLOW_TESTING_ROOT', workspace)
+    monkeypatch.setattr(d, '_guard_d_workflow_copy', lambda *a: {'sha256': 'fixed'})
+    monkeypatch.setattr(d, '_pinned_snapshot_ids', lambda *a: set())
+    body = dict(contract=disposition.D_WORKFLOW_TESTING_CONTRACT, authority_node_id='penguin', origin_node_id='penguin',
+        authorization='user approved old trial copies', decision='discard_without_preservation',
+        targets=[dict(base='d-workflow-benchmark', relative='benchmarks/round69/full_trial_0_baseline',
+                      kind='directory', reason='benchmark')])
+    path = tmp_path/'policy-finished.json'
+    path.write_text(json.dumps({**body, 'identity_sha256':d.identity(body)}))
+    policy = d.load_policy(path)
+    target = policy['targets'][0]
+    source = workspace/target['relative']
+    source.mkdir(parents=True)
+    (source/'first').write_bytes(b'one')
+    dry = d.discard_target(policy, target, **args)
+    plan = {k:v for k,v in dry.items() if k not in {'state', 'deleted'}}
+    parent = source.parent/'.stockagent-testing-quarantine-finished'
+    parent.mkdir()
+    quarantine = parent/source.name
+    source.rename(quarantine)
+    (quarantine/'first').unlink()
+    result = {'state':'discarded-without-preservation', 'target':target, 'deleted':True,
+              'policy_identity_sha256':policy['identity_sha256'], 'reclaimed_allocated_bytes':4096}
+    journal = args['state_root']/(d.identity(target)+'.json')
+    d.write_discard_receipt(journal, {'state':'unlink_finished', 'plan':plan,
+                                      'quarantine':str(quarantine), 'result':result})
+    if crash_point != 'empty_root':
+        quarantine.rmdir()
+    if crash_point == 'both_removed':
+        parent.rmdir()
+    assert d.restore_unchanged_discard_quarantine(policy, target, **args)
+    saved = json.loads(journal.read_bytes())
+    assert saved['state'] == 'discarded' and saved['result']['reclaimed_allocated_bytes'] == 4096
+    assert not source.exists() and not parent.exists()
+
+
+def test_d_workflow_cleanup_restores_terminal_receipt_after_status_interruption(setup, tmp_path, monkeypatch):
+    from scripts import discard_local_testing_artifacts as cleanup
+    from stockagent.data_sync import testing_disposition as disposition
+    _, _, args = setup
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path/'common.lock')
+    monkeypatch.setattr(disposition, 'D_WORKFLOW_TESTING_ROOT', tmp_path/'d-artifacts')
+    monkeypatch.setattr(d, '_guard_d_workflow_copy', lambda *a: None)
+    policy = d_workflow_policy(tmp_path)
+    policy_path = tmp_path/'d-workflow-policy.json'
+    target = policy['targets'][0]
+    state = tmp_path/'cleanup-state'
+    journal = state/'transactions'/(d.identity(target)+'.json')
+    journal.parent.mkdir(parents=True)
+    d.write_discard_receipt(journal, {'state':'discarded', 'result':{
+        'state':'discarded-without-preservation', 'target':target, 'deleted':True,
+        'policy_identity_sha256':policy['identity_sha256'], 'reclaimed_allocated_bytes':8192}})
+    result = cleanup.cycle(policy_path, state, apply=True, repo=args['repo_root'])
+    assert result['state'] == 'completed' and result['reclaimed_allocated_bytes'] == 8192
+    source = disposition.D_WORKFLOW_TESTING_ROOT/target['relative']
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b'new generation')
+    result = cleanup.cycle(policy_path, state, apply=True, repo=args['repo_root'])
+    assert result['state'] == 'waiting_protected_targets' and source.read_bytes() == b'new generation'
+
+
 def test_local_cleanup_resumes_completed_counters_and_protects_recreated_output(setup, tmp_path, monkeypatch):
     from scripts import discard_local_testing_artifacts as cleanup
     _, _, args = setup
@@ -294,6 +477,33 @@ def test_local_cleanup_busy_owner_retains_target_without_consuming_error_retry(s
     assert result['targets_blocked'] == 1 and root.exists()
     assert result['results'][0]['reason'] == 'canonical_owner_busy'
     assert 'error_attempts' not in result['results'][0]
+
+
+def test_local_cleanup_cycle_reconciles_a_file_absent_after_unlink_intent(setup, tmp_path, monkeypatch):
+    from scripts import discard_local_testing_artifacts as cleanup
+    _, _, args = setup
+    monkeypatch.setattr(cleanup, 'COMMON_OWNER', tmp_path/'common.lock')
+    monkeypatch.setattr(d, '_pinned_snapshot_ids', lambda *a: set())
+    monkeypatch.setattr(d, 'process_references_many', lambda *_a, **_kw: [])
+    target = {'base': 'artifact', 'relative': 'benchmarks/closed-case/result.json',
+              'kind': 'file', 'reason': 'benchmark'}
+    p = local_testing_policy(tmp_path, targets=[target])
+    source = args['repo_root']/'artifacts'/target['relative']
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b'performance output')
+    original = d.unlink_preserved_file_names
+    def interrupted(*a, **kw):
+        original(*a, **kw)
+        raise OSError('interrupted after unlink')
+    monkeypatch.setattr(d, 'unlink_preserved_file_names', interrupted)
+    state = tmp_path/'cleanup-state'
+    first = cleanup.cycle(tmp_path/'local-testing-policy.json', state, apply=True, repo=args['repo_root'])
+    assert first['results'][0]['state'] == 'retry_pending' and not source.exists()
+    monkeypatch.setattr(d, 'unlink_preserved_file_names', original)
+    second = cleanup.cycle(tmp_path/'local-testing-policy.json', state, apply=True, repo=args['repo_root'])
+    assert second['state'] == 'completed' and second['targets_completed'] == 1
+    assert second['results'][0]['reconciled_absent_after_unlink_intent']
+    assert second['reclaimed_allocated_bytes'] == 0
 
 
 def test_exhausted_cleanup_retries_only_after_code_repair_and_retains_failure(setup, tmp_path, monkeypatch):
@@ -512,6 +722,40 @@ def test_only_unchanged_owned_quarantine_can_resume(setup, monkeypatch):
     plan = d.discard_target(p, p["targets"][0], **args)
     result = d.discard_target(p, p["targets"][0], **args, apply=True, expected_plan_identity=plan["identity_sha256"])
     assert result["deleted"] and not root.exists()
+
+
+@pytest.mark.parametrize('after_unlink', [False, True])
+def test_local_file_discard_recovers_an_interrupted_exact_unlink(setup, tmp_path, monkeypatch, after_unlink):
+    _old, _root, args = setup
+    target = {'base': 'artifact', 'relative': 'benchmarks/closed-case/result.json',
+              'kind': 'file', 'reason': 'benchmark'}
+    p = local_testing_policy(tmp_path, targets=[target])
+    source = args['repo_root']/'artifacts'/target['relative']
+    source.parent.mkdir(parents=True)
+    source.write_bytes(b'performance output')
+    monkeypatch.setattr(d, 'process_references_many', lambda *_args, **_kwargs: [])
+    plan = d.discard_target(p, target, **args)
+    real_unlink = d.unlink_preserved_file_names
+    def interrupted(*a, **kw):
+        if after_unlink:
+            real_unlink(*a, **kw)
+        raise OSError('simulated interrupted unlink')
+    monkeypatch.setattr(d, 'unlink_preserved_file_names', interrupted)
+    with pytest.raises(OSError, match='interrupted unlink'):
+        d.discard_target(p, target, **args, apply=True, expected_plan_identity=plan['identity_sha256'])
+    journal = args['state_root']/(d.identity(target)+'.json')
+    assert json.loads(journal.read_text())['state'] == 'unlink_started'
+    monkeypatch.setattr(d, 'unlink_preserved_file_names', real_unlink)
+    assert d.restore_unchanged_discard_quarantine(p, target, **args)
+    if after_unlink:
+        result = json.loads(journal.read_text())['result']
+        assert not source.exists() and result['reconciled_absent_after_unlink_intent']
+        assert result['reclaimed_allocated_bytes'] == 0 and result['reclaimed_allocation_unknown']
+    else:
+        assert source.read_bytes() == b'performance output'
+        plan = d.discard_target(p, target, **args)
+        assert d.discard_target(p, target, **args, apply=True,
+                                expected_plan_identity=plan['identity_sha256'])['deleted']
 
 
 def cold_fixture(tmp_path):

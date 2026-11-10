@@ -15,6 +15,29 @@ DAY = "2026-09-24"
 TAIPEI = ZoneInfo("Asia/Taipei")
 
 
+def test_nontrade_settlement_public_projection_has_no_source_path_or_fake_exit():
+    from stockagent.live.public_dashboards import sanitize_tw_positions
+
+    position = {"market": "m", "symbol": "2330", "session_date": DAY, "signed_shares": 0,
+        "status": "nontrade_book_settled", "realized_net_pnl_twd": 120.,
+        "nontrade_settlement": {"contract": "last_observed_trade_nonexecution_book_settlement_v1",
+            "quantity": 1000, "accounting_at": f"{DAY}T13:30:00+08:00",
+            "reference": {"reference_observed_at": f"{DAY}T12:59:20+08:00", "source_path": "/private/source",
+                          "reference_price": 999.},
+            "assumed_exit_fee_and_tax_twd": 5., "net_pnl_twd": 80.,
+            "reference_before_simulated_entry": False, "simulated_fill": False,
+            "broker_fill": False, "exchange_fill": False}}
+    safe = dashboard._safe_position(position)
+    assert safe["execution_realized_net_pnl_twd"] == 40.
+    assert safe["nontrade_settlement_net_pnl_twd"] == 80.
+    assert "exit_at" not in safe and "exit_price" not in safe
+    public = sanitize_tw_positions({"simulation_only": True, "production_order_possible": False, "rows": [safe]})
+    row = public["rows"][0]
+    assert row["nontrade_settlement_shares"] == 1000
+    assert row["nontrade_reference_observed_at"] == f"{DAY}T12:59:20+08:00"
+    assert "/private/source" not in str(public) and "999.0" not in str(public)
+
+
 def test_history_uses_pinned_header_without_rereading_replaced_state(tmp_path, monkeypatch):
     original = dashboard._object
 
@@ -592,6 +615,24 @@ def test_historical_costs_come_from_the_selected_mark(fragmented_accounts):
     assert account["cumulative_corporate_action_net_twd"] == 40
 
 
+@pytest.mark.parametrize("has_historical_value", [False, True])
+def test_historical_nontrade_component_is_not_backdated_from_latest_account(fragmented_accounts, has_historical_value):
+    root, now, active = fragmented_accounts
+    state_path = root / "state.json"
+    state = json.loads(state_path.read_text())
+    state["modes"][active[0]].update(session_date="2026-09-25", cumulative_nontrade_settlement_net_pnl_twd=999.)
+    state_path.write_text(json.dumps(state))
+    mark_path = root / "marks.jsonl"
+    rows = [json.loads(line) for line in mark_path.read_text().splitlines()]
+    for row in rows:
+        if row.get("session_date") == DAY and row["market"] == active[0] and has_historical_value:
+            row["cumulative_nontrade_settlement_net_pnl_twd"] = 12.
+    _write_rows(mark_path, rows)
+    snapshot = dashboard.build_dashboard_snapshot(state_dir=root, now=now, session_date=DAY)
+    mode = next(mode for mode in snapshot["modes"] if mode["market"] == active[0])
+    assert mode["cumulative_nontrade_settlement_net_pnl_twd"] == (12. if has_historical_value else None)
+
+
 @pytest.mark.parametrize("strict", [False, True])
 def test_research_carry_presentation_never_weakens_strict_intraday(strict):
     mode = {
@@ -622,6 +663,20 @@ def test_latest_no_fill_warning_does_not_erase_prior_positions(open_positions):
     assert "沒有建立任何成交部位" not in issue["detail"]
 
 
+def test_unavailable_price_band_does_not_claim_every_security_has_limits():
+    mode = {"market": "m", "label": "模型", "session_date": DAY,
+            "signal_reason_counts": {"price_limit_unavailable": 1}}
+    issues = dashboard._operational_issues(
+        modes=[mode], preopen={}, observed=datetime(2026, 9, 24, 11, tzinfo=TAIPEI),
+    )
+    issue = next(row for row in issues if row["code"] == "price_limit_unavailable")
+    assert issue["severity"] == "error" and issue["count"] == 1
+    assert "未提供或不適用" in issue["title"]
+    assert "未取得可驗證" in issue["detail"] and "不適用漲跌幅限制" in issue["detail"]
+    assert "TP／SL" in issue["detail"] and "未建立或增加該筆新持倉" in issue["detail"]
+    assert "既有持倉不因此被移除" in issue["detail"]
+
+
 @pytest.mark.parametrize("open_positions", [0, 9])
 def test_divergent_ledger_warning_explains_exit_processing_is_suspended(open_positions):
     mode = {
@@ -648,3 +703,54 @@ def test_counterfactual_later_signal_is_not_silently_presented_as_causal(source_
         modes=[mode], preopen={}, observed=datetime(2026, 9, 24, 11, tzinfo=TAIPEI),
     )
     assert any(row["code"] == "replay_signal_after_simulated_time" for row in issues) is warning
+
+
+@pytest.mark.parametrize("provisional", [False, True])
+def test_provisional_replay_discloses_unknown_source_gaps(provisional):
+    mode = {"market": "tw_day_trade_100m", "label": "100m", "session_date": DAY,
+            "simulation_replay": True, "provisional_minute_source_coverage": provisional}
+    issues = dashboard._operational_issues(
+        modes=[mode], preopen={}, observed=datetime(2026, 9, 24, 14, tzinfo=TAIPEI))
+    matches = [row for row in issues if row["code"] == "provisional_minute_source_coverage"]
+    assert bool(matches) is provisional
+    if provisional:
+        assert matches[0]["severity"] == "warning"
+        assert "結果可能改變" in matches[0]["detail"]
+        assert "不是券商成交" in matches[0]["detail"]
+
+
+def test_later_live_session_still_discloses_provisional_cumulative_history():
+    mode = {"market": "tw_day_trade_unit_mgda_2m_20261103", "label": "200 萬",
+            "session_date": DAY, "simulation_replay": False,
+            "provisional_minute_source_coverage": False,
+            "cumulative_provisional_minute_source_coverage": True,
+            "provisional_history_from": "2026-01-02"}
+    issues = dashboard._operational_issues(
+        modes=[mode], preopen={}, observed=datetime(2026, 9, 24, 14, tzinfo=TAIPEI))
+    match = next(row for row in issues if row["code"] == "cumulative_provisional_minute_source_coverage")
+    assert match["severity"] == "warning"
+    assert "累積權益" in match["detail"]
+    assert "不是券商成交" in match["detail"]
+
+
+def test_public_status_retains_cumulative_history_warning_after_session_projection(fragmented_accounts):
+    from stockagent.live.public_dashboards import sanitize_tw_status
+
+    root, now, active = fragmented_accounts
+    path = root / "state.json"
+    state = json.loads(path.read_text())
+    state["modes"][active[0]].update(
+        simulation_replay=False, provisional_minute_source_coverage=False,
+        cumulative_provisional_minute_source_coverage=True,
+        provisional_history_from="2026-01-02",
+    )
+    path.write_text(json.dumps(state))
+    snapshot = dashboard.build_dashboard_snapshot(state_dir=root, now=now, session_date=DAY,
+        include_ledger_session_dates=False)
+    public = sanitize_tw_status(snapshot)
+    selected = next(row for row in public["modes"] if row["market"] == active[0])
+    assert selected["simulation_replay"] is False
+    assert selected["cumulative_provisional_minute_source_coverage"] is True
+    assert selected["provisional_history_from"] == "2026-01-02"
+    assert any(issue["code"] == "cumulative_provisional_minute_source_coverage"
+               and issue["market"] == active[0] for issue in public["operational_issues"])

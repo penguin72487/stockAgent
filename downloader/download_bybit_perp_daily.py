@@ -20,6 +20,9 @@ import pyarrow.parquet as pq
 SCRIPT_DIR = Path(__file__).resolve().parent
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
+REPO_ROOT = SCRIPT_DIR.parent
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(1, str(REPO_ROOT))
 
 from common import (
     PersistentProgress,
@@ -1090,7 +1093,8 @@ def main() -> None:
     if args.tail_only and (args.refresh or args.mode == "full"):
         raise ValueError("--tail-only cannot be combined with --refresh or --mode full")
     output_dir = Path(args.output_dir)
-    with exclusive_dataset_lock(
+    from stockagent.data_sync.bybit_workspace_guard import writer_guard
+    with writer_guard(output_dir, timeout_seconds=args.lock_timeout_seconds), exclusive_dataset_lock(
         output_dir / ".download.lock", provider="bybit",
         timeout_seconds=args.lock_timeout_seconds,
     ) as acquisition:

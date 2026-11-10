@@ -31,7 +31,14 @@ def commands(root: Path, output: Path, start_year: int, day: date) -> list[list[
     # The canonical reference baseline contract starts in 2000. An isolated
     # current-year download must never be relabelled as a complete baseline.
     reference_start = start_year if baseline.get("baseline_established") else 2000
-    return [[sys.executable, str(ROOT / "downloader/download_tw_corporate_action_reference.py"),
+    # The official trading-universe owner needs a verified share-replacement
+    # catalog; it does not consume the slower exact-entitlement collector.
+    # Publish that independent source first, while keeping full action
+    # readiness gated on all three collectors and their final validation.
+    return [[sys.executable, str(ROOT / "downloader/download_tw_share_replacement_reference.py"),
+             "--output-dir", str(output), "--start-date", f"{start_year}-01-01", "--end-date", str(day),
+             "--request-interval", "1.0"],
+            [sys.executable, str(ROOT / "downloader/download_tw_corporate_action_reference.py"),
              "--output-dir", str(output), "--tpex-daily-path", str(root / "tpex_daily_ohlcv.parquet"),
              "--mode", "repair", "--start-year", str(reference_start), "--end-date", str(day),
              "--workers", "2", "--request-interval", "1.0"],
@@ -40,9 +47,6 @@ def commands(root: Path, output: Path, start_year: int, day: date) -> list[list[
              "--universe-report", str(root / "stocks/official_symbol_build_report.csv"),
              "--retained-source-dir", str(root),
              "--mode", "repair", "--start-date", f"{start_year}-01-01", "--end-date", str(day),
-             "--request-interval", "1.0"],
-            [sys.executable, str(ROOT / "downloader/download_tw_share_replacement_reference.py"),
-             "--output-dir", str(output), "--start-date", f"{start_year}-01-01", "--end-date", str(day),
              "--request-interval", "1.0"]]
 
 
@@ -119,7 +123,9 @@ def main() -> None:
         target = output / "readiness.json"
         atomic_write_json(target, receipt)
         try:
+            share_failure: str | None = None
             for command in commands(root, output, args.start_year, day):
+                is_share = Path(command[1]).name == "download_tw_share_replacement_reference.py"
                 step_started = time.monotonic()
                 try:
                     result = subprocess.run(command, cwd=ROOT, timeout=900, check=False)
@@ -130,6 +136,11 @@ def main() -> None:
                         "error_class": type(exc).__name__,
                     })
                     atomic_write_json(target, receipt)
+                    if is_share:
+                        share_failure = f"{type(exc).__name__}: {exc}"
+                        receipt["share_replacement_preflight"] = {"status": "blocked", "error": share_failure}
+                        atomic_write_json(target, receipt)
+                        continue
                     raise
                 receipt["steps"].append({
                     "script": Path(command[1]).name,
@@ -138,7 +149,34 @@ def main() -> None:
                 })
                 atomic_write_json(target, receipt)
                 if result.returncode:
+                    if is_share:
+                        share_failure = f"collector exit {result.returncode}"
+                        receipt["share_replacement_preflight"] = {"status": "blocked", "error": share_failure}
+                        atomic_write_json(target, receipt)
+                        continue
                     raise RuntimeError(f"execution action collector failed: {command[1]}")
+                if is_share:
+                    # This branch is independently source-verified before the
+                    # canonical merger can advance the public catalog. A later
+                    # entitlement failure still leaves overall actions blocked,
+                    # while the universe owner may use this separate proof.
+                    share_started = time.monotonic()
+                    try:
+                        share_events = load_share_replacements(
+                            output, required_start=date(args.start_year, 1, 1), required_end=day)
+                    except Exception as exc:
+                        share_failure = f"{type(exc).__name__}: {exc}"
+                        receipt["share_replacement_preflight"] = {"status": "blocked", "error": share_failure}
+                        atomic_write_json(target, receipt)
+                        continue
+                    receipt["share_replacement_preflight"] = {
+                        "status": "source_ready", "events": len(share_events),
+                        "elapsed_seconds": round(time.monotonic() - share_started, 3),
+                    }
+                    receipt["historical_catalog_sync"] = sync_historical_share_catalog(root, output, day)
+                    atomic_write_json(target, receipt)
+            if share_failure is not None:
+                raise RuntimeError(f"share-replacement source failed: {share_failure}")
             validation_started = time.monotonic()
             ref = output / "tw_corporate_action_reference.parquet"
             ent = output / "tw_corporate_action_entitlements.parquet"

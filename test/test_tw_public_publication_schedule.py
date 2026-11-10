@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import date, datetime, time as datetime_time, timedelta
 import fcntl
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -911,6 +913,44 @@ def test_0830_missing_current_revision_is_not_reported_as_observed_drift() -> No
     )
     assert errors == ["current live-root dependency revision is unavailable"]
 
+@pytest.mark.parametrize("retry_code", [0, 75, 1])
+def test_symbol_cache_capacity_fallback_keeps_full_canonical_scope(monkeypatch, retry_code):
+    module = run_tw_public_0830_check
+    command = module._derived_data_commands(live_root=Path("/exact/live"), expected_latest="2026-11-03")[1]
+    command.append("--incremental-merge-cache")
+    calls, steps = [], []
+
+    def run(arguments, **kwargs):
+        calls.append(list(arguments))
+        assert kwargs == {"cwd": module.REPO_ROOT, "check": False}
+        return SimpleNamespace(returncode=75 if len(calls) == 1 else retry_code)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    result = module._run_derived_command(command, step_name="build_official_symbol_panel", steps=steps)
+    assert result.returncode == retry_code and len(calls) == 2
+    assert calls[0] == command  # The caller's command must not be mutated.
+    assert calls[1] == [value for value in command if value != "--incremental-merge-cache"] + ["--no-source-cache"]
+    assert steps[0]["original_return_code"] == 75
+    assert steps[0]["status"] == "retry_without_optional_cache_write"
+
+
+@pytest.mark.parametrize("return_code,uncached,other_builder", [(0, False, False), (1, False, False), (75, True, False), (75, False, True)])
+def test_symbol_cache_fallback_never_retries_other_failures_or_owners(monkeypatch, return_code, uncached, other_builder):
+    module = run_tw_public_0830_check
+    command = module._derived_data_commands(live_root=Path("/exact/live"), expected_latest="2026-11-03")[0 if other_builder else 1]
+    if uncached:
+        command.append("--no-source-cache")
+    calls, steps = [], []
+
+    def run(arguments, **kwargs):
+        calls.append(list(arguments))
+        return SimpleNamespace(returncode=return_code)
+
+    monkeypatch.setattr(module.subprocess, "run", run)
+    result = module._run_derived_command(command, step_name="fixture", steps=steps)
+    assert result.returncode == return_code and calls == [command] and steps == []
+
+
 def test_0830_builds_canonical_derived_layers_from_accepted_source_date(
     tmp_path: Path,
 ) -> None:
@@ -1294,6 +1334,19 @@ def test_systemd_timers_have_no_random_delay() -> None:
     assert "publish_tw_public_cold_release.py" in margin_runner
     assert "--defer-stale-derived-receipts" in margin_runner
     assert "run_downloader_with_release.sh" not in margin_runner
+
+
+def test_completed_session_source_uses_existing_bounded_trading_priority():
+    service = Path("deploy/systemd/stockagent-tw-public-publication-sweep.service.in").read_text()
+    installer = Path("scripts/install_tw_public_publication_services.sh").read_text()
+    assert 'Environment="STOCKAGENT_TW_DAY_TRADE_PRIORITY_SOURCE=1"' in service
+    assert "--publication-only) publication_only=true" in installer
+    assert "scoped install options are mutually exclusive" in installer
+    scoped = installer.rsplit('if [[ "$publication_only" == true ]]; then', 1)[1].split("fi", 1)[0]
+    assert "systemctl daemon-reload" in scoped
+    assert "systemctl enable --now stockagent-tw-public-publication-sweep.timer" in scoped
+    assert "restart" not in scoped.split("echo", 1)[0]
+    assert "exit 0" in scoped
 
 
 def test_cold_publish_sanitizes_active_writer_preflight() -> None:
@@ -1779,6 +1832,56 @@ def test_source_event_accepts_taifex_csv_representation_but_rejects_html() -> No
         )
 
 
+def test_twse_t187ap11_csv_and_json_versions_match_without_losing_rows_or_values() -> None:
+    url = "https://openapi.twse.com.tw/v1/opendata/t187ap11_L"
+    first = ["1151020", "11509", "1101", "台泥", "董事", "張,安平", "12", "13",
+             "0", "0.00%", "1", "0", "0.00%"]
+    second = [*first]
+    second[2], second[7] = "2330", "22"
+
+    def csv_bytes(rows):
+        stream = io.StringIO(newline="")
+        writer = csv.writer(stream)
+        writer.writerow(source_events.T187AP11_CSV_FIELDS)
+        writer.writerows(rows)
+        return stream.getvalue().encode("utf-8-sig")
+
+    records = [dict(zip(source_events.T187AP11_JSON_FIELDS, row, strict=True))
+               for row in (first, second, first)]
+    body = json.dumps(records, ensure_ascii=False).encode()
+    expected = source_events._body_sha256(body, expected_json=True)
+    kwargs = dict(expected_json=True, content_type="text/csv", content_disposition="data.csv", source_url=url)
+    assert source_events._response_body_sha256(csv_bytes([second, first, first]), **kwargs) == expected
+    assert source_events._response_body_sha256(csv_bytes([second, first]), **kwargs) != expected
+    changed = list(first)
+    changed[7] = "14"
+    assert source_events._response_body_sha256(csv_bytes([second, first, changed]), **kwargs) != expected
+    assert source_events._response_body_sha256(csv_bytes([second, first, first]),
+        **{**kwargs, "source_url": "https://other.example/v1/opendata/t187ap11_L"}) != expected
+    response = _probe_test_response(csv_bytes([second, first, first]), content_type="text/csv")
+    result = source_events._request(
+        SimpleNamespace(get=lambda *_args, **_kwargs: response), url=url, previous={},
+        expected_json=True, limiter=SimpleNamespace(wait=lambda: None),
+        args=SimpleNamespace(timeout=1, retries=0),
+    )
+    assert result["version"] == expected
+    spec = DEFAULT_DATASETS["twse_api_opendata_t187ap11_l"]
+    state = {"datasets": {spec.name: {"observed_version": expected, "applied_version": expected}}}
+    intervals = SimpleNamespace(fast_interval_seconds=60, medium_interval_seconds=300, slow_interval_seconds=300)
+    def apply(version):
+        return source_events._apply_probe_results(state, [source_events.ProbeResult(
+            dataset=spec.name, status="ok", url=url,
+            checked_at_taipei="2026-11-04T09:40:00+08:00", version=version,
+            body_sha256=version)], specs_by_name={spec.name: spec}, args=intervals)
+    assert apply(result["version"]) == []
+    changed_version = source_events._response_body_sha256(csv_bytes([second, first, changed]), **kwargs)
+    assert apply(changed_version) == [spec.name]
+    assert state["datasets"][spec.name]["applied_version"] == expected
+    invalid = csv_bytes([first]).replace("公司代號".encode(), "證券代號".encode(), 1)
+    with pytest.raises(ValueError, match="schema"):
+        source_events._response_body_sha256(invalid, **kwargs)
+
+
 def _probe_test_response(body: bytes, *, status: int = 200, content_type="application/json"):
     response = source_events.requests.Response()
     response.status_code = status
@@ -1898,6 +2001,19 @@ def test_source_event_version_migration_preserves_pending_state() -> None:
     assert state["datasets"]["accepted"]["applied_version"] == "accepted-body"
     assert state["datasets"]["pending"]["observed_version"] == "pending-body"
     assert state["datasets"]["pending"]["applied_version"] == "older-applied"
+
+
+def test_source_event_v2_upgrade_preserves_exact_observed_and_applied_hashes() -> None:
+    state = {"version_contract": "canonical_body_sha256_v2", "datasets": {
+        "accepted_csv": {"body_sha256": "csv-v2", "observed_version": "csv-v2", "applied_version": "csv-v2"},
+        "pending": {"body_sha256": "json-v2", "observed_version": "json-v2", "applied_version": "csv-v2"},
+    }}
+    source_events._migrate_version_contract(state)
+    assert state["version_contract"] == source_events.VERSION_CONTRACT
+    assert state["datasets"]["accepted_csv"]["observed_version"] == "csv-v2"
+    assert state["datasets"]["accepted_csv"]["applied_version"] == "csv-v2"
+    assert state["datasets"]["pending"]["observed_version"] == "json-v2"
+    assert state["datasets"]["pending"]["applied_version"] == "csv-v2"
 
 
 def test_source_event_is_unacknowledged_until_download_accepts_it() -> None:

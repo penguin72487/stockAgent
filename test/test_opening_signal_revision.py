@@ -1,6 +1,6 @@
 """Progressive decisions are immutable; inventory changes by actual deltas."""
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 import hashlib
 import json
 
@@ -60,6 +60,22 @@ def register(engine, spec, index, weight, previous=None, *, quote=None, at=None,
 
 def ledger(path):
     return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+
+
+def test_new_session_live_signal_does_not_inherit_previous_replay_proof(tmp_path):
+    spec = revision_spec(tmp_path)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    mode = engine._mode(spec)
+    mode.update(session_date="2026-08-12", entry_completed_at="2026-08-12T09:01:00+08:00",
+                simulation_replay=True,
+                published_revision_replay={"source_signal_id": "previous-day-replay",
+                                           "publication_upper_bound": "2026-08-12T09:00:10+08:00"})
+    register(engine, spec, 0, 0.0)
+    current = engine.state["modes"][spec.market]
+    assert current["session_date"] == "2026-08-13" and current["simulation_replay"] is False
+    assert "published_revision_replay" not in current
+    restored = TwDayTradeSimulationEngine(tmp_path / "state")
+    assert "published_revision_replay" not in restored.state["modes"][spec.market]
 
 
 def test_initial_opening_publication_proof_survives_later_revisions(tmp_path):
@@ -547,6 +563,97 @@ def historical_revision_summary(index, published, previous=None):
         "published_revision_replay": {"contract": PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT,
             "plan_sha256": "a" * 64, "source_signal_id": f"original-{index}",
             "publication_upper_bound": published.isoformat()}}
+
+
+def late_historical_revision_summary(index, published, previous=None, *, first_published=None):
+    from stockagent.live.tw_day_trade_simulation import PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT
+    first_published = first_published or published
+    summary = historical_revision_summary(index, published, previous)
+    source = f"original-{index}"
+    summary.update(signal_started_at=published.isoformat(), artifact_published_at=published.isoformat(),
+                   execution_pointer_written_at=published.isoformat(), opening_repair_of_signal_id=source,
+                   original_weights_preserved=True, counterfactual_signal_regeneration=False)
+    summary["published_revision_replay"] = {
+        "contract": PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT, "plan_sha256": "a" * 64,
+        "source_signal_id": source, "publication_upper_bound": published.isoformat(),
+        "first_entry_is_counterfactual": True, "first_source_signal_id": "original-0",
+        "first_publication_upper_bound": first_published.isoformat(),
+        "original_revision": {"index": index, "root_signal_id": "original-0"}}
+    return summary
+
+
+def test_late_first_publication_is_explicit_counterfactual_and_later_revisions_stay_causal(tmp_path):
+    spec = replace(revision_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                   historical_progressive_revision_replay=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    first_at = _now(10, 2, 15)
+    initial = late_historical_revision_summary(0, first_at)
+    quote = _quote(minute_volume_lots=100.) | {"execution_price_0901": 1000.,
+        "execution_price_0901_method": "minute_vwap", "quote_at": _now(9, 1).isoformat()}
+    assert engine.register_signal(spec=spec, summary=initial, signal_rows=[_row(.4)],
+        quotes={"2330": quote}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1),
+        counterfactual_open_replay=True) == "registered"
+    mode = engine.state["modes"][spec.market]
+    assert inventory(engine, spec) == 4000
+    assert datetime.fromisoformat(mode["source_signal_at"]) == first_at
+    assert mode["published_revision_replay"]["first_entry_is_counterfactual"] is True
+    assert mode["published_revision_replay"]["first_publication_upper_bound"] == first_at.isoformat()
+    assert ledger(engine.fills_path)[0]["simulation_replay"] is True
+    later = late_historical_revision_summary(1, _now(10, 2, 30), initial, first_published=first_at)
+    assert engine.register_signal(spec=spec, summary=later, signal_rows=[dict(_row(.2), open_price=1000.)],
+        quotes={}, eligibility=_eligibility(), eligibility_coverage={}, now=_now(10, 4),
+        counterfactual_open_replay=True) == "registered"
+    assert mode["pending_reduction_orders"]["2330"]["remaining_shares"] == 2000
+
+
+@pytest.mark.parametrize("damage", ["old_contract", "not_counterfactual", "not_original_weights",
+    "regenerated", "wrong_root", "wrong_revision", "wrong_source", "naive_publication",
+    "wrong_publication", "after_entry_cutoff", "live_order", "malformed_proof"])
+def test_late_first_publication_rejects_unproven_or_live_counterfactual(tmp_path, damage):
+    from stockagent.live.tw_day_trade_simulation import PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT
+    spec = replace(revision_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                   historical_progressive_revision_replay=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    first = late_historical_revision_summary(0, _now(10, 2, 15))
+    proof = first["published_revision_replay"]
+    if damage == "old_contract": proof["contract"] = PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT
+    elif damage == "not_counterfactual": proof["first_entry_is_counterfactual"] = False
+    elif damage == "not_original_weights": first["original_weights_preserved"] = False
+    elif damage == "regenerated": first["counterfactual_signal_regeneration"] = True
+    elif damage == "wrong_root": proof["first_source_signal_id"] = "other"
+    elif damage == "wrong_revision": proof["original_revision"]["index"] = 1
+    elif damage == "wrong_source": first["opening_repair_of_signal_id"] = "other"
+    elif damage == "naive_publication": proof["first_publication_upper_bound"] = "2026-08-13T10:02:15"
+    elif damage == "wrong_publication": first["artifact_published_at"] = _now(10, 3).isoformat()
+    elif damage == "after_entry_cutoff": proof["first_publication_upper_bound"] = _now(13, 20).isoformat()
+    elif damage == "live_order": first["production_order_possible"] = True
+    elif damage == "malformed_proof": first["published_revision_replay"] = ["invalid"]
+    result = engine.register_signal(spec=spec, summary=first, signal_rows=[_row(.4)], quotes={},
+        eligibility=_eligibility(), eligibility_coverage={}, now=_now(9, 1), counterfactual_open_replay=True)
+    assert result != "registered"
+    assert ledger(engine.fills_path) == []
+
+
+@pytest.mark.parametrize("damage", ["too_recent", "wrong_root", "wrong_first_clock", "foreign_plan"])
+def test_late_counterfactual_later_revision_requires_same_lineage_and_full_minute(tmp_path, damage):
+    spec = replace(revision_spec(tmp_path), entry_fill_policy=ENTRY_FILL_POLICY_0901_MINUTE_PRICE,
+                   historical_progressive_revision_replay=True)
+    engine = TwDayTradeSimulationEngine(tmp_path / "state")
+    first_at = _now(10, 2, 15)
+    initial = late_historical_revision_summary(0, first_at)
+    kwargs = dict(spec=spec, quotes={}, eligibility=_eligibility(), eligibility_coverage={},
+                  signal_rows=[_row(.4)], counterfactual_open_replay=True)
+    assert engine.register_signal(**kwargs, summary=initial, now=_now(9, 1)) == "registered"
+    later = late_historical_revision_summary(1, _now(10, 2, 30), initial, first_published=first_at)
+    proof = later["published_revision_replay"]
+    if damage == "too_recent":
+        proof["publication_upper_bound"] = _now(10, 3, 1).isoformat()
+        later["artifact_published_at"] = later["execution_pointer_written_at"] = proof["publication_upper_bound"]
+    elif damage == "wrong_root": proof["first_source_signal_id"] = "other"
+    elif damage == "wrong_first_clock": proof["first_publication_upper_bound"] = _now(10, 2, 14).isoformat()
+    elif damage == "foreign_plan": proof["plan_sha256"] = "b" * 64
+    assert engine.register_signal(**kwargs, summary=later, now=_now(10, 4)) != "registered"
+    assert ledger(engine.fills_path) == []
 
 
 def test_completed_minute_revision_replay_is_opt_in_and_preserves_fifo(tmp_path):

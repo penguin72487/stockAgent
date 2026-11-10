@@ -87,6 +87,7 @@ case "$refresh_scope" in
     ;;
   features)
     exec env "${common_env[@]}" \
+      CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS="${CRYPTO_BACKGROUND_LOCK_WAIT_SECONDS:-21600}" \
       RUN_ID="registered-features-$(date -u +%Y%m%dT%H%M%S%NZ)" \
       LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_features.lock" \
       RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_features" \
@@ -112,12 +113,27 @@ case "$refresh_scope" in
     # Full-history symbols hold decoded candle pages and existing Parquet in
     # memory until each symbol commits. Keep providers parallel without
     # multiplying daily tail worker counts across three full-history jobs.
+    # An explicitly requested crypto-only repair can resume failed exchange
+    # groups while the original run still finishes its independent Yahoo work.
+    # The provider's own source/writer locks continue to serialize all writes.
+    backfill_yahoo=1
+    backfill_id="registered-backfill"
+    backfill_lock="$repo_root/artifacts/daily_downloader/registered_backfill.lock"
+    if [[ "${BACKFILL_CRYPTO_ONLY:-0}" == "1" ]]; then
+      backfill_yahoo=0
+      backfill_id="registered-backfill-crypto-repair"
+      backfill_lock="$repo_root/artifacts/daily_downloader/registered_backfill_crypto_repair.lock"
+    elif [[ "${BACKFILL_CRYPTO_ONLY:-0}" != "0" ]]; then
+      echo "BACKFILL_CRYPTO_ONLY must be 0 or 1" >&2
+      exit 2
+    fi
     exec env "${common_env[@]}" \
-      RUN_ID="registered-backfill-$(date -u +%Y%m%dT%H%M%S%NZ)" \
-      LOCK_FILE="$repo_root/artifacts/daily_downloader/registered_backfill.lock" \
+      CRYPTO_SOURCE_LOCK_TIMEOUT_SECONDS="${CRYPTO_BACKGROUND_LOCK_WAIT_SECONDS:-21600}" \
+      RUN_ID="${backfill_id}-$(date -u +%Y%m%dT%H%M%S%NZ)" \
+      LOCK_FILE="$backfill_lock" \
       RUN_LOG_DIR="$repo_root/artifacts/daily_downloader/registered_backfill" \
       RUN_RECORD_FILE="$repo_root/artifacts/daily_downloader/registered_backfill_runs.tsv" \
-      RUN_YAHOO=1 \
+      RUN_YAHOO="$backfill_yahoo" \
       YAHOO_ASSETS="us_stocks" \
       YAHOO_VERIFY_US_HISTORY_HEAD=1 \
       YAHOO_HISTORY_START_DATE=1900-01-01 \

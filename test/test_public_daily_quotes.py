@@ -33,6 +33,44 @@ def source_at(tmp_path, rows=None, **kwargs):
     return OfficialDailyQuoteSource(tmp_path, **kwargs)
 
 
+def test_current_session_skips_impossible_daily_scan_before_close_and_retries_after(tmp_path, monkeypatch):
+    class Clock(datetime):
+        current = datetime.fromisoformat("2026-09-21T13:29:59+08:00")
+
+        @classmethod
+        def now(cls, tz=None):
+            return cls.current.astimezone(tz) if tz else cls.current.replace(tzinfo=None)
+
+    source = source_at(tmp_path, [official_row(_downloaded_at_utc="2026-09-21T05:30:00+00:00")])
+    original = quote_module._projected_daily_quote_rows
+    scans = []
+
+    def record_scan(*args, **kwargs):
+        scans.append(kwargs["sessions"])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(quote_module, "datetime", Clock)
+    monkeypatch.setattr(quote_module, "_projected_daily_quote_rows", record_scan)
+    assert source.session(DAY) == {}
+    with source.read_view([{"symbol": "2330", "session_date": DAY}]) as view:
+        assert view.enrich({"symbol": "2330", "session_date": DAY}).get("official_daily_quote") is None
+    assert scans == []
+    assert DAY not in source._sessions
+    Clock.current = datetime.fromisoformat("2026-09-21T13:30:01+08:00")
+    assert source.session(DAY)["2330"]["close"] == 2480.0
+    assert scans == [{DAY}]
+
+
+def test_daily_receipt_skip_is_timezone_aware_and_does_not_skip_completed_sessions():
+    before_close = datetime.fromisoformat("2026-09-21T05:29:59+00:00")
+    assert not quote_module._daily_receipt_may_exist("2026-09-21", observed=before_close)
+    assert not quote_module._daily_receipt_may_exist("2026-09-22", observed=before_close)
+    assert quote_module._daily_receipt_may_exist("2026-09-20", observed=before_close)
+    assert quote_module._daily_receipt_may_exist("2026-09-21", observed=datetime.fromisoformat("2026-09-21T05:30:00+00:00"))
+    with pytest.raises(ValueError, match="timezone-aware"):
+        quote_module._daily_receipt_may_exist("2026-09-21", observed=datetime(2026, 9, 21))
+
+
 def tpex_row(**overrides):
     return {"date": DAY, "代號": "6168", "開盤": "28.00", "最高": "29.20",
             "最低": "27.80", "收盤": "28.20", "均價": "28.1234",

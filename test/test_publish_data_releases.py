@@ -117,6 +117,24 @@ def test_all_ready_failure_is_isolated_from_other_datasets(tmp_path, monkeypatch
     assert result['skipped'][0]['validation_or_publication_error'] == 'source validation rejected'
 
 
+def test_hft_publisher_and_builder_share_the_source_lock(tmp_path, monkeypatch):
+    from scripts import build_shioaji_hft_dataset as builder
+    module = _module()
+    monkeypatch.setattr(module, 'REPO_ROOT', tmp_path)
+    root = tmp_path/'data_tw_microstructure/hft_dataset'
+    root.mkdir(parents=True)
+    entry = {'dataset':'tw-microstructure-train', 'source':'data_tw_microstructure/hft_dataset',
+             'source_coordination_lock':'data_tw_microstructure/hft_dataset/.download.lock'}
+    with builder._output_owner(root):
+        with pytest.raises(module.SourceCoordinationLockTimeout):
+            with module._source_coordination_lock(entry, wait_seconds=0):
+                pytest.fail('publisher must wait for the active builder')
+    with module._source_coordination_lock(entry, wait_seconds=0):
+        with pytest.raises(BlockingIOError):
+            with builder._output_owner(root):
+                pytest.fail('builder must wait for the active publisher')
+
+
 def test_all_ready_defers_busy_source_without_sleeping(tmp_path, monkeypatch, capsys):
     module = _module()
     monkeypatch.setattr(module, "REPO_ROOT", tmp_path)
@@ -380,6 +398,30 @@ def test_catalog_publish_holds_source_lock_through_snapshot(tmp_path, monkeypatc
     with (tmp_path / lock_relative).open("a+b") as other:
         fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
         fcntl.flock(other, fcntl.LOCK_UN)
+
+
+def test_expected_previous_manifest_fences_canonical_publication(tmp_path, monkeypatch, capsys):
+    module = _module()
+    monkeypatch.setattr(module, 'REPO_ROOT', tmp_path)
+    monkeypatch.setattr(module, '_running_commands', lambda: [])
+    source = tmp_path/'source'
+    source.mkdir()
+    (source/'value').write_text('first')
+    catalog = tmp_path/'catalog.json'
+    catalog.write_text(json.dumps({'schema_version': 1, 'datasets': [{
+        'dataset': 'fixture', 'source': str(source), 'role': 'test', 'publish': True,
+        'note': 'test', 'active_process_substrings': [], 'pack_buckets': 1, 'loose_threshold_mib': 8}]}))
+    cold = tmp_path/'cold'
+    base = ['publish', 'fixture', '--catalog', str(catalog), '--sync-root', str(cold), '--node-id', 'test']
+    assert module.main(base) == 0
+    first = packed_snapshots.resolve_latest_packed(cold, 'fixture')
+    capsys.readouterr()
+    (source/'value').write_text('second')
+    assert module.main(base+['--expected-previous-manifest-sha256', 'f'*64]) == 2
+    assert packed_snapshots.resolve_latest_packed(cold, 'fixture').manifest_sha256 == first.manifest_sha256
+    assert 'expected previous manifest changed' in capsys.readouterr().err
+    assert module.main(base+['--expected-previous-manifest-sha256', first.manifest_sha256]) == 0
+    assert packed_snapshots.resolve_latest_packed(cold, 'fixture').manifest_sha256 != first.manifest_sha256
 
 
 @pytest.mark.parametrize("provider", ["okx", "bybit", "binance"])

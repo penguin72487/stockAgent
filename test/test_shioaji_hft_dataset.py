@@ -1,10 +1,28 @@
 from __future__ import annotations
 
 from datetime import date
-
 import polars as pl
+import pytest
 
 from scripts.build_shioaji_hft_dataset import NS_PER_SECOND, build_hft_frame
+
+
+def test_hft_builder_waits_for_owner_and_refuses_missing_workspace(tmp_path, monkeypatch):
+    from scripts import build_shioaji_hft_dataset as builder
+    from stockagent.data_sync import workspace_source_handoff as handoff
+    root = tmp_path/'hft'
+    def unavailable(_path):
+        raise handoff.SnapshotError('workspace unavailable')
+    monkeypatch.setattr(handoff, 'guard_path', unavailable)
+    with pytest.raises(handoff.SnapshotError, match='workspace unavailable'):
+        with builder._output_owner(root):
+            pytest.fail('must not enter an unavailable workspace')
+    assert not root.exists()
+    monkeypatch.setattr(handoff, 'guard_path', lambda _path: None)
+    with builder._output_owner(root):
+        with pytest.raises(BlockingIOError):
+            with builder._output_owner(root):
+                pytest.fail('must not enter the active owner')
 
 
 def _books(base_ns: int) -> pl.LazyFrame:

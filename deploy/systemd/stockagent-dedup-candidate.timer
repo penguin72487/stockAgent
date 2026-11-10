@@ -1,0 +1,12 @@
+[Unit]
+Description=Retry E deduplicated dataset candidate preparation
+
+[Timer]
+OnBootSec=30s
+OnUnitInactiveSec=60s
+AccuracySec=1s
+Persistent=true
+Unit=stockagent-dedup-candidate.service
+
+[Install]
+WantedBy=timers.target

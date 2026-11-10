@@ -1,0 +1,14 @@
+[Unit]
+Description=Prepare and retire an enrolled C handoff payload through E
+Requires=stockagent-e-workspace-mount.service stockagent-service-layout.service
+After=stockagent-e-workspace-mount.service stockagent-service-layout.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=__REPO_ROOT__
+ExecCondition=/bin/bash -c 'source scripts/runtime_env.sh; run_fintech_python scripts/check_outside_tw_opening_resource_window.py --minimum-runway-minutes 120 --protected-until 13:30 --official-calendar-root data_tw_public'
+ExecStart=/bin/bash __REPO_ROOT__/scripts/run_authority_storage_operation.sh scripts/run_handoff_source_repack_queue.py
+TimeoutStartSec=1h 58min
+Nice=10
+IOSchedulingClass=best-effort
+IOSchedulingPriority=6

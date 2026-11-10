@@ -43,19 +43,63 @@ def test_semantic_reference_cannot_change_production_limits(monkeypatch):
         engineering_reference_limits()
 
 
+def test_export_rechecks_guard_after_catalog_owner_releases(tmp_path, monkeypatch):
+    from stockagent.control import lakehouse
+    state = tmp_path / 'state'; state.mkdir()
+    guards, attempts, waits = [], [], []
+    monkeypatch.setattr(lakehouse, 'guard', lambda c: guards.append(True))
+    class Conn:
+        def execute(self, _sql): return self
+        def fetchone(self): return (8,)
+        def close(self): pass
+    monkeypatch.setattr(lakehouse, 'connect', lambda *a, **kw: Conn())
+    original = lakehouse.fcntl.flock
+    def busy_twice(fd, operation):
+        attempts.append(operation)
+        if len(attempts) <= 2:
+            raise BlockingIOError('busy')
+        return original(fd, operation)
+    monkeypatch.setattr(lakehouse.fcntl, 'flock', busy_twice)
+    result = lakehouse.export({'state_root': str(state)}, 7, on_owner_busy=lambda: waits.append(True) or True)
+    assert result['state'] == 'catalog_advanced' and result['snapshot_id'] == 8
+    assert len(attempts) == 3 and len(waits) == 2 and len(guards) == 2
+
+
+def test_export_owner_wait_can_stop_without_touching_data(tmp_path, monkeypatch):
+    from stockagent.control import lakehouse
+    state = tmp_path / 'state'; state.mkdir()
+    monkeypatch.setattr(lakehouse, 'guard', lambda c: None)
+    monkeypatch.setattr(lakehouse.fcntl, 'flock', lambda *args: (_ for _ in ()).throw(BlockingIOError('busy')))
+    with pytest.raises(lakehouse.CatalogOwnerBusy):
+        lakehouse.export({'state_root': str(state)}, 7, on_owner_busy=lambda: False)
+    assert not (state / 'export-7.json').exists()
+
+
 @pytest.mark.parametrize('bounds', [(0, 1), (1, 0), (-1, 2)])
 def test_zero_or_negative_pages_rejected(bounds):
     with pytest.raises(ValueError, match='positive bounds'):
         list(paged_metadata_rows(None, maximum_bytes=bounds[0], maximum_rows=bounds[1]))
 
 
-@pytest.mark.parametrize('variant', ['unique', 'duplicate', 'null', 'negative', 'empty', 'reordered'])
-def test_real_sql_pages_preserve_complete_original_order_and_hash(variant):
+@pytest.mark.parametrize('mode', ['paged', 'single_pass', 'memory_short', 'observation_failure', 'missing_helper'])
+@pytest.mark.parametrize('variant', ['unique', 'duplicate', 'null', 'negative', 'empty', 'reordered', 'collated'])
+def test_real_sql_pages_preserve_complete_original_order_and_hash(variant, mode, monkeypatch):
     import duckdb
+    from stockagent import remote_build
+    def profile(*args):
+        if mode == 'missing_helper':
+            raise ImportError('optional memory observer absent from an older restore capsule')
+        if mode == 'observation_failure':
+            raise ValueError('unavailable cgroup observation')
+        return {'limits': {'memory_headroom_bytes': 64*1024**3 if mode == 'single_pass' else 0}}
+    monkeypatch.setattr(remote_build, 'observe_node', profile)
     connection = duckdb.connect()
     try:
+        connection.execute("SET memory_limit='-1'")
         connection.execute("ATTACH ':memory:' AS lake")
-        fields = ('sha256 VARCHAR,relative VARCHAR' if variant == 'reordered' else 'relative VARCHAR,sha256 VARCHAR')
+        fields = ('sha256 VARCHAR,relative VARCHAR' if variant == 'reordered' else
+                  'relative VARCHAR COLLATE nocase,sha256 VARCHAR COLLATE nocase' if variant == 'collated' else
+                  'relative VARCHAR,sha256 VARCHAR')
         connection.execute('CREATE TABLE lake.source_metadata('+fields+',bytes BIGINT,content_utf8 VARCHAR)')
         rows = [('heads/a', str(i), len(('中文'+str(i)).encode()), '中文'+str(i)) for i in range(12)]
         if variant == 'duplicate': rows.append(('heads/a', '1', 7, '不同內容'))
@@ -63,14 +107,37 @@ def test_real_sql_pages_preserve_complete_original_order_and_hash(variant):
         elif variant == 'negative': rows.append(('heads/b', '0', -1, 'raw'))
         elif variant == 'empty': rows = []
         elif variant == 'reordered': rows.extend([('a', 'z', 1, 'a'), ('z', 'a', 1, 'z')])
+        elif variant == 'collated': rows.append(('HEADS/A', '1', 1, 'case-insensitive ordering tie'))
         if rows:
             connection.executemany('INSERT INTO lake.source_metadata VALUES (?,?,?,?)', rows)
         original = connection.execute('SELECT * FROM lake.source_metadata ORDER BY ALL').fetchall()
-        observed = list(paged_metadata_rows(connection, maximum_bytes=16, maximum_rows=2))
+        queries = []
+        class TrackedConnection:
+            def execute(self, query, *args):
+                queries.append(query)
+                connection.execute(query, *args)
+                return self
+            def __getattr__(self, name):
+                return getattr(connection, name)
+        observed = list(paged_metadata_rows(TrackedConnection(), maximum_bytes=16, maximum_rows=2,
+                                           single_pass=mode != 'paged'))
         assert observed == original
         assert canonical_row_digest(observed) == (len(original), identity_sha256(original))
+        if variant == 'unique':
+            pages = sum('WHERE relative' in query for query in queries)
+            assert (pages == 0) if mode == 'single_pass' else (pages > 1)
     finally:
         connection.close()
+
+
+@pytest.mark.parametrize('sql,available,expected', [
+    ('16.0 EiB', 64*1024**3, True), ('16.0 GiB', 64*1024**3, True),
+    ('512.0 MiB', 64*1024**3, False), ('16.0 EiB', 8*1024**3, False),
+    ('invalid', 64*1024**3, False), (None, 64*1024**3, False),
+    ('16.0 EiB', None, False)])
+def test_metadata_single_pass_needs_current_sql_and_host_memory(sql, available, expected):
+    from stockagent.control import lakehouse
+    assert lakehouse._metadata_sort_fits_memory(1024**3, 100, sql, available) is expected
 
 
 @pytest.mark.parametrize('table', ['dataset_releases', 'source_objects', 'catalog_captures', 'source_metadata'])

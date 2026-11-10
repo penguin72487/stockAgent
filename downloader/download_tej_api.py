@@ -106,6 +106,63 @@ def seed_queue(api: TejTrialAPI, catalog: dict) -> dict:
     return {"tasks_inserted": inserted, "all_entitled_tables_queued": len(catalog["tables"])}
 
 
+def requeue_rejected_pages_once(api: TejTrialAPI, task_ids: list[str]) -> dict:
+    """Recheck exact, confirmed HTTP-400 cursor requests once through the owner.
+
+    A rejected response is not an unknown submission or a successful page.
+    Preserve its request, cursor, previous pages, row count and priority. If
+    the same cursor is rejected again it returns to blocked; its new private
+    HTTP diagnostic can then identify the vendor's actual reason.
+    Caller holds the canonical API lock; this function sends no requests.
+    """
+    import re
+    if not task_ids or len(set(task_ids)) != len(task_ids) or any(
+            not isinstance(item, str) or not re.fullmatch(r'[0-9a-f]{32}', item) for item in task_ids):
+        raise ValueError('Distinct exact TEJ API task IDs required')
+    checked = api.now().isoformat()
+    queued, already = [], []
+    with closing(connect(api.root)) as con, con:
+        con.execute('''CREATE TABLE IF NOT EXISTS rejected_page_rechecks (
+            task_id TEXT NOT NULL, request_id TEXT NOT NULL, table_id TEXT NOT NULL,
+            queued_at_utc TEXT NOT NULL, original_intent_sha256 TEXT NOT NULL,
+            PRIMARY KEY(task_id,request_id))''')
+        for task_id in task_ids:
+            task = con.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if task is None:
+                raise ValueError('Exact rejected task is missing')
+            task = dict(task)
+            req_id = task.get('active_request_id')
+            if not isinstance(req_id, str) or not re.fullmatch(r'[0-9a-f]{32}', req_id):
+                raise ValueError('Exact original rejected request required')
+            if con.execute('SELECT 1 FROM rejected_page_rechecks WHERE task_id=? AND request_id=?',
+                           (task_id, req_id)).fetchone():
+                already.append(task_id)
+                continue
+            request = con.execute('SELECT account,state,actual_rows FROM requests WHERE id=?', (req_id,)).fetchone()
+            intent_path = api.root / 'requests' / (req_id + '.intent.json')
+            if (task['state'] != 'blocked' or task['error_code'] != 'query_rejected'
+                    or not task.get('cursor') or task.get('query_rows', 0) <= 0
+                    or request is None or request['account'] != api._account_id
+                    or request['state'] != 'http_400' or request['actual_rows'] != 0
+                    or con.execute('SELECT 1 FROM pages WHERE request_id=?', (req_id,)).fetchone()
+                    or intent_path.is_symlink() or not intent_path.is_file() or intent_path.stat().st_size > 65536):
+                raise ValueError('Only an exact captured HTTP-400 cursor rejection may be rechecked')
+            raw = intent_path.read_bytes()
+            intent = json.loads(raw)
+            if intent.get('request_id') != req_id or intent.get('task_id') != task_id:
+                raise ValueError('Original HTTP intent identity differs')
+            con.execute('INSERT INTO rejected_page_rechecks VALUES(?,?,?,?,?)',
+                        (task_id, req_id, task['table_id'], checked, hashlib.sha256(raw).hexdigest()))
+            changed = con.execute("UPDATE tasks SET state='retry',error_code='query_rejected_probe_requeued', "
+                                  "next_attempt_utc=? WHERE id=? AND state='blocked' AND active_request_id=?",
+                                  (checked, task_id, req_id)).rowcount
+            if changed != 1:
+                raise ValueError('Original rejection changed during requeue')
+            queued.append(task_id)
+    return {'queued': queued, 'already_queued': already, 'provider_requests_sent': 0,
+            'original_request_and_pages_preserved': True}
+
+
 def _partition_at_cap(con, task: dict, receipt: dict, api: TejTrialAPI) -> str:
     # A capped query is not complete. Partition into explicit disjoint filters;
     # never reset an opaque cursor to evade the per-query limit.
@@ -296,17 +353,38 @@ def publish_financial_reference_fields(api: TejTrialAPI, output: Path) -> dict:
             "all_concept_histories_complete": False}
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("inventory", "seed", "run", "status", "allocate", "reindex", "enable-allocation", "recover", "reference-fields"))
+    parser.add_argument("action", choices=("inventory", "seed", "run", "status", "allocate", "reindex", "enable-allocation", "recover", "reference-fields", "recheck-rejected"))
     parser.add_argument("--root", type=Path, default=Path("data_tej/api_trial_v1"))
     parser.add_argument("--env", type=Path, default=Path(".env"))
     parser.add_argument("--output", type=Path, default=Path("artifacts/data_quality/tej_trial_api_inventory_2026-10-04"))
     parser.add_argument("--refresh", action="store_true")
     parser.add_argument("--max-pages", type=int, default=500)
-    args = parser.parse_args()
-    api = TejTrialAPI.from_env(args.root, args.env)
-    with exclusive_dataset_lock(api.root / ".api.lock", provider="tej-api", timeout_seconds=5):
+    parser.add_argument('--task-id', action='append', default=[], help='Exact rejected task ID; repeat for each sample')
+    args = parser.parse_args(argv)
+    if (args.action == 'recheck-rejected') != bool(args.task_id):
+        parser.error('--task-id is required only for recheck-rejected')
+    # The client constructor opens and can migrate the SQLite queue. Admit the
+    # actual provider workspace before credentials, locks, or local writes.
+    if args.action == 'status':
+        # Status remains available during ordinary low-space conditions, but
+        # its legacy client opens SQLite, so it must respect a pending handoff.
+        from stockagent.data_sync.desync_snapshots import SnapshotError
+        from stockagent.data_sync.provider_workspace import check_path
+        try:
+            check_path(args.root.absolute())
+        except (OSError, ValueError, SnapshotError):
+            print(json.dumps({'state': 'deferred', 'reason': 'provider_workspace_unavailable',
+                              'retryable': True, 'provider_calls': 0}))
+            return 75
+    else:
+        from scripts.check_acquisition_capacity import check_dispatch
+        deferred = check_dispatch(args.root, report_admitted=False)
+        if deferred:
+            return deferred
+    with exclusive_dataset_lock(args.root.resolve() / ".api.lock", provider="tej-api", timeout_seconds=5):
+        api = TejTrialAPI.from_env(args.root, args.env)
         if args.action == "inventory":
             result = inventory(api, args.output, refresh=args.refresh)
         elif args.action == "seed":
@@ -330,10 +408,13 @@ def main() -> None:
             result = api.recover_saved_pages()
         elif args.action == "reference-fields":
             result = publish_financial_reference_fields(api, args.output)
+        elif args.action == 'recheck-rejected':
+            result = requeue_rejected_pages_once(api, args.task_id)
         else:
             result = status(api)
     print(json.dumps(result, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

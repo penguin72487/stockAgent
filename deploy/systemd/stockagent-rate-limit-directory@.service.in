@@ -1,0 +1,10 @@
+[Unit]
+Description=Prepare shared StockAgent rate-limit directory for UID %i
+
+[Service]
+Type=oneshot
+User=root
+Group=root
+WorkingDirectory=@REPO_ROOT@
+ExecStart=/usr/bin/bash -lc 'source "@REPO_ROOT@/scripts/runtime_env.sh" && run_fintech_python "@REPO_ROOT@/scripts/ensure_rate_limit_directory.py" --uid %i'
+UMask=0077

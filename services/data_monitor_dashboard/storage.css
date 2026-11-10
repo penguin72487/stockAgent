@@ -52,6 +52,22 @@
 .storage-operation-notice {padding:.65rem .85rem;border-left:3px solid #587e90;background:#102331;border-radius:4px;overflow-wrap:anywhere}
 .storage-operation-notice-blocked {border-left-color:#f6bb89}.storage-operation-notice strong {font-size:.85rem}.storage-operation-notice p {margin:.2rem 0}
 .storage-operation-flow {display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:.6rem;margin:.8rem 0}
+.storage-phase-overview {margin:1rem 0 1.2rem}.storage-phase-overview h4 {margin:.4rem 0;font-size:.95rem}
+.storage-archive-policy {margin:1rem 0;padding:1rem;border:1px solid #263d4c;border-radius:8px}
+.storage-archive-policy h4 {margin:0 0 .7rem;font-size:.95rem}
+.storage-archive-roles {display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:.8rem}
+.storage-archive-role {min-width:0}.storage-archive-role strong {font-size:.9rem;color:#c5dce7}
+.storage-archive-role p {margin:.35rem 0}
+.storage-policy-gap {font-size:.82rem;line-height:1.6;padding:.5rem .7rem;border-left:3px solid #d0a868;background:#152a35;color:#e6d8bf;overflow-wrap:anywhere}
+.storage-archive-badge {display:inline-block;font-size:.78rem;line-height:1.5;color:#a8d4d8;border:1px solid #34565d;border-radius:6px;padding:.15rem .45rem;margin-left:.65rem;white-space:normal}
+@media(max-width:850px){.storage-archive-roles{grid-template-columns:1fr}}
+.storage-phase-table {width:100%;table-layout:fixed;border-collapse:collapse;font-size:.82rem;line-height:1.6}
+.storage-phase-table thead {display:table-header-group}.storage-phase-table tbody {display:table-row-group}
+.storage-phase-table tr {display:table-row;padding:0;border:0;border-radius:0;background:transparent}
+.storage-phase-table th,.storage-phase-table td {display:table-cell;padding:.65rem .5rem;text-align:left;vertical-align:top;border-bottom:1px solid #263d4c;overflow-wrap:anywhere}
+.storage-phase-table td::before {content:none}
+.storage-phase-table col.storage-phase-name {width:35%}.storage-phase-table col.storage-phase-state {width:20%}.storage-phase-table col.storage-phase-time {width:45%}
+.storage-phase-table tbody th {font-weight:500;color:#c5dce7}.storage-phase-table small {display:block;margin-top:.3rem}
 .storage-operation-stage {padding:.75rem;border:1px solid #263d4c;border-radius:8px;min-width:0;overflow-wrap:anywhere}
 .storage-operation-stage strong {display:block;font-size:.85rem}.storage-operation-stage p {margin:.2rem 0}
 @media(max-width:850px){.storage-operation-flow{grid-template-columns:1fr}}

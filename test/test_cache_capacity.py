@@ -219,13 +219,13 @@ def test_protected_trading_source_uses_only_its_own_physical_reserve(tmp_path, m
     monkeypatch.setattr(capacity, "_admit_backing_volume", admit)
     with capacity.reserve_cache_write(trade, key="trade", maximum_growth_bytes=16 * gib,
                                      family="prepared", policy=policy) as accepted:
-        assert accepted["physical_reserve_bytes"] == 20 * gib
+        assert accepted["physical_reserve_bytes"] == 4 * gib
         assert accepted["filesystem"]["minimum_free_bytes"] == 25 * gib
-        assert observed[-1] == 36 * gib + CONTROL_HEADROOM_BYTES
+        assert observed[-1] == 20 * gib + CONTROL_HEADROOM_BYTES
         with capacity.reserve_cache_write(panel, key="trade-panel", maximum_growth_bytes=gib,
                                          family="panel", policy=policy) as nested:
-            assert nested["physical_reserve_bytes"] == 20 * gib
-            assert observed[-1] == 37 * gib + 2 * CONTROL_HEADROOM_BYTES
+            assert nested["physical_reserve_bytes"] == 4 * gib
+            assert observed[-1] == 21 * gib + 2 * CONTROL_HEADROOM_BYTES
         # Another family still reserves the full 25 GiB and the trading lease;
         # it cannot displace the in-progress protected source.
         with pytest.raises(CapacityDeferred, match="physical_backing_reserve"):
@@ -242,6 +242,49 @@ def test_protected_trading_source_uses_only_its_own_physical_reserve(tmp_path, m
             with capacity.reserve_cache_write(root, key="normal", maximum_growth_bytes=16 * gib,
                                              family="prepared", policy=policy):
                 pytest.fail("ordinary source used priority backing reserve")
+
+
+@pytest.mark.parametrize("case", ["protected", "source_groups", "ordinary", "oversized", "other_path"])
+def test_bounded_official_symbol_refresh_can_use_trading_reserve(tmp_path, monkeypatch, policy, case):
+    gib = 1024**3
+    symbols = tmp_path / "official-symbols"
+    symbols.mkdir()
+    monkeypatch.setattr(capacity, "TRADING_SYMBOL_ROOT", symbols)
+    source_groups = tmp_path / "source-groups"
+    source_groups.mkdir()
+    monkeypatch.setattr(capacity, "TRADING_SYMBOL_SOURCE_ROOT", source_groups)
+    monkeypatch.setenv(capacity.TRADING_PRIORITY_ENV, "1")
+    monkeypatch.setattr("stockagent.data_sync.completed_forward_capacity.os.statvfs",
+                        lambda _: SimpleNamespace(f_bavail=100 * gib, f_frsize=1))
+    policy["minimum_free_bytes"] = 25 * gib
+    policy["panel_family_capacity_bytes"] = 64 * gib
+    observed = []
+    def admit(path, required):
+        observed.append(required)
+        if required > 17 * gib:
+            raise CapacityDeferred("physical_backing_reserve")
+        return {"physical_free_bytes": 17 * gib}
+    monkeypatch.setattr(capacity, "_admit_backing_volume", admit)
+    growth = 53 * MIB
+    if case == "source_groups":
+        symbols = source_groups
+    elif case == "ordinary":
+        monkeypatch.delenv(capacity.TRADING_PRIORITY_ENV)
+    elif case == "oversized":
+        growth = gib + 1
+    elif case == "other_path":
+        symbols = tmp_path / "unrelated-symbols"
+    if case in {"protected", "source_groups"}:
+        with capacity.reserve_cache_write(symbols, key="official", maximum_growth_bytes=growth,
+                                         family="panel", policy=policy) as accepted:
+            assert accepted["physical_reserve_bytes"] == 4 * gib
+            assert accepted["filesystem"]["minimum_free_bytes"] == 25 * gib
+            assert observed[-1] == 4 * gib + growth + 128 * 1024
+    else:
+        with pytest.raises(CapacityDeferred, match="physical_backing_reserve"):
+            with capacity.reserve_cache_write(symbols, key="official", maximum_growth_bytes=growth,
+                                             family="panel", policy=policy):
+                pytest.fail("unprotected or oversized writer spent the trading reserve")
 
 
 def test_unattended_backing_query_uses_explicit_authority_identity_without_mutating_environment(tmp_path, monkeypatch):

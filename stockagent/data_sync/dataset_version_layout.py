@@ -13,7 +13,7 @@ from typing import Any, Mapping
 
 from stockagent.data_sync.desync_snapshots import SnapshotError
 from stockagent.data_sync.packed_snapshots import (
-    CHUNKED_SNAPSHOT_SCHEMA_VERSION, MAX_FILE_CHUNK_BYTES, resolve_latest_packed,
+    ALIAS_SNAPSHOT_SCHEMA_VERSION, CHUNKED_SNAPSHOT_SCHEMA_VERSION, MAX_FILE_CHUNK_BYTES, resolve_latest_packed,
 )
 
 
@@ -35,6 +35,8 @@ def version_policy(repo_root: Path) -> dict[str, Any]:
         if (not name.startswith("data_") or Path(name).name != name or not isinstance(spec, dict)
                 or not spec.get("native_layout") or not spec.get("target_grain")):
             raise SnapshotError(f"invalid dataset versioning root: {name!r}")
+        if spec.get('incremental_base_union') not in (None, 'immutable_path_union_v1'):
+            raise SnapshotError(f"unknown incremental source semantics: {name!r}")
     return policy
 
 
@@ -55,7 +57,9 @@ def publication_version_options(
     is validated by the canonical catalog loader, not inferred from file names.
     """
     if "file_chunk_bytes" in entry:
-        return {"file_chunk_bytes": entry["file_chunk_bytes"]}
+        return {"file_chunk_bytes": entry["file_chunk_bytes"],
+                **({"allow_content_alias_v3": True}
+                   if entry.get("reader_contract") == "packed-v3-content-alias" else {})}
     if reader_contract != "packed-v2-chunks" or "publication_family" in entry:
         return {}
     policy = version_policy(repo_root)
@@ -230,9 +234,16 @@ def inventory_version_layout(
         private_v2 = any(item.get("schema_version") == CHUNKED_SNAPSHOT_SCHEMA_VERSION
                          and item.get('storage_scope') == 'host_private'
                          for item in current_heads)
+        shared_v3 = any(item.get("schema_version") == ALIAS_SNAPSHOT_SCHEMA_VERSION
+                        and item.get('storage_scope') == 'shared' for item in current_heads)
+        private_v3 = any(item.get("schema_version") == ALIAS_SNAPSHOT_SCHEMA_VERSION
+                         and item.get('storage_scope') == 'host_private' for item in current_heads)
         enrolled = [item["dataset"] for item in bindings
                     if item.get("reader_contract") == "packed-v2-chunks"
                     and item.get("file_chunk_bytes") == policy["file_chunk_bytes"]]
+        enrolled_v3 = [item["dataset"] for item in bindings
+                       if item.get("reader_contract") == "packed-v3-content-alias"
+                       and item.get("file_chunk_bytes") == policy["file_chunk_bytes"]]
         rows.append({"root": name, "exists": root.is_dir(), "path_is_symlink": root.is_symlink(),
             **spec, "writer_implementation": writer,
             "source_and_consumer_entrypoints": descriptions.get(name, {}).get("sources", []),
@@ -244,12 +255,18 @@ def inventory_version_layout(
             "private_v2_head_observed": private_v2,
             "current_v2_head_observed": shared_v2 or private_v2,
             "configured_v2_publication_branches": enrolled,
+            "shared_v3_head_observed": shared_v3,
+            "private_v3_head_observed": private_v3,
+            "current_v3_head_observed": shared_v3 or private_v3,
+            "configured_v3_publication_branches": enrolled_v3,
             "native_workspace_migrated": native_acceptance is not None and native_acceptance["state"] == "verified_receipt",
             **({"native_acceptance": native_acceptance} if native_acceptance is not None else {}),
             "rollout_state": (native_rollout if native_rollout is not None
+                              else "shared_v3_head_observed" if shared_v3
+                              else "host_private_v3_head_observed" if private_v3
                               else "shared_v2_head_observed" if shared_v2
                               else "host_private_v2_head_observed" if private_v2
-                              else "policy_enrolled_head_pending" if enrolled
+                              else "policy_enrolled_head_pending" if enrolled or enrolled_v3
                               else "reader_first_rollout_required"),
             "coverage_claim": "layout_inventory_only_not_download_or_recovery_acceptance"})
     return {"contract_version": 2, "head_observation_contract": "shared_and_host_private_heads_v1",

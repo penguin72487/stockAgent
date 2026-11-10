@@ -162,3 +162,37 @@ def prioritize_source_checks(connection: sqlite3.Connection, plan: dict, now: da
                 preempted_foreign_history_requests=removed,
                 finite_query_priority=finite_query_ready,
                 source_verification_priority=True)
+
+
+def yield_explicitly_paused_owners(plan: dict, now: datetime, paused: frozenset[str]) -> dict:
+    """Let a user-requested finite query proceed without restarting paused lanes.
+
+    The complete original quota reservation remains unchanged. Only the
+    dispatch precedence of *currently disabled and inactive* owners yields;
+    future releases, queue state, retry clocks and provider limits are kept.
+    Callers must independently re-observe service and process state.
+    """
+    if (not paused or plan.get('observed_at_utc') != now.isoformat()
+            or not isinstance(plan.get('events'), list) or plan.get('queue_errors')
+            or type(plan.get('ready_requests')) is not int
+            or type(plan.get('reserve_requests')) is not int
+            or not 0 <= plan['ready_requests'] <= plan['reserve_requests']):
+        return plan
+    total = removed = 0
+    try:
+        for event in plan['events']:
+            count = event['requests']
+            due = datetime.fromisoformat(event['due_at_utc'].replace('Z', '+00:00'))
+            if type(count) is not int or count < 0 or due.tzinfo is None:
+                return plan
+            if due <= now:
+                total += count
+                if event.get('owner') in paused:
+                    removed += count
+    except (KeyError, TypeError, ValueError):
+        return plan
+    if total != plan['ready_requests'] or not removed:
+        return plan
+    return dict(plan, ready_requests=plan['ready_requests'] - removed,
+                paused_owner_ready_yielded=removed, paused_owners=sorted(paused),
+                quota_reservation_for_paused_owners_preserved=True)

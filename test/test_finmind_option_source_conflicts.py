@@ -76,9 +76,123 @@ def test_option_whole_market_waiter_checks_product_workflow_before_source_calls(
             'batches': 2, 'source_days_requiring_reaudit': 0, 'full_contract_or_training_completeness': False}) + '\n')
     monkeypatch.setattr(waiter.time, 'sleep', finish)
     assert waiter.wait_for_product_predecessor(root, run_id, request_id) is True
+    # A deferred priority must not be registered just to wait for its parent.
+    (root / 'priority_queries' / f'{request_id}.json').unlink()
+    assert waiter.wait_for_product_predecessor(root, run_id, None) is True
     record.update(state='failed', exit_code=75)
     (run_dir / 'run.json').write_text(json.dumps(record))
-    assert waiter.wait_for_product_predecessor(root, run_id, request_id) is False
+    assert waiter.wait_for_product_predecessor(root, run_id, None) is False
+
+
+def test_deferred_option_priority_uses_only_original_unresolved_scope(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter, 'REPO', tmp_path)
+    artifacts = tmp_path / 'artifacts/markets/test'
+    artifacts.mkdir(parents=True)
+    root = tmp_path / 'data_finmind/complement'
+    root.mkdir(parents=True)
+    now = datetime.now(UTC)
+    (root / SIDECAR).write_text(json.dumps({'expires_at_utc': (now + timedelta(days=1)).isoformat()}))
+    items = [{'dataset': 'TaiwanOptionTick', 'data_id': '', 'partition': f'2020-01-0{i}'}
+             for i in (2, 3)]
+    template = {'contract': 'provider_priority_query_v1', 'provider': 'finmind', 'reason': 'old scope',
+                'created_at_utc': (now - timedelta(days=8)).isoformat(),
+                'expires_at_utc': (now - timedelta(days=1)).isoformat(), 'items': items}
+    original, output = artifacts / 'original.json', artifacts / 'renewed.json'
+    original.write_text(json.dumps(template))
+    requests = [{'dataset': 'TaiwanOptionTick', 'start_date': item['partition'], 'correction_id': 'other'}
+                for item in items]
+    monkeypatch.setattr(waiter, 'active_plans', lambda *a: [{'requests': requests}])
+    monkeypatch.setattr(waiter, 'corrected_contract_readbacks', lambda *a: ({}, {}))
+    monkeypatch.setattr(waiter, 'read_states', lambda *a: [
+        {'task_state': 'complete', 'correction_state': 'repaired'},
+        {'task_state': 'pending', 'correction_state': 'queued'}])
+    called = []
+    monkeypatch.setattr(waiter, 'register_priority', lambda root, plan, now: called.append(plan) or
+                        {'request_id': 'registered'})
+    sha = hashlib.sha256(original.read_bytes()).hexdigest()
+    assert waiter.deferred_priority(root, original, output, sha, []) == 'registered'
+    assert called[0]['items'] == items[1:]
+    first = output.read_bytes()
+    assert waiter.deferred_priority(root, original, output, sha, []) == 'registered'
+    assert output.read_bytes() == first
+    requests[1]['start_date'] = '2020-01-04'
+    with pytest.raises(ValueError, match='outside original'):
+        waiter.deferred_priority(root, original, output, sha, [])
+    assert len(called) == 2
+
+
+def test_deferred_option_priority_rejects_expired_sidecar_before_registration(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter, 'REPO', tmp_path)
+    artifacts = tmp_path / 'artifacts/markets/test'
+    artifacts.mkdir(parents=True)
+    root = tmp_path / 'data_finmind/complement'
+    root.mkdir(parents=True)
+    (root / SIDECAR).write_text(json.dumps({'expires_at_utc': (datetime.now(UTC) - timedelta(seconds=1)).isoformat()}))
+    original = artifacts / 'original.json'
+    original.write_text('{}')
+    calls = []
+    monkeypatch.setattr(waiter, 'register_priority', lambda *a, **k: calls.append(1))
+    with pytest.raises(ValueError, match='expired source-conflict sidecar'):
+        waiter.deferred_priority(root, original, artifacts / 'renewed.json',
+                                 hashlib.sha256(original.read_bytes()).hexdigest(), [])
+    assert not calls
+    assert not (artifacts / 'renewed.json').exists()
+
+
+def test_deferred_option_priority_rechecks_expiry_after_evidence_readback(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter, 'REPO', tmp_path)
+    artifacts = tmp_path / 'artifacts/markets/test'
+    artifacts.mkdir(parents=True)
+    root = tmp_path / 'data_finmind/complement'
+    root.mkdir(parents=True)
+    start = datetime.now(UTC)
+    (root / SIDECAR).write_text(json.dumps({'expires_at_utc': (start + timedelta(seconds=1)).isoformat()}))
+    original = artifacts / 'original.json'
+    original.write_text('{}')
+
+    class Clock(datetime):
+        calls = 0
+
+        @classmethod
+        def now(cls, tz=None):
+            cls.calls += 1
+            return start if cls.calls == 1 else start + timedelta(seconds=2)
+
+    monkeypatch.setattr(waiter, 'datetime', Clock)
+    monkeypatch.setattr(waiter, 'active_plans', lambda *a: [{'requests': []}])
+    monkeypatch.setattr(waiter, 'corrected_contract_readbacks', lambda *a: ({}, {}))
+    monkeypatch.setattr(waiter, 'read_states', lambda *a: [])
+    monkeypatch.setattr(waiter, 'register_priority', lambda *a, **k: pytest.fail('registered expired scope'))
+    with pytest.raises(ValueError, match='expired source-conflict sidecar'):
+        waiter.deferred_priority(root, original, artifacts / 'renewed.json',
+                                 hashlib.sha256(original.read_bytes()).hexdigest(), [])
+    assert not (artifacts / 'renewed.json').exists()
+
+
+def test_deferred_priority_is_not_registered_when_product_predecessor_fails(tmp_path, monkeypatch):
+    root = tmp_path / 'data_finmind/complement'
+    root.mkdir(parents=True)
+    source, output = tmp_path / 'source.json', tmp_path / 'renewed.json'
+    source.write_text('{}')
+    monkeypatch.setattr(waiter, 'ROOT', root)
+    seen = []
+    monkeypatch.setattr(waiter, 'wait_for_product_predecessor',
+                        lambda _root, _run, request_id, **_kwargs: seen.append(request_id) or False)
+    monkeypatch.setattr(waiter, 'deferred_priority', lambda *a: pytest.fail('registered before product gate'))
+    monkeypatch.setattr(waiter.sys, 'argv', ['waiter', '--renew-priority-from', str(source),
+                        '--renew-priority-output', str(output), '--after-product-run', 'parent',
+                        '--corrected-contract-readback', str(tmp_path / 'readback.json')])
+    assert waiter.main() == 75
+    assert seen == [None]
+    assert not output.exists()
+
+
+def test_product_gate_stops_when_pinned_owner_changes_before_parent_finishes(tmp_path, monkeypatch):
+    monkeypatch.setattr(waiter, 'REPO', tmp_path)
+    root = tmp_path / 'data_finmind/complement'
+    root.mkdir(parents=True)
+    assert waiter.wait_for_product_predecessor(root, 'product-backlog-123', None,
+                                               still_valid=lambda: False) is False
 
 NOW = datetime(2026, 9, 27, 12, tzinfo=UTC)
 
@@ -502,6 +616,32 @@ def test_contract_proof_requires_missing_keys_and_preserves_original_keys(tmp_pa
     assert verify([false_week, missing_key]) is None
     original.write_bytes(original.read_bytes() + b'changed')
     assert verify([prior_key, missing_key]) is None
+
+
+def test_option_contract_proof_reuses_only_unchanged_exact_evidence(tmp_path, monkeypatch):
+    original, current = tmp_path / 'original.parquet', tmp_path / 'current.parquet'
+    def write(path, rows):
+        pq.write_table(pa.table({'option_id': [r[0] for r in rows], 'contract_date': [r[1] for r in rows],
+                                 'ExercisePrice': pa.array([r[2] for r in rows], type=pa.float32()),
+                                 'PutCall': [r[3] for r in rows]}), path)
+    old = ('TXO', '202511F4', 25100.0, 'P')
+    added = ('CAO', '202511', 24.5, 'C')
+    write(original, [old]); write(current, [old, added])
+    expected = [list(added)]
+    digest = _sha(original)
+    scan = corrections.pl.scan_parquet
+    calls = []
+    monkeypatch.setattr(corrections.pl, 'scan_parquet', lambda path: calls.append(path) or scan(path))
+    def proof():
+        return corrections._option_contract_proof(original, corrections._file_signature(original), digest,
+            current, corrections._file_signature(current), expected)
+    assert proof() == (1, 1) and len(calls) == 2
+    assert proof() == (1, 1) and len(calls) == 2
+    write(current, [old])  # Changed generation must not reuse a successful proof.
+    assert proof() is None and len(calls) == 4
+    assert proof() is None and len(calls) == 4  # Unchanged negative proof is reusable too.
+    write(original, [added])  # SHA mismatch invalidates even the negative proof.
+    assert proof() is None
 
 
 def test_overlapping_source_conflicts_share_the_same_existing_task(tmp_path):

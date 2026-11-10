@@ -8,11 +8,13 @@ owns every new simulated fill. Prepare validates an isolated candidate first.
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 from copy import deepcopy
 from dataclasses import asdict, replace
 from datetime import date, datetime, time, timedelta
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -43,13 +45,17 @@ from stockagent.live.day_trade_maintenance import control_lease
 from stockagent.live.market_status import short_file_fingerprint
 from stockagent.live.paper_journal import journal_write_transaction, open_paper_journal, rebind_cloned_journals
 from stockagent.live.tw_day_trade_simulation import (
+    DELAYED_AUCTION_PAPER_REPLAY_CONTRACT,
     ENTRY_FILL_POLICY_0901_MINUTE_PRICE, REPLAY_FILL_CONTRACT_0901_MINUTE_PRICE,
     SIMULATION_SCHEMA_VERSION, TwDayTradeSimulationEngine, _append_jsonl_many,
-    PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT,
+    PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT, PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT,
     load_live_eligibility, whole_lot_target_shares,
 )
 from stockagent.live.opening_signal_revision import (
     SIGNAL_UPDATE_PROGRESSIVE, revision_admission, revision_fields,
+)
+from stockagent.live.tw_day_trade_nontrade import (
+    CONTRACT as NONTRADE_CONTRACT, apply_nontrade_observation, load_pinned_finmind_ticks,
 )
 
 TAIPEI = ZoneInfo("Asia/Taipei")
@@ -57,13 +63,17 @@ SERVICE = "stockagent-tw-day-trade-simulation.service"
 CONTRACT = "never_filled_missing_open_append_only_minute_repair_v1"
 ORIGINAL_SIGNAL_CONTRACT = "never_filled_original_signal_append_only_minute_repair_v2"
 MISSING_SESSION_CONTRACT = "missing_completed_session_append_only_minute_repair_v1"
-PUBLISHED_SESSION_CONTRACT = "missing_session_published_revisions_append_only_minute_repair_v1"
+PUBLISHED_SESSION_CONTRACT_V1 = "missing_session_published_revisions_append_only_minute_repair_v1"
+PUBLISHED_SESSION_CONTRACT = "missing_session_published_revisions_append_only_minute_repair_v2"
+PUBLISHED_SESSION_CONTRACTS = frozenset({PUBLISHED_SESSION_CONTRACT_V1, PUBLISHED_SESSION_CONTRACT})
 ECONOMIC_KEYS = (
     "initial_capital_twd", "cumulative_realized_net_pnl_twd",
     "cumulative_commission_rebate_accrued_twd", "total_equity_twd",
     "session_sizing_nav_twd", "session_date", "signal_id", "processed_signal_ids",
     "positions", "pending_entry_orders", "pending_reduction_orders",
     "cumulative_corporate_action_net_twd", "cumulative_carry_cost_twd",
+    "cumulative_nontrade_settlement_net_pnl_twd", "nontrade_settlement_count",
+    "nontrade_settlement_shares",
 )
 POSITION_ECONOMIC_KEYS = (
     "symbol", "side", "target_weight", "requested_shares",
@@ -72,6 +82,7 @@ POSITION_ECONOMIC_KEYS = (
     "realized_net_pnl_twd", "last_complete_net_pnl_twd", "total_net_pnl_twd",
     "last_mark_price", "exit_at", "exit_price",
     "take_profit_price", "stop_trigger_price", "entry_fill_policy",
+    "nontrade_settlement",
 )
 REPLAY_SUMMARY_FIELDS = frozenset("""
     signal_id market execution_mode asof_date generated_at signal_started_at
@@ -89,7 +100,8 @@ REPLAY_SUMMARY_FIELDS = frozenset("""
     opening_entry_clock_contract initial_opening_signal_id initial_opening_publication_proof
     entry_fill_contract entry_liquidity_assumption historical_minute_valuation
     replay_basis replay_open_evidence_contract replay_source simulation_only simulation_replay
-    production_order_possible published_revision_replay
+    production_order_possible published_revision_replay provisional_minute_source_coverage
+    opening_repair_of_signal_id original_weights_preserved counterfactual_signal_regeneration
     missed_opening_original_policy_fingerprint missed_opening_original_signal_revision
     missed_opening_original_signal_update_policy missed_opening_recovery
 """.split())
@@ -99,6 +111,25 @@ def _compact_replay_summary(summary: dict) -> dict:
     # Full originals stay byte-pinned. The executor does not consume the MB-sized
     # diagnostics/panel inventories; do not retain 163 copies of them in RAM.
     return {key: value for key, value in summary.items() if key in REPLAY_SUMMARY_FIELDS}
+
+
+def _published_replay_proof(plan: dict, version: dict, *, opening_entry_at: datetime) -> dict:
+    """Retain the real publication clocks and version a late-root assumption."""
+    first = plan["versions"][0]
+    first_published = datetime.fromisoformat(first["publication_upper_bound"])
+    if first_published.utcoffset() is None or opening_entry_at.utcoffset() is None:
+        raise ValueError("published replay clocks must be timezone-aware")
+    late_first = first_published >= opening_entry_at
+    return {
+        "contract": (PUBLISHED_REVISION_LATE_OPEN_REPLAY_CONTRACT if late_first
+                     else PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT),
+        "plan_sha256": plan["plan_sha256"], "source_signal_id": version["signal_id"],
+        "publication_upper_bound": version["publication_upper_bound"],
+        "original_revision": version["opening_signal_revision"],
+        **({"first_entry_is_counterfactual": True,
+            "first_source_signal_id": first["signal_id"],
+            "first_publication_upper_bound": first["publication_upper_bound"]} if late_first else {}),
+    }
 
 
 def _object(path: Path) -> dict:
@@ -202,19 +233,216 @@ def _has_live_fill(state_dir: Path, market: str, session: str) -> bool:
     return TwDayTradeSimulationEngine._session_has_fill(probe, market, session)
 
 
-def _require_missing_session_target(mode: dict, day: date) -> None:
+def _previous_terminal_orders_proven(
+    mode: dict, day: date, events_path: Path | None, *,
+    completed_same_day_at: datetime | None = None,
+    terminal_entry_validator=None,
+) -> bool:
+    """Admit retained, independently evidenced terminal orders.
+
+    The engine retains cancelled quantities and zero-change inventory targets
+    for audit.  Their presence is not proof of an active order, but neither is
+    a status string alone proof that the prior session was safely settled.
+    Same-day proof is opt-in and requires an actual observation after the
+    recorded close; missing-session append keeps the strictly-prior default.
+    """
+    try:
+        prior = date.fromisoformat(str(mode["session_date"]))
+        settled = datetime.fromisoformat(str(mode["closing_auction_settled_at"]))
+        if (prior > day or settled.utcoffset() is None
+                or settled.astimezone(TAIPEI).date() != prior
+                or settled.astimezone(TAIPEI).time().replace(tzinfo=None) < time(13, 30)):
+            return False
+        if prior == day:
+            if (completed_same_day_at is None or completed_same_day_at.utcoffset() is None
+                    or completed_same_day_at.astimezone(TAIPEI).date() != prior
+                    or settled > completed_same_day_at
+                    or mode.get("engine_status") != "session_flat_after_exit"):
+                return False
+        elif completed_same_day_at is not None and (completed_same_day_at.utcoffset() is None
+                                                     or settled > completed_same_day_at):
+            return False
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return False
+    if (mode.get("execution_evidence_complete") is not True
+            or mode.get("engine_status") not in {
+                "waiting_signal", "waiting_09_00_signal", "session_flat_after_exit",
+                # After today's close the engine labels a flat, older session
+                # session_complete. This is only a presentation state: the
+                # independent settlement, order and event proofs below remain
+                # mandatory before any missing-session append.
+                "session_complete",
+            }
+            or any(type(mode.get(key)) is not int or mode[key] != 0 for key in (
+                "pending_entry_shares", "pending_entry_source_count", "pending_reduction_shares",
+                "closing_auction_pending_count", "unresolved_exit_count"))):
+        return False
+    positions = mode.get("positions")
+    consumed = mode.get("processed_signal_ids")
+    signal_id, market = mode.get("signal_id"), mode.get("market")
+    if (not isinstance(positions, dict) or any(not isinstance(p, dict)
+            or type(p.get("signed_shares")) is not int or p["signed_shares"] != 0
+            for p in positions.values()) or not isinstance(consumed, list)
+            or not all(isinstance(s, str) for s in consumed)
+            or not isinstance(signal_id, str) or signal_id not in consumed
+            or not isinstance(market, str) or not market):
+        return False
+
+    required = Counter()
+    for field in ("pending_entry_orders", "pending_reduction_orders"):
+        orders = mode.get(field)
+        if not isinstance(orders, dict):
+            return False
+        for symbol, order in orders.items():
+            if not isinstance(symbol, str) or not symbol or not isinstance(order, dict):
+                return False
+            status, remaining = order.get("status"), order.get("remaining_shares")
+            if type(remaining) is not int or remaining < 0:
+                return False
+            if status == "filled" and remaining == 0:
+                if field == "pending_entry_orders" and order.get("sizing_pending") is False:
+                    continue
+                if field == "pending_reduction_orders":
+                    reductions = mode.get("signal_reductions")
+                    progress = reductions.get(symbol) if isinstance(reductions, dict) else None
+                    requested = order.get("requested_shares")
+                    sequence = order.get("sequence")
+                    try:
+                        signal_at = datetime.fromisoformat(str(order.get("signal_at")))
+                        if (isinstance(progress, dict) and type(requested) is int and requested > 0
+                                and type(sequence) is int and sequence > 0
+                                and type(progress.get("requested_shares")) is int
+                                and type(progress.get("filled_shares")) is int
+                                and progress["requested_shares"] == requested
+                                and progress["filled_shares"] == requested
+                                and signal_at.utcoffset() is not None
+                                and signal_at.astimezone(TAIPEI).date() == prior
+                                and signal_at.astimezone(TAIPEI).time().replace(tzinfo=None) < time(13, 20)
+                                and str(order.get("signal_at")) == str(mode.get("signal_at"))):
+                            continue
+                    except (TypeError, ValueError, OverflowError):
+                        pass
+                return False
+            if field == "pending_entry_orders":
+                position = order.get("position")
+                if (not isinstance(position, dict) or position.get("symbol") != symbol
+                        or position.get("market") != market or position.get("session_date") != prior.isoformat()
+                        or not isinstance(position.get("signal_id"), str)
+                        or position["signal_id"] not in consumed
+                        or type(order.get("sizing_pending")) is not bool):
+                    return False
+                if position["signal_id"] != signal_id:
+                    try:
+                        order_signal_at = datetime.fromisoformat(str(position["signal_at"]))
+                        if order_signal_at.utcoffset() is None:
+                            return False
+                        local = order_signal_at.astimezone(TAIPEI)
+                        if local.date() != prior or local.time().replace(tzinfo=None) >= time(13, 20):
+                            return False
+                    except (KeyError, TypeError, ValueError, OverflowError):
+                        return False
+                if status == "inventory_target_retained":
+                    if remaining != 0 or order["sizing_pending"] or position.get("requested_shares") != 0:
+                        return False
+                    continue
+                if status == "cancelled_entry_price_guard":
+                    if (terminal_entry_validator is None or completed_same_day_at is None
+                            or not terminal_entry_validator(order, mode, now=completed_same_day_at)):
+                        return False
+                    continue
+                if (status != "cancelled_exit_priority" or (order["sizing_pending"]
+                        and (remaining != 0 or position.get("requested_shares") != 0))):
+                    return False
+                # A later, already consumed after-close signal may replace the
+                # mode's current signal ID. The retained order still belongs
+                # to its own intraday signal, not that later publication.
+                required[(position["signal_id"], "entry", symbol, remaining)] += 1
+            else:
+                try:
+                    signal_at = datetime.fromisoformat(str(order["signal_at"]))
+                    requested = order["requested_shares"]
+                    if (status != "cancelled_exit_priority" or signal_at.utcoffset() is None
+                            or signal_at.astimezone(TAIPEI).date() != prior
+                            or signal_at.astimezone(TAIPEI).time().replace(tzinfo=None) >= time(13, 20)
+                            or str(order["signal_at"]) != str(mode.get("signal_at"))
+                            or type(requested) is not int or requested < remaining):
+                        return False
+                except (KeyError, TypeError, ValueError, OverflowError):
+                    return False
+                # The canonical cancellation event records reduction quantities,
+                # but not their symbols; the immutable state retains the latter.
+                # Reduction rows do not retain a signal ID; keep the stricter
+                # current-signal binding rather than inferring an older one.
+                required[(signal_id, "reduction", "", remaining)] += 1
+    if not required:
+        return True
+    if events_path is None:
+        return False
+    observed = Counter()
+    try:
+        with open_paper_journal(events_path) as handle:
+            for line in handle:
+                if not line.endswith(b"\n"):
+                    continue
+                row = json.loads(line)
+                if (row.get("event") != "signal_revision_exit_priority" or row.get("market") != market
+                        or row.get("signal_id") not in consumed):
+                    continue
+                stamp = datetime.fromisoformat(str(row.get("recorded_at")))
+                if (stamp.utcoffset() is None or stamp.astimezone(TAIPEI).date() != prior
+                        or stamp.astimezone(TAIPEI).time().replace(tzinfo=None) < time(13, 20)
+                        or stamp > settled or not isinstance(row.get("cancelled"), list)):
+                    continue
+                for item in row["cancelled"]:
+                    if (isinstance(item, dict) and item.get("kind") in {"entry", "reduction"}
+                            and type(item.get("shares")) is int and item["shares"] >= 0):
+                        symbol = item.get("symbol", "") if item["kind"] == "entry" else ""
+                        observed[(row["signal_id"], item["kind"], symbol, item["shares"])] += 1
+    except (OSError, TypeError, ValueError, json.JSONDecodeError, AttributeError):
+        return False
+    return all(observed[key] >= count for key, count in required.items())
+
+
+def _require_evidenced_cutover_orders(
+    state: dict, events_path: Path, *, now: datetime, terminal_entry_validator,
+) -> None:
+    """Do not admit retained order labels without same-owner settlement proof."""
+    if not isinstance(state, dict) or not isinstance(state.get("modes"), dict):
+        raise ValueError("invalid cutover mode state")
+    if now.utcoffset() is None:
+        raise ValueError("cutover observation clock must have a timezone")
+    for market, mode in state["modes"].items():
+        if not isinstance(mode, dict):
+            raise ValueError(f"invalid cutover mode: {market}")
+        groups = (mode.get("pending_entry_orders", {}), mode.get("pending_reduction_orders", {}))
+        if not all(isinstance(group, dict) for group in groups):
+            raise ValueError(f"invalid cutover orders: {market}")
+        if not any(groups):
+            continue
+        if (mode.get("market") != market or not _previous_terminal_orders_proven(
+                mode, now.astimezone(TAIPEI).date(), events_path,
+                completed_same_day_at=now, terminal_entry_validator=terminal_entry_validator)):
+            raise ValueError(f"unproven terminal paper orders: {market}")
+
+
+def _require_missing_session_target(mode: dict, day: date, *, events_path: Path | None = None) -> None:
     """Append a new session, never rearm or replace a previously traded one."""
     previous = str(mode.get("session_date") or "")
     if not previous or date.fromisoformat(previous) >= day:
         raise RuntimeError("missing-session append requires a strictly later session")
-    if mode.get("ledger_state_divergence") or any(
-        int(position.get("signed_shares") or 0) for position in (mode.get("positions") or {}).values()
-    ):
+    positions = mode.get("positions")
+    if (mode.get("ledger_state_divergence") or mode.get("entry_retry_pending_commit")
+            or not isinstance(positions, dict) or any(not isinstance(position, dict)
+                or type(position.get("signed_shares")) is not int or position["signed_shares"] != 0
+                for position in positions.values())):
         raise RuntimeError("missing-session append requires flat, reconciled prior inventory")
-    if any(not (order.get("status") == "filled" and type(order.get("remaining_shares")) is int
+    order_groups = [mode.get(name, {}) for name in ("pending_entry_orders", "pending_reduction_orders")]
+    if not all(isinstance(group, dict) for group in order_groups):
+        raise RuntimeError("missing-session append cannot bypass malformed pending orders")
+    orders = [order for group in order_groups for order in group.values()]
+    if any(not (isinstance(order, dict) and order.get("status") == "filled" and type(order.get("remaining_shares")) is int
                 and order["remaining_shares"] == 0 and order.get("sizing_pending") is False)
-           for name in ("pending_entry_orders", "pending_reduction_orders")
-           for order in (mode.get(name) or {}).values()):
+           for order in orders) and not _previous_terminal_orders_proven(mode, day, events_path):
         raise RuntimeError("missing-session append cannot bypass active or unknown pending orders")
 
 
@@ -361,7 +589,7 @@ def plan_published_revisions(args) -> dict:
     spec, _ = _spec(args.market, args.markets_dir, True)
     day = datetime.now(TAIPEI).date()
     mode = _object(args.live_dir / "state.json")["modes"][args.market]
-    _require_missing_session_target(mode, day)
+    _require_missing_session_target(mode, day, events_path=args.live_dir / "events.jsonl")
     if datetime.now(TAIPEI).time() < time(13, 31) or _has_live_fill(args.live_dir, args.market, str(day)):
         raise RuntimeError("published revision repair requires an unfilled completed session")
     plan = _published_revision_inventory(spec, day)
@@ -432,6 +660,46 @@ def _assert_source_pins(pins: list[dict]) -> None:
             raise RuntimeError(f"repair source changed: {pin['path']}")
 
 
+def _verified_finmind_replay_sources(roots: list[str], day: date) -> tuple[list[dict], list[dict]]:
+    """Verify explicitly selected private projections and retain their inputs."""
+    from scripts.prepare_finmind_tw_day_trade_repair_source import MANIFEST, verify
+
+    sources, pins = [], []
+    for value in roots:
+        root = Path(value).resolve(strict=True)
+        proof = verify(root)
+        if proof["session_date"] != day.isoformat():
+            raise RuntimeError("FinMind replay projection belongs to another session")
+        marker = root / MANIFEST
+        marker_pin = {"path": str(marker), "sha256": _sha256(marker)}
+        sources.append({"root": str(root), "contract": proof["contract"],
+                        "manifest_sha256": marker_pin["sha256"],
+                        "summary": proof["summary"]})
+        pins.extend([marker_pin, {"path": proof["output"]["path"], "sha256": proof["output"]["sha256"]},
+                     *({"path": item["path"], "sha256": item["sha256"]} for item in proof["source_pins"])])
+    return sources, pins
+
+
+def _verified_finmind_price_limits(root_value: str, day: date, price_limit_dir: Path) -> tuple[dict, list[dict]]:
+    """Verify a selected private limits projection and its complete provenance."""
+    from scripts.prepare_finmind_tw_day_trade_price_limits import MANIFEST, verify
+
+    root = Path(root_value).resolve(strict=True)
+    if root != price_limit_dir.resolve(strict=True):
+        raise RuntimeError("FinMind price-limit projection differs from the selected limits directory")
+    proof = verify(root)
+    if (proof["session_date"] != day.isoformat()
+            or Path(proof["output"]["path"]).resolve() != root / f"{day}.parquet"):
+        raise RuntimeError("FinMind price-limit projection belongs to another session")
+    marker = root / MANIFEST
+    marker_pin = {"path": str(marker), "sha256": _sha256(marker)}
+    source = {"root": str(root), "contract": proof["contract"],
+              "manifest_sha256": marker_pin["sha256"], "summary": proof["summary"]}
+    pins = [marker_pin, {"path": proof["output"]["path"], "sha256": proof["output"]["sha256"]},
+            *({"path": item["path"], "sha256": item["sha256"]} for item in proof["source_pins"])]
+    return source, pins
+
+
 def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tuple[list[dict], list[dict]]:
     result, pins = [], []
     roots = tuple(Path(value) for value in manifest["minute_roots"])
@@ -492,7 +760,15 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
                 pins.append({"path": str(path.resolve()), "sha256": _sha256(path)})
         if not symbols <= opens.keys():
             raise RuntimeError(f"{day}: selected model opening prices still missing")
-        limit_path = Path(manifest.get("price_limit_dir", ROOT / "artifacts/live/tw_price_limits")) / f"{day}.parquet"
+        price_limit_dir = Path(manifest.get("price_limit_dir", ROOT / "artifacts/live/tw_price_limits"))
+        if manifest.get("finmind_price_limit_source_root"):
+            limit_lineage, limit_pins = _verified_finmind_price_limits(
+                manifest["finmind_price_limit_source_root"], day, price_limit_dir)
+            if not fetch_current and source.get("finmind_price_limit_source_lineage") != limit_lineage:
+                raise RuntimeError("FinMind price-limit lineage changed after candidate preparation")
+            source["finmind_price_limit_source_lineage"] = limit_lineage
+            pins.extend(limit_pins)
+        limit_path = price_limit_dir / f"{day}.parquet"
         limits = _load_price_limits(limit_path)
         # Keep every original model row, but do not fetch prices for targets
         # which cannot buy even one lot at the frozen session NAV.
@@ -507,6 +783,11 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
                 raise RuntimeError(f"{day}: original targets have no whole-lot orders")
         if not symbols <= limits.keys():
             raise RuntimeError(f"{day}: executable target legal price limits missing: {sorted(symbols - limits.keys())}")
+        source_lineages, source_pins = _verified_finmind_replay_sources(
+            manifest.get("finmind_replay_source_roots", []), day)
+        if source_lineages:
+            source["finmind_replay_source_lineages"] = source_lineages
+            pins.extend(source_pins)
         completed = source.get("completed_through")
         if completed:
             cutoff = datetime.fromisoformat(completed)
@@ -613,6 +894,7 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
                           "counterfactual_signal_regeneration": not preserve_original,
                           "original_weights_preserved": preserve_original,
                           "repair_recorded_at": manifest["created_at"],
+                          "provisional_minute_source_coverage": manifest.get("provisional_minute_source_coverage") is True,
                           "simulation_only": True}
         revisions = []
         if published:
@@ -634,11 +916,9 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
                     "opening_repair_of_signal_id": version["signal_id"],
                     "original_weights_preserved": True, "counterfactual_signal_regeneration": False,
                     "repair_recorded_at": manifest["created_at"], "simulation_only": True,
+                    "provisional_minute_source_coverage": manifest.get("provisional_minute_source_coverage") is True,
                     "production_order_possible": False,
-                    "published_revision_replay": {"contract": PUBLISHED_REVISION_MINUTE_REPLAY_CONTRACT,
-                        "plan_sha256": plan["plan_sha256"], "source_signal_id": version["signal_id"],
-                        "publication_upper_bound": version["publication_upper_bound"],
-                        "original_revision": version["opening_signal_revision"]}}
+                    "published_revision_replay": _published_replay_proof(plan, version, opening_entry_at=observed)}
                 prior = derived
                 revisions.append({"summary": derived, "rows": _canonicalize_signal_rows_for_replay(version_rows, opens),
                                   "observed": datetime.fromisoformat(version["effective_entry_at"])})
@@ -653,19 +933,22 @@ def _prepared_sessions(manifest: dict, spec, live, *, fetch_current: bool) -> tu
                        "quotes": quotes, "eligibility": eligibility, "coverage": coverage,
                        "bars": bars, "end_at": end_at, "book_proof": book_proof,
                        "bar_proof": bar_proof, "quote_proof": quote_proof,
-                       "rule_data_dir": rule_source, "rule_proof": rule_proof})
+                       "rule_data_dir": rule_source, "rule_proof": rule_proof,
+                       "nontrade_tick_receipt": manifest.get("nontrade_tick_receipt")})
         if published:
             result[-1]["revisions"] = revisions[1:]
     return result, pins
 
 
-def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, reason: str) -> list[dict]:
+def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, reason: str,
+             prior_events_path: Path | None = None) -> list[dict]:
     market = spec.market
     completed_replay = reason == ORIGINAL_SIGNAL_CONTRACT and all(item["end_at"] == time(13, 30) for item in sessions)
-    if reason in {MISSING_SESSION_CONTRACT, PUBLISHED_SESSION_CONTRACT}:
+    if reason in {MISSING_SESSION_CONTRACT, *PUBLISHED_SESSION_CONTRACTS}:
         if len(sessions) != 1 or sessions[0]["end_at"] != time(13, 30):
             raise RuntimeError("missing-session append requires one completed session")
-        _require_missing_session_target(engine.state["modes"][market], sessions[0]["day"])
+        _require_missing_session_target(engine.state["modes"][market], sessions[0]["day"],
+                                        events_path=prior_events_path or engine.state_dir / "events.jsonl")
         if engine._session_has_fill(market, str(sessions[0]["day"])):
             raise RuntimeError("missing-session append found existing target fills")
     else:
@@ -682,6 +965,9 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
             raise RuntimeError(f"{item['day']}: registration failed: {result}")
         engine.begin_deferred_ledger_writes()
         mode = engine.state["modes"][market]
+        if item.get("nontrade_tick_receipt"):
+            mode["nontrade_settlement_count"] = 0
+            mode["nontrade_settlement_shares"] = 0
         # This is an explicitly re-played historical session. An inherited
         # terminal cash-mark cache must not suppress this journal's 13:30 row.
         mode.pop("terminal_curve_mark", None)
@@ -699,11 +985,24 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
         engine._mark_mode(market, item["observed"], _historical_minute_valuation_quotes(
             mode, item["bars"], observed=item["observed"]), append_history=True)
         def closing():
+            if reason != PUBLISHED_SESSION_CONTRACT:
+                _require_no_known_delayed_closing_trade(
+                    engine.state["modes"][market], item["bars"], item["day"]
+                )
             quotes, proof = _close_quotes(engine, {market: spec}, trading_date=item["day"],
                 quote_at=datetime.combine(item["day"], time(13, 30), tzinfo=TAIPEI),
                 twse_daily_ohlcv_path=DEFAULT_TWSE_DAILY_OHLCV_PATH,
                 tpex_daily_ohlcv_path=DEFAULT_TPEX_DAILY_OHLCV_PATH,
                 official_raw_root=item["rule_data_dir"] / "raw")
+            if reason == PUBLISHED_SESSION_CONTRACT:
+                item["delayed_close_quotes"] = _separate_delayed_auction_quotes(
+                    engine.state["modes"][market], item["bars"], item["bar_proof"]["source_files"],
+                    item["day"], quotes)
+                proof["delayed_auction_symbols"] = sorted(item["delayed_close_quotes"])
+                if item.get("nontrade_tick_receipt"):
+                    settlement = _settle_missing_close_nontrade(
+                        engine, engine.state["modes"][market], item, quotes)
+                    proof["nontrade_settlement"] = settlement
             item["closing_proof"] = proof
             return quotes
         remaining_revisions = {revision["observed"]: revision for revision in item.get("revisions", [])}
@@ -721,12 +1020,22 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
         _replay_historical_intraday(engine, markets=[market], bars=item["bars"],
             trading_date=item["day"], end_at=item["end_at"],
             terminal_close_quote_provider=closing if (item["day"] < datetime.now(TAIPEI).date()
-                or reason in {MISSING_SESSION_CONTRACT, PUBLISHED_SESSION_CONTRACT}) else None,
+                or reason in {MISSING_SESSION_CONTRACT, *PUBLISHED_SESSION_CONTRACTS}) else None,
             **({"before_completed_minute": update_targets} if item.get("revisions") else {}))
         if remaining_revisions:
             raise RuntimeError("published revisions were not completely replayed")
+        persisted_at = datetime.combine(item["day"], item["end_at"], tzinfo=TAIPEI)
+        if item.get("delayed_close_quotes"):
+            persisted_at = datetime.combine(item["day"], time(13, 33), tzinfo=TAIPEI)
+            engine.process_quotes(quotes=item["delayed_close_quotes"], now=persisted_at,
+                                  markets=[market], persist=False)
+            item["delayed_auction_event_at"] = persisted_at.isoformat()
+        if mode.get("nontrade_settlement_count"):
+            # Flat accounting inventory is not evidence that every exit was
+            # filled, even if the normal terminal routine made the mode flat.
+            mode["execution_evidence_complete"] = False
         engine.flush_deferred_ledger_writes()
-        engine._persist(datetime.combine(item["day"], item["end_at"], tzinfo=TAIPEI))
+        engine._persist(persisted_at)
         mode = engine.state["modes"][market]
         if item["end_at"] == time(13, 30) and int(mode["open_position_count"]):
             raise RuntimeError(f"{item['day']}: completed replay not flat")
@@ -737,11 +1046,131 @@ def _execute(engine: TwDayTradeSimulationEngine, spec, sessions: list[dict], *, 
                          "cumulative_realized_net_pnl_twd": mode["cumulative_realized_net_pnl_twd"],
                          "open_position_count": mode["open_position_count"],
                          "completed_through": item["end_at"].isoformat(),
+                         **({"delayed_auction_event_at": item["delayed_auction_event_at"]}
+                            if item.get("delayed_auction_event_at") else {}),
                          "closing_proof": item.get("closing_proof"),
                          "eligibility_source_proof": item.get("rule_proof"),
                          **({"later_revisions_applied": len(consumed_revisions),
                              "original_revision_signal_ids": consumed_revisions} if item.get("revisions") else {})})
     return accepted
+
+
+def _settle_missing_close_nontrade(engine, mode: dict, item: dict, terminal_quotes: dict) -> dict:
+    """Book explicitly authorized residuals without adding order/fill rows.
+
+    A missing closing-minute observation is not evidence of a closing fill.
+    Record the source's actual last-observation clock separately from the
+    assumed 13:30 bookkeeping clock; preserve any genuine earlier partial exit.
+    """
+    day = item["day"]
+    at = datetime.combine(day, time(13, 30), tzinfo=TAIPEI)
+    key = at.isoformat(timespec="minutes")
+    positions = [p for p in (mode.get("positions") or {}).values()
+                 if int(p.get("signed_shares") or 0)
+                 and str(p.get("symbol") or "") not in (item.get("delayed_close_quotes") or {})
+                 and key not in (item["bars"].get(str(p.get("symbol") or "")) or {})]
+    if not positions:
+        return {"contract": NONTRADE_CONTRACT, "position_count": 0, "settled_shares": 0,
+                "simulation_only": True, "exchange_fill": False, "broker_fill": False}
+    symbols = {str(p["symbol"]) for p in positions}
+    official = {}
+    for symbol in symbols:
+        evidence = (terminal_quotes.get(symbol) or {}).get("session_close_evidence") or {}
+        if (evidence.get("session_date") != str(day) or evidence.get("symbol") != symbol
+                or evidence.get("price_basis") != "official_session_close"
+                or evidence.get("source") not in {"twse_official_daily_close", "tpex_official_daily_close"}
+                or not evidence.get("source_path") or _sha256(Path(evidence["source_path"])) != evidence.get("source_sha256")):
+            raise RuntimeError(f"{day}/{symbol}: missing pinned traded official close evidence")
+        official[symbol] = float(evidence["price"])
+    observed, pins = load_pinned_finmind_ticks(Path(item["nontrade_tick_receipt"]),
+                                                day=day, symbols=symbols, official_closes=official)
+    settled_shares = 0
+    for p in positions:
+        symbol = str(p["symbol"])
+        reference = observed[symbol]
+        quantity = abs(int(p["signed_shares"]))
+        apply_nontrade_observation(engine, mode, p, day=day, reference=reference,
+            official_evidence=terminal_quotes[symbol]["session_close_evidence"])
+        settled_shares += quantity
+        terminal_quotes.pop(symbol, None)
+    item["nontrade_source_pins"] = pins
+    return {"contract": NONTRADE_CONTRACT, "position_count": len(positions), "settled_shares": settled_shares,
+            "symbols": sorted(symbols), "source_pins": pins, "simulation_only": True,
+            "exchange_fill": False, "broker_fill": False}
+
+
+def _require_no_known_delayed_closing_trade(mode: dict, bars: dict, day: date) -> None:
+    """Do not use a known 13:33 auction as an executable 13:30 close.
+
+    A 13:33 positive-volume bar is evidence of a delayed closing trade, not a
+    13:30 quote. The existing completed-session replay ends at 13:30, so open
+    affected positions require a later-settlement-aware replay before apply.
+    A missing 13:33 bar does not independently prove no delay.
+    """
+    key = datetime.combine(day, time(13, 33), tzinfo=TAIPEI).isoformat(timespec="minutes")
+    delayed = sorted({str(position.get("symbol") or "")
+        for position in (mode.get("positions") or {}).values()
+        if int(position.get("signed_shares") or 0)
+        and key in (bars.get(str(position.get("symbol") or "")) or {})})
+    if delayed:
+        raise RuntimeError(
+            f"{day}: 13:33 delayed closing trade cannot be settled at 13:30: {delayed}"
+        )
+
+
+def _separate_delayed_auction_quotes(mode: dict, bars: dict, source_files: list[dict],
+                                    day: date, terminal_quotes: dict) -> dict:
+    """Defer only source-verified 13:33 bars; never backdate their prices."""
+    key = datetime.combine(day, time(13, 33), tzinfo=TAIPEI).isoformat(timespec="minutes")
+    ordinary = datetime.combine(day, time(13, 30), tzinfo=TAIPEI).isoformat(timespec="minutes")
+    held = {str(position.get("symbol") or "") for position in (mode.get("positions") or {}).values()
+            if int(position.get("signed_shares") or 0)}
+    delayed = {}
+    for symbol in sorted(held):
+        bar = (bars.get(symbol) or {}).get(key)
+        if bar is None:
+            continue
+        if ordinary in (bars.get(symbol) or {}):
+            raise RuntimeError(f"{day}/{symbol}: ambiguous 13:30 and 13:33 closing observations")
+        candidates = [item for item in source_files if symbol in (item.get("symbols") or [])]
+        if len(candidates) != 1:
+            raise RuntimeError(f"{day}/{symbol}: delayed auction source ownership is ambiguous")
+        candidate = candidates[0]
+        path = Path(candidate["path"]).resolve(strict=True)
+        if _sha256(path) != candidate.get("sha256"):
+            raise RuntimeError(f"{day}/{symbol}: delayed auction source changed")
+        frame = pl.read_parquet(path).filter(pl.col("symbol") == symbol)
+        def local_clock(row):
+            stamp = row.get("ts")
+            if not isinstance(stamp, datetime):
+                return None
+            return stamp.replace(tzinfo=TAIPEI) if stamp.tzinfo is None else stamp.astimezone(TAIPEI)
+        matching = [row for row in frame.to_dicts() if (stamp := local_clock(row)) is not None
+                    and stamp.date() == day and stamp.time() == time(13, 33)]
+        if len(matching) != 1:
+            raise RuntimeError(f"{day}/{symbol}: exact delayed auction source row missing")
+        row = matching[0]
+        close, volume = float(bar["close"]), float(bar["volume_shares"])
+        if (not math.isfinite(close) or close <= 0 or not math.isfinite(volume) or volume <= 0
+                or not math.isclose(float(row["Close"]), close, rel_tol=0, abs_tol=1e-9)
+                or not math.isclose(float(row["volume_shares"]), volume, rel_tol=0, abs_tol=1e-6)):
+            raise RuntimeError(f"{day}/{symbol}: delayed auction bar differs from its source")
+        quote = terminal_quotes.get(symbol) or {}
+        official = quote.get("session_close_evidence") or {}
+        try:
+            official_price = float(official.get("price"))
+        except (TypeError, ValueError):
+            official_price = math.nan
+        if not math.isclose(official_price, close, rel_tol=0, abs_tol=1e-9):
+            raise RuntimeError(f"{day}/{symbol}: delayed auction differs from official closing price")
+        stamp = datetime.combine(day, time(13, 33), tzinfo=TAIPEI)
+        delayed[symbol] = {**quote, "delayed_paper_auction": {
+            "contract": DELAYED_AUCTION_PAPER_REPLAY_CONTRACT, "session_date": str(day),
+            "symbol": symbol, "source_minute_at": stamp.isoformat(), "observed_close": close,
+            "volume_shares": volume, "source_path": str(path), "source_sha256": candidate["sha256"],
+            "clock_basis": "historical_source_minute_label_not_broker_match"}}
+        terminal_quotes.pop(symbol, None)
+    return delayed
 
 
 def _curve_proof(path: Path, market: str, sessions: list[dict]) -> list[dict]:
@@ -758,12 +1187,16 @@ def _curve_proof(path: Path, market: str, sessions: list[dict]) -> list[dict]:
         count = (item["end_at"].hour-9)*60+item["end_at"].minute
         expected = {(item["observed"]+timedelta(minutes=i)).isoformat(timespec="minutes")[:16]
                     for i in range(count)}
+        if item.get("delayed_auction_event_at"):
+            expected.add(str(item["delayed_auction_event_at"])[:16])
         actual = set(points[str(item["day"])])
         if actual != expected:
             raise RuntimeError(f"{item['day']}: minute curve mismatch {len(actual)}/{len(expected)}")
         proof.append({"session_date": str(item["day"]), "unique_minute_points": len(actual),
                       "expected_minute_points": len(expected), "start": "09:01",
-                      "end": item["end_at"].strftime("%H:%M")})
+                      "end": item["end_at"].strftime("%H:%M"),
+                      **({"delayed_auction_event_at": item["delayed_auction_event_at"]}
+                         if item.get("delayed_auction_event_at") else {})})
     return proof
 
 
@@ -773,6 +1206,13 @@ def prepare(args) -> dict:
     if manifest_path.exists():
         raise FileExistsError("repair manifest exists; inspect/verify it before another operation")
     published = getattr(args, "published_revisions", False)
+    provisional = getattr(args, "provisional_incomplete_minute_data", False)
+    nontrade_receipt = getattr(args, "nontrade_tick_receipt", None)
+    if provisional and not published:
+        raise ValueError("incomplete-minute authorization applies only to published-revision replay")
+    if nontrade_receipt and (not published or not provisional or args.market not in {
+            "tw_day_trade_100m", "tw_day_trade_v8_annual_log_cash"}):
+        raise ValueError("nontrade settlement is only authorized for the two explicitly selected provisional modes")
     spec, live = _spec(args.market, args.markets_dir, True) if published else _spec(args.market, args.markets_dir)
     mode = _object(args.live_dir / "state.json")["modes"][args.market]
     preserve_original = getattr(args, "preserve_original_signal", False)
@@ -792,7 +1232,8 @@ def prepare(args) -> dict:
         if (len(paths) != 1 or str(_object(paths[0])["asof_date"])[:10] != str(datetime.now(TAIPEI).date())
                 or datetime.now(TAIPEI).time() < time(13, 31)):
             raise RuntimeError("missing-session append is limited to today's completed session")
-        _require_missing_session_target(mode, datetime.now(TAIPEI).date())
+        _require_missing_session_target(mode, datetime.now(TAIPEI).date(),
+                                        events_path=args.live_dir / "events.jsonl")
     else:
         _require_empty_target(mode, preserve_original_signal=preserve_original)
     contract = PUBLISHED_SESSION_CONTRACT if published else MISSING_SESSION_CONTRACT if append_missing else ORIGINAL_SIGNAL_CONTRACT if preserve_original else CONTRACT
@@ -800,13 +1241,20 @@ def prepare(args) -> dict:
                 "preserve_original_signal": preserve_original,
                 "append_missing_session": append_missing,
                 "published_revisions": published,
+                "provisional_minute_source_coverage": bool(provisional),
+                "nontrade_tick_receipt": str(nontrade_receipt.resolve(strict=True)) if nontrade_receipt else None,
                 "spec_sha256": _spec_digest(spec),
                 "production_order_possible": False, "market": args.market,
                 "live_dir": str(args.live_dir.resolve()), "operation_root": str(root),
                 "price_limit_dir": str(getattr(args, "price_limit_dir", ROOT / "artifacts/live/tw_price_limits").resolve()),
+                "finmind_price_limit_source_root": str(args.finmind_price_limit_source_root.resolve())
+                    if getattr(args, "finmind_price_limit_source_root", None) else None,
                 "created_at": datetime.now(TAIPEI).isoformat(), "anchor": _anchor(mode),
+                "finmind_replay_source_roots": [str(path.resolve()) for path in
+                                                getattr(args, "finmind_replay_source_root", [])],
                 "minute_roots": [str(path.resolve()) for path in
-                                 (*getattr(args, "minute_data_root", []), *DEFAULT_MINUTE_DATA_ROOTS)], "sessions": []}
+                                 (*getattr(args, "finmind_replay_source_root", []),
+                                  *getattr(args, "minute_data_root", []), *DEFAULT_MINUTE_DATA_ROOTS)], "sessions": []}
     if published:
         manifest["published_revision_plan"] = plan
     if preserve_original and (len(paths) != 1 or str(mode["session_date"]) != str(datetime.now(TAIPEI).date())
@@ -848,7 +1296,8 @@ def prepare(args) -> dict:
     _atomic_json(candidate/"state.json", {"schema_version": SIMULATION_SCHEMA_VERSION,
                  "modes": {args.market: deepcopy(mode)}, "enabled_markets": [args.market]})
     candidate_engine = TwDayTradeSimulationEngine(candidate, publication_clock=lambda: datetime.now(TAIPEI))
-    accepted = _execute(candidate_engine, spec, sessions, reason=contract)
+    accepted = _execute(candidate_engine, spec, sessions, reason=contract,
+                        prior_events_path=args.live_dir / "events.jsonl")
     if preserve_original and (accepted[0]["entry_requested_shares"] != int(mode["entry_requested_shares"])
                               or accepted[0]["entry_filled_shares"] != accepted[0]["entry_requested_shares"]):
         raise RuntimeError("original-signal replay did not complete the same requested whole-lot target")
@@ -859,24 +1308,34 @@ def prepare(args) -> dict:
         )
         with open_paper_journal(candidate / "fills.jsonl") as handle:
             fills = [json.loads(line) for line in handle if line.endswith(b"\n")]
+        with open_paper_journal(candidate / "events.jsonl") as handle:
+            nontrade_events = [row for line in handle if line.endswith(b"\n")
+                               if (row := json.loads(line)).get("event") == "nontrade_last_observed_accounting_settlement"]
         manifest["candidate_fill_accounting"] = verify_published_fill_accounting(
             candidate_engine.state["modes"][args.market], fills, day=str(sessions[0]["day"]),
             plan=plan, bars=sessions[0]["bars"],
             prior_realized=float(manifest["anchor"]["cumulative_realized_net_pnl_twd"]),
-            terminal_close_sources=(accepted[0].get("closing_proof") or {}).get("terminal_close_sources", []))
+            terminal_close_sources=(accepted[0].get("closing_proof") or {}).get("terminal_close_sources", []),
+            minute_source_files=sessions[0]["bar_proof"]["source_files"],
+            nontrade_events=nontrade_events,
+            require_observed_terminal_minute=bool(provisional))
         with open_paper_journal(candidate / "marks.jsonl") as handle:
             marks = [json.loads(line) for line in handle if line.endswith(b"\n")]
         manifest["candidate_minute_source_coverage"] = verify_minute_source_coverage(
             candidate_engine.state["modes"][args.market], marks, market=args.market,
-            day=str(sessions[0]["day"]), source_files=sessions[0]["bar_proof"]["source_files"])
+            day=str(sessions[0]["day"]), source_files=sessions[0]["bar_proof"]["source_files"],
+            allow_unverified_gaps=bool(provisional), bars=sessions[0]["bars"] if provisional else None)
     for item in accepted:
         for source in (item.get("closing_proof") or {}).get("terminal_close_sources", []):
             pins.append({"path": source["path"], "sha256": source["sha256"]})
+    for item in sessions:
+        pins.extend(item.get("nontrade_source_pins") or [])
     for source in (args.markets_dir / f"{args.market}.yaml", Path(spec.config_path)):
         pins.append({"path": str(source.resolve()), "sha256": _sha256(source)})
     if preserve_original or append_missing:
         for source in (Path(__file__), ROOT/"scripts/rebuild_tw_day_trade_open_price_replay.py",
                        ROOT/"stockagent/live/tw_day_trade_simulation.py", Path(spec.checkpoint_path),
+                       *((ROOT/"stockagent/live/tw_day_trade_nontrade.py",) if nontrade_receipt else ()),
                        *((ROOT/"scripts/verify_tw_day_trade_scoped_repair.py",) if published else ())):
             pins.append({"path": str(source.resolve()), "sha256": _sha256(source)})
     _assert_source_pins(pins)
@@ -911,7 +1370,7 @@ def _apply_locked(args) -> dict:
     preserve_original = manifest.get("preserve_original_signal") is True
     append_missing = manifest.get("append_missing_session") is True
     completed_replay = (((preserve_original and manifest.get("contract") == ORIGINAL_SIGNAL_CONTRACT)
-                         or (append_missing and manifest.get("contract") in {MISSING_SESSION_CONTRACT, PUBLISHED_SESSION_CONTRACT}))
+                         or (append_missing and manifest.get("contract") in {MISSING_SESSION_CONTRACT, *PUBLISHED_SESSION_CONTRACTS}))
                         and len(sessions) == 1 and sessions[0]["day"] == datetime.now(TAIPEI).date()
                         and cutoff == datetime.combine(sessions[0]["day"], time(13, 30), tzinfo=TAIPEI)
                         and sessions[0]["end_at"] == time(13, 30))
@@ -926,7 +1385,7 @@ def _apply_locked(args) -> dict:
         engine = TwDayTradeSimulationEngine(args.live_dir, publication_clock=lambda: datetime.now(TAIPEI))
         mode = engine.state["modes"][args.market]
         if append_missing:
-            _require_missing_session_target(mode, sessions[0]["day"])
+            _require_missing_session_target(mode, sessions[0]["day"], events_path=args.live_dir / "events.jsonl")
         else:
             _require_empty_target(mode, preserve_original_signal=preserve_original)
         if _anchor(mode) != manifest["anchor"]:
@@ -1157,15 +1616,31 @@ def main() -> None:
     parser.add_argument("--signal-summary", type=Path, action="append", default=[])
     parser.add_argument("--minute-data-root", type=Path, action="append", default=[],
                         help="Additional canonical collector roots, checked before default local sources.")
+    parser.add_argument("--finmind-replay-source-root", type=Path, action="append", default=[],
+                        help="Explicit private FinMind projection; verify native and official lineage before use.")
     parser.add_argument("--price-limit-dir", type=Path, default=ROOT / "artifacts/live/tw_price_limits",
                         help="Receipt-backed exact-session static limits; original snapshots stay untouched.")
+    parser.add_argument("--finmind-price-limit-source-root", type=Path,
+                        help="Verify and pin an explicitly selected private FinMind limits projection.")
     parser.add_argument("--preserve-original-signal", action="store_true",
                         help="Repair a never-filled completed minute replay without model inference or weight changes.")
     parser.add_argument("--append-missing-session", action="store_true",
                         help="Append today's missing completed session after flat prior history; never replace existing fills.")
     parser.add_argument("--published-revisions", action="store_true",
                         help="Use a pinned all-lineage published-revision plan for the missing completed session.")
+    parser.add_argument("--provisional-incomplete-minute-data", action="store_true",
+                        help="Explicitly authorized published replay only: keep source gaps provisional; never fill a gap.")
+    parser.add_argument("--nontrade-tick-receipt", type=Path,
+                        help="Explicit authorization: non-fill bookkeeping at the last observed source trade.")
     args = parser.parse_args()
+    if args.finmind_replay_source_root and args.action != "prepare":
+        parser.error("--finmind-replay-source-root is selected during prepare and pinned for apply")
+    if args.finmind_price_limit_source_root and args.action != "prepare":
+        parser.error("--finmind-price-limit-source-root is selected during prepare and pinned for apply")
+    if args.provisional_incomplete_minute_data and (args.action != "prepare" or not args.published_revisions):
+        parser.error("--provisional-incomplete-minute-data requires prepare --published-revisions")
+    if args.nontrade_tick_receipt and (args.action != "prepare" or not args.provisional_incomplete_minute_data):
+        parser.error("--nontrade-tick-receipt requires an explicitly provisional prepare")
     result = plan_published_revisions(args) if args.action == "plan-published-revisions" else prepare(args) if args.action == "prepare" else apply(args) if args.action == "apply" else recover_interrupted(args) if args.action == "recover-interrupted" else bridge_marks(args) if args.action == "bridge-marks" else _object(
         args.operation_root/"ledger_repair_manifest.json")
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))

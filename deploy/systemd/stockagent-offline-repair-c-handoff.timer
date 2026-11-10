@@ -1,0 +1,11 @@
+[Unit]
+Description=Resume the fixed offline repair candidate handoff
+
+[Timer]
+OnBootSec=2min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+Unit=stockagent-offline-repair-c-handoff.service
+
+[Install]
+WantedBy=timers.target

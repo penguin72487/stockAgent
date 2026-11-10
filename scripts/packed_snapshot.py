@@ -130,6 +130,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_LOOSE_FILE_THRESHOLD_BYTES // (1024 * 1024),
     )
     publish.add_argument("--pack-buckets", type=int, default=DEFAULT_PACK_BUCKETS)
+    publish.add_argument("--pack-layout", choices=("path-hash-v1", "source-directory-v1", "source-dataset-v1"),
+                         help="Group new packs by original directory or the entire source dataset.")
+    publish.add_argument("--pack-target-mib", type=int,
+                         help="Logical size target for source-directory packs; a single file stays whole.")
+    publish.add_argument("--large-file-layout", choices=("chunked-v1", "whole-file-v1"),
+                         help="Policy for new large files; previously referenced chunks stay unchanged.")
     publish.add_argument(
         "--file-chunk-mib", type=int,
         help="Opt in to v2 exact large-file chunks (1–64 MiB); deploy v2 readers before shared publication.",
@@ -258,6 +264,10 @@ def main(argv: list[str] | None = None) -> int:
                 node_id=args.node_id,
                 loose_file_threshold_bytes=args.loose_threshold_mib * 1024 * 1024,
                 pack_buckets=args.pack_buckets,
+                pack_layout=args.pack_layout,
+                pack_target_bytes=(args.pack_target_mib * 1024 * 1024
+                                   if args.pack_target_mib is not None else None),
+                large_file_layout=args.large_file_layout,
                 compression_level=args.compression_level,
                 max_clock_skew_seconds=args.max_clock_skew_seconds,
                 metadata=_metadata(args.metadata),

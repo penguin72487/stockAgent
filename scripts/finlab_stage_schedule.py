@@ -105,6 +105,39 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
                                    quota_cycle_start(now) + timedelta(days=1)) for r in higher), default=now)
         daily_capacity[priority] = (sum(c or 0 for c in costs) if all(c is not None for c in costs) else 0,
                                     last_first_slot)
+
+    # The old forecast rescanned all unfinished targets several times for
+    # every simulated request. Priority can change only at the quota-cycle
+    # boundary; maintain per-priority minimum admissions with lazy deletion.
+    # A second pair of heaps tracks exempt targets becoming ready over time.
+    # This keeps the same starvation test without quadratic repeated parsing.
+    target_admission = {key: max(_number(by_key[key].get('transfer_bytes')) or 0,
+                                 _number(by_key[key].get('admission_bytes')) or 0)
+                        for key in targets}
+    target_checked = {key: utc_time(by_key[key].get('source_checked_at_utc')) for key in targets}
+    exempt_future = [(initial_slot(by_key[key]), key) for key in targets
+                     if by_key[key].get('incremental_quota_exempt') is True]
+    heapq.heapify(exempt_future)
+    exempt_ready = []
+    target_heaps = {}
+    target_priorities = {}
+    target_exempt_counts = {}
+    target_cycle = None
+
+    def rebuild_target_heaps():
+        nonlocal target_cycle, target_heaps, target_priorities, target_exempt_counts
+        target_cycle = quota_cycle_start(cursor)
+        target_heaps, target_priorities, target_exempt_counts = {}, {}, {}
+        for key in targets:
+            row = by_key[key]
+            priority = queue_priority(row['queue_role'], checked=target_checked[key], now=cursor)
+            target_priorities[key] = priority
+            target_heaps.setdefault(priority, []).append((target_admission[key], key))
+            if row.get('incremental_quota_exempt') is True:
+                target_exempt_counts[priority] = target_exempt_counts.get(priority, 0) + 1
+        for heap in target_heaps.values():
+            heapq.heapify(heap)
+
     while targets:
         if cursor >= horizon or processed >= max_jobs:
             return result("capacity_constrained")
@@ -118,22 +151,24 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
             ready = [(queue_priority(by_key[key]["queue_role"], checked=age, now=cursor),
                       age, sequence, key, initial) for _, age, sequence, key, initial in ready]
             heapq.heapify(ready)
-        target_priority = min(queue_priority(by_key[key]["queue_role"],
-                                            checked=utc_time(by_key[key].get("source_checked_at_utc")), now=cursor)
-                              for key in targets)
+        if target_cycle != quota_cycle_start(cursor):
+            rebuild_target_heaps()
+        for heap in target_heaps.values():
+            while heap and heap[0][1] not in targets:
+                heapq.heappop(heap)
+        target_priority = min(priority for priority, heap in target_heaps.items() if heap)
         recurring_bytes, last_first_slot = daily_capacity[target_priority]
-        first_targets = [by_key[key] for key in targets if queue_priority(by_key[key]["queue_role"],
-                         checked=utc_time(by_key[key].get("source_checked_at_utc")), now=cursor) == target_priority]
-        smallest_target = min(max(_number(r.get("transfer_bytes")) or 0,
-                                  _number(r.get("admission_bytes")) or 0) for r in first_targets)
-        exempt_target = any(r.get("incremental_quota_exempt") is True for r in first_targets)
+        smallest_target = target_heaps[target_priority][0][0]
+        exempt_target = target_exempt_counts.get(target_priority, 0) > 0
         target_budget = gross_budget if exempt_target else budget
         target_room = room if exempt_target else max(0, room - reserve_bytes)
-        ready_exempt_target = any(
-            by_key[key].get("incremental_quota_exempt") is True
-            and max(_number(by_key[key].get("transfer_bytes")) or 0,
-                    _number(by_key[key].get("admission_bytes")) or 0) <= room
-            and initial_slot(by_key[key]) <= cursor for key in targets)
+        while exempt_future and exempt_future[0][0] <= cursor:
+            _, key = heapq.heappop(exempt_future)
+            if key in targets:
+                heapq.heappush(exempt_ready, (target_admission[key], key))
+        while exempt_ready and exempt_ready[0][1] not in targets:
+            heapq.heappop(exempt_ready)
+        ready_exempt_target = bool(exempt_ready and exempt_ready[0][0] <= room)
         if (refresh_days == 1 and recurring_bytes and recurring_bytes + smallest_target > target_budget
                 and cursor >= last_first_slot and target_room < smallest_target and not ready_exempt_target):
             # In this conservative daily recurrence model a complete higher
@@ -232,6 +267,8 @@ def forecast(rows: list[dict], *, now: datetime, quota: dict, reserve_mb: float,
         room -= cost
         processed += 1
         if key in targets:
+            if row.get('incremental_quota_exempt') is True:
+                target_exempt_counts[target_priorities[key]] -= 1
             targets.remove(key)
             completions[key] = cursor.isoformat()
             stage = row["queue_role"]

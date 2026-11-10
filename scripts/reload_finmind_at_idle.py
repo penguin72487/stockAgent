@@ -40,6 +40,7 @@ STORE_MEASUREMENT = 'finmind_content_addressed_store_fence_v1'
 PUBLICATION_MEASUREMENT = 'finmind_bounded_json_publication_pipeline_v1'
 PRODUCT_VERIFICATION_ACCEPTANCE = 'finmind_finite_product_query_semantics_v1'
 PROVIDER_QUERY_ACCEPTANCE = 'canonical_provider_priority_semantics_v1'
+CAPACITY_RESUME_ACCEPTANCE = 'finmind_capacity_resume_semantics_v1'
 
 
 def metadata(path, maximum=4 * 1024**2):
@@ -169,6 +170,8 @@ def preparation_boundary(root, before):
                                          uri=True, timeout=.2)) as conn:
                 tables = ('finmind_object_prefetch_claims', 'complement_year_batch_claims')
                 claims = {name: conn.execute(f'SELECT count(*) FROM {name}').fetchone()[0] for name in tables}
+                claims['inflight_tasks'] = conn.execute(
+                    "SELECT count(*) FROM tasks WHERE state='inflight'").fetchone()[0]
             if not any(claims.values()):
                 status = metadata(root / 'status.json')
                 proof = {'mode': 'frozen_drained_preparation', 'pid': pid, 'claims': claims,
@@ -183,7 +186,7 @@ def preparation_boundary(root, before):
             subprocess.run(['systemctl', 'thaw', UNIT], check=True, timeout=5)
 
 
-def idle_proof(root, now):
+def idle_proof(root, now, *, allow_disk_guard=False):
     status, waiting = metadata(root / "status.json"), metadata(root / "worker_status.json", 8192)
     reason = waiting.get("reason")
     # Complement's completed-cycle wait has no wake_if. Only quota-reserve
@@ -191,6 +194,8 @@ def idle_proof(root, now):
     # genuine drained wait, but authorize it only while the canonical calendar
     # gate is still in force. Never create an artificial idle window.
     nonreactive = reason in {"batch_complete", "current_queue"} or (
+        allow_disk_guard and reason == "disk_guard"
+    ) or (
         reason == "protected_opening" and protected_stock_opening(now)
     )
     if (idle_heartbeat(root, status, now).get("state") != "waiting"
@@ -295,6 +300,13 @@ def code_matches(accepted):
     hashes = accepted.get("code_sha256", {})
     required = {str(REPO / "downloader/download_finmind_complement.py"),
                 str(REPO / "downloader/finmind_queue_indexes.py")}
+    if accepted.get('measurement_contract') == CAPACITY_RESUME_ACCEPTANCE:
+        required.update(str(REPO / name) for name in (
+            'stockagent/data_sync/acquisition_capacity_sampler.py',
+            'test/test_acquisition_capacity_sampler.py', 'test/test_finmind_complement.py',
+            'test/test_cache_capacity.py', 'test/test_finmind_batch_integration.py',
+            'test/test_finmind_dashboard.py', 'test/test_reload_finmind_at_idle.py',
+            'scripts/reload_finmind_at_idle.py'))
     if accepted.get('measurement_contract') == PRODUCT_VERIFICATION_ACCEPTANCE:
         required.update(str(REPO / name) for name in (
             'downloader/finmind_product_query_verification.py',
@@ -332,6 +344,34 @@ def code_matches(accepted):
 
 def accepted_local_measurement(accepted):
     """Require the local verification appropriate to this exact change."""
+    if accepted.get('measurement_contract') == CAPACITY_RESUME_ACCEPTANCE:
+        import xml.etree.ElementTree as ET
+        if (accepted.get('state') != 'capacity_resume_semantics_accepted'
+                or accepted.get('source_only_no_training_injection') is not True
+                or accepted.get('source_state_preserved') is not True
+                or any(accepted.get(key) != 0 for key in
+                       ('provider_calls', 'production_queue_mutations', 'source_writes'))):
+            return False
+        required = {
+            'test_capacity_wait_rechecks_each_minute_and_reuses_sampler',
+            'test_capacity_wait_resumes_promptly_after_the_inflight_probe',
+            'test_background_startup_keeps_summary_clock_and_does_not_scan',
+            'test_background_capacity_wait_never_overrides_a_real_reserve',
+            'test_wait_for_refresh_reuses_inflight_probe_and_returns_only_new_result',
+            'test_pending_and_expired_samples_fail_closed_with_only_one_probe',
+            'test_probe_failure_and_invalid_result_are_not_admission',
+            'test_idle_disk_guard_requires_explicit_complement_scope_and_no_claims',
+        }
+        try:
+            path = Path(accepted['semantic_junit_path'])
+            if file_sha(path) != accepted['semantic_junit_sha256']:
+                return False
+            cases = ET.parse(path).getroot().findall('.//testcase')
+            passed = {case.get('name', '').split('[', 1)[0] for case in cases}
+            return bool(required <= passed and all(
+                case.find(tag) is None for case in cases for tag in ('failure', 'error', 'skipped')))
+        except (OSError, ValueError, KeyError, TypeError, ET.ParseError):
+            return False
     if accepted.get('measurement_contract') in {PRODUCT_VERIFICATION_ACCEPTANCE, PROVIDER_QUERY_ACCEPTANCE}:
         import xml.etree.ElementTree as ET
         provider_query = accepted['measurement_contract'] == PROVIDER_QUERY_ACCEPTANCE
@@ -521,6 +561,12 @@ def eta_projection_readback(connection, now):
     return {'inventory_plan': work, 'recent_outcomes_plan': recent, 'index_statistics': stats}
 
 
+def _owner_readback_timeout(accepted):
+    """Allow measured long queue preparation without claiming success early."""
+    extended = ETA_MEASUREMENTS | {CAPACITY_RESUME_ACCEPTANCE}
+    return 300 if accepted.get('measurement_contract') in extended else 90
+
+
 def _main(argv, resources):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--acceptance", type=Path, required=True)
@@ -551,7 +597,10 @@ def _main(argv, resources):
             source_queue = Path(manifest.get('source', '')) / 'sponsor/queue.sqlite3'
         else:
             raise ValueError('sponsor_queue_requires_its_full_measured_snapshot')
-    if (not accepted.get("exact_output_parity") or not accepted.get("code_stable")
+    output_proof = (accepted.get('source_state_preserved') is True
+                    if accepted.get('measurement_contract') == CAPACITY_RESUME_ACCEPTANCE
+                    else accepted.get('exact_output_parity') is True)
+    if (not output_proof or not accepted.get("code_stable")
             or not accepted_local_measurement(accepted)
             or source_queue.resolve() != (root / "queue.sqlite3").resolve()
             or not code_matches(accepted)):
@@ -569,9 +618,12 @@ def _main(argv, resources):
     protected = {name: identity(name) for name in protected_units}
     end = time.monotonic() + args.wait_seconds
     proof = None
+    allow_disk_guard = (args.owner == 'complement'
+                        and accepted.get('measurement_contract') == CAPACITY_RESUME_ACCEPTANCE)
     while True:
         try:
-            proof = idle_proof(root, datetime.now(UTC))
+            proof = (idle_proof(root, datetime.now(UTC), allow_disk_guard=True)
+                     if allow_disk_guard else idle_proof(root, datetime.now(UTC)))
             if proof is None and args.apply and args.allow_preparation_boundary:
                 with ExitStack() as attempt:
                     proof = attempt.enter_context(preparation_boundary(root, before))
@@ -601,7 +653,8 @@ def _main(argv, resources):
     # service generation and remaining deadline immediately before dispatch.
     frozen = proof.get('mode') in {'frozen_drained_preparation', 'frozen_drained_reserve'}
     if (identity(unit) != before or not code_matches(accepted)
-            or not frozen and (idle_proof(root, datetime.now(UTC)) != proof
+            or not frozen and ((idle_proof(root, datetime.now(UTC), allow_disk_guard=True)
+                                 if allow_disk_guard else idle_proof(root, datetime.now(UTC))) != proof
                 or datetime.fromisoformat(proof["deadline"]) - datetime.now(UTC) < timedelta(seconds=1))):
         report["state"] = "deferred_generation_or_deadline_changed"
         atomic_write_json(args.output, report)
@@ -610,11 +663,22 @@ def _main(argv, resources):
     report.update(state="restart_requested", restart_requested=True, restart_at_utc=stamp.isoformat())
     atomic_write_json(args.output, report)  # Retain action evidence even if interrupted.
     if frozen:
-        terminate_frozen_preparation(proof)
+        try:
+            terminate_frozen_preparation(proof)
+        except ValueError as error:
+            if str(error) != 'preparation_owner_has_nondefault_sigterm':
+                raise
+            # No signal was sent and systemd was not called. Do not leave the
+            # pre-action intent labelled as an actual requested restart.
+            report.update(state='deferred_frozen_owner_not_safe_to_stop', restart_requested=False,
+                          defer_reason='preparation_owner_has_nondefault_sigterm')
+            report.pop('restart_at_utc', None)
+            atomic_write_json(args.output, report)
+            return 0
     subprocess.run(["systemctl", "restart", unit], check=True, timeout=30)
     # A measured first-time projection build can exceed the old 90-second
     # status window. Wait for the owner; never build indexes from this reader.
-    until = time.monotonic() + (300 if accepted.get('measurement_contract') in ETA_MEASUREMENTS else 90)
+    until = time.monotonic() + _owner_readback_timeout(accepted)
     while time.monotonic() < until:
         after = identity(unit)
         try:

@@ -295,7 +295,12 @@ def test_full_recovery_fuses_chunk_hash_and_original_hash_without_pre_read(
         tmp_path, monkeypatch, memory_rows):
     from collections import Counter
     from pathlib import Path
+    from stockagent.data_sync import packed_metadata
     monkeypatch.setattr(packed, 'METADATA_MEMORY_ROWS', memory_rows)
+    # This checks in-memory versus spilled recovery semantics, not the host's
+    # live Windows/WSL volume bridge. Keep the disposable index in the test
+    # workspace so a transient production mount probe cannot decide the test.
+    monkeypatch.setattr(packed_metadata, '_metadata_scratch_location', lambda: (tmp_path, 0, False))
     source = tmp_path / 'source'
     source.mkdir()
     (source / 'first.bin').write_bytes(b'a' * 16 + b'b' * 16 + b'c' * 16)

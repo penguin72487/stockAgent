@@ -1,0 +1,11 @@
+[Unit]
+Description=Check completed staged source links on E
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=5min
+AccuracySec=1s
+Unit=stockagent-workspace-symlink-closure.service
+
+[Install]
+WantedBy=timers.target

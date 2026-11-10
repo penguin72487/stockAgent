@@ -3,7 +3,7 @@
 import argparse
 import asyncio
 from contextlib import ExitStack, contextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import fcntl
 import hashlib
 import json
@@ -314,6 +314,38 @@ class PublicationOwnerBusy(TimeoutError):
     """Only an unacquired original publication boundary is a normal wait."""
 
 
+async def started_activities(c):
+    """Read the three canonical workflow activities without changing them."""
+    from temporalio.api.enums.v1 import PendingActivityState
+    from temporalio.client import Client
+    from temporalio.service import RPCError, RPCStatusCode
+    client = await Client.connect(c['temporal_endpoint'], namespace=c['temporal_namespace'])
+    active = []
+    for name in (*IDS, *OPTIONAL_IDS):
+        try:
+            description = await client.get_workflow_handle(name).describe(rpc_timeout=timedelta(seconds=10))
+        except RPCError as error:
+            if name in OPTIONAL_IDS and error.status == RPCStatusCode.NOT_FOUND:
+                continue
+            raise
+        if description.status.name != 'RUNNING':
+            raise ValueError('canonical workflow is not running during the handoff check')
+        for item in description.raw_description.pending_activities:
+            if not item.activity_type.name or not item.activity_id:
+                raise ValueError('pending storage activity identity is incomplete')
+            if item.state in {PendingActivityState.PENDING_ACTIVITY_STATE_STARTED,
+                              PendingActivityState.PENDING_ACTIVITY_STATE_CANCEL_REQUESTED}:
+                active.append((name, item.activity_type.name, item.activity_id))
+            elif item.state != PendingActivityState.PENDING_ACTIVITY_STATE_SCHEDULED:
+                raise ValueError('pending storage activity state is unknown')
+    return active
+
+
+def require_drained_activities(checkpoint, active):
+    if (checkpoint and checkpoint.get('inflight_attempts')) or active:
+        raise PublicationOwnerBusy('publication owner has not reached its handoff boundary: active activity or recovery')
+
+
 @contextmanager
 def publication_boundary(locks, deadline, *, on_wait=None):
     """Acquire the complete boundary without parking unrelated owners.
@@ -420,7 +452,7 @@ def main(argv=None):
         if wait_status is not None:
             atomic_write_json(args.handoff_status, {**wait_status,
                 'observed_at_epoch': time.time(), 'waiting_owner_lock': str(lock),
-                'publication_progress_renewed': False, 'original_active_owner_forced': False})
+                'publication_progress_renewed': False, 'original_active_owner_forced': args.restart_active_owner})
     policy=(c['source_replication'] if args.reload_code_only else
             json.loads((ROOT/'configs/data_sync/lake_source_replication.json').read_bytes()))
     source_wave_policy({**c,'source_replication':policy})
@@ -457,7 +489,10 @@ def main(argv=None):
             if pid(OWNER) != '0':
                 raise ValueError('original worker did not stop; retain all owners and journals')
         version_owner = Path(c['state_root'])/'dataset-versions'
-        locks = ([version_owner/'owner.lock'] if version_owner.exists() else [])
+        # The activity lease is acquired before any owner lock. Once loaded,
+        # new activities cannot start their I/O while rollout owns it.
+        locks = [Path(c['state_root'])/'activity-lease.lock']
+        locks += ([version_owner/'owner.lock'] if version_owner.exists() else [])
         locks += [Path(c['state_root'])/name for name in
                   ('source-replication-owner.lock','catalog-owner.lock')]
         if cutover:
@@ -470,6 +505,10 @@ def main(argv=None):
             if worker_code_identity()!=original_code_identity:
                 raise ValueError('worker candidate changed while waiting for the owner boundary')
             if not stopped:
+                # Older workers do not yet use activity-lease.lock. Observe
+                # persisted in-flight work and Temporal STARTED activities as
+                # an additional fence before the first upgrade.
+                require_drained_activities(migration_checkpoint(c['state_root']), asyncio.run(started_activities(c)))
                 stopped=True
                 subprocess.run(['systemctl','stop',OWNER],check=True,timeout=110)
             if worker_code_identity()!=original_code_identity:

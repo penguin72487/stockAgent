@@ -5,8 +5,9 @@ from datetime import datetime, timedelta
 import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
+import pytest
 
-from stockagent.data.panel import LOG_RETURN_FEATURE_COLUMNS, build_tail_panel
+from stockagent.data.panel import LOG_RETURN_FEATURE_COLUMNS, build_panel, build_tail_panel
 from downloader.ohlcv_hot_tail import hot_tail_path
 
 
@@ -127,3 +128,37 @@ def test_build_tail_panel_filters_return_valuation_with_sparse_symbol_dates(
     assert panel.features.shape[0] == 6
     assert int(panel.tradable_mask[:, sparse_idx].sum()) == 2
     assert np.isfinite(panel.returns_1d[:, sparse_idx]).sum() <= 1
+
+
+@pytest.mark.parametrize("transform", ["ordinary", "zero_fill", "shift"])
+def test_tail_open_gap_matches_training_when_symbol_misses_a_session(tmp_path, transform):
+    """A later real trade must not appear in the missing prior session."""
+    stocks = tmp_path / "stocks"
+    stocks.mkdir()
+    days = [datetime(2026, 8, day) for day in (20, 21, 24, 25)]
+
+    def write(symbol, selected, prices):
+        pq.write_table(pa.table({
+            "date": selected, "open": prices, "max": prices, "min": prices,
+            "close": prices, "adjclose": prices, "Trading_Volume": [1000.] * len(prices),
+        }), stocks / f"{symbol}_features.parquet")
+
+    write("1111", days, [30., 31., 32., 33.])
+    write("2222", [days[0], days[2], days[3]], [38., 41.1, 42.])
+    gap = "next_session_open_gap_logret"
+    kwargs = {"benchmark_name": "1111", "panel_load_workers": 0,
+              "feature_include": ["open_raw", "close_raw", gap],
+              "feature_zero_fill": [gap] if transform == "zero_fill" else [],
+              "feature_shift_next_session": [gap] if transform == "shift" else []}
+    full = build_panel(stocks, panel_backend="pyarrow", panel_cache_root=tmp_path / "full-cache", **kwargs)
+    tail = build_tail_panel(stocks, tail_rows=16, **kwargs)
+    assert full.feature_names == tail.feature_names
+    np.testing.assert_array_equal(full.dates, tail.dates)
+    np.testing.assert_array_equal(full.features.view(np.uint32), tail.features.view(np.uint32))
+    symbol, column = tail.symbols.index("2222"), tail.feature_names.index(gap)
+    # 08/21 has no source row. 08/24's opening cannot be backdated to 08/21.
+    assert tail.features[0, symbol, column] == 0.
+    assert tail.features[1, symbol, column] == 0.
+    if transform == "ordinary":
+        expected = np.float32(np.log(np.float64(np.float32(42.)) / np.float64(np.float32(41.1))))
+        assert tail.features[2, symbol, column] == expected

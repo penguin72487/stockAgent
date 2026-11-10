@@ -165,6 +165,20 @@ def test_live_panel_worker_override_is_a_cap(
     assert _live_panel_load_workers(2) == 2
 
 
+def test_live_tail_cache_version_only_changes_for_open_gap_consumers(tmp_path):
+    cfg = SimpleNamespace(data=SimpleNamespace(parquet_root=tmp_path))
+    key = signal_engine._live_panel_disk_backend_key
+    standard = key(cfg, live_tail_rows=48, panel_kwargs={"feature_include": ["close_raw"]})
+    gap = key(cfg, live_tail_rows=48, panel_kwargs={
+        "feature_include": ["close_raw", "next_session_open_gap_logret"]})
+    excluded = key(cfg, live_tail_rows=48, panel_kwargs={
+        "feature_include": ["close_raw", "next_session_open_gap_logret"],
+        "feature_exclude": ["next_session_open_gap_logret"]})
+    assert standard.startswith("live-tail-v1:")
+    assert gap.startswith("live-tail-v2-aligned-gap:")
+    assert excluded.startswith("live-tail-v1:")
+
+
 def test_realtime_daily_decision_uses_quote_time_for_weights_history() -> None:
     assert _decision_weights_timestamp(
         panel_data_date="2026-07-16",
@@ -214,6 +228,41 @@ def test_day_trade_live_window_uses_current_open_without_incomplete_daily_bar() 
     assert np.isclose(window[-1, 0, 1], np.log(102.0 / 100.0))
     assert window[-1, 1, 1] == 0.0
     assert np.array_equal(window[:, :, 0], panel.features[:, :, 0])
+
+
+def test_live_open_gap_uses_exact_cached_training_price_precision_without_mutating_quote() -> None:
+    from stockagent.data.panel import _append_day_trade_open_gap_feature
+
+    closes = np.array([[35.4, 25.6, 56.3], [38.9, 27.8, 59.1]], dtype=np.float32)
+    opens = np.array([[32.45, 23.35, 55.5], [38.9, 27.8, 59.1]], dtype=np.float32)
+    common = dict(symbols=["6103", "6226", "6547"], feature_names=["base"],
+                  returns_1d=np.zeros((2, 3), dtype=np.float32),
+                  tradable_mask=np.ones((2, 3), dtype=bool),
+                  alive_mask=np.ones((2, 3), dtype=bool),
+                  benchmark_returns=np.zeros(2, dtype=np.float32),
+                  close_prices=closes, open_prices=opens)
+    historical = PanelData(dates=np.array(["2026-08-25", "2026-08-26"], dtype="datetime64[D]"),
+                           features=np.zeros((2, 3, 1), dtype=np.float32), **common)
+    _append_day_trade_open_gap_feature(historical)
+    live = PanelData(dates=historical.dates[:1], symbols=common["symbols"],
+                     feature_names=historical.feature_names,
+                     features=historical.features[:1].copy(),
+                     returns_1d=historical.returns_1d[:1],
+                     tradable_mask=historical.tradable_mask[:1],
+                     alive_mask=historical.alive_mask[:1],
+                     benchmark_returns=historical.benchmark_returns[:1],
+                     close_prices=historical.close_prices[:1])
+    raw_opens = np.array([38.9, 27.8, 59.1], dtype=np.float64)
+    snapshot = PriceSnapshot(prices=raw_opens.copy(), open_prices=raw_opens.copy(),
+                             source="twse_tpex:mis", timestamp="2026-08-26T09:00:00+08:00")
+    window, _, _, live_session, observed = _day_trade_live_model_window(
+        live, panel_idx=0, lookback=1, price_snapshot=snapshot,
+        resolved_asof="2026-08-26 09:00:00", source_timezone="Asia/Taipei")
+    assert live_session and observed.tolist() == [True, True, True]
+    np.testing.assert_array_equal(window[-1, :, 1].view(np.uint32),
+                                  historical.features[0, :, 1].view(np.uint32))
+    np.testing.assert_array_equal(snapshot.open_prices, raw_opens)
+    assert snapshot.open_prices.dtype == np.float64
 
 
 def test_day_trade_live_window_can_use_only_fresh_latest_quote_rows() -> None:
@@ -397,14 +446,16 @@ def test_market_config_loads_and_fingerprints_only_named_reference_policies(tmp_
         load_market_config(path)
 
 
-def test_provisional_fresh_price_still_wins_when_latest_completed_close_is_missing():
+def test_provisional_fresh_price_is_observed_but_gap_is_neutral_without_previous_close():
     panel, snapshot = _provisional_reference_fixture()
     panel.close_prices[-1, 0] = np.nan
     window, _, _, live, observed = _day_trade_live_model_window(panel, panel_idx=1,
         lookback=2, price_snapshot=snapshot, resolved_asof="2026-10-16 09:00:01",
         source_timezone="Asia/Taipei", opening_reference_policy=signal_engine.OPENING_PROVISIONAL_REFERENCE_POLICY)
     assert live and observed[0]
-    assert window[-1, 0, 1] == pytest.approx(np.log(101. / 100.))
+    # Training's gap feature needs the immediately preceding panel close;
+    # an older trade can be a price reference, not that denominator.
+    assert window[-1, 0, 1] == 0.0
 
 
 @pytest.mark.parametrize("invalid_source", ["previous_session", "trial", "unavailable", "unclocked_broker"])

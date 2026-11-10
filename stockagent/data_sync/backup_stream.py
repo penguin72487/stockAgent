@@ -17,6 +17,7 @@ import itertools
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import stat
 import time
@@ -31,7 +32,7 @@ from stockagent.data_sync.offhost_backup import (
     _regular, export_incremental_delivery, private_json,
 )
 from stockagent.data_sync.packed_backup import (
-    PinnedObjectSignatures, mounted_volume, object_descriptor, safe_path, signature,
+    PinnedObjectSignatures, EXPECTED_SUFFIX, mounted_volume, object_descriptor, safe_path, signature,
 )
 from stockagent.data_sync.packed_snapshots import PACKED_HEAD_SCHEMA_VERSION, _validate_manifest
 from stockagent.data_sync.transport_capacity import (
@@ -60,30 +61,54 @@ _CATALOG_OBSERVATION = 'stockagent.backup_catalog_observation.v1'
 
 
 def transport_placement_pending(config: dict, *, evidence=None, now=None) -> bool:
-    """Yield a new full inventory to a queued, enrolled sender cutover.
+    """Yield inventories to an enrolled cutover or drained worker handoff.
 
     Receipt ingestion/retirement still runs before this check. A fresh waiting
     observation gives the original placement owner its short lock boundary;
     no source inventory, signature or NAS acceptance is renewed by this hint.
+    Independent retirement of old D names must not repeatedly stop new backup
+    waves once the sender already uses E. Its own locks/gates remain unchanged.
     """
     if config.get('transport_namespace_handoff_contract') != 'stockagent.transport_namespace_handoff.v1':
         return False
     if evidence is None:
         from stockagent.data_sync.workspace_volume import ENROLLMENT
         evidence = ENROLLMENT.parent/'transport-relocation-v1'
-    try:
-        path = _regular(Path(evidence)/'attempt.json')
-        if path.stat().st_size > 16384:
-            return False
-        waiting = json.loads(path.read_bytes())
-        if not isinstance(waiting, dict):
-            return False
-        timestamp = waiting.get('observed_at_epoch')
-        current = time.time() if now is None else now
-        return (waiting.get('state') == 'waiting_for_original_owner_or_reader'
-                and type(timestamp) in (int, float) and -5 <= current - timestamp <= 120)
-    except (OSError, ValueError, KeyError, TypeError, SnapshotError):
-        return False
+    current = time.time() if now is None else now
+
+    def waiting(name, state):
+        try:
+            path = _regular(Path(evidence) / name)
+            if path.stat().st_size > 16384:
+                return {}
+            value = json.loads(path.read_bytes())
+            timestamp = value.get('observed_at_epoch') if isinstance(value, dict) else None
+            return value if (isinstance(value, dict) and value.get('state') == state
+                and type(timestamp) in (int, float) and -5 <= current - timestamp <= 120) else {}
+        except (OSError, ValueError, KeyError, TypeError, SnapshotError):
+            return {}
+
+    worker = waiting('worker-reload.json', 'waiting_for_original_owner')
+    candidate = worker.get('candidate_code_identity_sha256')
+    if (worker.get('contract') == 'stockagent.workspace_worker_handoff.v1'
+            and isinstance(candidate, str) and HASH.fullmatch(candidate)
+            and worker.get('publication_progress_renewed') is False
+            and worker.get('original_active_owner_forced') is False):
+        # This stream takes neither the SQL catalog nor dataset-version owner.
+        # A handoff drops every partial lock before waiting, so stopping this
+        # read-only capture cannot free either independent owner. Reconsider
+        # priority when the handoff reaches a boundary this stream can affect.
+        archive = config.get('immutable_archive_state_root')
+        independent_wait = (isinstance(archive, str)
+            and worker.get('waiting_owner_lock') in {
+                str(Path(archive) / 'catalog-owner.lock'),
+                str(Path(archive) / 'dataset-versions' / 'owner.lock')})
+        if not independent_wait:
+            return True
+    sender = waiting('attempt.json', 'waiting_for_original_owner_or_reader')
+    # Missing purpose preserves older original cutover observers. Newly
+    # emitted GC hints are explicit and cannot veto the next source capture.
+    return bool(sender) and (sender.get('purpose') is None or sender.get('purpose') == 'namespace_handoff')
 
 
 def _catalog_file_signatures_identity(catalog: dict) -> str | None:
@@ -344,9 +369,52 @@ def _catalog_metadata_workers(cold: Path) -> int:
     return 4
 
 
+def _recursive_cold_object_paths(cold: Path):
+    """Retain the original diagnostics for noncanonical directory layouts."""
+    for parent, directories, names in os.walk(cold / 'objects', followlinks=False):
+        if any((Path(parent) / name).is_symlink() for name in directories):
+            raise SnapshotError('cold object directory is redirected')
+        for name in names:
+            yield (Path(parent) / name).relative_to(cold).as_posix()
+
+
+def _cold_object_paths(cold: Path, pinned: PinnedObjectSignatures):
+    """Enumerate canonical CAS names without re-statting every referenced leaf.
+
+    Referenced leaves already have this pass's regular-file signatures;
+    unreferenced leaves still require the caller's no-follow signature. Pin
+    and recheck all listed directories. Unexpected namespace layouts retain
+    the original recursive diagnostics instead of silently losing evidence.
+    """
+    shards = []
+    try:
+        for kind in sorted(pinned.directory_names('objects')):
+            if kind not in EXPECTED_SUFFIX:
+                raise ValueError('noncanonical CAS namespace')
+            parent = 'objects/' + kind
+            for prefix in sorted(pinned.directory_names(parent)):
+                if not re.fullmatch(r'[0-9a-f]{2}', prefix):
+                    raise ValueError('noncanonical CAS shard')
+                shards.append(parent + '/' + prefix)
+    except (ValueError, NotADirectoryError):
+        yield from _recursive_cold_object_paths(cold)
+        return
+    for shard in shards:
+        try:
+            names = pinned.directory_names(shard)
+        except NotADirectoryError:
+            # A file at a directory's canonical name remains a noncanonical
+            # member for the original descriptor/error path below.
+            yield shard
+            continue
+        for name in names:
+            yield shard + '/' + name
+
+
 def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: Path | None = None,
                     *, include_unreferenced_objects: bool = False, testing_disposition: Path | None = None,
-                    metadata_workers: int | None = None, private_backup_policy: dict | None = None) -> dict:
+                    metadata_workers: int | None = None, private_backup_policy: dict | None = None,
+                    history_retirement_root: Path | None = None) -> dict:
     """Fixed metadata inventory, with per-release missing-object diagnostics.
 
     Missing historical objects do not erase a historical manifest or obstruct
@@ -365,7 +433,8 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
         result = _capture_catalog(cold, publication_catalog, history_disposition,
             include_unreferenced_objects=include_unreferenced_objects,
             testing_disposition=testing_disposition, metadata_pins=metadata_pins,
-            metadata_workers=workers, private_backup_policy=private_backup_policy)
+            metadata_workers=workers, private_backup_policy=private_backup_policy,
+            history_retirement_root=history_retirement_root)
         metadata_pins.recheck()
         if private_backup_policy is not None:
             validate_private_root(cold, private_backup_policy)
@@ -375,7 +444,8 @@ def capture_catalog(cold: Path, publication_catalog: Path, history_disposition: 
 def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition: Path | None,
                      *, include_unreferenced_objects: bool, testing_disposition: Path | None,
                      metadata_pins: PinnedObjectSignatures, metadata_workers: int = 1,
-                     private_backup_policy: dict | None = None) -> dict:
+                     private_backup_policy: dict | None = None,
+                     history_retirement_root: Path | None = None) -> dict:
     cold = cold.absolute()
     entries = json.loads(publication_catalog.read_bytes())["datasets"]
     excluded = ({r["dataset"] for r in entries if r.get("publish") is not True}
@@ -474,6 +544,8 @@ def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition:
                     observe_manifest(path, observed)
                 except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
                     rows.pop(relative, None)
+                    if include_unreferenced_objects:
+                        orphan_scan_blocked = True
                     errors.append({"relative": relative, "reason": type(error).__name__})
     for path in sorted((cold / "heads").glob("*/*.json")):
         if path.parent.name in excluded:
@@ -502,31 +574,55 @@ def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition:
             row["captured_bytes_utf8"] = raw.decode("utf-8")
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
             rows.pop(relative, None)
+            if include_unreferenced_objects:
+                orphan_scan_blocked = True
             errors.append({"relative": relative, "reason": type(error).__name__})
 
     # Previous head bytes are durable provenance, distinct from mutable heads.
-    for path in sorted((cold / "head-history/heads").glob("*/*/*.json")):
-        dataset, node = path.parent.parent.name, path.parent.name
-        if dataset in excluded:
-            continue
-        relative = path.relative_to(cold).as_posix()
+    # As with manifests above, overlap only bounded complete no-follow reads;
+    # consume, validate and record each result in the original sorted order.
+    # The same pass-local directory pins and final recheck remain mandatory.
+    def prefetch_historical_head(path: Path):
+        if path.parent.parent.name in excluded:
+            return None, None
         try:
-            raw, row = add_metadata(path)
-            head = json.loads(raw)
-            if head.get("manifest_relpath") not in metadata and head.get("manifest_relpath") not in discarded_testing_metadata:
-                observe_manifest(safe_path(cold, head["manifest_relpath"]))
-            manifest, manifest_row = (metadata[head["manifest_relpath"]] if head["manifest_relpath"] in metadata
-                                      else discarded_testing_metadata[head["manifest_relpath"]])
-            if (head["schema_version"] != PACKED_HEAD_SCHEMA_VERSION or head["dataset"] != dataset
-                    or head["node_id"] != node or path.stem != row["sha256"]
-                    or head["manifest_sha256"] != manifest_row["sha256"]
-                    or head["snapshot_id"] != manifest.snapshot_id or head["hlc"] != manifest.hlc):
-                raise SnapshotError("historical head does not match its fixed manifest")
-            if head["manifest_relpath"] in discarded_testing_metadata:
-                continue
+            return metadata_pins.read_metadata(path.relative_to(cold).as_posix()), None
         except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
-            rows.pop(relative, None)
-            errors.append({"relative": relative, "reason": type(error).__name__})
+            return None, error
+
+    history_pool = (ThreadPoolExecutor(max_workers=metadata_workers)
+                    if metadata_workers > 1 else nullcontext(None))
+    with history_pool as pool:
+        paths = iter(sorted((cold / "head-history/heads").glob("*/*/*.json")))
+        while batch := list(itertools.islice(paths, metadata_workers)):
+            fetched = (pool.map(prefetch_historical_head, batch) if pool is not None
+                       else map(prefetch_historical_head, batch))
+            for path, (observed, read_error) in zip(batch, fetched, strict=True):
+                dataset, node = path.parent.parent.name, path.parent.name
+                if dataset in excluded:
+                    continue
+                relative = path.relative_to(cold).as_posix()
+                try:
+                    if read_error is not None:
+                        raise read_error
+                    raw, row = add_metadata(path, observed)
+                    head = json.loads(raw)
+                    if head.get("manifest_relpath") not in metadata and head.get("manifest_relpath") not in discarded_testing_metadata:
+                        observe_manifest(safe_path(cold, head["manifest_relpath"]))
+                    manifest, manifest_row = (metadata[head["manifest_relpath"]] if head["manifest_relpath"] in metadata
+                                              else discarded_testing_metadata[head["manifest_relpath"]])
+                    if (head["schema_version"] != PACKED_HEAD_SCHEMA_VERSION or head["dataset"] != dataset
+                            or head["node_id"] != node or path.stem != row["sha256"]
+                            or head["manifest_sha256"] != manifest_row["sha256"]
+                            or head["snapshot_id"] != manifest.snapshot_id or head["hlc"] != manifest.hlc):
+                        raise SnapshotError("historical head does not match its fixed manifest")
+                    if head["manifest_relpath"] in discarded_testing_metadata:
+                        continue
+                except (OSError, ValueError, KeyError, TypeError, SnapshotError) as error:
+                    rows.pop(relative, None)
+                    if include_unreferenced_objects:
+                        orphan_scan_blocked = True
+                    errors.append({"relative": relative, "reason": type(error).__name__})
 
     missing = {}
     object_file_keys = {}
@@ -592,22 +688,17 @@ def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition:
             # Back up unique evidence in the enrolled cold object namespace;
             # lack of a manifest grants neither deletion nor release identity.
             # Objects belonging to restricted manifests remain excluded.
-            for parent, dirs, names in os.walk(cold / "objects", followlinks=False):
-                for name in dirs:
-                    if (Path(parent) / name).is_symlink():
-                        raise SnapshotError("cold object directory is redirected")
-                for name in names:
-                    relative = (Path(parent) / name).relative_to(cold).as_posix()
-                    if relative in all_referenced_objects:
-                        continue
-                    try:
-                        digest = object_descriptor(relative)
-                        observed = pinned.signature(relative)
-                        rows[relative] = {"relative": relative, "sha256": digest,
-                            "bytes": observed[2], "signature": list(observed),
-                            "role": "unreferenced_cold_object", "release_provenance_verified": False}
-                    except (OSError, SnapshotError) as error:
-                        errors.append({"relative": relative, "reason": type(error).__name__})
+            for relative in _cold_object_paths(cold, pinned):
+                if relative in all_referenced_objects:
+                    continue
+                try:
+                    digest = object_descriptor(relative)
+                    observed = pinned.signature(relative)
+                    rows[relative] = {"relative": relative, "sha256": digest,
+                        "bytes": observed[2], "signature": list(observed),
+                        "role": "unreferenced_cold_object", "release_provenance_verified": False}
+                except (OSError, SnapshotError) as error:
+                    errors.append({"relative": relative, "reason": type(error).__name__})
         pinned.recheck()
     if not releases:
         raise SnapshotError("no valid retained packed releases found")
@@ -622,7 +713,16 @@ def _capture_catalog(cold: Path, publication_catalog: Path, history_disposition:
         body.update(scope='all retained private immutable manifests; separate personal NAS backup authorization',
                     private_backup_policy_identity_sha256=identity_sha256(private_backup_policy))
     from stockagent.data_sync.backup_history import apply_disposition
-    body = apply_disposition(body, history_disposition)
+    def enrolled_retirement_root():
+        # Only the canonical D authority may consult the enrolled E owner
+        # journals. Other roots stay strict unless explicitly supplied evidence.
+        from stockagent.data_sync import workspace_volume
+        config = workspace_volume.configuration()
+        return (Path(config['mount_point'])/'migration/stream-source-repack-v1',
+                lambda: workspace_volume.check(c=config))
+    body = apply_disposition(body, history_disposition,
+        retirement_journal_root=history_retirement_root,
+        retirement_root_factory=enrolled_retirement_root if cold == Path('/srv/stockagent-packed') else None)
     if disposition:
         body["discarded_testing_releases"] = discarded_testing_releases
         body["discarded_testing_objects"] = sorted(discarded_testing_objects - retained_referenced_objects)
@@ -747,9 +847,15 @@ def coverage(catalog: dict, ledger: dict) -> dict:
         "accepted_file_keys": accepted, "current_release_count": len(current),
         "current_releases_nas_file_covered": sum(recovered(r) for r in current),
         "retained_release_count": len(catalog["releases"]),
-        "observed_release_count": len(catalog["releases"]) + len(catalog.get("abandoned_releases", [])),
+        "observed_release_count": len(catalog["releases"]) + sum(
+            r.get("manifest_observed_in_current_catalog") is not False
+            for r in catalog.get("abandoned_releases", [])),
         "abandoned_history_release_count": len(catalog.get("abandoned_releases", [])),
         "abandoned_unavailable_object_count": len(catalog.get("abandoned_missing_objects", [])),
+        "retired_history_disposition_count": sum(
+            r.get("manifest_observed_in_current_catalog") is False
+            for r in catalog.get("abandoned_releases", [])),
+        "retired_historical_missing_object_count": len(catalog.get("retired_historical_missing_objects", [])),
         "retained_releases_nas_file_covered": sum(recovered(r) for r in catalog["releases"]),
         "missing_object_count": len(catalog["missing_objects"]),
         "blocked_retained_releases": sum(bool(r["missing_objects"]) for r in catalog["releases"]),
@@ -800,6 +906,7 @@ def recovery_index(catalog: dict, ledger: dict, repository_id: str) -> dict:
         "releases": [{k: row[k] for k in ("dataset", "snapshot_id", "manifest_sha256", "manifest_relative",
             "source_fingerprint_sha256", "current_head", "missing_objects")} for row in catalog["releases"]],
         "abandoned_releases": catalog.get("abandoned_releases", []),
+        "retired_historical_missing_objects": catalog.get("retired_historical_missing_objects", []),
         "nas_provenance_verified_by_index": False, "canonical_reconstruction_verified": False,
         "full_history_backup_verified": False}
     return {**body, "identity_sha256": identity_sha256(body)}

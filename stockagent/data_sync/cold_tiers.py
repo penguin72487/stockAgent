@@ -419,7 +419,7 @@ def status_record(report: dict, policy: dict, previous: dict) -> dict:
     """Keep the last actual work separate from a later outside-window poll."""
     current = {**report, "contract": CONTRACT, "observed_at_epoch": time.time(),
         "schedule": {key: policy[key] for key in ("daily_window_timezone", "daily_window_start_hour",
-            "daily_window_end_hour", "stable_after_hours")}}
+            "daily_window_end_hour", "stable_after_hours", "reserve_bytes")}}
     previous_work = previous.get("last_work_cycle") if previous.get("contract") == CONTRACT else None
     if report.get("apply") is True and (report.get("intent_waves_attempted", 0) > 0
             or report.get("objects_completed", 0) > 0):

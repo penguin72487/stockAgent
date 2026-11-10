@@ -24,10 +24,10 @@ from urllib.parse import quote
 import uuid
 
 from stockagent.data_sync.desync_snapshots import (
-    SnapshotError, atomic_write_bytes, atomic_write_json, sha256_file,
+    SnapshotError, _safe_relative_path, atomic_write_bytes, atomic_write_json, sha256_file,
 )
 from stockagent.data_sync.packed_snapshots import (
-    PackedPublicationBusy, UnsafeSnapshotSymlink, _check_packed_read_authority, _iter_inventory,
+    IncompleteIncrementalWorkspace, PackedPublicationBusy, UnsafeSnapshotSymlink, _check_packed_read_authority, _iter_inventory,
     _storage_extents,
     initialize_packed_layout, publish_packed_snapshot, resolve_latest_packed,
     resolve_packed_snapshot_id, verify_packed_snapshot,
@@ -36,9 +36,30 @@ from stockagent.data_sync.packed_metadata import MetadataRows
 
 CONTRACT = "all_catalog_incremental_migration_v1"
 PRIVATE_RELATIVE = ".local-state/private-history"
-CONTROL_SCOPE = "recursive_mutable_controls_v17"
+CONTROL_SCOPE = "recursive_mutable_controls_v18"
 FROZEN_CONTROLS_INLINE_LIMIT = 4096
 MIGRATION_OPERATIONS = Path('/var/lib/stockagent/lakehouse-control/dataset-versions/operations')
+RECOVERY_PAUSE_CONTRACT = 'stockagent.dataset_recovery_migration_pause.v1'
+
+
+def _recovery_paused(path) -> bool:
+    """Read the explicit private user-migration pause, without changing it."""
+    if path is None:
+        return False
+    path = Path(path)
+    if not os.path.lexists(path):
+        return False
+    descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    with os.fdopen(descriptor, 'rb') as source:
+        info = os.fstat(source.fileno())
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid()
+                or info.st_mode & 0o077 or info.st_size > 4096 or info.st_nlink != 1):
+            raise SnapshotError('dataset recovery pause is not a private local file')
+        value = json.loads(source.read(4097))
+    if (not isinstance(value, dict) or value.get('contract') != RECOVERY_PAUSE_CONTRACT
+            or value.get('paused') is not True):
+        raise SnapshotError('dataset recovery pause identity differs')
+    return True
 
 
 def _identity(document):
@@ -319,8 +340,30 @@ def _sqlite_databases(source: Path, excluded: list[str], *, progress=None) -> li
     return result
 
 
-def _snapshot_sqlite(database: Path, staging: Path, logical_path: str) -> dict:
+def _snapshot_sqlite(database: Path, staging: Path, logical_path: str, *, progress=None) -> dict:
     """SQLite's own read transaction, never copy a live main/WAL/SHM trio."""
+    last_report, last_stage = 0.0, None
+    def report(stage, *, force=False, **counters):
+        nonlocal last_report, last_stage
+        now = time.monotonic()
+        if progress is not None and (force or stage != last_stage or now-last_report >= 5):
+            last_report, last_stage = now, stage
+            progress({'stage': stage, 'acceptance': False, **counters})
+
+    def hash_snapshot(path):
+        total, done = path.stat().st_size, 0
+        digest = hashlib.sha256()
+        report('hashing_sqlite_snapshot', force=True, logical_bytes_processed=0, logical_bytes_total=total)
+        with path.open('rb') as stream:
+            while chunk := stream.read(8 * 1024**2):
+                digest.update(chunk)
+                done += len(chunk)
+                report('hashing_sqlite_snapshot', logical_bytes_processed=done, logical_bytes_total=total)
+        if done != total or path.stat().st_size != total:
+            raise SnapshotError('owned SQLite snapshot changed while hashing')
+        report('hashing_sqlite_snapshot', force=True, logical_bytes_processed=done, logical_bytes_total=total)
+        return digest.hexdigest()
+
     staging.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     marker = {"contract": "owned_sqlite_backup_intent_v1", "source": str(database),
               "source_relative": logical_path, "target": "snapshot.sqlite3"}
@@ -340,7 +383,7 @@ def _snapshot_sqlite(database: Path, staging: Path, logical_path: str) -> dict:
             proof = json.loads((staging / "snapshot.json").read_text())
             payload = staging / "snapshot.sqlite3"
             if (payload.is_symlink() or payload.stat().st_size != proof["snapshot_bytes"]
-                    or sha256_file(payload) != proof["snapshot_sha256"]):
+                    or hash_snapshot(payload) != proof["snapshot_sha256"]):
                 raise SnapshotError("completed native SQLite backup changed")
             return proof
     else:
@@ -354,9 +397,13 @@ def _snapshot_sqlite(database: Path, staging: Path, logical_path: str) -> dict:
     if process_references_many([staging]):
         raise SnapshotError("native SQLite scratch is still used by another process")
     started = time.monotonic()
-    def progress(_status, _remaining, _total):
+    report('snapshotting_sqlite_state', force=True)
+    def sqlite_progress(_status, remaining, total):
         if time.monotonic() - started > 900:
             raise SnapshotError("consistent SQLite snapshot exceeded its bounded attempt")
+        counters = ({'phase_completed_items': max(0, total-remaining), 'phase_total_items': total}
+                    if type(total) is int and type(remaining) is int and total > 0 else {})
+        report('snapshotting_sqlite_state', **counters)
     with closing(sqlite3.connect("file:" + quote(str(database), safe="/") + "?mode=ro", uri=True,
                                  timeout=5)) as original, closing(sqlite3.connect(target)) as snapshot:
         journal_mode = original.execute("PRAGMA journal_mode").fetchone()[0]
@@ -367,19 +414,30 @@ def _snapshot_sqlite(database: Path, staging: Path, logical_path: str) -> dict:
             # transaction on a rollback-journal source.
             original.execute("BEGIN")
             original.execute("SELECT rootpage FROM sqlite_schema LIMIT 1").fetchall()
-        original.backup(snapshot, pages=1024, progress=progress, sleep=0.05)
+        original.backup(snapshot, pages=1024, progress=sqlite_progress, sleep=0.05)
         # Only the owned backup destination is normalized. A portable closed
         # backup must not depend on live destination WAL/SHM files, and a
         # connection context manager alone does NOT close its connection.
+        report('finalizing_sqlite_snapshot', force=True)
         snapshot.commit()
         if snapshot.execute("PRAGMA journal_mode=DELETE").fetchone() != ("delete",):
             raise SnapshotError("native SQLite backup did not become a standalone database")
-        if snapshot.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
-            raise SnapshotError("consistent SQLite snapshot failed its own integrity check")
+        report('checking_sqlite_snapshot', force=True)
+        if progress is not None:
+            def sqlite_check_heartbeat():
+                report('checking_sqlite_snapshot')
+                return 0
+            snapshot.set_progress_handler(sqlite_check_heartbeat, 100000)
+        try:
+            if snapshot.execute("PRAGMA quick_check").fetchall() != [("ok",)]:
+                raise SnapshotError("consistent SQLite snapshot failed its own integrity check")
+        finally:
+            if progress is not None:
+                snapshot.set_progress_handler(None, 0)
     with target.open("rb") as stream:
         os.fsync(stream.fileno())
     proof = {"contract": "sqlite_backup_api_consistent_state_v1", "source_relative": logical_path,
-             "snapshot_sha256": sha256_file(target), "snapshot_bytes": target.stat().st_size,
+             "snapshot_sha256": hash_snapshot(target), "snapshot_bytes": target.stat().st_size,
              "source_journal_mode": journal_mode,
              "source_read_snapshot_pinned": journal_mode == "wal",
              "destination_connections_closed": True,
@@ -442,8 +500,17 @@ def _mutable_published_locations(source: Path) -> dict[str, tuple[str, ...] | No
         # build_tw_public_training_features closes its temporary table and
         # checks source identities before os.replace. This is not permission
         # to copy arbitrary feature/raw Parquet files that change in place.
-        return {'features': ('tw_public_stock_daily.parquet',
-                             'tw_public_research_wide_2014_v1.parquet')}
+        locations = {'features': ('tw_public_stock_daily.parquet',
+                                  'tw_public_research_wide_2014_v1.parquet')}
+        daily = source / 'shioaji/daily'
+        if daily.exists() or daily.is_symlink():
+            if daily.resolve() != daily or not daily.is_dir():
+                raise SnapshotError('Shioaji daily writer directory is redirected')
+            # download_shioaji_tw_kbars closes and atomically replaces these
+            # exact per-symbol tables. Other raw Parquet trees remain strict.
+            locations['shioaji/daily'] = tuple(sorted(member.name for member in daily.iterdir()
+                if re.fullmatch(r'[A-Za-z0-9]+\.parquet', member.name)))
+        return locations
     return {}
 
 
@@ -471,6 +538,17 @@ def _mutable_control_file_locations(source: Path) -> dict[str, tuple[str, ...]]:
         # They are separate fixed observations, not a globally atomic pair.
         locations['features'] = ('tw_public_stock_daily.summary.json',
                                  'tw_public_research_wide_2014_v1.research.json')
+        from downloader.tw_public_contract import DAILY_CLOSE_CORE_DATASETS, DAILY_CLOSE_OPTIONAL_DATASETS
+        # _finish_historical_coverage_state uses _write_json and os.replace for
+        # these exact market coverage records; data rows remain separate.
+        market_states = DAILY_CLOSE_CORE_DATASETS | DAILY_CLOSE_OPTIONAL_DATASETS | {'tpex_day_trade_eligibility'}
+        locations['state'] = tuple(sorted(name + '.json' for name in market_states))
+        daily = source / 'shioaji/daily'
+        if daily.exists() or daily.is_symlink():
+            if daily.resolve() != daily or not daily.is_dir():
+                raise SnapshotError('Shioaji daily writer directory is redirected')
+            locations['shioaji/daily'] = tuple(sorted(member.name for member in daily.iterdir()
+                if re.fullmatch(r'[A-Za-z0-9]+\.summary\.json', member.name)))
         metadata = source / 'metadata'
         if metadata.is_dir() and not metadata.is_symlink():
             locations['metadata'] = tuple(member.name for member in metadata.iterdir()
@@ -575,11 +653,15 @@ def _validate_frozen_control(raw: bytes, *, json_control: bool, json_lines: bool
 
 
 def _freeze_streamed_observation(original: Path, target: Path, logical: str, *,
-                                 capture_kind='closed_atomic_published_payload', json_lines=False) -> dict:
+                                 capture_kind='closed_atomic_published_payload', json_lines=False,
+                                 allow_growing_log_prefix=False) -> dict:
     """One bounded-memory stable-FD copy of a reviewed output or operational log."""
     from stockagent.data_sync.desync_snapshots import _fsync_directory, rename_without_overwrite
     from stockagent.data_sync.immutable_cache_files import payload_info, stable_payload_hash
 
+    if allow_growing_log_prefix and (json_lines or logical != 'logs/supervisor.log'
+                                     or original.parent.parent.name != 'data_openBB'):
+        raise SnapshotError('growing log capture is not an enrolled producer')
     if target.exists():
         # Only a complete fsynced capture can acquire this final name. A crash
         # before saving the preparation must retain that observation, not copy
@@ -603,7 +685,8 @@ def _freeze_streamed_observation(original: Path, target: Path, logical: str, *,
                 output_fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC, 0o600)
                 with os.fdopen(output_fd, 'wb') as output:
                     while block := (source.readline(64 * 1024**2 + 1) if json_lines else
-                                    source.read(min(8 * 1024**2, before.st_size - copied + 1))):
+                                    source.read(min(8 * 1024**2, before.st_size - copied
+                                                    + (0 if allow_growing_log_prefix else 1)))):
                         if copied + len(block) > before.st_size:
                             oversized = True
                             break  # A growing in-place writer cannot make this copy unbounded.
@@ -616,6 +699,29 @@ def _freeze_streamed_observation(original: Path, target: Path, logical: str, *,
                         copied += len(block)
                     after = os.fstat(source.fileno())
                     stable = not oversized and signature(before) == signature(after) and copied == before.st_size
+                    captured_kind = capture_kind
+                    if (not stable and allow_growing_log_prefix and not oversized and copied == before.st_size
+                            and (before.st_dev, before.st_ino) == (after.st_dev, after.st_ino)
+                            and after.st_size > before.st_size):
+                        # This exact producer uses O_APPEND with copy/truncate
+                        # rotation. Re-read the originally observed length to
+                        # reject a concurrent truncate or in-place rewrite.
+                        source.seek(0)
+                        recheck, remaining = hashlib.sha256(), before.st_size
+                        while remaining:
+                            block = source.read(min(8 * 1024**2, remaining))
+                            if not block:
+                                break
+                            remaining -= len(block)
+                            recheck.update(block)
+                        final = os.fstat(source.fileno())
+                        current = original.lstat()
+                        stable = (remaining == 0 and recheck.digest() == digest.digest()
+                            and (before.st_dev, before.st_ino) == (final.st_dev, final.st_ino)
+                            == (current.st_dev, current.st_ino) and stat.S_ISREG(current.st_mode)
+                            and final.st_size >= before.st_size and current.st_size >= before.st_size)
+                        if stable:
+                            captured_kind = 'verified_operational_log_prefix'
                     if stable:
                         output.flush()
                         os.fsync(output.fileno())
@@ -626,7 +732,7 @@ def _freeze_streamed_observation(original: Path, target: Path, logical: str, *,
             rename_without_overwrite(temporary, target)
             _fsync_directory(target.parent)
             return {'path': str(target), 'sha256': digest.hexdigest(), 'bytes': copied,
-                    'capture_kind': capture_kind}
+                    'capture_kind': captured_kind}
         finally:
             temporary.unlink(missing_ok=True)  # This call's exact owned work file, never a source.
     raise AssertionError('bounded published capture did not return or reject')
@@ -656,7 +762,7 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                  "recursive_mutable_controls_v10", "recursive_mutable_controls_v11",
                  "recursive_mutable_controls_v12", "recursive_mutable_controls_v13",
                  "recursive_mutable_controls_v14", "recursive_mutable_controls_v15",
-                 "recursive_mutable_controls_v16")):
+                 "recursive_mutable_controls_v16", "recursive_mutable_controls_v17")):
             raise SnapshotError("control freeze intent changed")
         if previous_intent != intent:
             # Expand the named control scope without replacing retained
@@ -696,7 +802,8 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                         'recursive_mutable_controls_v9', 'recursive_mutable_controls_v10',
                         'recursive_mutable_controls_v11', 'recursive_mutable_controls_v12',
                         'recursive_mutable_controls_v13', 'recursive_mutable_controls_v14',
-                        'recursive_mutable_controls_v15', 'recursive_mutable_controls_v16', CONTROL_SCOPE}:
+                        'recursive_mutable_controls_v15', 'recursive_mutable_controls_v16',
+                        'recursive_mutable_controls_v17', CONTROL_SCOPE}:
         # Completed recursive censuses only need named delta probes. v4 added
         # reports/atomic outputs; v5 added rule-only TAIFEX, v6 news controls.
         # v7 adds native CEX reports/lock epochs and the official feature table;
@@ -711,6 +818,7 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
         # v15 adds only the FinMind announcement watcher's two mutable heads.
         # v16 adds the FinLab overlay's exact token/year closed outputs.
         # v17 adds only the two reviewed mutable null-audit JSON reports.
+        # v18 adds exact TW market-coverage states and Shioaji daily tables.
         # Large receipt
         # trees are observed directly into cold packs, never millions of copies.
         # Never rewalk millions of raw files or replace retained observations.
@@ -782,10 +890,12 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
                 raise SnapshotError("control freeze target is redirected")
             if published_payload or streamed_control:
                 streamed_jsonl = streamed_control and name.endswith('.jsonl')
+                openbb_supervisor = source.name == 'data_openBB' and logical == 'logs/supervisor.log'
                 frozen[logical] = _freeze_streamed_observation(original, target, logical,
-                    capture_kind=('stable_operational_jsonl' if streamed_jsonl else 'stable_operational_log')
+                    capture_kind=('verified_operational_log_prefix' if openbb_supervisor else
+                                  'stable_operational_jsonl' if streamed_jsonl else 'stable_operational_log')
                         if streamed_control else 'closed_atomic_published_payload',
-                    json_lines=streamed_jsonl)
+                    json_lines=streamed_jsonl, allow_growing_log_prefix=openbb_supervisor)
                 captured_bytes += frozen[logical]['bytes']
                 continue
             if target.exists():
@@ -828,6 +938,55 @@ def _freeze_controls(source: Path, staging: Path, excluded: list[str], *, existi
 
 def _preparation_path(args, dataset):
     return args.migration_state.absolute() / "preparations" / (dataset + ".json")
+
+
+def _repack_evidence_workspace() -> Path:
+    from stockagent.data_sync import workspace_volume
+    config = workspace_volume.configuration()
+    workspace_volume.check(c=config)
+    return Path(config['mount_point'])
+
+
+def _reconcile_prepared_sqlite(entry: dict, args, cold: Path, prepared: dict) -> None:
+    """Follow exact physical encodings of the already-frozen SQLite observation.
+
+    Reuse the original backup's bytes and clocks. A missing manifest may have
+    been retired after a complete exact repack; a corrupt extant manifest is
+    still an error. The final reference is persisted while retirement is fenced.
+    """
+    from stockagent.data_sync import packed_snapshots as packed, repack_generation_evidence as evidence
+    for row in prepared['sqlite_states']:
+        try:
+            fixed = resolve_packed_snapshot_id(cold, row['dataset'], row['snapshot_id'])
+        except FileNotFoundError:
+            original = cold/'manifests'/row['dataset']/(row['snapshot_id']+'.json')
+            if os.path.lexists(original):
+                raise  # Missing payload is different from a retired manifest.
+            workspace = _repack_evidence_workspace()
+            with packed._try_publication_lock(cold/'.local-state/locks/publish-retention-global.lock', shared=True):
+                current = resolve_latest_packed(cold, row['dataset'], require_objects=False)
+                proof = evidence.chain(cold, workspace, row['dataset'], row, private=True, current=current)
+                if (proof is None or current.manifest.get('metadata', {}).get('role') != 'private_consistent_sqlite_state'
+                        or current.manifest['metadata'].get('source_relative') != row['source_relative']):
+                    raise SnapshotError('prepared SQLite successor is not its original frozen state')
+                matches = [item for item in packed._iter_inventory(cold, current.manifest)
+                           if item.get('path') == 'snapshot.sqlite3']
+                state = row['consistent_state']
+                if (len(matches) != 1 or matches[0].get('kind') != 'file'
+                        or matches[0].get('size') != state['snapshot_bytes']
+                        or matches[0].get('sha256') != state['snapshot_sha256']):
+                    raise SnapshotError('prepared SQLite successor changed its frozen database bytes')
+                fixed = resolve_packed_snapshot_id(cold, row['dataset'], proof['snapshot_id'])
+                if fixed.manifest_sha256 != proof['manifest_sha256']:
+                    raise SnapshotError('prepared SQLite successor changed before binding')
+                history = row.setdefault('physical_repack_rebindings', [])
+                if not isinstance(history, list) or len(history) >= 32:
+                    raise SnapshotError('prepared SQLite rebinding history exceeds its bound')
+                history.append(proof)
+                row.update(snapshot_id=proof['snapshot_id'], manifest_sha256=proof['manifest_sha256'])
+                atomic_write_json(_preparation_path(args, entry['dataset']), prepared)
+        if fixed.manifest_sha256 != row['manifest_sha256']:
+            raise SnapshotError('prepared SQLite release identity changed')
 
 
 def _migration_scratch_root(directory: Path, *, create: bool) -> Path:
@@ -889,10 +1048,17 @@ def _private_preparation(entry: dict, args, source: Path, cold: Path, policy: di
             prepared["sqlite_states"].append({"source_relative": relative, "dataset": name,
                 "retained_snapshot_staging": str(stage), "native_backup_state": "pending"})
             atomic_write_json(path, prepared)
-        for row in prepared["sqlite_states"]:
+        for index, row in enumerate(prepared["sqlite_states"], 1):
+            reporter = getattr(args, 'publication_progress', None)
+            sqlite_scope = hashlib.sha256(row['source_relative'].encode()).hexdigest()
+            def report_sqlite(event):
+                if reporter is not None:
+                    reporter({**event, 'sqlite_state_identity': sqlite_scope,
+                              'sqlite_state_index': index, 'sqlite_states_total': len(prepared['sqlite_states'])})
             if "consistent_state" not in row:
                 row["consistent_state"] = _snapshot_sqlite(source / row["source_relative"],
-                    Path(row["retained_snapshot_staging"]), row["source_relative"])
+                    Path(row["retained_snapshot_staging"]), row["source_relative"],
+                    progress=report_sqlite if reporter is not None else None)
                 row["native_backup_state"] = "snapshot_ready"
                 atomic_write_json(path, prepared)
             if "snapshot_id" in row:
@@ -900,6 +1066,9 @@ def _private_preparation(entry: dict, args, source: Path, cold: Path, policy: di
             saved = publish_packed_snapshot(cold, row["dataset"], Path(row["retained_snapshot_staging"]),
                 node_id=args.node_id, pack_buckets=1, file_chunk_bytes=policy["file_chunk_bytes"],
                 batch_directory_fsync=True, publication_lock_nonblocking=True,
+                **({'progress': lambda event: report_sqlite({**event, 'sqlite_substage': event.get('stage'),
+                                                             'stage': 'publishing_sqlite_state'})}
+                   if reporter is not None else {}),
                 metadata={"role": "private_consistent_sqlite_state", "source_relative": row["source_relative"],
                           "shared_export": "false", "nas_export": "false"})
             row.update(snapshot_id=saved.manifest["snapshot_id"], manifest_sha256=saved.manifest_sha256)
@@ -922,10 +1091,7 @@ def _private_preparation(entry: dict, args, source: Path, cold: Path, policy: di
                                                upgrade_from=prepared.get("control_scope"))
         prepared["control_scope"] = CONTROL_SCOPE
         atomic_write_json(path, prepared)
-    for row in prepared["sqlite_states"]:
-        selected = resolve_packed_snapshot_id(cold, row["dataset"], row["snapshot_id"])
-        if selected.manifest_sha256 != row["manifest_sha256"]:
-            raise SnapshotError("prepared SQLite release identity changed")
+    _reconcile_prepared_sqlite(entry, args, cold, prepared)
     for row in prepared["controls"].values():
         original = Path(row["path"])
         if original.is_symlink() or original.stat().st_size != row["bytes"] or sha256_file(original) != row["sha256"]:
@@ -963,7 +1129,8 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
             guard_source_links, prepare_source_links, source_link_metadata,
         )
         source_links = prepare_source_links(repo, entry, source, cold, args.migration_state.absolute(),
-                                           progress=getattr(args, "publication_progress", None))
+                                           progress=getattr(args, "publication_progress", None),
+                                           recovery_pause_path=getattr(args, 'recovery_pause_path', None))
         inherited_files, inherited_objects, inherited_proofs = _bootstrap_public_storage(
             repo, entry, parent, cold, catalog, file_sink=bootstrap_index,
             progress=getattr(args, "publication_progress", None))
@@ -1001,8 +1168,16 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
             if retained is not None:
                 retained.check_generation()
             parquet_proof.guard()
+            # SQLite side releases are prepared before the main publication.
+            # Recheck their exact fixed identities under the publication lock
+            # so retention cannot retire one between preparation and commit.
+            for row in snapshots:
+                fixed = resolve_packed_snapshot_id(cold, row['dataset'], row['snapshot_id'])
+                if fixed.manifest_sha256 != row['manifest_sha256']:
+                    raise SnapshotError('prepared SQLite dependency changed before publication commit')
             if source_links:
-                guard_source_links(source, source_links)
+                guard_source_links(source, source_links, cold=cold,
+                                   recovery_pause_path=getattr(args, 'recovery_pause_path', None))
 
         saved = publish_packed_snapshot(cold, str(entry["dataset"]), source, node_id=args.node_id,
             loose_file_threshold_bytes=(_loose_threshold_bytes(entry)
@@ -1015,11 +1190,18 @@ def _private_publish(repo: Path, entry: dict, args, parent: Path, policy: dict, 
             bootstrap_file_storage=inherited_files, bootstrap_objects=inherited_objects,
             private_observation_cohort=True,
             private_atomic_json_controls=source.name in {
-                'data_finlab', 'data_finmind', 'data_crypto_reference', 'data_tej'},
+                'data_finlab', 'data_finmind', 'data_crypto_reference', 'data_tej',
+                'data_tw_index_derivatives_ticks'},
             private_staging_file_rules=staging_rules,
             sealed_pack_hints=hints,
+            **({'require_previous_files_present': True}
+               if getattr(args, 'require_previous_files_present', False) else {}),
+            **({'merge_previous_missing_files': True}
+               if getattr(args, 'merge_previous_missing_files', False) else {}),
+            **({'expected_incremental_base': args.expected_incremental_base}
+               if getattr(args, 'expected_incremental_base', None) is not None else {}),
             file_overrides={name: Path(row["path"]) for name, row in prepared["controls"].items()},
-            **({"source_guard": source_guard} if source_links or parquet_proof.applicable or retained else {}),
+            **({"source_guard": source_guard} if source_links or snapshots or parquet_proof.applicable or retained else {}),
             **({'retained_source_files': retained.publication_request()} if retained is not None else {}),
             progress=getattr(args, "publication_progress", None),
             metadata={"role": str(entry["role"]), "shared_export": "false", "nas_export": "false",
@@ -1206,8 +1388,13 @@ def _retire_owned_scratch(directory: Path, dataset: str, publication: dict, *, p
     return result
 
 
+def _expected_packed_schemas(entry: dict) -> set[int]:
+    """A v3 reader can consume legacy v2 while a source is being repacked."""
+    return {2, 3} if entry.get('reader_contract') == 'packed-v3-content-alias' else {2}
+
+
 def _committed_catalog_release(entry: dict, args, cold: Path):
-    """Pin an already admitted v2 release; never republish stale/live source bytes.
+    """Pin an already admitted compatible release; never republish stale/live source bytes.
 
     Migration proves recovery of a fixed historical version, not perpetual
     freshness of its source workspace. The canonical publisher's exact entry
@@ -1229,10 +1416,18 @@ def _committed_catalog_release(entry: dict, args, cold: Path):
     saved = resolve_latest_packed(cold, entry['dataset'], require_objects=False)
     manifest, expected = saved.manifest, catalog_publication_identity(entry)
     metadata = manifest.get('metadata', {})
-    if (manifest['schema_version'] != 2
+    identities = {expected}
+    if entry.get('reader_contract') == 'packed-v3-content-alias':
+        # The physical repack changes only reader capability; retain the exact
+        # original scope/rights/gates identity from its admitted v2 release.
+        identities.add(catalog_publication_identity({**entry, 'reader_contract': 'packed-v2-chunks'}))
+    if (manifest['schema_version'] not in _expected_packed_schemas(entry)
             or metadata.get('catalog_publication_contract') != CATALOG_PUBLICATION_CONTRACT
-            or metadata.get('catalog_entry_sha256') != expected):
+            or metadata.get('catalog_entry_sha256') not in identities):
         return None
+    if (manifest['schema_version'] == 3 and metadata.get('catalog_entry_sha256') != expected
+            and not re.fullmatch(r'[0-9a-f]{64}', str(metadata.get('physical_repack_original_manifest_sha256', '')))):
+        raise SnapshotError('v3 catalog transition lacks its original physical release binding')
     source, archive = manifest['source'], manifest['archive']
     options = _version_options(entry, args)
     from stockagent.data_sync.packed_snapshots import (
@@ -1277,6 +1472,181 @@ def _source_step_order(entries, datasets, priorities):
     return sorted(entries, key=key)
 
 
+def _whole_root_refresh_schedule(repo: Path, entries: list[dict], policy: dict,
+                                 datasets: dict, *, observed: float, interval: int, daily_window=None):
+    """Select one unexcluded owner per registered data root, without aliases.
+
+    Published subtrees and frozen research outputs retain their existing
+    owners.  A root with ambiguous ownership is reported and not guessed.
+    """
+    from scripts.publish_data_releases import _source_path
+    by_path = {}
+    for entry in entries:
+        if entry.get('excluded_subtrees') or entry.get('included_root_files'):
+            continue
+        by_path.setdefault(_source_path(entry).resolve(), []).append(entry)
+    choices, ambiguous, closed = [], 0, 0
+    for name in sorted(policy['roots']):
+        matches = by_path.get((repo/name).resolve(), [])
+        if len(matches) != 1:
+            ambiguous += 1
+            continue
+        entry = matches[0]
+        row = datasets.get(entry['dataset'])
+        if not isinstance(row, dict):
+            ambiguous += 1
+            continue
+        if entry.get('closed_source_contract'):
+            # Explicitly closed historical datasets have their own fixed
+            # lifecycle; they are not daily incremental sources.
+            closed += 1
+            continue
+        if (row.get('state') not in {'verified', 'recovery_deferred_user_migration'}
+                or not isinstance(row.get('snapshot_id'), str)
+                or not re.fullmatch(r'[0-9a-f]{64}', str(row.get('manifest_sha256', '')))):
+            continue
+        last = row.get('freshness_completed_at_epoch')
+        if type(last) not in (int, float) or not math.isfinite(last):
+            last = None
+            for field in ('recovery_deferred_at_utc', 'verified_at_utc', 'started_at_utc'):
+                try:
+                    stamp = datetime.fromisoformat(row[field].replace('Z', '+00:00')).timestamp()
+                except (KeyError, ValueError, AttributeError, TypeError, OverflowError):
+                    continue
+                if math.isfinite(stamp):
+                    last = stamp
+                    break
+        # Missing clocks trigger one explicit source check, never a claim that
+        # an unknown source is already fresh. Future clocks wait for repair.
+        if last is not None and last > observed + 300:
+            ambiguous += 1
+            continue
+        if daily_window is not None:
+            from stockagent.data_sync.archive_schedule import next_due
+            due = next_due(last, observed, daily_window)
+        else:
+            due = observed if last is None else last + interval
+        choices.append((due, entry['dataset'], name))
+    return sorted(choices), ambiguous, closed
+
+
+def _retired_refresh_successor(cold: Path, entry: dict, previous: dict):
+    """Follow an already completed, explicitly qualified owner handoff only.
+
+    A latest-selection handoff can have uncompared old values. It supplies a
+    current exact base, never a claim that the retired history was identical.
+    """
+    if cold != Path('/srv/stockagent-packed') or entry.get('publish') is not True:
+        return None
+    from stockagent.data_sync.semantic_link_promotion import FAST_LATEST_DATASETS
+    dataset = entry['dataset']
+    if dataset not in FAST_LATEST_DATASETS:
+        return None
+    current = resolve_latest_packed(cold, dataset, require_objects=False)
+    if current.manifest_sha256 == previous['manifest_sha256']:
+        return None
+    from stockagent.data_sync import workspace_volume
+    from stockagent.data_sync.latest_repack_successor import latest_fixed_successor
+    config = workspace_volume.configuration()
+    workspace_volume.check(c=config)
+    stage = Path(config['mount_point'])/'migration/stream-source-repack-v1'/dataset/previous['manifest_sha256']
+    proof = latest_fixed_successor(cold, stage, dataset, previous['manifest_sha256'], previous['snapshot_id'])
+    if (proof is None or proof['manifest_sha256'] != current.manifest_sha256
+            or proof['snapshot_id'] != current.manifest['snapshot_id']):
+        return None
+    return {'contract': 'stockagent.refresh_latest_successor_binding.v1', **proof,
+            'previous_snapshot_id': previous['snapshot_id'],
+            'previous_manifest_sha256': previous['manifest_sha256'],
+            'historical_recovery_claimed': False}
+
+
+def _exact_repack_refresh_successor(cold: Path, workspace: Path, entry: dict, previous: dict):
+    """Bind an exact source-hashed physical repack, without another payload read."""
+    from stockagent.data_sync import repack_generation_evidence as evidence
+    dataset = entry['dataset']
+    old_sha, old_id = previous['manifest_sha256'], previous['snapshot_id']
+    if (re.fullmatch(r'[a-f0-9]{64}', str(old_sha)) is None or not isinstance(old_id, str)
+            or previous.get('domain') != ('shared' if entry['publish'] else 'host_private')):
+        raise SnapshotError('refresh original domain or identity differs')
+    selected = resolve_latest_packed(cold, dataset, require_objects=False)
+    if selected.manifest_sha256 == old_sha:
+        return None
+    manifest = selected.manifest
+    if manifest.get('metadata', {}).get('physical_repack_original_manifest_sha256') != old_sha:
+        return None
+    return evidence.transition(cold, workspace, dataset, old_sha=old_sha, old_id=old_id,
+        new_sha=selected.manifest_sha256, new_id=manifest['snapshot_id'], private=not entry['publish'],
+        files=manifest['source']['files'], logical_bytes=manifest['source']['logical_bytes'], current_manifest=manifest)
+
+
+def _refresh_successor(repo: Path, parent: Path, entry: dict, previous: dict):
+    """Follow a verified exact physical repack or an already-qualified handoff."""
+    from stockagent.data_sync import workspace_volume
+    from stockagent.data_sync.dataset_version_layout import version_policy
+    authority = parent if entry['publish'] else private_history_root(parent, version_policy(repo), initialize=False)
+    current = resolve_latest_packed(authority, entry['dataset'], require_objects=False)
+    if current.manifest_sha256 == previous.get('manifest_sha256'):
+        return None
+    if current.manifest.get('metadata', {}).get('physical_repack_original_manifest_sha256'):
+        config = workspace_volume.configuration()
+        workspace_volume.check(c=config)
+        from stockagent.data_sync import repack_generation_evidence as evidence
+        return evidence.chain(authority, Path(config['mount_point']), entry['dataset'], previous,
+                              private=not entry['publish'], current=current)
+    return _retired_refresh_successor(parent, entry, previous)
+
+
+def _rebind_refresh_base(repo: Path, parent: Path, entry: dict, row: dict) -> bool:
+    """Advance only a queued refresh's original, fully evidenced encoding base."""
+    refresh = row.get('freshness_refresh') or {}
+    if not refresh or 'snapshot_id' in row:
+        return False
+    prior = {'domain': row['domain'], 'snapshot_id': refresh['previous_snapshot_id'],
+             'manifest_sha256': refresh['previous_manifest_sha256']}
+    try:
+        rebound = _refresh_successor(repo, parent, entry, prior)
+    except (SnapshotError, OSError, ValueError, KeyError):
+        return False  # Preserve the original binding; publication reports its actual blocker.
+    if rebound is None:
+        return False
+    history = refresh.setdefault('base_rebindings', [])
+    initial = int(not history and bool(refresh.get('base_rebinding')))
+    if not isinstance(history, list) or len(history)+initial+1 > 32:
+        raise SnapshotError('refresh base rebinding history exceeds bound')
+    if not history and refresh.get('base_rebinding'):
+        history.append(refresh['base_rebinding'])
+    history.append(rebound)
+    refresh.update(previous_snapshot_id=rebound['snapshot_id'],
+        previous_manifest_sha256=rebound['manifest_sha256'], base_rebinding=rebound)
+    return True
+
+
+def _arm_whole_root_refresh(directory: Path, result: dict, choice, *, observed: float, successor=None):
+    """Save the prior fixed binding before scheduling a fresh source read."""
+    due, dataset, root_name = choice
+    previous = result['datasets'][dataset]
+    record = {'contract': 'stockagent.whole_root_refresh_previous.v1',
+              'dataset': dataset, 'source_root': root_name, 'previous': previous}
+    digest = _identity(record)
+    path = directory/'freshness-history'/dataset/(digest+'.json')
+    if path.exists() or path.is_symlink():
+        if path.is_symlink() or json.loads(path.read_bytes()) != record:
+            raise SnapshotError('prior root refresh evidence changed or was redirected')
+    else:
+        atomic_write_json(path, record)
+    base_id = successor['snapshot_id'] if successor is not None else previous['snapshot_id']
+    base_sha = successor['manifest_sha256'] if successor is not None else previous['manifest_sha256']
+    result['datasets'][dataset] = {
+        'state': 'pending', 'attempts': 0, 'domain': previous['domain'], 'source': previous['source'],
+        'freshness_refresh': {'contract': 'stockagent.whole_root_refresh.v1',
+                              'previous_snapshot_id': base_id,
+                              'previous_manifest_sha256': base_sha,
+                              'previous_receipt': str(path), 'source_root': root_name,
+                              'due_at_epoch': due, 'requested_at_epoch': observed,
+                              **({'base_rebinding': successor} if successor is not None else {}),
+                              'source_freshness_checked': False}}
+
+
 def _source_link_observation(source: Path, relative: str) -> dict | None:
     """Bounded metadata for one known bad link; never follow its target."""
     from stockagent.data_sync.desync_snapshots import _safe_relative_path
@@ -1297,8 +1667,13 @@ def _source_link_observation(source: Path, relative: str) -> dict | None:
         return None
 
 
+def _source_cold_minimum(cold: Path) -> int:
+    # Match the canonical native writer, not the unrelated E workspace reserve.
+    return 32 * 1024**3 if Path(cold).absolute() == Path('/srv/stockagent-packed') else 64 * 1024**2
+
+
 def _source_precondition_wait(entry: dict, row: dict, datasets: dict, *, retry_seconds: float,
-                              cold: Path | None = None) -> bool:
+                              cold: Path | None = None, recovery_pause_path=None) -> bool:
     """Wait on observable conditions without spending another publication attempt.
 
     Fixed committed releases must finish their own recovery first. Every real
@@ -1311,7 +1686,11 @@ def _source_precondition_wait(entry: dict, row: dict, datasets: dict, *, retry_s
         # census while no new pack can be installed. This is a write admission,
         # not a recovery proof, reservation or guarantee the whole source fits.
         available = shutil.disk_usage(cold).free
-        minimum = 64 * 1024**2
+        # The canonical D immutable writer refuses new payloads below this
+        # physical floor. Do not rescan millions of source files only to hit
+        # that same admission failure after the census. Non-D fixtures and
+        # portable authorities retain their original small metadata floor.
+        minimum = _source_cold_minimum(cold)
         if available < minimum:
             row.update(state='waiting_retry', retry_at_unix=time.time() + retry_seconds,
                 capacity_wait={'contract': 'source_publication_capacity_v1',
@@ -1322,7 +1701,11 @@ def _source_precondition_wait(entry: dict, row: dict, datasets: dict, *, retry_s
             row['retry_at_unix'] = 0
     if entry['dataset'] == 'local-tw-futures' and 'local-tw-index-futures' in datasets:
         dependency = datasets['local-tw-index-futures']
-        if dependency['state'] != 'verified':
+        deferred = (dependency.get('state') == 'recovery_deferred_user_migration'
+                    and isinstance(dependency.get('snapshot_id'), str) and bool(dependency['snapshot_id'])
+                    and re.fullmatch('[a-f0-9]{64}', str(dependency.get('manifest_sha256'))) is not None
+                    and _recovery_paused(recovery_pause_path))
+        if dependency['state'] != 'verified' and not deferred:
             row.update(state='waiting_retry',
                 dependency_wait={'dataset': 'local-tw-index-futures', 'state': dependency['state']},
                 retry_at_unix=time.time() + retry_seconds)
@@ -1373,6 +1756,13 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
     attempt_budget = getattr(args, "maximum_attempted_sources", None)
     if attempt_budget is not None and (type(attempt_budget) is not int or attempt_budget < 1):
         raise SnapshotError("migration attempt budget must be positive")
+    refresh_interval = getattr(args, 'whole_root_refresh_interval_seconds', None)
+    refresh_allowed = getattr(args, 'whole_root_refresh_allowed', False)
+    if (refresh_interval is not None and
+            (type(refresh_interval) is not int or not 3600 <= refresh_interval <= 7*86400)):
+        raise SnapshotError('whole-root refresh interval is invalid')
+    if type(refresh_allowed) is not bool:
+        raise SnapshotError('whole-root refresh admission must be explicit')
     parent, directory = args.sync_root.absolute(), args.migration_state.absolute()
     _check_packed_read_authority(parent)
     if (directory.is_relative_to(parent) or any(directory.is_relative_to(_source_path(e).resolve())
@@ -1393,6 +1783,7 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
     run_args.defer_scan = (parent / ".stockagent-d-primary").is_file()
     run_args.publication_lock_nonblocking = True
     run_args.batch_directory_fsync = True
+    recovery_pause = getattr(args, 'recovery_pause_path', None)
     state_path = directory / "progress.json"
     with _operation_owner(directory):
         if state_path.exists():
@@ -1436,6 +1827,40 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                           state="verified" if all(s == "verified" for s in states) else "processing")
             atomic_write_json(state_path, result)
         save()
+        if refresh_interval is not None:
+            supplied = getattr(args, 'whole_root_refresh_observed_epoch', None)
+            refresh_now = time.time() if supplied is None else supplied
+            if type(refresh_now) not in (int, float) or not math.isfinite(refresh_now):
+                raise SnapshotError('whole-root refresh clock is invalid')
+            choices, ambiguous, closed = _whole_root_refresh_schedule(
+                repo, entries, policy, result['datasets'], observed=refresh_now, interval=refresh_interval,
+                daily_window=getattr(args, 'whole_root_refresh_daily_window', None))
+            due = [item for item in choices if item[0] <= refresh_now]
+            result['whole_root_refresh'] = {
+                'contract': 'stockagent.whole_root_refresh_queue.v1',
+                'scope': 'one_unexcluded_owner_per_registered_data_root',
+                'registered_roots': len(policy['roots']),
+                'eligible_roots': len(choices), 'ambiguous_roots': ambiguous, 'closed_roots': closed,
+                'due_roots': len(due), 'window_allowed': refresh_allowed,
+                'next_due_epoch': choices[0][0] if choices else None,
+                'source_freshness_claimed': False}
+            daily = getattr(args, 'whole_root_refresh_daily_window', None)
+            if daily is not None:
+                from stockagent.data_sync.archive_schedule import allows_start, next_due
+                result['whole_root_refresh'].update(
+                    daily_merge_window_allowed=allows_start(refresh_now, daily),
+                    next_daily_merge_epoch=next_due(None, refresh_now, daily))
+            if refresh_allowed and due:
+                target = next(entry for entry in entries if entry['dataset'] == due[0][1])
+                try:
+                    successor = _refresh_successor(repo, parent, target, result['datasets'][target['dataset']])
+                except (SnapshotError, OSError, ValueError, KeyError):
+                    # Keep the original exact binding. A later publication will
+                    # show the true blocker rather than guessing a successor.
+                    successor = None
+                _arm_whole_root_refresh(directory, result, due[0], observed=refresh_now,
+                                        successor=successor)
+            save()
         completed_this_call = 0
         attempted_this_call = 0
         stop_requested = getattr(args, 'stop_requested', lambda: False)
@@ -1449,15 +1874,45 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                 if stop_requested():
                     return result
                 row = result["datasets"][entry["dataset"]]
+                allowed_pending = getattr(args, 'allowed_unchanged_pending_datasets', None)
+                if (allowed_pending is not None and 'snapshot_id' not in row
+                        and entry['dataset'] not in allowed_pending):
+                    # A contract transition may leave a previously committed
+                    # release intentionally deferred. While the user pauses
+                    # independent recovery, unrelated unchanged sources can
+                    # still publish under their exact original contracts.
+                    continue
                 if getattr(args, 'committed_recovery_only', False) and 'snapshot_id' not in row:
+                    continue
+                if row.get('freshness_refresh') and 'snapshot_id' not in row and not refresh_allowed:
+                    # An interrupted daily refresh waits for its next admitted
+                    # window; never mistake a queued retry for urgent trading.
                     continue
                 if row["state"] == "verified":
                     continue
+                if 'snapshot_id' in row and _recovery_paused(recovery_pause):
+                    if row.get('state') != 'recovery_deferred_user_migration':
+                        row.update(state='recovery_deferred_user_migration',
+                                   recovery_deferred_at_utc=_now(),
+                                   recovery_deferred_by_user=True,
+                                   retry_at_unix=time.time()+args.retry_seconds)
+                        save()
+                    continue
+                if row.get('state') == 'recovery_deferred_user_migration':
+                    row.update(state='recovery', retry_at_unix=0)
+                    row.pop('recovery_deferred_by_user', None)
+                    save()
                 if ('snapshot_id' not in row and entry['publish']
-                        and shutil.disk_usage(parent).free < 64 * 1024**2):
+                        and shutil.disk_usage(parent).free < _source_cold_minimum(parent)):
                     # A crash may have committed the exact release before its
                     # journal write. Disk pressure forbids new publication,
                     # never recovery of an already admitted fixed version.
+                    if row.get('freshness_refresh'):
+                        row.update(state='waiting_retry', error_type='ColdCapacity',
+                                   error='cold capacity below the enrolled publication reserve',
+                                   retry_at_unix=time.time()+args.retry_seconds)
+                        save()
+                        continue
                     committed = _committed_catalog_release(entry, run_args, parent)
                     if committed is not None:
                         row.update(snapshot_id=committed.manifest['snapshot_id'],
@@ -1469,11 +1924,38 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                                 'current_source_freshness_checked': False,
                                 'all_current_source_history_complete_claim': False})
                 if _source_precondition_wait(entry, row, result['datasets'], retry_seconds=args.retry_seconds,
-                                             cold=parent):
+                                             cold=parent, recovery_pause_path=recovery_pause):
                     save()
                     continue
                 if row.get("retry_at_unix", 0) > time.time():
                     continue
+                blocked_paths = row.get('blocked_incremental_paths')
+                if blocked_paths:
+                    # An absent prior file cannot become present by rescanning
+                    # millions of rows. Probe only the named hints each retry;
+                    # a present hint merely permits a full source/union check.
+                    source_path = _source_path(entry).resolve()
+                    still_missing = False
+                    for item in blocked_paths:
+                        name = item.get('path') if isinstance(item, dict) else item
+                        kind = item.get('kind') if isinstance(item, dict) else 'file'
+                        if kind not in {'file', 'directory', 'symlink'}:
+                            raise SnapshotError('incremental missing-path hint type is invalid')
+                        relative = _safe_relative_path(name, 'incremental missing-path hint')
+                        try:
+                            info = source_path.joinpath(*relative.parts).lstat()
+                            if not {'file': stat.S_ISREG, 'directory': stat.S_ISDIR,
+                                    'symlink': stat.S_ISLNK}[kind](info.st_mode):
+                                still_missing = True
+                                break
+                        except OSError:
+                            still_missing = True
+                            break
+                    if still_missing:
+                        row['retry_at_unix'] = time.time() + args.retry_seconds
+                        save()
+                        continue
+                    row.pop('blocked_incremental_paths', None)
                 if attempt_budget is not None and attempted_this_call >= attempt_budget:
                     return result
                 attempted_this_call += 1
@@ -1489,13 +1971,35 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                 save()
                 try:
                     progress_path = directory / "publication" / (entry["dataset"] + ".json")
-                    run_args.publication_progress = lambda progress: atomic_write_json(progress_path,
-                        {**progress, "dataset": entry["dataset"], "attempt_id": row["attempt_id"],
-                         "observed_at_utc": _now()}, durable=False)
+                    def publication_progress(progress):
+                        atomic_write_json(progress_path,
+                            {**progress, "dataset": entry["dataset"], "attempt_id": row["attempt_id"],
+                             "observed_at_utc": _now()}, durable=False)
+                        if (row.get('freshness_refresh') and
+                                getattr(args, 'whole_root_refresh_stop_requested', lambda: False)()):
+                            raise SnapshotError('daily refresh yielded to the TW trading priority window')
+                    run_args.publication_progress = publication_progress
                     run_args.publication_progress({"stage": "preparing_source", "acceptance": False,
                         "files_completed": 0, "files_total": None,
                         "logical_bytes_processed": 0, "logical_bytes_total": None})
                     cold = parent if entry["publish"] else private_history_root(parent, policy)
+                    run_args.require_previous_files_present = bool(row.get('freshness_refresh'))
+                    # Omitted physical files can mean either archived immutable
+                    # history OR deliberate compaction/deletion. Only an audited
+                    # source-specific append-only contract can distinguish them.
+                    refresh = row.get('freshness_refresh') or {}
+                    if refresh and 'snapshot_id' not in row:
+                        # A repack may commit after this refresh was armed, or
+                        # its receipt may arrive after an earlier failed try.
+                        # Recheck only exact owner evidence; the publisher still
+                        # fences this base again under its own lock.
+                        if _rebind_refresh_base(repo, parent, entry, row):
+                            save()
+                    run_args.expected_incremental_base = (
+                        (refresh['previous_snapshot_id'], refresh['previous_manifest_sha256']) if refresh else None)
+                    root_spec = policy['roots'].get(refresh.get('source_root'), {})
+                    run_args.merge_previous_missing_files = (
+                        bool(refresh) and root_spec.get('incremental_base_union') == 'immutable_path_union_v1')
                     # An interrupted publish might have committed. Keep its exact
                     # selected binding; never infer a failed/missing receipt meant no write.
                     if "snapshot_id" in row:
@@ -1503,7 +2007,10 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                                                           require_objects=False)
                         extra = row.get("publication", {})
                     elif entry["publish"]:
-                        saved = _committed_catalog_release(entry, run_args, parent)
+                        # A fixed committed release is useful for migration
+                        # recovery but does not prove today's source is fresh.
+                        saved = (None if row.get('freshness_refresh') else
+                                 _committed_catalog_release(entry, run_args, parent))
                         if saved is None:
                             from stockagent.data_sync.packing_checkpoint import SealedPackHints
                             run_args.sealed_pack_hints = SealedPackHints(
@@ -1526,14 +2033,36 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                                    retry_at_unix=time.time() + args.retry_seconds)
                         save()
                         continue
-                    if saved.manifest["schema_version"] != 2:
-                        raise SnapshotError("source did not commit the required v2 reader contract")
+                    source_status = extra.get('source_status', {}) if isinstance(extra, dict) else {}
+                    source_pin = source_status.get('fixed_pin') if isinstance(source_status, dict) else None
+                    if (row.get('freshness_refresh') and isinstance(source_status, dict)
+                            and (source_status.get('fixed_closed_release_reused') is True
+                                 or isinstance(source_pin, dict) and source_pin.get('reused') is True)):
+                        # A fixed historic substitute is a valid migration
+                        # binding, but it does not observe the live source.
+                        row.update(state='waiting_source_owner', publication=extra,
+                                   retry_at_unix=time.time()+max(args.retry_seconds, 3600))
+                        row['freshness_refresh']['reason'] = 'fixed_source_not_freshness_observation'
+                        save()
+                        continue
+                    if saved.manifest["schema_version"] not in _expected_packed_schemas(entry):
+                        raise SnapshotError("source did not commit its explicitly enrolled reader contract")
                     row.update(state="recovery", snapshot_id=saved.manifest["snapshot_id"],
                         manifest_sha256=saved.manifest_sha256, publication=extra,
                         source_files=saved.manifest["source"]["files"],
                         logical_bytes=saved.manifest["source"]["logical_bytes"],
                         new_payload_bytes=saved.manifest["archive"].get("new_stored_bytes"))
+                    if row.get('freshness_refresh'):
+                        supplied = getattr(args, 'whole_root_refresh_observed_epoch', None)
+                        row['freshness_completed_at_epoch'] = time.time() if supplied is None else supplied
+                        row['freshness_refresh']['source_freshness_checked'] = True
                     save()
+                    if _recovery_paused(recovery_pause):
+                        row.update(state='recovery_deferred_user_migration',
+                                   recovery_deferred_at_utc=_now(), recovery_deferred_by_user=True,
+                                   retry_at_unix=time.time()+args.retry_seconds)
+                        save()
+                        continue
                     proof = directory / "recovery" / (entry["dataset"] + ".json")
                     _recover(cold, entry["dataset"], row["snapshot_id"], proof,
                              proof.with_suffix(".progress.json"), attempt_id=row["attempt_id"])
@@ -1589,6 +2118,9 @@ def migrate_catalog(repo: Path, args, catalog: list[dict]) -> dict:
                     else:
                         row.update(state="waiting_retry", error_type=type(error).__name__, error=str(error),
                                    retry_at_unix=time.time() + args.retry_seconds)
+                        if isinstance(error, IncompleteIncrementalWorkspace):
+                            row['blocked_incremental_paths'] = [
+                                {'path': path, 'kind': kind} for path, kind in error.members]
                         if isinstance(error, UnsafeSnapshotSymlink) and 'snapshot_id' not in row:
                             observation = _source_link_observation(_source_path(entry), error.relative_path)
                             if observation and observation.get('target') == error.target:
@@ -1648,11 +2180,13 @@ def _inflight_lock_only_catalog(repo: Path, root: Path, current: dict, catalog: 
     return frozen
 
 
-def _catalog_contract_transition(repo, root, current, catalog, policy, cold):
+def _catalog_contract_transition(repo, root, current, catalog, policy, cold, *, allow_deferred=False):
     """Carry exact accepted work for unchanged per-source contracts.
 
     No moving head, source payload or acceptance timestamp is substituted. A
-    committed, unfinished release finishes in its original operation first.
+    committed, unfinished release finishes in its original operation first,
+    unless the user has explicitly paused the independent recovery. In that
+    case carry the exact deferred binding without calling it verified.
     Changed sources receive fresh acceptance; completed daily cycles retain their
     original deadline. The old journal remains an independently readable record.
     """
@@ -1693,7 +2227,10 @@ def _catalog_contract_transition(repo, root, current, catalog, policy, cold):
         changed = [name for name in old if old[name] != new[name]]
         if not changed and not added:
             return None
-        if any(row.get('state') != 'verified' and 'snapshot_id' in row for row in rows.values()):
+        unfinished_committed = [row for row in rows.values()
+                                if row.get('state') != 'verified' and 'snapshot_id' in row]
+        if unfinished_committed and not (allow_deferred and all(
+                row.get('state') == 'recovery_deferred_user_migration' for row in unfinished_committed)):
             frozen = [old[entry['dataset']] for entry in catalog if entry['dataset'] in old]
             if migration_entries(repo, frozen, policy) != saved['catalog']:
                 raise SnapshotError('pending transition cannot reconstruct the committed original plan')
@@ -1702,6 +2239,20 @@ def _catalog_contract_transition(repo, root, current, catalog, policy, cold):
         from stockagent.data_sync.private_source_links import manifest_source_links, source_link_dependencies
 
         proofs, adopted, carried = {}, {}, []
+
+        def pending_after_unavailable_manifest(name, entry, row):
+            return {'state': 'pending', 'attempts': 0,
+                'domain': 'shared' if entry['publish'] else 'host_private',
+                'source': str(_source_path(entry)),
+                'previous_contract_binding': {
+                    'operation': str(operation), 'plan_sha256': current['plan_sha256'],
+                    'snapshot_id': row['snapshot_id'], 'manifest_sha256': row['manifest_sha256'],
+                    'state': ('historically_verified_manifest_now_unavailable'
+                              if row['state'] == 'verified' else 'deferred_manifest_now_unavailable'),
+                    'scope': 'historical_binding_not_current_recoverability'}}
+
+        def missing_own_manifest(error, authority, name, row):
+            return error.filename == str(authority / 'manifests' / name / (row['snapshot_id'] + '.json'))
 
         def fixed_proof(authority, binding, source_directory, target_directory):
             dataset = binding['dataset']
@@ -1732,9 +2283,30 @@ def _catalog_contract_transition(repo, root, current, catalog, policy, cold):
                 adopted[name] = {'state': 'pending', 'attempts': 0,
                     'domain': 'shared' if entry['publish'] else 'host_private',
                     'source': str(_source_path(entry))}
+                if name in old and 'snapshot_id' in rows[name]:
+                    adopted[name]['previous_contract_binding'] = {
+                        'operation': str(operation), 'plan_sha256': current['plan_sha256'],
+                        'snapshot_id': rows[name]['snapshot_id'],
+                        'manifest_sha256': rows[name].get('manifest_sha256'),
+                        'state': rows[name]['state'],
+                        'scope': 'prior_contract_only_not_acceptance_for_current_contract'}
                 continue
             row = rows[name]
             copied = dict(row)
+            if allow_deferred and row['state'] == 'recovery_deferred_user_migration':
+                authority = cold if entry['publish'] else private_history_root(cold, policy, initialize=False)
+                try:
+                    release = resolve_packed_snapshot_id(authority, name, row['snapshot_id'], require_objects=False)
+                    if release.manifest_sha256 != row['manifest_sha256']:
+                        raise SnapshotError('deferred migration manifest identity changed')
+                except FileNotFoundError as error:
+                    if not missing_own_manifest(error, authority, name, row):
+                        raise
+                    # The old deferred generation can no longer be recovered.
+                    # Keep its fixed binding in both journals and let the
+                    # canonical publisher bind a current release instead.
+                    adopted[name] = pending_after_unavailable_manifest(name, entry, row)
+                    continue
             if row['state'] == 'verified':
                 # Each accepted source owns its dependency closure. A changed
                 # dependency can then receive a fresh proof without overwriting
@@ -1751,8 +2323,20 @@ def _catalog_contract_transition(repo, root, current, catalog, policy, cold):
                         or row.get('domain') != ('shared' if entry['publish'] else 'host_private')):
                     raise SnapshotError('accepted migration proof escaped its original source or recovery owner')
                 authority = cold if entry['publish'] else private_history_root(cold, policy, initialize=False)
-                release, raw = fixed_proof(authority, {**row, 'dataset': name},
-                                           source_directory, target_directory)
+                try:
+                    release, raw = fixed_proof(authority, {**row, 'dataset': name},
+                                               source_directory, target_directory)
+                except FileNotFoundError as error:
+                    if not allow_deferred or not missing_own_manifest(error, authority, name, row):
+                        raise
+                    # A prior fixed release may have been retired during the
+                    # explicitly authorized migration. Preserve its historic
+                    # acceptance in previous-progress.json, but require a new
+                    # current binding instead of claiming that missing release
+                    # is still recoverable. A missing proof or dependency is
+                    # not silently downgraded by this exception.
+                    adopted[name] = pending_after_unavailable_manifest(name, entry, row)
+                    continue
                 count, size = release.manifest['source']['files'], release.manifest['source']['logical_bytes']
                 if row.get('source_files') != count or row.get('logical_bytes') != size:
                     raise SnapshotError('accepted migration proof does not cover its exact fixed release')
@@ -1843,8 +2427,13 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
     if settings.get("enabled") is not True:
         return {"state": "disabled"}
     interval, retry = settings.get("completed_cycle_interval_seconds"), settings.get("busy_retry_seconds")
+    refresh_interval = settings.get('whole_root_refresh_interval_seconds')
+    from stockagent.data_sync.archive_schedule import validate_window, allows_start, next_due
+    daily_window = validate_window(settings.get('daily_merge_window'))
     if (type(interval) is not int or not 3600 <= interval <= 7 * 86400
             or type(retry) is not int or not 10 <= retry <= 300
+            or (refresh_interval is not None and
+                (type(refresh_interval) is not int or not 3600 <= refresh_interval <= 7*86400))
             or settings.get("completed_source_budget_per_activity") != 1
             or settings.get("attempted_source_budget_per_activity") != 1
             or settings.get("state_directory") != "dataset-versions"):
@@ -1858,11 +2447,26 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
     _pending_source_priorities(settings.get('pending_source_priority', ()), entries)
     plan = _identity({"catalog": entries, "policy": policy})
     observed = time.time() if now is None else now
+    refresh_allowed = bool(refresh_interval is not None)
+    refresh_stop = lambda: False
+    if refresh_allowed and cold == Path('/srv/stockagent-packed'):
+        from stockagent.control.lakehouse import _trading_priority_window
+        refresh_allowed = not _trading_priority_window()
+        refresh_stop = _trading_priority_window
+    refresh_allowed = refresh_allowed and allows_start(observed, daily_window)
     with _operation_owner(root):
         current_path = root / "current.json"
         current = json.loads(current_path.read_text()) if current_path.exists() else None
+        if current and daily_window is not None and current.get('daily_merge_window') != daily_window:
+            # Timing changes never replace an in-flight exact source or its
+            # durable preparation. A completed rolling deadline may advance.
+            current['daily_merge_window'] = daily_window
+            if current.get('state') == 'verified':
+                current['next_cycle_unix'] = next_due(None, observed, daily_window)
+            atomic_write_json(current_path, current)
         transition = None
         committed_recovery_only = False
+        allowed_unchanged_pending = None
         # Coordination policy changes neither the accepted bytes nor their
         # source scope. Complete an in-flight original plan, and preserve a
         # completed cycle's deadline instead of immediately rereading every
@@ -1878,13 +2482,38 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
                     atomic_write_json(current_path, current)
                 catalog, plan = frozen, current['plan_sha256']
             else:
-                transition = _catalog_contract_transition(repo, root, current, catalog, policy, cold)
+                transition = _catalog_contract_transition(
+                    repo, root, current, catalog, policy, cold,
+                    allow_deferred=_recovery_paused(
+                        Path(configuration['state_root']).absolute()/'dataset-recovery-migration-pause.json'))
                 if transition is not None and transition['state'] == 'finish_original_committed_recovery':
                     current['deferred_catalog_plan_sha256'] = plan
                     atomic_write_json(current_path, current)
+                    if _recovery_paused(Path(configuration['state_root']).absolute()/'dataset-recovery-migration-pause.json'):
+                        # Recovery is intentionally deferred by the user. Do
+                        # not make that one fixed snapshot prevent publication
+                        # of sources whose original contracts are unchanged.
+                        # Changed and newly enrolled sources still wait for
+                        # the versioned transition; no acceptance is implied.
+                        latest_entries = {e['dataset']: e for e in migration_entries(repo, catalog, policy)}
+                        frozen_entries = {e['dataset']: e for e in migration_entries(repo, transition['catalog'], policy)}
+                        allowed_unchanged_pending = frozenset(name for name, entry in frozen_entries.items()
+                                                              if latest_entries.get(name) == entry)
                     catalog, plan = transition['catalog'], current['plan_sha256']
                     transition = None
-                    committed_recovery_only = True
+                    committed_recovery_only = allowed_unchanged_pending is None
+        if (refresh_interval is not None and policy['roots'] and current
+                and current.get('plan_sha256') == plan and current.get('state') == 'verified'
+                and observed >= current['next_cycle_unix']):
+            if not refresh_allowed:
+                scheduled_wait = daily_window is not None and not allows_start(observed, daily_window)
+                return {'state': 'waiting_daily_archive_window' if scheduled_wait else 'waiting_trading_priority',
+                        'reason': 'daily_archive_window' if scheduled_wait else 'tw_day_trade_priority_window',
+                        'source_count': current['source_count'],
+                        'verified_datasets': current['verified_datasets'], 'next_poll_seconds': 60}
+            # Keep the existing fixed operation and its retained evidence;
+            # refresh one whole-root owner rather than adopting the old head.
+            current['state'] = 'processing'
         if (current is None or current.get("plan_sha256") != plan
                 or (current.get("state") == "verified" and observed >= current["next_cycle_unix"])):
             current = {"contract": CONTRACT, "plan_sha256": plan, "state": "processing",
@@ -1901,29 +2530,57 @@ def advance_catalog_versions(repo: Path, configuration: dict, *, now: float | No
                     "source_count": current["source_count"], "next_cycle_unix": current["next_cycle_unix"],
                     **({'deferred_catalog_plan_sha256': current['deferred_catalog_plan_sha256']}
                        if 'deferred_catalog_plan_sha256' in current else {})}
+        permit_refresh = refresh_allowed and not committed_recovery_only and allowed_unchanged_pending is None
         args = SimpleNamespace(sync_root=cold, migration_state=Path(current["operation_directory"]),
             node_id=None, retry_seconds=retry, maximum_passes=1, watch=False,
             maximum_completed_sources=1, retire_staging=True,
             maximum_attempted_sources=1,
             pending_source_priority=settings.get('pending_source_priority', ()),
             committed_recovery_only=committed_recovery_only,
+            allowed_unchanged_pending_datasets=allowed_unchanged_pending,
+            recovery_pause_path=Path(configuration['state_root']).absolute()/'dataset-recovery-migration-pause.json',
             stop_requested=stop_requested if stop_requested is not None else lambda: False,
-            recover_missing_base_objects=False, source_lock_fd=None)
+            recover_missing_base_objects=False, source_lock_fd=None,
+            whole_root_refresh_interval_seconds=refresh_interval,
+            whole_root_refresh_daily_window=daily_window,
+            whole_root_refresh_allowed=permit_refresh,
+            whole_root_refresh_stop_requested=refresh_stop,
+            whole_root_refresh_observed_epoch=observed if now is not None else None)
         result = migrate_catalog(repo, args, catalog)
         current.update(state=result["state"], verified_datasets=result["verified_datasets"],
                        source_count=result["source_count"], updated_at_utc=_now())
         if result["state"] == "verified":
-            current["next_cycle_unix"] = current.get('preserved_cycle_deadline_unix', observed + interval)
+            choices = []
+            if refresh_interval is not None:
+                choices, _, _ = _whole_root_refresh_schedule(repo, entries, policy, result['datasets'],
+                    observed=observed, interval=refresh_interval, daily_window=daily_window)
+            current["next_cycle_unix"] = (max(observed, choices[0][0]) if choices else
+                current.get('preserved_cycle_deadline_unix', observed + interval))
+        if result.get('whole_root_refresh'):
+            current['whole_root_refresh'] = result['whole_root_refresh']
         atomic_write_json(current_path, current)
         # Host paths and licensed source metadata stay in the local journal,
         # not in Temporal history or a public dashboard.
         # Hand off immediately when another source is eligible. Busy sources
         # have individual deadlines; never hot-poll them to remove a blanket
         # 30-second delay, or hold the operation lock while sleeping.
-        pending = [row for row in result['datasets'].values() if row['state'] != 'verified'
-                   and (not committed_recovery_only or 'snapshot_id' in row)]
+        recovery_paused = _recovery_paused(args.recovery_pause_path)
+        pending = [row for name, row in result['datasets'].items() if row['state'] != 'verified'
+                   and not (recovery_paused and row.get('state') == 'recovery_deferred_user_migration')
+                   and not (row.get('freshness_refresh') and 'snapshot_id' not in row and not permit_refresh)
+                   and (not committed_recovery_only or 'snapshot_id' in row)
+                   and (allowed_unchanged_pending is None or 'snapshot_id' in row
+                        or name in allowed_unchanged_pending)]
         poll_clock = time.time()
-        remaining = min((row.get('retry_at_unix', 0) - poll_clock for row in pending), default=0)
+        held_refresh = any(row.get('freshness_refresh') and 'snapshot_id' not in row and not permit_refresh
+                           for row in result['datasets'].values())
+        default_delay = retry if (recovery_paused and result['state'] != 'verified' or held_refresh) else 0
+        remaining = min((row.get('retry_at_unix', 0) - poll_clock for row in pending), default=default_delay)
         delay = min(retry, max(0, math.ceil(remaining)))
+        if refresh_interval is not None and permit_refresh:
+            choices, _, _ = _whole_root_refresh_schedule(repo, entries, policy, result['datasets'],
+                observed=observed, interval=refresh_interval, daily_window=daily_window)
+            if choices and choices[0][0] <= observed:
+                delay = 0  # An unrelated due root can proceed despite another retry.
         return {**{key: current[key] for key in ("state", "source_count", "verified_datasets", "plan_sha256")},
                 'next_poll_seconds': delay}

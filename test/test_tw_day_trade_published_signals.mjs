@@ -65,6 +65,95 @@ test("an unverified calendar clears dated targets instead of carrying a previous
   assert.throws(() => validate({...unverified, rows: snapshot().rows}));
 });
 
+test("empty preview distinguishes missing signals from a verified zero-target result", () => {
+  const {merge, emptyMessage} = contracts();
+  const waiting = merge(null, snapshot({modes: [{market: "m", label: "模型", status: "unavailable"}], rows: []}));
+  assert.match(emptyMessage(waiting, ""), /尚未產生或無法核對/);
+  const zero = merge(null, snapshot({modes: [{...snapshot().modes[0], target_count: 0}], rows: []}));
+  assert.match(emptyMessage(zero, ""), /已發布.*沒有非零目標/);
+  const mixed = {...zero, modes: [...zero.modes, {market: "other", label: "另一模式", status: "waiting"}]};
+  assert.match(emptyMessage(mixed, ""), /其餘模式尚未可用/);
+  assert.equal(emptyMessage(waiting, "更新失敗"), "更新失敗");
+  assert.match(emptyMessage({...waiting, session_date: null}, ""), /交易日尚未驗收/);
+});
+
+test("preopen close references are validated and never become current signal rows", () => {
+  const {validate, merge} = contracts();
+  const mode = {market: "m", label: "模型", price_data_date: "2026-10-27",
+    signal_ready_at: "2026-10-27T18:00:00+08:00", target_count: 1, public_signal_key: key};
+  const reference = {modes: [mode], rows: snapshot().rows};
+  const pending = snapshot({modes: [{market: "m", label: "模型", status: "waiting"}],
+    rows: [], preopen_reference: reference});
+  validate(pending);
+  const merged = merge(null, pending);
+  assert.equal(merged.rows.length, 0);
+  assert.equal(merged.preopen_reference.rows[0].symbol, "2330");
+  assert.throws(() => validate({...pending, preopen_reference: {...reference, rows: []}}));
+  assert.throws(() => validate({...pending, modes: snapshot().modes}));
+  const opened = merge(merged, snapshot());
+  assert.equal(opened.rows[0].symbol, "2330");
+  assert.equal(opened.preopen_reference.rows.length, 0);
+});
+
+test("preopen references render explicitly and are replaced by current signals", async () => {
+  const nodes = new Map(), scheduled = [];
+  function node(id) {
+    if (!nodes.has(id)) nodes.set(id, {textContent: "", html: "", classList: {remove() {}, add() {}, toggle() {}}, addEventListener() {}});
+    return nodes.get(id);
+  }
+  const reference = {modes: [{market: "m", label: "模型", price_data_date: "2026-10-27",
+    signal_ready_at: "2026-10-27T18:00:00+08:00", target_count: 1, public_signal_key: key}], rows: snapshot().rows};
+  let data = snapshot({modes: [{market: "m", label: "模型", status: "waiting"}], rows: [], preopen_reference: reference});
+  const dashboard = {byId: node, escapeHtml: value => String(value ?? ""),
+    setTrustedHtml: (id, html) => { node(id).html = html; },
+    createFetch: () => async () => ({status: 200, headers: {get: () => ""}, payload: data}),
+    readJsonResponse: async response => response.payload,
+    scheduleRefresh: callback => { scheduled.push(callback); return {run: callback}; }};
+  const context = vm.createContext({StockAgentDashboard: dashboard,
+    document: {getElementById: node}, location: {pathname: "/tw-day-trade/"}, Intl, Date});
+  vm.runInContext(source, context);
+  await scheduled[0]();
+  assert.match(node("published-signal-body").html, /2330.*非今日訊號|非今日訊號.*2330/);
+  assert.match(node("published-signal-status").html, /2026-10-27 收盤/);
+  assert.equal(context.StockAgentPublishedSignals.getSnapshot().data.rows.length, 0);
+  data = snapshot();
+  await scheduled[0]();
+  assert.doesNotMatch(node("published-signal-body").html, /非今日訊號/);
+  assert.equal(context.StockAgentPublishedSignals.getSnapshot().data.rows.length, 1);
+});
+
+test("temporarily unavailable modes retry promptly without changing normal cadence", async () => {
+  const nodes = new Map(), timers = [], scheduled = [];
+  function node(id) {
+    if (!nodes.has(id)) nodes.set(id, {textContent: "", html: "", classList: {remove() {}, add() {}, toggle() {}}, addEventListener() {}});
+    return nodes.get(id);
+  }
+  let data = snapshot({modes: [{market: "m", label: "模型", status: "unavailable"}], rows: []});
+  let retried = null;
+  const dashboard = {byId: node, escapeHtml: value => String(value ?? ""),
+    setTrustedHtml: (id, html) => { node(id).html = html; },
+    createFetch: () => async () => ({status: 200, headers: {get: () => ""}, payload: data}),
+    readJsonResponse: async response => response.payload,
+    scheduleRefresh: (callback, options) => {
+      assert.equal(options.intervalMs, 60000);
+      scheduled.push(callback);
+      return {run: () => { retried = callback(); return retried; }};
+    }};
+  const context = vm.createContext({StockAgentDashboard: dashboard,
+    document: {getElementById: node}, location: {pathname: "/tw-day-trade/"}, Intl, Date,
+    setTimeout: (callback, delay) => { timers.push({callback, delay}); return timers.length; },
+    clearTimeout() {}});
+  vm.runInContext(source, context);
+  await scheduled[0]();
+  assert.equal(timers.length, 1);
+  assert.equal(timers[0].delay, 2000);
+  data = snapshot();
+  timers[0].callback();
+  await retried;
+  assert.equal(context.StockAgentPublishedSignals.getSnapshot().data.rows[0].symbol, "2330");
+  assert.equal(timers.length, 1);
+});
+
 test("website paints published signals while no status or fill API has responded, then updates in place", async () => {
   const nodes = new Map(), requests = [], scheduled = [], optionsSeen = [];
   function node(id) {

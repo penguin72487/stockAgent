@@ -1,10 +1,51 @@
 from __future__ import annotations
 
 from pathlib import Path
+import os
+import subprocess
+import sys
+from types import SimpleNamespace
+import fcntl
 
 import polars as pl
+import pytest
 
 from downloader import download_coinmetrics_community as coinmetrics
+
+
+def test_direct_cli_finds_handoff_guard_without_pythonpath(tmp_path):
+    not_directory = tmp_path / 'not-a-directory'
+    not_directory.write_text('sentinel')
+    env = {key: value for key, value in os.environ.items() if key != 'PYTHONPATH'}
+    result = subprocess.run([sys.executable, str(Path(coinmetrics.__file__).resolve()),
+        '--output-dir', str(not_directory / 'source'), '--lock-timeout-seconds', '0'],
+        cwd=tmp_path, env=env, text=True, capture_output=True, timeout=15)
+    assert result.returncode != 0
+    assert "No module named 'stockagent'" not in result.stderr
+    assert 'NotADirectoryError' in result.stderr or 'FileExistsError' in result.stderr
+    assert not_directory.read_text() == 'sentinel'
+
+
+def test_collector_holds_the_original_dataset_lock_before_any_requests(tmp_path, monkeypatch):
+    lock = tmp_path / '.download.lock'
+    monkeypatch.setattr(coinmetrics, 'parse_args',
+                        lambda: SimpleNamespace(output_dir=str(tmp_path), lock_timeout_seconds=0))
+    entered = []
+
+    def run(_args):
+        with lock.open('r+b') as other:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(other, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        entered.append(True)
+
+    monkeypatch.setattr(coinmetrics, '_run_locked_download', run)
+    coinmetrics.main()
+    assert entered == [True]
+    with lock.open('r+b') as owner:
+        fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(TimeoutError):
+            coinmetrics.main()
+    assert entered == [True]  # Busy staging cannot initiate a provider call.
 
 
 def test_metric_columns_are_stable_and_collision_checked() -> None:

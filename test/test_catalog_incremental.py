@@ -70,6 +70,20 @@ def test_unchanged_version_has_zero_payload_copies(tmp_path):
     assert seal(second, {'kind': 'ducklake_catalog_and_data'})['files'] == expected
 
 
+def test_catalog_copy_reports_phase_counts_without_changing_the_copy(tmp_path):
+    from stockagent.data_sync.work_progress import observe_work
+    source = tmp_path / 'source'
+    source.mkdir()
+    (source / 'one').write_bytes(b'first')
+    (source / 'two').write_bytes(b'second')
+    observed = []
+    with observe_work(observed.append):
+        expected, _ = incremental.copy_catalog_data(source, tmp_path / 'target')
+    assert [row['completed_items'] for row in observed] == [0, 1, 2]
+    assert all(row['phase'] == 'catalog_copy' and row['total_items'] == 2 for row in observed)
+    assert set(expected) == {'data/one', 'data/two'}
+
+
 def test_unlinking_one_immutable_alias_does_not_change_retained_version(tmp_path):
     source, release, original = seed(tmp_path)
     target = tmp_path / 'copy'

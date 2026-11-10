@@ -266,6 +266,26 @@ def test_repaired_desktop_wakes_recovery_locally_within_five_seconds(queue,monke
     assert calls == ['source'] and stop.waits == [5,2]
 
 
+def test_blocked_owned_desktop_allows_inspection_but_not_replay_or_new_query(queue, monkeypatch):
+    from downloader.tej_startup import CONTRACT as STARTUP_CONTRACT
+    root, config = queue
+    config['automation']['desktop_startup'] = dict(enabled=True, contract=STARTUP_CONTRACT,
+        authorization_basis='explicit_user_request_automatic_tej_restart_after_boot',
+        owned_workbook_windows='%LOCALAPPDATA%\\StockAgent\\TEJSmartWizard\\StockAgent-TEJ-Acquisition.xlsx')
+    add_task(root)
+    calls = []
+    monkeypatch.setattr('downloader.tej_startup.desktop_ready', lambda *a, **k: False)
+    monkeypatch.setattr('downloader.tej_scheduler.desktop_reconciliation_transport_ready', lambda *_: True)
+    monkeypatch.setattr('downloader.tej_scheduler.recover_complete_local_response', lambda *_: False)
+    monkeypatch.setattr('downloader.tej_scheduler.recover_retained_desktop_response',
+                        lambda *_: calls.append('inspect') or False)
+    monkeypatch.setattr('downloader.tej_scheduler.replay_authorized_unknown',
+                        lambda *_: pytest.fail('An unready desktop cannot replay'))
+    watch_queue(root, None, config, stop=InstantWait(limit=1), max_cycles=1, emit=emit,
+                runner=lambda *_: pytest.fail('An unready desktop cannot start a query'))
+    assert calls == ['inspect']
+
+
 def test_metadata_contention_waits_locally_and_never_resets_unknown_source_action(queue):
     import sqlite3
     root,config=queue;calls=[]

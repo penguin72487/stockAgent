@@ -36,6 +36,25 @@ def initial_resize(c):
     atomic_write_json(ENROLLMENT.parent / "initial-resize.json", result)
 
 
+def disable_workspace_online_discard(shared):
+    """Honor the no-online-TRIM policy on the already-enrolled E filesystem."""
+    def options():
+        result = subprocess.run(
+            ["findmnt", "-n", "-o", "OPTIONS", "--mountpoint", str(shared)],
+            capture_output=True, text=True, check=True, timeout=15,
+        )
+        value = result.stdout.strip()
+        if not value or "\n" in value:
+            raise ValueError("E workspace mount options are unavailable or ambiguous")
+        return set(value.split(","))
+
+    if "discard" in options():
+        subprocess.run(["mount", "-o", "remount,nodiscard", str(shared)],
+                       check=True, timeout=15)
+    if "discard" in options():
+        raise ValueError("E workspace still has online discard enabled")
+
+
 def rootfs(c, target):
     """Small local system binaries with their exact ELF dependencies; no keys."""
     with tempfile.TemporaryDirectory(prefix="stockagent-data-rootfs-") as td:
@@ -137,6 +156,9 @@ def mount(c, *, enrolling=False):
             raise ValueError("refuse to hide C data beneath E workspace")
         subprocess.run(["mount", "--bind", str(shared), str(target)], check=True)
     result = check(physical=True, c=c)
+    # `check` binds this mount to the fixed E volume before changing its
+    # superblock option. The bind-mounted service paths share that option.
+    disable_workspace_online_discard(shared)
     for role in ("downloads", "increments", "build", "verify", "restore", "transport", "migration"):
         child = target / role
         if child.is_symlink():
@@ -166,7 +188,7 @@ def mount_finlab_futures(c):
     if target.is_symlink():
         raise ValueError("FinLab futures workspace alias is redirected")
     target.mkdir(mode=0o700, exist_ok=True)
-    if not target.is_mount():
+    if not (target.samefile(source) and _mount_info(target)['target'] == str(target)):
         if any(target.iterdir()):
             raise ValueError("refuse to hide existing FinLab futures objects")
         subprocess.run(["mount", "--bind", str(source), str(target)], check=True)

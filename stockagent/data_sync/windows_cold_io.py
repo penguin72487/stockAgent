@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+import fcntl
 import hashlib
 import json
 import os
@@ -57,6 +58,9 @@ _INTEROP_DIRECTORY = Path('/run/WSL')
 _INTEROP_LOCK = threading.Lock()
 _INTEROP_CACHE = None
 _INTEROP_MARKER = b'stockagent-cold-interop-v1'
+# A larger read pipe reduces native-to-WSL handoffs for long sequential
+# streams. It is an optional transport hint, not a write/readback policy.
+NATIVE_STDOUT_PIPE_BYTES = 1024 * 1024
 # The admission executes an empty batch only. A busy Windows host can need
 # over 10 s to start an otherwise healthy bridge; do not classify that as a
 # failed endpoint before allowing a bounded startup interval.
@@ -361,6 +365,16 @@ def _native_command(configs, *, batched=False, startup_token=None):
     return command
 
 
+def _expand_native_stdout_pipe(stream):
+    """Keep a larger existing pipe; treat an unsupported enlargement as a no-op."""
+    try:
+        fd = stream.fileno()
+        if fcntl.fcntl(fd, fcntl.F_GETPIPE_SZ) < NATIVE_STDOUT_PIPE_BYTES:
+            fcntl.fcntl(fd, fcntl.F_SETPIPE_SZ, NATIVE_STDOUT_PIPE_BYTES)
+    except (OSError, TypeError, ValueError, AttributeError):
+        pass
+
+
 def _launch(configs, *, batched=False, startup_token=None):
     encoded = base64.b64encode(_native_command(configs, batched=batched,
         startup_token=startup_token).encode('utf-16le')).decode()
@@ -373,6 +387,7 @@ def _launch(configs, *, batched=False, startup_token=None):
     except BaseException:
         errors.close()
         raise
+    _expand_native_stdout_pipe(process.stdout)
     return process, errors
 
 
@@ -649,8 +664,49 @@ def binary_reader_many(members):
         time.sleep((0.2, 1.0)[attempt])
 
 
+class _IdleBoundedReader:
+    """Read-only pipe: bound inactivity, including before the first byte.
+
+    There is exactly one reader and no buffered reads precede this wrapper.
+    Raw reads preserve the complete byte stream; a timeout is never a retry
+    after partial output, nor a checksum or successful EOF.
+    """
+    def __init__(self, stream, timeout):
+        if type(timeout) not in (int, float) or not 0 < timeout <= 3600:
+            raise ValueError('native read requires a bounded inactivity timeout')
+        self.stream, self.timeout, self.prefix = stream, timeout, b''
+        self.selector = selectors.DefaultSelector()
+        self.selector.register(stream, selectors.EVENT_READ)
+
+    def _read(self, count):
+        if not self.selector.select(self.timeout):
+            raise SnapshotError('Native read inactivity timeout; source retained')
+        return os.read(self.stream.fileno(), count)
+
+    def peek(self, count):
+        if not self.prefix:
+            self.prefix = self._read(max(1, min(count, 65536)))
+        return self.prefix
+
+    def read(self, count=-1):
+        if count == 0:
+            return b''
+        if count < 0:
+            blocks = []
+            while block := self.read(8 * 1024**2):
+                blocks.append(block)
+            return b''.join(blocks)
+        if self.prefix:
+            result, self.prefix = self.prefix[:count], self.prefix[count:]
+            return result
+        return self._read(count)
+
+    def close(self):
+        self.selector.close()
+
+
 @contextmanager
-def binary_reader(path, *, expected_bytes=None):
+def binary_reader(path, *, expected_bytes=None, read_idle_timeout=None):
     path = Path(path)
     if windows_path(path) is None:
         with path.open('rb') as stream:
@@ -661,11 +717,14 @@ def binary_reader(path, *, expected_bytes=None):
             **({'expected_bytes': expected_bytes} if expected_bytes is not None else {}))
         process.stdin.close()
         retry = False
+        reader = None
         try:
             # A failed interop launch used to appear as a zero-byte checksum
             # failure after creating a restore member. Peek preserves every
             # actual byte, and retry is limited to the known empty startup.
-            if not process.stdout.peek(1) and process.wait(timeout=30):
+            reader = (_IdleBoundedReader(process.stdout, read_idle_timeout)
+                      if read_idle_timeout is not None else process.stdout)
+            if not reader.peek(1) and process.wait(timeout=30):
                 errors.seek(0)
                 failure = errors.read(4096)
                 if attempt < 2 and retryable_interop_startup(failure):
@@ -673,12 +732,14 @@ def binary_reader(path, *, expected_bytes=None):
                 else:
                     raise SnapshotError('Native Windows cold read failed: ' + failure.decode(errors='replace'))
             if not retry:
-                yield process.stdout
+                yield reader
                 if process.wait(timeout=120):
                     errors.seek(0)
                     raise SnapshotError('Native Windows cold read failed: ' + errors.read(4096).decode(errors='replace'))
                 return
         finally:
+            if isinstance(reader, _IdleBoundedReader):
+                reader.close()
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=30)
@@ -688,7 +749,14 @@ def binary_reader(path, *, expected_bytes=None):
 
 
 def hash_file(path):
-    before = Path(path).lstat()
+    path = Path(path)
+    # The immutable DuckLake namespace deliberately permits native SHA only,
+    # never an arbitrary byte stream. Route this API through the existing
+    # read-only full-hash contract instead of requesting forbidden read mode.
+    native = windows_path(path)
+    if native is not None and native.startswith('D:\\stockagent-immutable-lake\\'):
+        return hash_many([path])[path]
+    before = path.lstat()
     if not stat.S_ISREG(before.st_mode):
         raise SnapshotError('Native full SHA requires a regular non-redirected file')
     value = hashlib.sha256()
@@ -697,34 +765,60 @@ def hash_file(path):
         while block := stream.read(4 * 1024 * 1024):
             value.update(block)
             size += len(block)
-    after = Path(path).lstat()
+    after = path.lstat()
     fields = ('st_dev', 'st_ino', 'st_size', 'st_mtime_ns', 'st_ctime_ns', 'st_mode', 'st_nlink')
     if size != before.st_size or any(getattr(before, key) != getattr(after, key) for key in fields):
         raise SnapshotError('Cold bytes changed during native full SHA')
     return value.hexdigest()
 
 
+def _writer_readiness_line(process, *, timeout=30):
+    """Read only the startup line with an overall deadline and no prefetch."""
+    deadline = time.monotonic()+timeout
+    output = bytearray()
+    with selectors.DefaultSelector() as selector:
+        selector.register(process.stdout, selectors.EVENT_READ)
+        while len(output) < 4096:
+            remaining = deadline-time.monotonic()
+            if remaining <= 0 or not selector.select(remaining):
+                raise _BatchNotReady('writer-readiness-timeout', bytes(output))
+            block = os.read(process.stdout.fileno(), 1)
+            if not block:
+                break
+            output.extend(block)
+            if block == b'\n':
+                break
+    return bytes(output)
+
+
 class BinaryWriter:
-    def __init__(self, path, *, offset=0, prefix_sha256=None, reserve_bytes=32 * 1024**3):
+    def __init__(self, path, *, offset=0, prefix_sha256=None, reserve_bytes=32 * 1024**3,
+                 startup_timeout=30):
         if (type(offset) is not int or offset < 0
                 or (offset and prefix_sha256 is None)
                 or (prefix_sha256 is not None and (not isinstance(prefix_sha256, str)
                                                    or re.fullmatch(r'[a-f0-9]{64}', prefix_sha256) is None))):
             raise SnapshotError('Native append requires exact retained prefix size and SHA')
+        if type(startup_timeout) not in (int, float) or not 0 < startup_timeout <= 120:
+            raise ValueError('native writer requires a bounded startup timeout')
         self.path, self.offset = Path(path), offset
         self.appended = 0
         self.result = None
+        self.finish_failed = False
         fresh = offset == 0 and not self.path.exists() and not self.path.is_symlink()
         for attempt in range(3):
             self.process, self.errors = _process(path, mode='write', offset=offset,
                                                 prefix_sha256=prefix_sha256, reserve_bytes=reserve_bytes)
-            ready = self.process.stdout.readline(4096)
+            ready = b''
             try:
+                ready = _writer_readiness_line(self.process, timeout=startup_timeout)
                 record = json.loads(ready)
                 if record.get('state') != 'native_writer_ready' or record.get('offset') != offset:
                     raise SnapshotError('Native writer readiness differs; no input sent')
                 break
-            except (ValueError, SnapshotError) as error:
+            except (ValueError, SnapshotError, _BatchNotReady) as error:
+                if isinstance(error, _BatchNotReady):
+                    ready = error.received
                 if self.process.poll() is None:
                     self.process.terminate()
                 code = self.process.wait(timeout=30)
@@ -736,7 +830,7 @@ class BinaryWriter:
                 # The known WSL startup failure occurs before the script and
                 # before any input. Retry only an absent fresh destination;
                 # never replay an append, created partial or started writer.
-                if (attempt < 2 and fresh and not ready and code
+                if (attempt < 2 and fresh and not ready and code and not isinstance(error, _BatchNotReady)
                         and retryable_interop_startup(stderr)
                         and not self.path.exists() and not self.path.is_symlink()):
                     time.sleep((0.2, 1.0)[attempt])
@@ -753,30 +847,50 @@ class BinaryWriter:
             raise SnapshotError('Native Windows writer pipe failed: ' + self.errors.read(4096).decode(errors='replace')) from error
         self.appended += len(block)
 
-    def finish(self):
+    def finish(self, *, timeout=120):
         if self.result is not None:
             return self.result
+        if type(timeout) not in (int, float) or not 0 < timeout <= 3600:
+            raise ValueError('native writer requires a bounded finish timeout')
+        if self.finish_failed:
+            raise SnapshotError('Native Windows write already failed; source retained')
         try:
-            self.process.stdin.close()
-        except BrokenPipeError:
-            pass
-        output = self.process.stdout.read(8192)
-        code = self.process.wait(timeout=120)
-        if code:
-            self.errors.seek(0)
-            raise SnapshotError('Native Windows cold write failed: ' + self.errors.read(4096).decode(errors='replace'))
-        result = json.loads(output)
-        if result.get('flushed') is not True or result.get('bytes') != self.offset + self.appended:
-            raise SnapshotError('Native Windows durable byte count differs')
-        if self.path.lstat().st_size != result['bytes']:
-            raise SnapshotError('Canonical D namespace byte count differs from native writer')
-        self.result = result
-        return result
+            try:
+                self.process.stdin.close()
+            except BrokenPipeError:
+                pass
+            # A blocking stdout.read() before wait(timeout=...) made that
+            # timeout ineffective: a silent Windows flush could hold the
+            # publication owner forever. communicate bounds the whole EOF /
+            # receipt / process-exit wait. Input is already closed; never
+            # replay a partially written source after a timeout.
+            self.process.stdin = None
+            try:
+                output, _ = self.process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as error:
+                raise SnapshotError('Native Windows write finish timeout; source retained') from error
+            if self.process.returncode:
+                self.errors.seek(0)
+                raise SnapshotError('Native Windows cold write failed: ' + self.errors.read(4096).decode(errors='replace'))
+            if len(output) > 8192:
+                raise SnapshotError('Native Windows write receipt exceeds its bound')
+            result = json.loads(output)
+            if result.get('flushed') is not True or result.get('bytes') != self.offset + self.appended:
+                raise SnapshotError('Native Windows durable byte count differs')
+            if self.path.lstat().st_size != result['bytes']:
+                raise SnapshotError('Canonical D namespace byte count differs from native writer')
+            self.result = result
+            return result
+        except BaseException:
+            self.finish_failed = True
+            raise
 
     def close(self):
         try:
             if self.process.poll() is None:
                 try:
+                    if self.finish_failed:
+                        raise SnapshotError('Native Windows write already failed; source retained')
                     self.finish()
                 except BaseException:
                     self.process.terminate()

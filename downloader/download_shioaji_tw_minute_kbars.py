@@ -2346,8 +2346,7 @@ def _parallel_download_worker(
                 pass
 
 
-def main() -> None:
-    args = parse_args()
+def _run(args: argparse.Namespace) -> None:
     stop_at = datetime.fromisoformat(args.stop_at) if args.stop_at else None
     if stop_at is not None and stop_at.tzinfo is None:
         raise ValueError("--stop-at must contain a timezone offset")
@@ -2698,6 +2697,13 @@ def main() -> None:
     )
     if fatal_error:
         raise RuntimeError(fatal_error)
+
+
+def main() -> None:
+    args = parse_args()
+    from stockagent.data_sync.shioaji_minute_workspace_guard import writer_guard
+    with writer_guard(args.output_dir):
+        _run(args)
 
 
 if __name__ == "__main__":

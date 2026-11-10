@@ -318,7 +318,9 @@ def main() -> None:
     parser.add_argument("--backup-dir", type=Path, default=Path("data_yahoo/tw_stocks/repair_backups/finmind_source"))
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
-    repair(data_root=args.data_root, output_dir=args.output_dir, backup_dir=args.backup_dir, apply=bool(args.apply))
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(args.data_root, args.output_dir, args.backup_dir):
+        repair(data_root=args.data_root, output_dir=args.output_dir, backup_dir=args.backup_dir, apply=bool(args.apply))
 
 
 if __name__ == "__main__":

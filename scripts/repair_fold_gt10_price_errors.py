@@ -462,14 +462,16 @@ def main() -> None:
     parser.add_argument("--min-abs-log-return", type=float, default=math.log(1.5))
     parser.add_argument("--apply", action="store_true", help="Mutate parquet files. Without this flag only writes a repair plan.")
     args = parser.parse_args()
-    repair(
-        data_root=args.data_root,
-        investigation_path=args.investigation,
-        output_dir=args.output_dir,
-        backup_dir=args.backup_dir,
-        min_abs_log_return=float(args.min_abs_log_return),
-        apply=bool(args.apply),
-    )
+    from stockagent.data_sync.yahoo_workspace_guard import yahoo_writer_guard
+    with yahoo_writer_guard(args.data_root, args.output_dir, args.backup_dir):
+        repair(
+            data_root=args.data_root,
+            investigation_path=args.investigation,
+            output_dir=args.output_dir,
+            backup_dir=args.backup_dir,
+            min_abs_log_return=float(args.min_abs_log_return),
+            apply=bool(args.apply),
+        )
 
 
 if __name__ == "__main__":

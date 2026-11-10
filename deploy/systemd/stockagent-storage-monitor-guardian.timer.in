@@ -1,0 +1,11 @@
+[Unit]
+Description=Recover the one-minute storage monitor if it is not running
+
+[Timer]
+OnBootSec=90s
+OnUnitInactiveSec=60s
+AccuracySec=2s
+Unit=stockagent-storage-monitor-guardian.service
+
+[Install]
+WantedBy=timers.target

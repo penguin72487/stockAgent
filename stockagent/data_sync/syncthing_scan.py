@@ -239,11 +239,13 @@ def _scan_request_groups(
 ) -> tuple[tuple[str, ...], ...]:
     """Keep exact object coverage and strict object -> manifest -> head phases."""
 
-    paths = (
-        ["objects"]
-        if full_objects_scan or (len(new_object_paths) > 256 and not batch_object_paths)
-        else sorted(set(new_object_paths))
-    )
+    requested = sorted(set(new_object_paths))
+    if full_objects_scan or (len(requested) > 256 and not batch_object_paths):
+        # A broad objects scan does not cover removed manifests or historical
+        # heads; keep those independent paths even in the fallback mode.
+        paths = ['objects', *(path for path in requested if path != 'objects' and not path.startswith('objects/'))]
+    else:
+        paths = requested
     manifests = _validate_manifest_paths(dataset, new_manifest_paths)
     metadata = list(sorted(set(manifests))) if manifests is not None else [f"manifests/{dataset}"]
     metadata.append(f"heads/{dataset}")

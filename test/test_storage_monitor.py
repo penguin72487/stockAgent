@@ -13,6 +13,119 @@ from stockagent.data_sync import storage_monitor as storage
 _trading_opening_census_reason = storage.trading_opening_census_reason
 
 
+def test_slow_capacity_probe_keeps_original_clock_and_never_overlaps(monkeypatch):
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Event
+    entered, release = Event(), Event()
+    calls = []
+    old = {'penguin-c': {'state': 'measured', 'observed_at_utc': '2026-11-04T00:00:00+00:00'}}
+    new = {'penguin-c': {'state': 'measured', 'observed_at_utc': '2026-11-04T00:01:30+00:00'}}
+
+    def slow(_):
+        calls.append(1)
+        entered.set()
+        assert release.wait(3)
+        return new
+
+    monkeypatch.setattr(storage, 'observe_capacities', slow)
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        probe = storage.SingleFlightCapacityProbe(pool, {}, old)
+        assert probe.poll() == old and entered.wait(1)
+        assert probe.poll() == old and len(calls) == 1
+        release.set()
+        probe.future.result(timeout=2)
+        assert probe.poll() == new
+
+
+def test_prefetched_capacity_is_published_without_an_extra_probe():
+    class Ready:
+        def __init__(self, value): self.value = value
+        def done(self): return True
+        def result(self, timeout=None): return self.value
+    class Executor:
+        def __init__(self): self.calls = 0
+        def submit(self, *_):
+            self.calls += 1
+            return Ready({'sample': self.calls})
+    executor = Executor()
+    probe = storage.SingleFlightCapacityProbe(executor, {}, {})
+    probe.prefetch()
+    probe.prefetch()  # harvest previous sample and start the next minute's
+    assert executor.calls == 2
+    assert probe.poll() == {'sample': 2}
+    assert executor.calls == 2  # no immediate second SSH/native request
+
+
+def test_receiver_cadence_waits_for_delivery_without_refreshing_old_evidence():
+    from datetime import datetime, timezone
+    stamp = datetime.fromtimestamp(1000, timezone.utc).isoformat()
+    assert storage.receiver_aligned_delay({'generated_at_utc':stamp}, now=1025) == 47
+    assert storage.receiver_aligned_delay({'generated_at_utc':stamp}, now=1069) == 3
+    assert storage.receiver_aligned_delay({'generated_at_utc':stamp}, now=1200) is None
+    assert storage.receiver_aligned_delay({'generated_at_utc':stamp}, now=990) is None
+
+
+def test_watch_publishes_new_snapshots_while_capacity_probe_is_slow(tmp_path, monkeypatch):
+    from threading import Event
+    from stockagent.data_sync import storage_runtime
+    monkeypatch.setenv('WSL_DISTRO_NAME', 'test-distro')
+    config = {'schema_version': 1, 'observer_node_id': 'penguin', 'capacity_interval_seconds': 60,
+              'classification_interval_seconds': 21600, 'classification_timeout_seconds': 60,
+              'classification_depth': 2, 'volumes': [{'id': 'penguin-wsl', 'path': str(tmp_path), 'roots': []}]}
+    config_path, output = tmp_path/'config.json', tmp_path/'status.json'
+    config_path.write_text(json.dumps(config))
+    old = measured(observed_at_utc='2026-11-04T00:00:00+00:00')
+    output.write_text(json.dumps({'contract': storage.CONTRACT, 'volumes': [
+        {'id': 'penguin-wsl', 'capacity': old, 'classification': {'state': 'not_scanned'}}]}))
+    entered, release = Event(), Event()
+    calls, snapshots = [], []
+
+    def slow(_):
+        calls.append(1)
+        entered.set()
+        assert release.wait(5)
+        return {'penguin-wsl': measured(observed_at_utc=storage.utc())}
+
+    class Finished(Exception):
+        pass
+
+    def tick(_):
+        assert entered.wait(1)
+        snapshots.append(json.loads(output.read_text()))
+        if len(snapshots) == 2:
+            release.set()
+            raise Finished
+
+    monkeypatch.setattr(storage, 'observe_capacities', slow)
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: True)
+    monkeypatch.setattr(storage_runtime, 'collect', lambda *_a, **_k: {})
+    monkeypatch.setattr(storage.time, 'sleep', tick)
+    try:
+        with pytest.raises(Finished):
+            storage.monitor(config_path, output, tmp_path, watch=True)
+    finally:
+        release.set()
+    assert len(calls) == 1 and len(snapshots) == 2
+    assert snapshots[0]['generated_at_utc'] != snapshots[1]['generated_at_utc']
+    assert all(row['volumes'][0]['capacity']['observed_at_utc'] == old['observed_at_utc'] for row in snapshots)
+
+
+def test_independent_local_capacity_never_relabels_old_native_allocation():
+    old = '2026-11-04T00:00:00+00:00'
+    fresh = '2026-11-04T00:02:00+00:00'
+    native = {'state': 'measured', 'observed_at_utc': old, 'source': 'native_windows',
+              'wsl_allocation': {'complete': True}}
+    local = {'state': 'measured', 'observed_at_utc': fresh, 'source': 'statvfs'}
+    merged = storage.merge_independent_local_capacity(
+        {'penguin-c': native, 'penguin-wsl': native, 'vastai1T-disk': {'state': 'measured'}},
+        {'penguin-c': local, 'penguin-wsl': local})
+    assert merged['penguin-c'] == local and 'wsl_allocation' not in merged['penguin-c']
+    assert merged['penguin-wsl'] == local and 'vastai1T-disk' in merged
+    current_native = {**native, 'observed_at_utc': '2026-11-04T00:01:30+00:00'}
+    assert storage.merge_independent_local_capacity({'penguin-c': current_native},
+                                                     {'penguin-c': local})['penguin-c'] == current_native
+
+
 @pytest.fixture(autouse=True)
 def independent_of_live_trading_clock(monkeypatch):
     """Only explicit guardian tests use a clock, never the machine's current time."""
@@ -112,6 +225,8 @@ def test_cold_tier_projection_separates_schedule_poll_and_last_real_work():
     assert value["scope"] == "last_bounded_cycle_not_whole_lake_or_NAS"
     assert value["schedule"] == {"timezone": "Asia/Taipei", "start_hour": 3, "end_hour": 7, "stable_after_hours": 6}
     assert "private" not in json.dumps(value) and "secret" not in json.dumps(value)
+    raw["cold_tiers"]["state"] = "waiting_migration_priority"
+    assert storage.public_status(raw, now=now)["cold_tiers"]["state"] == "waiting_migration_priority"
     raw["cold_tiers"]["observed_at_epoch"] = now - 1800
     assert storage.public_status(raw, now=now)["cold_tiers"]["stale"] is True
 
@@ -499,6 +614,27 @@ def test_remote_failure_is_bounded_and_never_exposes_command_details(monkeypatch
     assert "private" not in json.dumps(result)
 
 
+def test_remote_observer_identity_override_is_scoped_and_missing_override_falls_back(tmp_path, monkeypatch):
+    primary, fallback = tmp_path/'observer', tmp_path/'ingress'
+    primary.write_text('test identity')
+    fallback.write_text('test identity')
+    config = {'target_env': 'TEST_MONITOR_TARGET', 'port_env': 'TEST_MONITOR_PORT',
+              'identity_env': 'TEST_MONITOR_IDENTITY', 'fallback_identity_env': 'TEST_INGRESS_IDENTITY'}
+    monkeypatch.setenv('TEST_MONITOR_TARGET', 'root@example.test')
+    monkeypatch.setenv('TEST_MONITOR_PORT', '43269')
+    monkeypatch.setenv('TEST_INGRESS_IDENTITY', str(fallback))
+    monkeypatch.delenv('TEST_MONITOR_IDENTITY', raising=False)
+    command = storage.ssh_prefix(config)
+    assert command[command.index('-i')+1] == str(fallback)
+    assert 'IdentitiesOnly=yes' in command and 'StrictHostKeyChecking=yes' in command
+    monkeypatch.setenv('TEST_MONITOR_IDENTITY', str(primary))
+    command = storage.ssh_prefix(config)
+    assert command[command.index('-i')+1] == str(primary)
+    monkeypatch.setenv('TEST_MONITOR_IDENTITY', str(tmp_path/'missing'))
+    with pytest.raises(ValueError, match='remote_not_enrolled'):
+        storage.ssh_prefix(config)
+
+
 def test_remote_probe_retries_one_transient_reset_within_original_budget(monkeypatch):
     monkeypatch.setattr(storage, 'ssh_prefix', lambda _: ['ssh', 'fixed-enrollment'])
     results = iter([subprocess.CompletedProcess([], 255, '', 'Connection reset by peer'),
@@ -722,6 +858,70 @@ def test_transport_retirement_preempts_optional_census_but_not_capacity(tmp_path
     assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) is None
 
 
+def test_provider_migration_preempts_optional_c_e_census_and_releases_after_handoff(tmp_path, monkeypatch):
+    configuration = tmp_path / 'configs/data_sync/storage_monitor.json'
+    configuration.parent.mkdir(parents=True)
+    registry = tmp_path / 'provider-placement.json'
+    configuration.write_text(json.dumps({'operations': {'provider_workspace_registry': str(registry)}}))
+    value = {'contract': 'temporary_provider_e_workspace_v1',
+             'providers': {'finlab': {'state': 'active'}, 'finmind': {'state': 'copying'}}}
+    registry.write_text(json.dumps(value))
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    for volume in ('penguin-wsl', 'penguin-workspace'):
+        assert storage.local_census_priority_reason({'id': volume}, tmp_path) == 'provider_workspace_owner_active'
+    assert storage.local_census_priority_reason({'id': 'penguin-c'}, tmp_path) is None
+    value['providers']['finmind']['state'] = 'active'
+    registry.write_text(json.dumps(value))
+    assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) is None
+    registry.write_text('{bad-registry')
+    assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) == 'provider_workspace_observation_unavailable'
+
+
+def test_optional_census_yields_to_fresh_migration_heartbeat_without_stale_starvation(tmp_path, monkeypatch):
+    import time
+    config = tmp_path/'configs/data_sync/storage_monitor.json'
+    config.parent.mkdir(parents=True)
+    workspace = tmp_path/'E'
+    status = workspace/'migration/source-local-exact-repack/queue-status.json'
+    status.parent.mkdir(parents=True)
+    config.write_text(json.dumps({'operations': {'provider_workspace_root': str(workspace)}}))
+    value = {'contract': 'stockagent.source_local_repack_queue.v1.status',
+             'observed_at_epoch': time.time(), 'entries': [{'dataset': 'fixture', 'state': 'running'}]}
+    status.write_text(json.dumps(value))
+    monkeypatch.setattr(storage, 'trading_opening_census_reason', lambda _: None)
+    monkeypatch.setattr(storage, 'priority_retirement_wave_pending', lambda _: False)
+    for volume in ('penguin-wsl', 'penguin-d', 'penguin-workspace'):
+        assert storage.local_census_priority_reason({'id': volume}, tmp_path) == 'source_local_migration_active'
+    assert storage.local_census_priority_reason({'id': 'penguin-c'}, tmp_path) is None
+    value['observed_at_epoch'] = time.time()-181
+    status.write_text(json.dumps(value))
+    assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) is None
+    value['observed_at_epoch'], value['entries'][0]['state'] = time.time(), 'completed'
+    status.write_text(json.dumps(value))
+    assert storage.local_census_priority_reason({'id': 'penguin-workspace'}, tmp_path) is None
+
+
+def test_census_fingerprint_rechecks_changed_provider_layout_without_tracking_heartbeats(tmp_path):
+    registry = tmp_path / 'provider-placement.json'
+    config = {'classification_depth': 3, 'operations': {'provider_workspace_registry': str(registry)}}
+    volume = {'id': 'penguin-workspace'}
+    before = storage.census_fingerprint(config, volume, None)
+    value = {'contract': 'temporary_provider_e_workspace_v1', 'providers': {
+        'finmind': {'state': 'copying', 'destination': '/enrolled-E/data', 'filesystem_uuid': 'fixed-e'}}}
+    registry.write_text(json.dumps(value))
+    copying = storage.census_fingerprint(config, volume, None)
+    assert before != copying
+    value['observed_at_epoch'] = 1234
+    registry.write_text(json.dumps(value))
+    assert storage.census_fingerprint(config, volume, None) == copying
+    value['providers']['finmind']['state'] = 'active'
+    registry.write_text(json.dumps(value))
+    assert storage.census_fingerprint(config, volume, None) != copying
+    # Remote/physical C capacity-only views do not acquire these data-layout dependencies.
+    assert storage.census_fingerprint(config, {'id': 'penguin-c'}, None) == storage.census_fingerprint(
+        {**config, 'operations': {}}, {'id': 'penguin-c'}, None)
+
+
 def test_stale_retirement_counter_still_defers_optional_census_while_original_lock_is_held(tmp_path, monkeypatch):
     import time
     config = tmp_path / 'configs/data_sync'
@@ -809,7 +1009,7 @@ def test_public_classification_only_exposes_known_deferral_reasons():
                                             'deferred_reason': 'dataset_version_owner_active'}
     result = volume(storage.public_status(raw), 'penguin-wsl')['classification']
     assert result['deferred_reason'] == 'dataset_version_owner_active'
-    for reason in ('tw_opening_guard_active', 'tw_opening_guard_unknown'):
+    for reason in ('tw_opening_guard_active', 'tw_opening_guard_unknown', 'source_local_migration_active'):
         raw['volumes'][0]['classification']['deferred_reason'] = reason
         result = volume(storage.public_status(raw), 'penguin-wsl')['classification']
         assert result['deferred_reason'] == reason

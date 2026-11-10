@@ -70,6 +70,13 @@
 釋鎖後等待五分鐘，再由原 owner 重驗准入，不能把這個已知讓位永久當成未知
 失敗。等待仍受原 request 期限限制；未知結果與來源程式變更仍停止保留證據。
 
+2026-11-09 擴充同一交接器的 `--family stock`：只接受已登錄、明確合法的
+股票代碼與 ISO 交易日的 `tw_minute` 分區；預設仍是原期貨範圍。股票不能
+選期貨專用 workspace 或 preferred-futures 選項。交接仍辨識原程序 PID 與
+kernel start time、等其退出、固定程式摘要，並讓既有有限 drain 重檢帳號鎖、
+開盤、容量、配額及一般追新。狀態、deadline 和來源改版均留在進度收據；
+等待不代表已派工或取得資料，既有有限佇列排序也不變。
+
 2026-10-28 的 Smart Wizard 排程更新：當同一 owner 持續有大量到期增量時，
 `finite_query_after_incremental_attempts: 4` 在四次實際增量任務 claim 後，
 讓一個已到期、符合隔離條件的有限查詢取得下一個位置；之後回到增量優先。
@@ -102,6 +109,19 @@ FinMind 的選擇權商品日史有限查詢可登記完整商品集合，由同
 時不使用此例外。容量檢查不是其他程序寫入的空間預留。這項機制只適用
 明確登記的選擇權日史，不適用逐筆或一般回補。相關測試與實機狀態見
 [研究紀錄](../artifacts/markets/tw_derivative_scopes_options_20261028_v1/README.md)。
+
+2026-11-03 逐筆商品比較的等待器沿用共用 `AcquisitionCapacitySampler`，
+容量不足時不再反覆啟動 Complement owner 或重讀整批原始 payload。
+開始時完整核對來源；等待中只查固定程式／計畫、原 priority 狀態及容量。
+容量恢復後、每次派工前和終止讀回時，再完整驗證原件，並在實際 child
+啟動邊界重查程式與期限。已完成任務及到期讀回不等待容量恢復；未取得
+准入時不持有 owner 鎖。原 owner 仍獨立重查來源、配額、容量與鎖。
+同一批多商品共用的原件只雜湊一次；相同路徑但不同內容承諾直接拒絕，
+並核對每次完整雜湊前後及整批讀回結束的 inode、大小與時間世代。
+第 38 批的 ABBA 來源核對由平均 0.173 秒降為 0.039 秒，輸出一致；
+這個局部測速不表示下載或訓練變快相同比例，見
+[固定來源測量](../artifacts/markets/tw_futures_full_history_v22_official10_20261030_v1/priority-source-hash-abba-20261103-v1.json)。
+這只移除無效啟動與重複讀取，不變更容量底線或來源結果。
 
 FinLab／FinMind 的前次歷史修復與實測見
 [原排程報告](finlab_finmind_scheduling_2026-10-27.md)。FinMind JSON 派工內部契約升為

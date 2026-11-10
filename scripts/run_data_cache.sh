@@ -20,7 +20,7 @@ case "${1:-}" in
 esac
 if [ -f "${edge_state}" ]; then
   case "${1:-}" in
-    use|gc|evict)
+    use|gc|evict|reader-status)
       # shellcheck source=scripts/runtime_env.sh
       source "${repo_root}/scripts/runtime_env.sh"
       if [ -r /etc/environment ]; then
@@ -29,7 +29,45 @@ if [ -f "${edge_state}" ]; then
         source /etc/environment
         set +a
       fi
-      run_fintech_python "${repo_root}/scripts/manage_packed_edge.py" "$@"
+      # An independently installed, pinned reader can support newer packed
+      # schemas without rewriting a running training checkout. The original
+      # edge state, lock, cache and live policy remain the owners.
+      edge_reader_control="${STOCKAGENT_PACKED_EDGE_READER_CONTROL:-/var/lib/stockagent-packed-edge/reader-release.control}"
+      edge_reader_script="${repo_root}/scripts/manage_packed_edge.py"
+      if [[ -e "$edge_reader_control" || -L "$edge_reader_control" ]]; then
+        if [[ ! -f "$edge_reader_control" || -L "$edge_reader_control" \
+              || "$(stat -c '%u' -- "$edge_reader_control")" != "$(id -u)" \
+              || "$(stat -c '%a' -- "$edge_reader_control")" != 600 ]]; then
+          printf '%s\n' 'ERROR: packed edge reader control is unsafe' >&2
+          exit 1
+        fi
+        IFS=' ' read -r edge_reader_root edge_reader_manifest edge_reader_repo edge_reader_extra < "$edge_reader_control" || true
+        if [[ -z "$edge_reader_root" || ! "$edge_reader_manifest" =~ ^[0-9a-f]{64}$ \
+              || -z "$edge_reader_repo" || -n "${edge_reader_extra:-}" \
+              || "$edge_reader_root" != /* || "$edge_reader_repo" != /* \
+              || ! -d "$edge_reader_root" || -L "$edge_reader_root" \
+              || "$(realpath -e -- "$edge_reader_root")" != "$edge_reader_root" \
+              || "$(stat -c '%u' -- "$edge_reader_root")" != "$(id -u)" \
+              || "$(stat -c '%a' -- "$edge_reader_root")" != 700 \
+              || ! -L "$edge_reader_root/configs" \
+              || "$(realpath -e -- "$edge_reader_root/configs")" != "$edge_reader_repo/configs" \
+              || ! -f "$edge_reader_root/reader-manifest.sha256" \
+              || -L "$edge_reader_root/reader-manifest.sha256" \
+              || ! -f "$edge_reader_root/scripts/manage_packed_edge.py" \
+              || ! -d "$edge_reader_root/vendor" ]]; then
+          printf '%s\n' 'ERROR: packed edge reader release is unavailable or invalid' >&2
+          exit 1
+        fi
+        edge_observed_manifest="$(sha256sum -- "$edge_reader_root/reader-manifest.sha256")"
+        if [[ "${edge_observed_manifest%% *}" != "$edge_reader_manifest" ]] \
+            || ! (cd -- "$edge_reader_root" && sha256sum --quiet --check reader-manifest.sha256); then
+          printf '%s\n' 'ERROR: packed edge reader release failed identity verification' >&2
+          exit 1
+        fi
+        edge_reader_script="$edge_reader_root/scripts/manage_packed_edge.py"
+        export PYTHONPATH="$edge_reader_root/vendor${PYTHONPATH:+:$PYTHONPATH}"
+      fi
+      run_fintech_python "$edge_reader_script" "$@"
       exit $?
       ;;
   esac

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 import pytest
@@ -37,6 +38,52 @@ def test_revision_fill_oracle_reconciles_quantities_prices_net_fees_and_pnl():
     result = verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars, prior_realized=0.)
     assert result["entry_shares"] == result["exit_shares"] == 1000
     assert result["session_realized_net_pnl_twd"] == pytest.approx(791.215)
+
+
+@pytest.mark.parametrize("damage", [None, "fake_execution", "event", "source", "quantity", "fee", "clock"])
+def test_nontrade_accounting_reconciles_without_fabricating_a_fill(tmp_path, monkeypatch, damage):
+    from stockagent.live import tw_day_trade_nontrade as nontrade
+
+    mode, fills, plan, bars = _revision_accounting_fixture()
+    position = mode["positions"]["p"]
+    position.update(entry_at="2026-10-29T09:01:00+08:00", status="nontrade_book_settled")
+    mode.update(execution_evidence_complete=False, nontrade_settlement_count=1, nontrade_settlement_shares=1000)
+    source = tmp_path / "twse_daily_ohlcv" / "2026-10-29.json"
+    source.parent.mkdir()
+    source.write_text(json.dumps({"date": "20261029", "stat": "OK", "tables": [
+        {"fields": ["證券代號", "收盤價", "成交股數"], "data": [["2330", "101", "1000"]]}]}))
+    sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    reference = {"symbol": "2330", "reference_price": 101., "receipt_path": "/pinned/receipt.json",
+                 "reference_observed_at": "2026-10-29T12:58:00+08:00"}
+    monkeypatch.setattr(nontrade, "load_pinned_finmind_ticks",
+                        lambda *args, **kwargs: ({"2330": dict(reference)}, []))
+    details = {"contract": nontrade.CONTRACT, "accounting_at": "2026-10-29T13:30:00+08:00",
+        "reference": dict(reference), "reference_before_simulated_entry": False,
+        "official_close_evidence": {"source": "twse_official_daily_close", "source_sha256": sha,
+            "source_path": str(source), "price": 101., "price_basis": "official_session_close"},
+        "quantity": 1000, "assumed_exit_fee_and_tax_twd": fills[1]["fee_and_tax_twd"],
+        "simulation_only": True, "exchange_fill": False, "broker_fill": False,
+        "simulated_order": False, "simulated_fill": False, "source_completeness_verified": False}
+    position["nontrade_settlement"] = details
+    event = {"event": "nontrade_last_observed_accounting_settlement", "recorded_at": "2026-10-29T18:00:00+08:00",
+             "market": "m", "session_date": "2026-10-29", "position_id": "p", "symbol": "2330", **details}
+    if damage == "fake_execution": mode["execution_evidence_complete"] = True
+    if damage == "event": event["simulated_fill"] = True
+    if damage == "source": details["reference"] = {**reference, "reference_price": 102.}
+    if damage == "quantity": details["quantity"] = 2000
+    if damage == "fee": details["assumed_exit_fee_and_tax_twd"] += 1
+    if damage == "clock": event["recorded_at"] = "2026-10-29T13:00:00+08:00"
+    kwargs = dict(day="2026-10-29", plan=plan, bars=bars, prior_realized=0., nontrade_events=[event],
+                  terminal_close_sources=[{"path": str(source), "sha256": sha}])
+    if damage:
+        with pytest.raises(RuntimeError):
+            verify.verify_published_fill_accounting(mode, fills[:1], **kwargs)
+    else:
+        result = verify.verify_published_fill_accounting(mode, fills[:1], **kwargs)
+        assert result["entry_shares"] == 1000 and result["exit_shares"] == 0
+        assert result["nontrade_settlement_shares"] == 1000
+        assert result["session_bookkeeping_net_pnl_twd"] == pytest.approx(791.215)
+        assert "session_realized_net_pnl_twd" not in result
 
 
 @pytest.mark.parametrize("damage", ["fee", "volume", "clock", "replay"])
@@ -89,6 +136,72 @@ def test_revision_terminal_close_requires_pinned_traded_official_evidence(tmp_pa
         result = verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars,
             prior_realized=0., terminal_close_sources=sources)
         assert result["session_realized_net_pnl_twd"] == pytest.approx(791.215)
+        with pytest.raises(RuntimeError, match="observed close-minute trade"):
+            verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars,
+                prior_realized=0., terminal_close_sources=sources, require_observed_terminal_minute=True)
+        bars["2330"]["2026-10-29T13:30+08:00"] = {"close": 101., "volume_shares": 1000.}
+        verify.verify_published_fill_accounting(mode, fills, day="2026-10-29", plan=plan, bars=bars,
+            prior_realized=0., terminal_close_sources=sources, require_observed_terminal_minute=True)
+
+
+@pytest.mark.parametrize("damage", [None, "clock", "volume", "row", "hash", "ordinary"])
+def test_delayed_terminal_fill_requires_pinned_1333_source_and_official_close(tmp_path, damage):
+    mode, fills, plan, bars = _revision_accounting_fixture()
+    official = tmp_path / "twse_daily_ohlcv" / "2026-10-29.json"
+    official.parent.mkdir()
+    official.write_text(json.dumps({"date": "20261029", "stat": "OK", "tables": [
+        {"fields": ["證券代號", "收盤價", "成交股數"], "data": [["2330", "101", "1000"]]}]}))
+    official_sha = hashlib.sha256(official.read_bytes()).hexdigest()
+    source = tmp_path / "bars.parquet"
+    pl.DataFrame({"symbol": ["2330"], "ts": [datetime(2026, 10, 29, 13, 33)],
+                  "Close": [100. if damage == "row" else 101.], "volume_shares": [2000.]}).write_parquet(source)
+    source_sha = hashlib.sha256(source.read_bytes()).hexdigest()
+    bars["2330"]["2026-10-29T13:33+08:00"] = {"close": 101., "volume_shares": 2000.}
+    if damage == "ordinary":
+        bars["2330"]["2026-10-29T13:30+08:00"] = {"close": 101., "volume_shares": 2000.}
+    close = fills[1]
+    close.update(fill_at="2026-10-29T13:33:00+08:00", purpose="13_33_delayed_close_paper_settlement",
+        fill_contract="source_close_full_deliverable_residual_no_capacity_paper_only_v1")
+    clock = dict(contract=verify.repair.DELAYED_AUCTION_PAPER_REPLAY_CONTRACT,
+        session_date="2026-10-29", symbol="2330", source_minute_at=close["fill_at"],
+        observed_close=101., volume_shares=2000., source_path=str(source), source_sha256=source_sha,
+        clock_basis="historical_source_minute_label_not_broker_match")
+    close["terminal_close_receipt"] = dict(contract=close["fill_contract"], broker_fill=False,
+        full_quantity_is_user_assumption=True, effective_at=close["fill_at"], delayed_paper_auction=clock,
+        source_evidence=dict(session_date="2026-10-29", price=101., source="twse_official_daily_close",
+                             source_sha256=official_sha, price_basis="official_session_close"))
+    if damage == "clock":
+        clock["source_minute_at"] = "2026-10-29T13:30:00+08:00"
+    elif damage == "volume":
+        clock["volume_shares"] = 1000.
+    elif damage == "hash":
+        clock["source_sha256"] = "0" * 64
+    kwargs = dict(day="2026-10-29", plan=plan, bars=bars, prior_realized=0.,
+        terminal_close_sources=[{"path": str(official), "sha256": official_sha}],
+        minute_source_files=[{"path": str(source), "sha256": source_sha, "symbols": ["2330"]}])
+    if damage:
+        with pytest.raises(RuntimeError):
+            verify.verify_published_fill_accounting(mode, fills, **kwargs)
+    else:
+        result = verify.verify_published_fill_accounting(mode, fills, **kwargs)
+        assert result["entry_shares"] == result["exit_shares"] == 1000
+
+
+def test_minute_coverage_accepts_a_separate_proven_1333_event_but_not_a_fake_bar():
+    start = datetime.fromisoformat("2026-10-29T09:01:00+08:00")
+    marks = [{"market": "m", "session_date": "2026-10-29",
+              "minute": (start + timedelta(minutes=i)).isoformat(),
+              "missing_price_position_count": 0, "valuation_stale": False} for i in range(270)]
+    marks.append({"market": "m", "session_date": "2026-10-29", "minute": "2026-10-29T13:33:00+08:00",
+                  "valuation_source": "source_pinned_delayed_auction_event_v1", "open_position_count": 0,
+                  "missing_price_position_count": 0, "valuation_stale": False})
+    mode = {"positions": {}, "delayed_paper_auction_settled_at": "2026-10-29T13:33:00+08:00"}
+    result = verify.verify_minute_source_coverage(mode, marks, market="m", day="2026-10-29", source_files=[])
+    assert result["minute_points"] == 270
+    assert result["delayed_auction_event_at"] == "2026-10-29T13:33:00+08:00"
+    marks[-1]["valuation_source"] = "other"
+    with pytest.raises(RuntimeError, match="delayed closing"):
+        verify.verify_minute_source_coverage(mode, marks, market="m", day="2026-10-29", source_files=[])
 
 
 def test_prefix_verification_accepts_append_but_not_overwrite_or_truncation(tmp_path):
@@ -145,6 +258,36 @@ def test_carried_minutes_need_explicit_no_trade_evidence_not_fabricated_freshnes
     else:
         with pytest.raises(RuntimeError, match="zero-trade"):
             verify.verify_carried_minute(row, no_trade_symbols=symbols, held_symbols={"3406"})
+
+
+def test_provisional_coverage_requires_opt_in_marker_and_prior_observed_bar():
+    start = datetime.fromisoformat("2026-10-29T09:01:00+08:00")
+    marks = [{"market": "m", "session_date": "2026-10-29",
+              "minute": (start + timedelta(minutes=i)).isoformat(),
+              "missing_price_position_count": 0, "valuation_stale": False} for i in range(270)]
+    marks[1].update({"historical_minute_replay": True,
+                     "provisional_minute_source_coverage": True,
+                     "minute_valuation_contract": "right_labelled_historical_last_trade_mark_v1",
+                     "valuation_stale": True, "stale_position_count": 1,
+                     "last_trade_carried_position_count": 1})
+    mode = {"positions": {"p": {"symbol": "3406", "entry_at": start.isoformat(),
+                               "exit_at": "2026-10-29T09:03:00+08:00"}}}
+    bars = {"3406": {"2026-10-29T09:01+08:00": {"close": 10., "volume_shares": 1000}}}
+    args = dict(market="m", day="2026-10-29", source_files=[])
+    with pytest.raises(RuntimeError, match="zero-trade"):
+        verify.verify_minute_source_coverage(mode, marks, **args)
+    result = verify.verify_minute_source_coverage(mode, marks, allow_unverified_gaps=True, bars=bars, **args)
+    assert result["unknown_carried_minute_symbols"] == {"2026-10-29T09:02": ["3406"]}
+    assert result["unsourced_held_price_minutes"] == 1
+    marks[1]["provisional_minute_source_coverage"] = False
+    with pytest.raises(RuntimeError, match="explicit replay marker"):
+        verify.verify_minute_source_coverage(mode, marks, allow_unverified_gaps=True, bars=bars, **args)
+    marks[1]["provisional_minute_source_coverage"] = True
+    with pytest.raises(RuntimeError, match="earlier observed bar"):
+        verify.verify_minute_source_coverage(mode, marks, allow_unverified_gaps=True, bars={"3406": {}}, **args)
+    with pytest.raises(RuntimeError, match="observed bars"):
+        verify.verify_minute_source_coverage(mode, marks, allow_unverified_gaps=True,
+            bars={"3406": {**bars["3406"], "2026-10-29T09:02+08:00": {"close": 10.}}}, **args)
 
 
 def _position():
@@ -236,3 +379,38 @@ def test_post_apply_provenance_never_exempts_prices_code_or_unapplied_candidates
     manifest["status"] = "candidate_validated_not_applied"
     with pytest.raises(RuntimeError, match="requires applied"):
         verify.verify_applied_source_provenance(manifest)
+
+
+def test_post_apply_code_archive_requires_exact_hash_and_never_weakens_preapply(tmp_path, monkeypatch):
+    monkeypatch.setattr(verify, "ROOT", tmp_path)
+    current = tmp_path / "scripts" / "verify_tw_day_trade_scoped_repair.py"
+    current.parent.mkdir()
+    current.write_bytes(b"new code")
+    root = tmp_path / "operation"
+    archive = root / "accepted_code_snapshots_20261104" / current.name
+    archive.parent.mkdir(parents=True)
+    archive.write_bytes(b"original code")
+    digest = hashlib.sha256(b"original code").hexdigest()
+    manifest = {"status": "applied", "operation_root": str(root), "applied_sessions": [],
+                "source_pins": [{"path": str(current), "sha256": digest}]}
+    result = verify.verify_applied_source_provenance(manifest)
+    assert result["byte_identical_source_pins"] == 0
+    assert result["archived_original_code_pins"][0]["original_path_bytes_unchanged_claim"] is False
+    with pytest.raises(RuntimeError, match="source changed"):
+        verify.repair._assert_source_pins(manifest["source_pins"])
+    archive.write_bytes(b"not the original")
+    with pytest.raises(RuntimeError, match="source changed"):
+        verify.verify_applied_source_provenance(manifest)
+
+
+def test_accounting_matches_only_sub_micro_twd_reduction_roundoff():
+    baseline = {"position_cohorts": 19, "entry_shares": 255000,
+                "net_fees_and_tax_twd": 27944.968349999992,
+                "session_realized_net_pnl_twd": -88614.96834999947,
+                "shared_minute_capacity_verified": True}
+    actual = {**baseline, "session_realized_net_pnl_twd": -88614.9683499995}
+    assert verify.accounting_matches(actual, baseline)
+    assert not verify.accounting_matches({**actual, "entry_shares": 254000}, baseline)
+    assert not verify.accounting_matches({**actual, "session_realized_net_pnl_twd": -88614.968}, baseline)
+    assert not verify.accounting_matches({**actual, "net_fees_and_tax_twd": float("nan")}, baseline)
+    assert not verify.accounting_matches({**actual, "shared_minute_capacity_verified": 1}, baseline)

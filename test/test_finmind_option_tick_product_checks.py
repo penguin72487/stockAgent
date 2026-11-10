@@ -125,6 +125,42 @@ def test_waiter_requires_the_same_source_and_priority_receipt(tmp_path, monkeypa
         waiter.checked_inputs(path, root, result['request_id'], NOW)
 
 
+@pytest.mark.parametrize('mutation', [None, 'conflicting_commitment', 'changed_during_readback'])
+def test_shared_originals_are_hashed_once_and_still_require_one_stable_generation(
+        tmp_path, monkeypatch, mutation):
+    from collections import Counter
+
+    root, receipt, parquet = fixture(tmp_path, monkeypatch)
+    digest = lambda p: hashlib.sha256(p.read_bytes()).hexdigest()
+    source = {'start_date': DAY,
+              'expected_source_contracts': [[PRODUCT, '202012', 20., 'C'], ['DKO', '202012', 21., 'P']],
+              'original_parquet_path': str(parquet.relative_to(root)), 'original_parquet_sha256': digest(parquet),
+              'original_receipt_sha256': digest(receipt)}
+    monkeypatch.setattr(checks, 'load_option_contract_conflicts',
+                        lambda *_a, **_kw: ({'requests': [source]}, 'verified-sidecar'))
+    path = tmp_path / 'source.json'
+    result = checks.register_checks(root, [(DAY, PRODUCT), (DAY, 'DKO')], NOW, path)
+    if mutation == 'conflicting_commitment':
+        plan = json.loads(path.read_text())
+        plan['checks'][1]['original_receipt_sha256'] = 'f' * 64
+        path.write_text(json.dumps(plan))
+    calls = Counter()
+    def read(source_path):
+        calls[source_path] += 1
+        value = digest(source_path)
+        if mutation == 'changed_during_readback' and source_path == parquet:
+            receipt.write_text('changed after its full SHA was checked')
+        return value
+    monkeypatch.setattr(waiter, 'sha256_file', read)
+    if mutation is None:
+        _, status = waiter.checked_inputs(path, root, result['request_id'], NOW)
+        assert len(status['items']) == 2
+        assert len(calls) == 3 and set(calls.values()) == {1}
+    else:
+        with pytest.raises(ValueError, match='conflicting|changed'):
+            waiter.checked_inputs(path, root, result['request_id'], NOW)
+
+
 def test_waiter_only_shortens_sampling_retry_for_a_fresh_disk_guard(tmp_path):
     status = tmp_path / 'status.json'
     started = datetime(2026, 10, 28, 17, tzinfo=UTC)
@@ -142,6 +178,98 @@ def test_waiter_only_shortens_sampling_retry_for_a_fresh_disk_guard(tmp_path):
     assert waiter.retry_delay('disk_guard', tmp_path, started) == (60, None)
     assert waiter.retry_delay('batch_complete', tmp_path, started) == (10, None)
     assert waiter.retry_delay('rate_limited', tmp_path, started) == (300, None)
+
+
+@pytest.mark.parametrize('capacity_state', ['deferred', 'unknown'])
+def test_capacity_wait_does_not_reopen_owner_or_rehash_sources_until_expiry(
+        tmp_path, monkeypatch, capsys, capacity_state):
+    from types import SimpleNamespace
+
+    root, _, _ = fixture(tmp_path, monkeypatch)
+    path = tmp_path / 'source.json'
+    result = checks.register_checks(root, [(DAY, PRODUCT)], NOW, path)
+    expires = datetime.fromisoformat(json.loads(path.read_text())['expires_at_utc'])
+    now, reads, samples, audits = [NOW], [], [], []
+    checked = waiter.checked_inputs
+    monkeypatch.setattr(waiter, 'checked_inputs', lambda *a: reads.append(a) or checked(*a))
+    monkeypatch.setattr(waiter.subprocess, 'run', lambda *_a, **_kw: pytest.fail('owner must remain unstarted'))
+    monkeypatch.setattr(readback, 'audit', lambda *_a: audits.append(True) or {'training_ready': False})
+    capacity = SimpleNamespace(initial_sample=lambda: samples.append(True) or {
+        'state': capacity_state, 'reason': 'physical_backing_reserve'})
+
+    def advance_to_expiry(_seconds):
+        now[0] = expires
+
+    assert waiter.run(path, result['request_id'], root=root, capacity=capacity,
+                      clock=lambda: now[0], sleep=advance_to_expiry) == 75
+    assert len(samples) == 1 and len(reads) == 2 and audits == [True]
+    events = [json.loads(line) for line in capsys.readouterr().out.splitlines()]
+    assert events[0]['state'] == 'waiting_capacity_before_owner'
+    assert events[0]['owner_started'] is False
+    assert events[-1]['state'] == 'plan_expired'
+
+
+def test_capacity_recovery_rechecks_changed_source_before_starting_owner(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    root, receipt, _ = fixture(tmp_path, monkeypatch)
+    path = tmp_path / 'source.json'
+    result = checks.register_checks(root, [(DAY, PRODUCT)], NOW, path)
+    samples = []
+    def sample():
+        samples.append(True)
+        return {'state': 'deferred' if len(samples) == 1 else 'admitted', 'reason': 'filesystem_reserve'}
+    monkeypatch.setattr(waiter.subprocess, 'run', lambda *_a, **_kw: pytest.fail('changed source cannot dispatch'))
+    assert waiter.run(path, result['request_id'], root=root,
+        capacity=SimpleNamespace(initial_sample=sample), clock=lambda: NOW,
+        sleep=lambda _seconds: receipt.write_text('changed while no owner was running')) == 75
+    assert len(samples) == 2
+
+
+@pytest.mark.parametrize('mutation', ['owner_changed', 'expired'])
+def test_slow_capacity_probe_cannot_dispatch_changed_or_expired_work(tmp_path, monkeypatch, mutation):
+    from types import SimpleNamespace
+
+    root, _, _ = fixture(tmp_path, monkeypatch)
+    path = tmp_path / 'source.json'
+    result = checks.register_checks(root, [(DAY, PRODUCT)], NOW, path)
+    expires = datetime.fromisoformat(json.loads(path.read_text())['expires_at_utc'])
+    code = tmp_path / 'owner.py'
+    code.write_text('original')
+    monkeypatch.setattr(waiter, 'OWNERS', (code,))
+    monkeypatch.setattr(waiter.subprocess, 'run', lambda *_a, **_kw: pytest.fail('dispatch boundary must revalidate'))
+    monkeypatch.setattr(readback, 'audit', lambda *_a: {'training_ready': False})
+    now = [NOW]
+    def sample():
+        if mutation == 'owner_changed':
+            code.write_text('replacement')
+        else:
+            now[0] = expires
+        return {'state': 'admitted'}
+    assert waiter.run(path, result['request_id'], root=root, capacity=SimpleNamespace(initial_sample=sample),
+                      clock=lambda: now[0], sleep=lambda _seconds: None) == 75
+
+
+def test_admitted_preflight_uses_the_same_owner_and_reads_its_terminal_result(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    root, _, _ = fixture(tmp_path, monkeypatch)
+    path = tmp_path / 'source.json'
+    result = checks.register_checks(root, [(DAY, PRODUCT)], NOW, path)
+    launched = []
+    def child(command, **kwargs):
+        launched.append(command)
+        with sqlite3_connect(root) as con:
+            con.execute("UPDATE tasks SET state='complete' WHERE data_id=?", (PRODUCT,))
+        return SimpleNamespace(returncode=0, stdout='{"state":"batch_complete"}', stderr='')
+    monkeypatch.setattr(waiter.subprocess, 'run', child)
+    monkeypatch.setattr(readback, 'audit', lambda *_a: {'source_readback': True, 'training_ready': False})
+    capacity = SimpleNamespace(initial_sample=lambda: {'state': 'admitted'})
+    assert waiter.run(path, result['request_id'], root=root, capacity=capacity,
+                      clock=lambda: NOW, sleep=lambda _seconds: None) == 0
+    assert launched == [waiter.owner_command(root, result['request_id'], ((checks.DATASET, PRODUCT, DAY),))]
+    saved = json.loads(path.with_name(path.stem + '_readback.json').read_text())
+    assert saved['source_readback'] is True and saved['training_ready'] is False
 
 
 def test_waiter_observes_canonical_lock_without_starting_an_owner(tmp_path):

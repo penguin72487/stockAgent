@@ -7,7 +7,7 @@ execution payload so a changing ledger cannot delay the first signal view.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, time
 from functools import lru_cache
 import json
 from pathlib import Path
@@ -117,6 +117,8 @@ def _read_market(
     return ({"status": "published", "signal_ready_at": ready_at,
              "artifact_published_at": artifact_at, "revision_index": revision_index,
              "completed_session_calculation": summary.get("price_source") == "panel_close",
+             "execution_preview_only": summary.get("execution_preview_only") is True,
+             "price_data_date": str(summary.get("price_data_date") or "")[:10],
              "target_count": len(rows), "public_signal_key": public_key}, tuple(rows))
 
 
@@ -130,6 +132,15 @@ def build_published_signal_snapshot(*, repo_root: Path, observed_at: datetime | 
     session = clock.get("display_session_date")
     configs = load_market_configs(repo / "services/discord_bot/markets")
     modes, rows = [], []
+    reference_modes, reference_rows = [], []
+    local_now = now.astimezone(_TAIPEI)
+    previous_session = None
+    # A completed-close calculation is only a separately labelled preopen
+    # reference. It is never a current-session signal, an order, or a fill.
+    if (session == local_now.date().isoformat()
+            and time(8, 30) <= local_now.time().replace(tzinfo=None) < time(9, 0)):
+        before_rollover = local_now.replace(hour=8, minute=29, second=0, microsecond=0)
+        previous_session = dashboard_session_clock(before_rollover).get("display_session_date")
     for market, config in sorted(configs.items()):
         if not config.enabled or not config.day_trade_simulation_enabled:
             continue
@@ -158,7 +169,37 @@ def build_published_signal_snapshot(*, repo_root: Path, observed_at: datetime | 
             mode.update(status="waiting")
         except (OSError, TypeError, ValueError, json.JSONDecodeError):
             mode.update(status="unavailable")
+            if previous_session:
+                try:
+                    pointer_path = root / "latest_signal.json"
+                    signature = _signature(pointer_path)
+                    pointer = _object(pointer_path, _MAX_POINTER_BYTES)
+                    timestamp = datetime.fromisoformat(str(pointer.get("signal_ready_at", "")).replace("Z", "+00:00"))
+                    if timestamp.tzinfo is None or timestamp >= now:
+                        raise ValueError("reference timestamp is not observable")
+                    pointer_session = timestamp.astimezone(_TAIPEI).date().isoformat()
+                    if pointer_session >= session:
+                        raise ValueError("reference is not from an earlier date")
+                    detail, candidate_rows = _read_market(str(repo), str(root), market, pointer_session, signature)
+                    artifact = datetime.fromisoformat(detail["artifact_published_at"].replace("Z", "+00:00"))
+                    if (not detail["completed_session_calculation"]
+                            or not detail["execution_preview_only"]
+                            or detail["price_data_date"] != previous_session
+                            or artifact < timestamp or artifact > now
+                            or _signature(pointer_path) != signature):
+                        raise ValueError("reference is not a verified previous-close preview")
+                    mode["status"] = "waiting"
+                    reference_modes.append({"market": market, "label": config.label,
+                                            "price_data_date": previous_session,
+                                            "signal_ready_at": detail["signal_ready_at"],
+                                            "target_count": detail["target_count"],
+                                            "public_signal_key": detail["public_signal_key"]})
+                    reference_rows.extend(candidate_rows)
+                except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+                    pass
         modes.append(mode)
     rows.sort(key=lambda row: (-abs(row["target_weight"]), row["market"], row["symbol"]))
+    reference_rows.sort(key=lambda row: (-abs(row["target_weight"]), row["market"], row["symbol"]))
     return {"schema_version": 1, "simulation_only": True, "production_order_possible": False,
-            "session_date": session, "modes": modes, "rows": rows}
+            "session_date": session, "modes": modes, "rows": rows,
+            "preopen_reference": {"modes": reference_modes, "rows": reference_rows}}

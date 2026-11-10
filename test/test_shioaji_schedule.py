@@ -252,7 +252,7 @@ def test_minute_runner_reserves_live_connections_and_does_not_gate_on_futures_ca
     assert "SHIOAJI_MINUTE_WORKERS:-4" in minute_runner
     assert "SHIOAJI_MINUTE_WORKERS:-5" not in minute_runner
     assert "minute_connection_plan(" in minute_runner
-    assert 'sleep "$market_delay"\n    # The target may advance while sleeping across the close.' in minute_runner
+    assert 'minute_runner_sleep_unlocked "$market_delay"\n    # The target may advance while sleeping across the close.' in minute_runner
     assert "futures_history=independent_downstream_gate" in minute_runner
     assert "futures_priority_state" not in minute_runner
     assert "--stop-at \"$minute_deadline\"" in minute_runner

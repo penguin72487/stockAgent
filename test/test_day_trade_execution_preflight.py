@@ -1,12 +1,15 @@
+import ast
 from pathlib import Path
 import fcntl
 import json
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
 import train
 from stockagent.config import load_config
+from stockagent.data import tw_day_trade_carry_source
 from stockagent.data.tw_day_trade_execution import discover_day_trade_minute_execution_source
 
 
@@ -15,6 +18,82 @@ def config_with_source(root):
     config.trading.execution_mode = "tw_day_trade"
     config.data.day_trade_minute_execution_root = str(root)
     return config
+
+
+def test_physical_source_preflight_matches_the_actual_builder_call():
+    """Adding a builder argument must update the early admission contract."""
+    # Read one source generation rather than asking inspect/linecache for two
+    # imported function offsets; another authorized task may edit train.py
+    # while this broad regression process is already running.
+    module = ast.parse(Path(train.__file__).read_text(encoding="utf-8"))
+    preflight = next(node for node in module.body if isinstance(node, ast.FunctionDef)
+                     and node.name == "_preflight_day_trade_carry_abi")
+    assignment = next(node for node in ast.walk(preflight) if isinstance(node, ast.Assign)
+                      and any(isinstance(target, ast.Name) and target.id == "required"
+                              for target in node.targets))
+    required = ast.literal_eval(assignment.value)
+    main = next(node for node in module.body if isinstance(node, ast.FunctionDef) and node.name == "main")
+    calls = [node for node in ast.walk(main) if isinstance(node, ast.Call)
+             and isinstance(node.func, ast.Name)
+             and node.func.id == "build_prepared_day_trade_carry_source"]
+    assert len(calls) == 1
+    assert required == {keyword.arg for keyword in calls[0].keywords}
+    config_assignment = next(node for node in ast.walk(preflight) if isinstance(node, ast.Assign)
+                             and any(isinstance(target, ast.Name) and target.id == "required_config"
+                                     for target in node.targets))
+    config_fields = ast.literal_eval(config_assignment.value)
+    actual_fields = {(node.value.attr, node.attr) for node in ast.walk(calls[0])
+                     if isinstance(node, ast.Attribute) and isinstance(node.value, ast.Attribute)
+                     and isinstance(node.value.value, ast.Name) and node.value.value.id == "config"}
+    assert {(section, field) for section, fields in config_fields.items() for field in fields} == actual_fields
+
+
+def test_physical_source_preflight_rejects_mixed_release_without_defaulting_cost(tmp_path, monkeypatch):
+    config = config_with_source(tmp_path / "minutes")
+    config.trading.tw_day_trade_unlimited_margin_conversion = True
+    config.trading.tw_day_trade_short_limit_up_penalty_rate = 0.07
+
+    # The older frozen source accepts no research-cost keyword; a generic
+    # **kwargs sink is not evidence that it implements that financial rule.
+    def older_builder(**kwargs):
+        raise AssertionError("the source builder must not execute during preflight")
+
+    monkeypatch.setattr(tw_day_trade_carry_source, "build_prepared_day_trade_carry_source", older_builder)
+    with pytest.raises(RuntimeError, match="physical source ABI mismatch") as error:
+        train._preflight_day_trade_carry_abi(config)
+    assert "short_limit_up_penalty_rate" in str(error.value)
+    assert config.trading.tw_day_trade_short_limit_up_penalty_rate == 0.07
+
+
+def test_physical_source_preflight_requires_the_loaded_config_cost_field(tmp_path):
+    config = config_with_source(tmp_path / "minutes")
+    config.trading = SimpleNamespace(
+        execution_mode="tw_day_trade", tw_day_trade_unlimited_margin_conversion=True,
+    )
+    with pytest.raises(RuntimeError, match="trading.tw_day_trade_short_limit_up_penalty_rate"):
+        train._preflight_day_trade_carry_abi(config)
+
+
+@pytest.mark.parametrize("execution_mode, minute_root, physical", [
+    ("naive", "minutes", True),
+    ("tw_day_trade", None, True),
+    ("tw_day_trade", "minutes", False),
+])
+def test_other_execution_paths_do_not_require_the_physical_source_abi(
+    tmp_path, monkeypatch, execution_mode, minute_root, physical,
+):
+    config = config_with_source(tmp_path / "minutes")
+    config.trading.execution_mode = execution_mode
+    config.data.day_trade_minute_execution_root = minute_root
+    config.trading.tw_day_trade_unlimited_margin_conversion = physical
+    monkeypatch.setattr(tw_day_trade_carry_source, "build_prepared_day_trade_carry_source", None)
+    train._preflight_day_trade_carry_abi(config)
+
+
+def test_physical_source_preflight_accepts_the_current_canonical_abi(tmp_path):
+    config = config_with_source(tmp_path / "minutes")
+    config.trading.tw_day_trade_unlimited_margin_conversion = True
+    train._preflight_day_trade_carry_abi(config)
 
 
 @pytest.mark.parametrize("damage", ["missing", "file", "empty", "invalid_date"])

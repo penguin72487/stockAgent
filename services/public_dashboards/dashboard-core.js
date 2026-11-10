@@ -932,6 +932,17 @@
   }
 
   function enhanceResponsiveTable(table, affectedRows = null) {
+    // A scrollable table needs a named keyboard focus target even when its
+    // columns are not eligible for card reflow. Dynamic tables share this path.
+    const region = table?.closest?.(".table-scroll,.table-wrap");
+    if (region?.setAttribute) {
+      if (!region.hasAttribute("tabindex")) region.setAttribute("tabindex", "0");
+      if (!region.hasAttribute("role")) region.setAttribute("role", "region");
+      if (!region.hasAttribute("aria-label") && !region.hasAttribute("aria-labelledby")) {
+        const caption = table.querySelector("caption")?.textContent?.trim();
+        region.setAttribute("aria-label", caption || "表格明細，可捲動");
+      }
+    }
     if (!responsiveTableEligible(table)) return false;
     const headers = [...table.querySelectorAll("thead th")]
       .map((cell) => String(cell.textContent || "").trim());

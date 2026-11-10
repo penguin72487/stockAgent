@@ -18,6 +18,7 @@ from stockagent.data_sync.packed_snapshots import (
     resolve_latest_packed,
     resolve_packed_snapshot_id,
     verify_packed_snapshot,
+    write_packed_pin,
 )
 
 
@@ -142,6 +143,36 @@ def test_pin_keeps_an_old_release_and_its_objects(retention_store):
     assert plan["protected_release_count"] == 2
     assert plan["candidate_manifests"] == 0
     assert plan["candidate_objects"] == 0
+
+
+def test_research_pin_retains_cold_release_without_pinning_materialized_copy(retention_store):
+    from stockagent.data_sync.materialized_cache import _pinned_snapshot_ids
+    cfg, old, _current = retention_store
+    pins = cfg.state_dir / "research-pins" / ("a" * 64)
+    pins.mkdir(parents=True)
+    (cfg.state_dir / module.RESEARCH_PIN_MARKER).write_text(json.dumps(
+        {"contract": module.RESEARCH_PIN_CONTRACT, "schema_version": 1}))
+    write_packed_pin(pins / "source.pin.json", old, exclusive=True)
+    plan = build_plan(cfg, now_ns=time.time_ns() + 1_000_000_000)
+    assert not plan["blockers"] and plan["candidate_manifests"] == 0
+    assert old.manifest['snapshot_id'] not in _pinned_snapshot_ids(cfg.materialized_root)
+
+
+def test_redirected_research_pin_root_blocks_retention(retention_store, tmp_path):
+    cfg, _old, _current = retention_store
+    cfg.state_dir.mkdir(parents=True)
+    (cfg.state_dir / "research-pins").symlink_to(tmp_path, target_is_directory=True)
+    plan = build_plan(cfg, now_ns=time.time_ns() + 1_000_000_000)
+    assert "local retention protection metadata requires audit" in plan["blockers"]
+
+
+def test_missing_research_pin_root_after_enrollment_blocks_retention(retention_store):
+    cfg, _old, _current = retention_store
+    cfg.state_dir.mkdir(parents=True)
+    (cfg.state_dir / module.RESEARCH_PIN_MARKER).write_text(json.dumps(
+        {"contract": module.RESEARCH_PIN_CONTRACT, "schema_version": 1}))
+    plan = build_plan(cfg, now_ns=time.time_ns() + 1_000_000_000)
+    assert "local retention protection metadata requires audit" in plan["blockers"]
 
 
 def test_missing_d_object_and_stale_peer_proof_fail_closed(retention_store):

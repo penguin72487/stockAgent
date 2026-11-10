@@ -209,7 +209,26 @@ def _validate_minute_curve_coverage(
     if receipt.get("linear_interpolation_used") is not False:
         failures.append("minute curve receipt permits linear interpolation")
     opening_revalued = receipt.get("opening_marks_revalued_at_completed_minute") is True
-    if opening_revalued:
+    from scripts.rebuild_tw_day_trade_minute_curves import opening_assumption_policy
+    first_bar_revalued = receipt.get("opening_marks_revalued_with_disclosed_first_bar_exceptions") is True
+    policy = opening_assumption_policy(first_bar_revalued)
+    cost_revalued = receipt.get("opening_marks_revalued_with_disclosed_cost_exceptions") is True
+    if first_bar_revalued and cost_revalued:
+        failures.append("opening reference assumption policies cannot be mixed")
+    cost_revalued = cost_revalued or first_bar_revalued
+    if cost_revalued:
+        cost_proof = strategy.get(policy["key"]) or {}
+        readback = strategy.get(policy["readback"]) or {}
+        if (opening_revalued or cost_proof.get("contract") != policy["contract"]
+                or not cost_proof.get("authorized_targets")
+                or readback.get("contract") != policy["contract"]
+                or readback.get("verified_symbol_points") != len(cost_proof["authorized_targets"])
+                or readback.get("market_observation_verified") is not False
+                or readback.get("financial_journals_changed") is not False):
+            failures.append("provisional opening cost valuation lacks explicit independent assumption acceptance")
+        if first_bar_revalued and readback.get("later_bar_source_verified") is not True:
+            failures.append("first-bar opening valuation lacks independent native source readback")
+    if opening_revalued or cost_revalued:
         if receipt.get("accepted_13_30_endpoints_preserved") is not True:
             failures.append("minute revaluation did not preserve accepted 13:30 endpoints")
         fills_path = marks_path.parent / "fills.jsonl"
@@ -237,8 +256,12 @@ def _validate_minute_curve_coverage(
             failures.append(f"minute curve output hash mismatch: {path.name}")
 
     observed: dict[tuple[str, str], set[str]] = {}
+    duplicate_rows = 0
+    duplicate_samples: list[str] = []
     unverified_interior_rows = 0
     unverified_interior_samples: list[str] = []
+    cost_symbols: set[tuple[str, str, str]] = set()
+    cost_points: set[tuple[str, str]] = set()
     if marks_path.is_file():
         with open_paper_journal(marks_path, "r", encoding="utf-8") as handle:
             for line_number, line in enumerate(handle, start=1):
@@ -254,10 +277,40 @@ def _validate_minute_curve_coverage(
                 if session_date not in completed_session_dates or market not in expected_markets:
                     continue
                 minute = str(row.get("minute") or "")
-                observed.setdefault((session_date, market), set()).add(minute)
+                assumed = row.get(policy["key"])
+                if row.get(opening_assumption_policy(not first_bar_revalued)["key"]) is not None:
+                    failures.append("unapproved opening assumption policy in marks")
+                if assumed is not None:
+                    if (not cost_revalued or minute != f"{session_date}T09:01+08:00"
+                            or not isinstance(assumed, dict)
+                            or assumed.get("contract") != cost_proof.get("contract")
+                            or row.get("valuation_stale") is not True
+                            or row.get("valuation_executable") is not False):
+                        failures.append("provisional opening cost row has invalid scope or disclosure")
+                    else:
+                        cost_points.add((market, minute))
+                        cost_symbols.update((market, session_date, str(p.get("symbol") or ""))
+                                            for p in assumed.get("cohorts", []) if isinstance(p, dict))
+                        if first_bar_revalued and (
+                                assumed.get("uses_later_observation") is not True
+                                or assumed.get("causal_0901_market_observation") is not False
+                                or not assumed.get("cohorts")
+                                or any(not isinstance(p, dict) or not isinstance(p.get("reference_bar"), dict)
+                                    or p["reference_bar"].get("session_date") != session_date
+                                    or p["reference_bar"].get("symbol") != p.get("symbol")
+                                    or not minute < str(p["reference_bar"].get("source_minute") or "") <= f"{session_date}T13:30+08:00"
+                                    for p in assumed["cohorts"])):
+                            failures.append("later first-bar valuation lost its actual source clock or retrospective disclosure")
+                minutes = observed.setdefault((session_date, market), set())
+                if minute in minutes:
+                    duplicate_rows += 1
+                    if len(duplicate_samples) < 20:
+                        duplicate_samples.append(f"{session_date}:{market}:{minute}")
+                minutes.add(minute)
                 if (
-                    (minute[11:16] != "13:30" if opening_revalued
+                    (minute[11:16] != "13:30" if opening_revalued or cost_revalued
                      else minute[11:16] not in {"09:01", "13:30"})
+                    and not (cost_revalued and assumed is not None)
                     and not historical_minute_mark_has_source(row)
                 ):
                     unverified_interior_rows += 1
@@ -265,6 +318,8 @@ def _validate_minute_curve_coverage(
                         unverified_interior_samples.append(
                             f"{session_date}:{market}:{minute}"
                         )
+    if cost_revalued and cost_symbols != {tuple(item) for item in cost_proof.get("authorized_targets", [])}:
+        failures.append("provisional opening cost marks differ from their explicitly authorized symbols")
     for session_date in completed_session_dates:
         base = datetime.fromisoformat(f"{session_date}T09:01:00+08:00")
         expected_minutes = {
@@ -284,18 +339,27 @@ def _validate_minute_curve_coverage(
             f"price provenance: {unverified_interior_rows}; "
             f"sample={unverified_interior_samples}"
         )
+    if duplicate_rows:
+        failures.append(
+            f"minute curve contains duplicate minute rows: {duplicate_rows}; "
+            f"sample={duplicate_samples}"
+        )
     return {
         "required": True,
         "contract": str(receipt.get("minute_contract") or ""),
         "completed_session_dates": completed_session_dates,
         "points_per_session_mode": MINUTE_CURVE_SESSION_POINTS,
         "opening_marks_revalued_at_completed_minute": opening_revalued,
+        **({policy["key"]: {**readback,
+            "verified_minute_points": len(cost_points),
+            "points": [list(item) for item in sorted(cost_points)]}} if cost_revalued else {}),
         "validated_rows": sum(len(values) for values in observed.values()),
         "audited_historical_interior_rows": (
             len(completed_session_dates) * len(expected_markets) * 268
             - unverified_interior_rows
         ),
         "unverified_historical_interior_rows": unverified_interior_rows,
+        "duplicate_minute_rows": duplicate_rows,
         "receipt_sha256": _sha256(receipt_path),
     }
 
@@ -646,6 +710,7 @@ def _validate_0901_minute_price_signal_ledger(
     allow_receipted_absence: bool = False,
     expected_prior_fills: int = 0,
     prior_manifest: dict[str, dict[str, Any]] | None = None,
+    allow_verified_provisional_open: bool = False,
 ) -> dict[str, Any]:
     path = candidate / "signals.jsonl"
     if not path.is_file():
@@ -662,6 +727,11 @@ def _validate_0901_minute_price_signal_ledger(
                 failures.append(f"signals.jsonl:{line_number}: invalid JSON")
                 continue
             if str(row.get("entry_fill_policy") or "") != MINUTE_VWAP_0901_ENTRY_POLICY:
+                continue
+            if row.get("historical_open_fallback_fill") is True and allow_verified_provisional_open:
+                # This is checked separately against the paired paper entry,
+                # source receipt and independent accounting audit. It is not
+                # an observed 09:01 minute fill and must not enter that count.
                 continue
             if row.get("prior_paper_fill_reused") is True:
                 prior_count += 1
@@ -771,6 +841,192 @@ def _validate_0901_minute_price_signal_ledger(
         "prior_paper_fills": prior_count,
         "absent_execution_price_validation": absence,
     }
+
+
+def _validate_provisional_open_assumptions(
+    candidate: Path, *, expected_by_session_market: Mapping[tuple[str, str], int],
+    failures: list[str],
+) -> dict[str, Any]:
+    """Reconcile disclosed assumptions; this is *not* source authorization.
+
+    The caller must additionally require the independent full-range source and
+    accounting audit, as well as an explicit per-market publication opt-in.
+    """
+    from stockagent.live.tw_day_trade_simulation import (
+        HISTORICAL_OPEN_FALLBACK_CONTRACT, entry_price_guard_reason,
+    )
+
+    rows: dict[str, dict[tuple[str, str, str], dict[str, Any]]] = {}
+    for name in ("signals", "fills"):
+        selected: dict[tuple[str, str, str], dict[str, Any]] = {}
+        path = candidate / f"{name}.jsonl"
+        if not path.is_file():
+            failures.append(f"{name} ledger missing for provisional open reconciliation")
+            rows[name] = selected
+            continue
+        with open_paper_journal(path, "r", encoding="utf-8") as stream:
+            for line_number, line in enumerate(stream, start=1):
+                try:
+                    row = json.loads(line)
+                except json.JSONDecodeError:
+                    failures.append(f"{name}.jsonl:{line_number}: invalid JSON")
+                    continue
+                if row.get("historical_open_fallback_fill") is not True:
+                    continue
+                key = tuple(str(row.get(field) or "") for field in ("session_date", "market", "symbol"))
+                if not all(key) or key in selected:
+                    failures.append(f"{name}.jsonl:{line_number}: duplicate or incomplete provisional entry")
+                    continue
+                selected[key] = row
+        rows[name] = selected
+
+    signals, fills = rows["signals"], rows["fills"]
+    if signals.keys() != fills.keys():
+        failures.append("provisional open assumptions do not have one matching signal and fill")
+    counts: dict[tuple[str, str], int] = {}
+    for key in signals.keys() & fills.keys():
+        signal, fill = signals[key], fills[key]
+        day, market, symbol = key
+        counts[(day, market)] = counts.get((day, market), 0) + 1
+        proof = signal.get("historical_open_fallback_evidence")
+        try:
+            stamp = datetime.fromisoformat(str(signal["recorded_at"]))
+            fill_stamp = datetime.fromisoformat(str(fill["fill_at"]))
+            quantity, requested = int(signal["filled_shares"]), int(signal["requested_shares"])
+            price, sizing_open, nav = (float(signal[field]) for field in
+                                       ("execution_price", "sizing_open_price", "sizing_nav_twd"))
+            side = signal.get("side")
+            same_values = (
+                stamp == fill_stamp and stamp.date().isoformat() == day
+                and stamp.hour == 9 and stamp.minute == 1 and stamp.second == 0
+                and stamp.utcoffset() == timedelta(hours=8)
+                and quantity == signal["filled_shares"] == fill.get("quantity")
+                and quantity > 0 and quantity % 1000 == 0 and quantity <= requested
+                and all(math.isfinite(value) and value > 0 for value in (price, sizing_open, nav))
+                and math.isclose(price, sizing_open, rel_tol=0, abs_tol=1e-8)
+                and math.isclose(price, float(fill["price"]), rel_tol=0, abs_tol=1e-8)
+                and quantity * price <= nav + 1e-6
+                and signal.get("filled_weight_basis") == "session_start_account_nav"
+                and side in {"long", "short"}
+                and signal.get("action") == ("BUY" if side == "long" else "SELL")
+                and entry_price_guard_reason(side=side, price=price,
+                    take_profit_price=signal.get("take_profit_price"),
+                    stop_trigger_price=signal.get("stop_trigger_price")) is None
+                and signal.get("take_profit_price") == fill.get("take_profit_price")
+                and signal.get("stop_trigger_price") == fill.get("stop_trigger_price")
+            )
+        except (KeyError, TypeError, ValueError, OverflowError):
+            same_values = False
+        disclosure = (
+            isinstance(proof, dict) and proof == fill.get("historical_open_fallback_evidence")
+            and proof.get("contract") == HISTORICAL_OPEN_FALLBACK_CONTRACT
+            and proof.get("session_date") == day and proof.get("symbol") == symbol
+            and proof.get("simulation_only") is True and proof.get("broker_fill") is False
+            and proof.get("exchange_fill") is False and proof.get("opening_time_known") is False
+            and proof.get("full_quantity_assumed") is True
+            and signal.get("reason") == "counterfactual_official_open_when_0901_unavailable"
+            and fill.get("purpose") == "entry" and fill.get("simulation_only") is True
+            and fill.get("fill_contract") == HISTORICAL_OPEN_FALLBACK_CONTRACT
+            and all(row.get("simulation_replay") is True
+                    and row.get("counterfactual_0901_price_fill") is False
+                    and row.get("counterfactual_open_price_fill") is False
+                    and row.get("synthetic_fill") is False
+                    and row.get("synthetic_fallback_fill") is False
+                    and row.get("paper_market_fill") is False
+                    and row.get("entry_price_method") == "official_open_fallback_assumption"
+                    and row.get("entry_price_source") == "official_daily_session_open_assumed_for_0901"
+                    and row.get("entry_price_guard_contract") == "strict_inside_original_take_profit_stop_loss_v1"
+                    and row.get("entry_price_offset_ticks") == 0 for row in (signal, fill))
+        )
+        if not same_values or not disclosure:
+            failures.append(f"{day}/{market}/{symbol}: inconsistent provisional open assumption")
+    expected = {key: int(value) for key, value in expected_by_session_market.items() if value}
+    if counts != expected:
+        failures.append("provisional open signal/fill counts do not match session receipts")
+    return {"assumption_entries": len(fills), "by_session_market": {
+        "|".join(key): value for key, value in sorted(counts.items())}}
+
+
+def _validate_provisional_signal_lineage(
+    candidate: Path, *, receipt: Mapping[str, Any], market: str,
+    checkpoint_fingerprint: str,
+) -> dict[str, Any]:
+    """Pin every retrospective signal and its opening input through cutover."""
+    preflight_path = (candidate / "signal_preflight.json").resolve(strict=True)
+    preflight_hash = _sha256(preflight_path)
+    if (receipt.get("signal_preflight") or {}).get("sha256") != preflight_hash:
+        raise ValueError("provisional signal preflight hash differs from replay receipt")
+    preflight = _load_object(preflight_path)
+    artifacts = preflight.get("artifacts")
+    sessions = receipt.get("sessions")
+    if (preflight.get("contract") != "exact_selected_signal_preflight_v1"
+            or preflight.get("status") != "accepted_sources_only"
+            or preflight.get("simulation_only") is not True
+            or preflight.get("production_order_possible") is not False
+            or preflight.get("execution_or_minute_coverage_accepted") is not False
+            or preflight.get("failures") != [] or not isinstance(artifacts, list)
+            or not isinstance(sessions, list) or not sessions
+            or type(preflight.get("expected_signals")) is not int
+            or preflight["expected_signals"] != len(sessions)
+            or preflight.get("accepted_signals") != len(sessions)
+            or len(artifacts) != len(sessions) or not checkpoint_fingerprint):
+        raise ValueError("provisional signal preflight scope or source contract is invalid")
+    expected: dict[str, Mapping[str, Any]] = {}
+    for session in sessions:
+        if not isinstance(session, Mapping) or not isinstance(session.get("modes"), list):
+            raise ValueError("invalid provisional signal session")
+        day = str(session.get("session_date") or "")
+        modes = session["modes"]
+        if day in expected or len(modes) != 1 or modes[0].get("market") != market:
+            raise ValueError("provisional signal sessions are duplicate or have a different market")
+        expected[day] = modes[0]
+    source_hashes = {str(preflight_path): preflight_hash}
+    seen: set[str] = set()
+    for item in artifacts:
+        if not isinstance(item, Mapping):
+            raise ValueError("invalid provisional signal artifact")
+        day = str(item.get("session_date") or "")
+        if day not in expected or day in seen or item.get("market") != market:
+            raise ValueError("provisional signal artifact has wrong or duplicate session")
+        seen.add(day)
+        row = expected[day]
+        for field in ("signal_id", "summary_path", "summary_sha256", "weights_path", "weights_sha256"):
+            if not item.get(field) or item.get(field) != row.get(field):
+                raise ValueError(f"provisional signal {field} differs from replay session")
+        paths = {}
+        for field in ("summary", "weights", "open_input"):
+            raw = Path(str(item.get(field + "_path") or ""))
+            if not raw.is_absolute():
+                raise ValueError("provisional signal source path must be absolute")
+            path = raw.resolve(strict=True)
+            digest = str(item.get(field + "_sha256") or "")
+            if len(digest) != 64 or _sha256(path) != digest:
+                raise ValueError(f"provisional signal source hash changed: {field}")
+            if str(path) in source_hashes and source_hashes[str(path)] != digest:
+                raise ValueError("conflicting provisional signal source hashes")
+            source_hashes[str(path)] = digest
+            paths[field] = path
+        if (paths["summary"].name != "summary.json"
+                or paths["weights"].parent != paths["summary"].parent
+                or paths["weights"].name not in {"target_weights.parquet", "execution_weights.json"}):
+            raise ValueError("provisional signal summary and weights are not the same artifact")
+        summary = _load_object(paths["summary"])
+        provenance = summary.get("counterfactual_open_provenance") or {}
+        if (summary.get("market") != market or summary.get("signal_id") != item["signal_id"]
+                or summary.get("checkpoint_fingerprint") != checkpoint_fingerprint
+                or summary.get("counterfactual_signal_regeneration") is not True
+                or summary.get("simulation_only") is not True
+                or summary.get("production_order_possible") is not False
+                or provenance.get("source") != "official_daily_session_open"
+                or str(provenance.get("input_path") or "") != str(item["open_input_path"])
+                or provenance.get("input_sha256") != item["open_input_sha256"]):
+            raise ValueError("provisional signal identity, checkpoint or open input differs")
+    if seen != set(expected):
+        raise ValueError("provisional signal source set is incomplete")
+    if any(_sha256(Path(path)) != digest for path, digest in source_hashes.items()):
+        raise RuntimeError("provisional signal source changed during validation")
+    return {"signal_count": len(seen), "source_hashes": source_hashes,
+            "retrospective_not_live_publication": True}
 
 
 def _validate_0901_minute_price_fill_ledger(
@@ -1002,12 +1258,18 @@ def _validate_rebuild(
     expected_markets: set[str],
     allow_current_open_session: bool = False,
     allow_margin_carry: bool = False,
+    allow_provisional_research_market: str | None = None,
 ) -> dict[str, Any]:
     from stockagent.live.day_trade_addition import CONTRACT as ADDITION_CONTRACT, validate_addition
     if _load_object(candidate / "rebuild_receipt.json").get("contract") == ADDITION_CONTRACT:
-        if allow_current_open_session or allow_margin_carry:
+        if allow_current_open_session or allow_margin_carry or allow_provisional_research_market:
             raise ValueError("additive validation keeps component-specific completed-session contracts")
         return validate_addition(candidate, expected_markets=expected_markets)
+    if allow_provisional_research_market is not None and (
+        expected_markets != {allow_provisional_research_market}
+        or allow_current_open_session or allow_margin_carry
+    ):
+        raise ValueError("provisional research requires one exact completed-session market")
     input_hashes = _promotion_input_hashes(candidate)
     receipt_path = candidate / "rebuild_receipt.json"
     state_path = candidate / "state.json"
@@ -1046,6 +1308,30 @@ def _validate_rebuild(
         strict_intraday_audit = audit(candidate, require_margin_carry=False)
         if not strict_intraday_audit.get("full_requested_range_passed"):
             failures.append(f"strict intraday full source/accounting audit failed: {strict_intraday_audit.get('errors')}")
+    provisional_research = allow_provisional_research_market is not None
+    provisional_signal_lineage = None
+    if provisional_research:
+        from stockagent.live.tw_day_trade_simulation import (
+            HISTORICAL_BRACKET_FULL_CROSS_CONTRACT, HISTORICAL_OPEN_FALLBACK_CONTRACT,
+        )
+        if (receipt.get("provisional_minute_source_coverage") is not True
+                or receipt.get("historical_open_fallback_assumption") != HISTORICAL_OPEN_FALLBACK_CONTRACT
+                or receipt.get("historical_bracket_cross_assumption") != HISTORICAL_BRACKET_FULL_CROSS_CONTRACT
+                or receipt.get("official_daily_close_reference_when_minute_missing") is not True
+                or receipt_entry_contract != MINUTE_PRICE_0901_REPLAY_CONTRACT
+                or not terminal_unlimited
+                or not strict_intraday_audit
+                or strict_intraday_audit.get("provisional_minute_source_coverage") is not True
+                or not strict_intraday_audit.get("full_requested_range_passed")):
+            failures.append("provisional research requires its explicit assumptions and full independent source/accounting audit")
+        try:
+            selected_mode = modes.get(allow_provisional_research_market) or {}
+            provisional_signal_lineage = _validate_provisional_signal_lineage(
+                candidate, receipt=receipt, market=allow_provisional_research_market,
+                checkpoint_fingerprint=str(selected_mode.get("checkpoint_fingerprint") or ""),
+            )
+        except (OSError, TypeError, ValueError, RuntimeError) as exc:
+            failures.append(f"provisional signal lineage failed: {exc}")
     if allow_margin_carry:
         from scripts.audit_tw_day_trade_margin_replay import audit
         from stockagent.live.tw_day_trade_simulation import MARGIN_CARRY_CONTRACT
@@ -1077,6 +1363,7 @@ def _validate_rebuild(
     post_0901_sweep_fills = 0
     post_0901_reductions_by_market: dict[str, int] = {}
     post_0901_sweep_by_session: dict[tuple[str, str], tuple[int, int]] = {}
+    provisional_opens_by_session: dict[tuple[str, str], int] = {}
     current_date = datetime.now(TAIPEI).date().isoformat()
     current_open_session: str | None = None
     for session_index, session in enumerate(sessions):
@@ -1104,6 +1391,11 @@ def _validate_rebuild(
         elif close_status != "settled_official_close" and not (
             allow_margin_carry and close_status == "assumed_margin_inventory_carried"
             and margin_audit and margin_audit.get("full_requested_range_passed")
+        ) and not (
+            provisional_research and strict_intraday_audit
+            and strict_intraday_audit.get("full_requested_range_passed")
+            and close_status in {"session_flat_no_broker_fill_claim",
+                                 "session_flat_with_nontrade_book_assumptions"}
         ):
             failures.append(f"{session_date}: session is not settled at official close")
         mode_rows = session.get("modes")
@@ -1163,7 +1455,10 @@ def _validate_rebuild(
                         failures.append(
                             f"{session_date}/{market}: 09:01 minute-price replay contract is not explicit"
                         )
-                    if minute_price_0901_count + prior_paper_count != fill_count:
+                    provisional_count = fill_count - minute_price_0901_count - prior_paper_count
+                    if provisional_research and provisional_count >= 0:
+                        provisional_opens_by_session[(session_date, market)] = provisional_count
+                    elif provisional_count != 0:
                         failures.append(
                             f"{session_date}/{market}: 09:01 minute-price fill counts do not reconcile"
                         )
@@ -1420,6 +1715,7 @@ def _validate_rebuild(
             allow_receipted_absence=allow_margin_carry or terminal_unlimited,
             expected_prior_fills=prior_paper_fills,
             prior_manifest=prior_manifest,
+            allow_verified_provisional_open=provisional_research,
         )
         signal_ledger_validation.update(
             _validate_0901_minute_price_fill_ledger(
@@ -1432,6 +1728,16 @@ def _validate_rebuild(
                 prior_manifest=prior_manifest,
             )
         )
+        if provisional_research:
+            assumptions = _validate_provisional_open_assumptions(
+                candidate, expected_by_session_market=provisional_opens_by_session,
+                failures=failures,
+            )
+            signal_ledger_validation["provisional_open_assumptions"] = assumptions
+            signal_ledger_validation["provisional_signal_lineage"] = provisional_signal_lineage
+            if (not strict_intraday_audit or assumptions["assumption_entries"]
+                    != strict_intraday_audit.get("official_open_0901_assumption_entries")):
+                failures.append("provisional open entries differ from the independent source audit")
 
     completed_session_dates = [
         session_date
@@ -1474,6 +1780,14 @@ def _validate_rebuild(
         "final_open_positions": final_open_positions,
         "margin_carry_audit": margin_audit,
         "strict_intraday_audit": strict_intraday_audit,
+        "provisional_research": ({
+            "market": allow_provisional_research_market,
+            "official_open_assumptions": signal_ledger_validation["provisional_open_assumptions"]["assumption_entries"],
+            "nontrade_book_assumptions": strict_intraday_audit.get("provisional_nontrade_accounting_assumptions"),
+            "complete_minute_source_coverage_verified": strict_intraday_audit.get("complete_minute_source_coverage_verified"),
+            "source_gaps_may_change_results": True,
+            "broker_or_exchange_execution_claimed": False,
+        } if provisional_research else None),
         "ending_equity_twd": ending_equity,
         "allow_current_open_session": bool(allow_current_open_session),
         "current_open_session": current_open_session,
@@ -1573,6 +1887,15 @@ def _cutover_blockers(
             retained_live = {m: row for m, row in live_modes.items() if aborted is None or m not in added}
             if not retained_accounts_match(prior.get("modes"), retained_live):
                 blockers.append("retained live accounts changed after the additive snapshot")
+            try:
+                from scripts.repair_tw_day_trade_flat_opening import _require_evidenced_cutover_orders
+                from scripts.reload_tw_day_trade_services_if_flat import terminal_entry_price_rejection
+                _require_evidenced_cutover_orders(
+                    {"modes": retained_live}, live / "events.jsonl", now=datetime.now(TAIPEI),
+                    terminal_entry_validator=terminal_entry_price_rejection,
+                )
+            except (OSError, TypeError, ValueError) as exc:
+                blockers.append(f"retained terminal paper orders are not proven: {exc}")
             # A flat heartbeat is harmless; losing an intervening decision,
             # order, fill, event or latency receipt is not. Recheck the complete
             # original byte streams again under the ordinary cutover locks.
@@ -1662,10 +1985,32 @@ def _revalidate_margin_sources(candidate: Path, acceptance: dict[str, Any]) -> N
     for name, digest in audit.get("terminal_close_source_hashes", {}).items():
         if _sha256(Path(name)) != digest:
             raise RuntimeError(f"audited terminal close source changed: {name}")
+    for field in ("official_open_fallback_source_hashes", "research_close_source_hashes",
+                  "nontrade_source_hashes", "finmind_projection_source_hashes"):
+        sources = audit.get(field, {})
+        if not isinstance(sources, dict):
+            raise ValueError(f"invalid audited source hash set: {field}")
+        for name, digest in sources.items():
+            if _sha256(Path(name)) != digest:
+                raise RuntimeError(f"audited {field} source changed: {name}")
+    calendar = audit.get("official_calendar_verification")
+    if calendar is not None:
+        if (not isinstance(calendar, dict) or not calendar.get("path")
+                or not calendar.get("sha256")):
+            raise ValueError("invalid audited official calendar evidence")
+        if _sha256(Path(calendar["path"])) != calendar["sha256"]:
+            raise RuntimeError("audited official calendar changed before cutover")
     for name, expected in audit.get("minute_source_signatures", {}).items():
         stat = Path(name).stat()
         if [stat.st_size, stat.st_mtime_ns, stat.st_ctime_ns] != list(expected):
             raise RuntimeError(f"audited fill-minute source changed: {name}")
+    signal_lineage = acceptance["signal_ledger_validation"].get("provisional_signal_lineage") or {}
+    signal_sources = signal_lineage.get("source_hashes", {})
+    if not isinstance(signal_sources, dict):
+        raise ValueError("invalid audited provisional signal source hashes")
+    for name, digest in signal_sources.items():
+        if _sha256(Path(name)) != digest:
+            raise RuntimeError(f"audited provisional signal source changed: {name}")
     absence = acceptance["signal_ledger_validation"].get("absent_execution_price_validation") or {}
     for name, expected in absence.get("source_signatures", {}).items():
         path = Path(name)
@@ -1684,6 +2029,7 @@ def _require_added_runtime_policy(candidate: Path, added_markets: set[str]) -> N
     from stockagent.live.market_config import load_market_config
     from stockagent.live.market_status import short_file_fingerprint
     state = _load_object(candidate / "state.json")
+    rebuild = _load_object(candidate / "rebuild_receipt.json")
     for market in added_markets:
         config = load_market_config(REPO_ROOT / "services/discord_bot/markets" / f"{market}.yaml")
         mode = state["modes"][market]
@@ -1696,6 +2042,13 @@ def _require_added_runtime_policy(candidate: Path, added_markets: set[str]) -> N
         if (not config.checkpoint_path or str(mode.get("checkpoint_fingerprint") or "")
                 != short_file_fingerprint(Path(config.checkpoint_path))):
             raise RuntimeError(f"independent runtime checkpoint differs from accepted replay: {market}")
+        authorization = rebuild.get("provisional_research_publication") or {}
+        if "research_model" in authorization:
+            from stockagent.live.day_trade_addition import _pin_research_model
+            if (_pin_research_model(mode) != authorization["research_model"]
+                    or Path(config.checkpoint_path).resolve() != Path(mode["checkpoint_path"]).resolve()
+                    or Path(config.config_path).resolve() != Path(mode["config_path"]).resolve()):
+                raise RuntimeError(f"independent research model source differs at cutover: {market}")
 
 
 def main(*, before_exchange: Callable[[], None] | None = None, argv=None) -> None:

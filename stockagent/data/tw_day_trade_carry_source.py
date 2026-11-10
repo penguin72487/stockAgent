@@ -662,6 +662,7 @@ def _source_identity(
     exact_stock_delivery_day: np.ndarray,
     no_regular_execution: np.ndarray,
     unresolved_replacement_block: np.ndarray,
+    materialization_year: int | None = None,
 ) -> tuple[
     str,
     dict[str, dict[str, Any]],
@@ -684,7 +685,9 @@ def _source_identity(
     ):
         raise RuntimeError("physical minute source manifest is not research_ready")
     partitions: dict[np.datetime64, tuple[Path, str]] = {}
-    selected_days = set(dates.astype("datetime64[D]"))
+    from stockagent.data.inference_scope import year_decision_mask
+    requested = year_decision_mask(dates, materialization_year)
+    selected_days = set(dates.astype("datetime64[D]")[requested])
     seen_manifest_days: set[np.datetime64] = set()
     partition_scope: dict[str, Any] = {
         "selected_panel_partitions": 0,
@@ -720,6 +723,14 @@ def _source_identity(
         if day in selected_days:
             partitions[day] = (output, output_sha256)
             partition_scope["selected_panel_partitions"] += 1
+            continue
+        if materialization_year is not None:
+            # This payload is not consumed by a year-scoped execution. Its
+            # manifest declaration remains validated; do not hash/rebuild an
+            # older minute partition or claim its bytes were verified.
+            partition_scope.setdefault("outside_materialization_scope_not_read", []).append({
+                "trade_date": trade_date, "output": relative,
+                "declared_output_sha256": output_sha256, "payload_verified": False})
             continue
         if not output.is_file():
             raise FileNotFoundError(
@@ -1745,6 +1756,7 @@ def build_prepared_day_trade_carry_source(
     entry_remainder_policy: str = "first_minute_only",
     subscription_right_policy: str = "reference_value_cash",
     sparse_event_slots: int | None = None,
+    materialization_year: int | None = None,
 ) -> PreparedDayTradeCarrySource:
     from stockagent.storage_layout import admit_output
     if (isinstance(short_limit_up_penalty_rate, bool)
@@ -1768,6 +1780,10 @@ def build_prepared_day_trade_carry_source(
     minute_path = Path(minute_root).resolve()
     public_path = _public_root(public_feature_path)
     dates = np.asarray(panel.dates, dtype="datetime64[D]").reshape(-1)
+    from stockagent.data.inference_scope import year_decision_mask, year_scope_receipt, scoped_source_digest
+    requested_rows = year_decision_mask(dates, materialization_year)
+    materialization_scope = (year_scope_receipt(dates, materialization_year)
+                             if materialization_year is not None else None)
     symbols = tuple(str(symbol) for symbol in panel.symbols)
     unsupported = [symbol for symbol in symbols if classify_tw_stock_or_etf(symbol) is None]
     if unsupported:
@@ -1881,9 +1897,12 @@ def build_prepared_day_trade_carry_source(
         exact_stock_delivery_day=exact_stock_delivery_day,
         no_regular_execution=no_regular_execution,
         unresolved_replacement_block=unresolved_replacement_block,
+        **({"materialization_year": materialization_year} if materialization_year is not None else {}),
     )
+    if materialization_year is not None:
+        digest = scoped_source_digest(digest, materialization_year)
     resume_compatible_release_ids: list[str] = []
-    if subscription_right_flat.size:
+    if subscription_right_flat.size and materialization_year is None:
         # V12 extends the physical objective only where v11 deterministically
         # failed on a held, source-verified pure subscription right. Recreate
         # the exact old content identity so a checkpoint from a trajectory
@@ -1938,7 +1957,7 @@ def build_prepared_day_trade_carry_source(
     if not partition_dates:
         raise FileNotFoundError("physical minute source has no dated partitions")
     first_minute = partition_dates[0]
-    if not allow_daily_proxy and bool((dates < first_minute).any()):
+    if not allow_daily_proxy and bool((dates[requested_rows] < first_minute).any()):
         raise ValueError("physical source forbids the required pre-minute daily proxy")
 
     lower, upper, security_types, limit_counts = _load_or_build_price_limit_cache(
@@ -2011,6 +2030,7 @@ def build_prepared_day_trade_carry_source(
                     and candidate.get("source_digest") == digest
                     and candidate.get("rows") == int(dates.size)
                     and candidate.get("symbols") == len(symbols)
+                    and candidate.get("materialization_scope") == materialization_scope
                     and ready.get("abi") == PHYSICAL_SOURCE_CACHE_ABI
                     and ready.get("source_digest") == digest
                     and ready.get("manifest_sha256") == _sha256(manifest_path)
@@ -2023,7 +2043,7 @@ def build_prepared_day_trade_carry_source(
         unresolved_gap_path = cache_root / "unresolved_action_gaps.npy"
         action_path = cache_root / "exact_inventory_actions.npz"
         required = [gap_path, unresolved_gap_path, action_path]
-        for day in dates:
+        for day in dates[requested_rows]:
             if day >= first_minute:
                 day_text = np.datetime_as_string(day, unit="D")
                 required.append(cache_root / f"session-{day_text}.npz")
@@ -2048,7 +2068,8 @@ def build_prepared_day_trade_carry_source(
             print(
                 "[physical source] rebuilding exact hybrid sessions "
                 f"rows={dates.size} symbols={len(symbols)} "
-                f"minute_sessions={int((dates >= first_minute).sum())}",
+                f"minute_sessions={int(((dates >= first_minute) & requested_rows).sum())} "
+                f"materialized_sessions={int(requested_rows.sum())}",
                 flush=True,
             )
             gaps = np.zeros(shape, dtype=np.bool_)
@@ -2098,9 +2119,11 @@ def build_prepared_day_trade_carry_source(
                 "daily_proxy_price_policy": daily_proxy_price_policy,
                 "board_lot_shares": BOARD_LOT_SHARES,
             }
-            total_minute_sessions = int((dates >= first_minute).sum())
+            total_minute_sessions = int(((dates >= first_minute) & requested_rows).sum())
             minute_sessions_built = 0
             for row, day in enumerate(dates):
+                if not requested_rows[row]:
+                    continue
                 valid_limits = (
                     np.isfinite(lower[row]) & np.isfinite(upper[row])
                     & (lower[row] > 0) & (upper[row] > lower[row])
@@ -2391,6 +2414,7 @@ def build_prepared_day_trade_carry_source(
                 "minute_volume_reconciliation": "regular_session_positive_volume_must_not_exceed_official_whole_day_volume_else_daily_proxy",
                 "session_encoding": "sorted_flat_sparse_exit_mark_and_exact_inventory_uncompressed_npz",
                 "storage_contract": incremental_contract,
+                **({"materialization_scope": materialization_scope} if materialization_scope is not None else {}),
                 "session_builds": session_builds,
                 "storage_build": reuse.statistics(),
                 "corporate_action_policy": {
@@ -2569,6 +2593,10 @@ def build_prepared_day_trade_carry_source(
         empty_entry_path[..., 0] = np.nan
 
     def _load_packed_session_uncached(row: int) -> PackedDayTradeCarrySession:
+        if row < 0 or row >= dates.size:
+            raise IndexError("physical session is outside its reference calendar")
+        if not requested_rows[row]:
+            raise ValueError("physical session is outside the declared inference year; no observation was materialized")
         day = dates[row]
         day_text = np.datetime_as_string(day, unit="D")
         gap = np.asarray(gaps[row], dtype=np.float64)
@@ -2786,6 +2814,7 @@ def build_prepared_day_trade_carry_source(
         packed_session_loader=load_packed_session,
         runtime_cache_info=session_cache.snapshot,
         audit_receipt={
+            **({"materialization_scope": materialization_scope} if materialization_scope is not None else {}),
             "abi": manifest["abi"],
             "cache_manifest": str(manifest_path),
             "cache_manifest_sha256": _sha256(manifest_path),
