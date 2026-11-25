@@ -21,6 +21,7 @@ from scripts import audit_git_content as content
     "stockagent-rate-limits-0/provider.state", "stockagent-rate-limits-1001/provider.state",
     "service_data/stockagent-live/state.json", ".stversions/README.md~20261110",
     ".codex_remote_perf/orig/stockagent/copied_source.py",
+    "opening-source-probe-temp/2026-11-11.acquisition.jsonl",
 ])
 def test_excludes_roles_not_needed_by_git(path):
     assert content.decision(path)["decision"] == "exclude"
@@ -187,7 +188,8 @@ def test_repo_ignore_rules_do_not_hide_source_or_required_fixtures(repo):
                ".data_future.pre-e-20990101-v2/receipt.json",
                "stockagent-rate-limits-0/provider.state", "stockagent-rate-limits-1001/provider.state",
                "service_data/stockagent-live/state.json", ".stversions/README.md~20261110",
-               ".codex_remote_perf/new/stockagent/copied_source.py"]
+               ".codex_remote_perf/new/stockagent/copied_source.py",
+               "opening-source-probe-temp/2026-11-11.acquisition.jsonl"]
     kept = ["configs/data_sync/catalog.json", "stockagent/data/panel.py", "test/test_new.py",
             "test/fixtures/a.parquet", "test/fixtures/nested/a.zip", ".env.example", "uv.lock",
             "services/discord_bot/.env copy.example", "services/dashboard/index.html",
@@ -195,7 +197,8 @@ def test_repo_ignore_rules_do_not_hide_source_or_required_fixtures(repo):
             "test/fixtures/provider.state", "docs/.data_move_notes.md",
             "configs/stockagent-rate-limits-defaults.json", "stockagent/service_data/adapter.py",
             "test/fixtures/.data_provider.pre-e-example/receipt.json",
-            "stockagent-rate-limits-helper.py", ".data_provider.pre-e-notes.md"]
+            "stockagent-rate-limits-helper.py", ".data_provider.pre-e-notes.md",
+            "test/fixtures/opening-source-probe-temp/synthetic.jsonl"]
     for name in ignored + kept:
         # Explicit file paths allow check-ignore to work without building test payload trees.
         path = repo / name

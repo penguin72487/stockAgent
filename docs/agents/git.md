@@ -52,6 +52,25 @@ Small reviewed binary fixtures belong under `test/fixtures`, not an exception
 for all production datasets. Avoid blanket `*.json`, `*.csv`, `*.html`, `docs/`
 or `.agents/skills/` ignores: those also hide necessary software and evidence.
 
+## Daily Git maintenance
+
+On Penguin, `stockagent-daily-git.timer` runs at 23:30 Asia/Taipei. It audits the
+`twRule` checkout and commits removals from tracking when both the committed
+root `.gitignore` and the content audit identify local outputs. The cached
+removal retains the on-disk files. User drafts and unrelated staged work stay
+available for their owners. The push includes committed work on `twRule`, after
+checking the path roles and running Gitleaks over all outgoing commits.
+
+The timer keeps its latest private receipt at
+`/var/lib/stockagent/daily-git/latest.json`. `systemctl list-timers stockagent-daily-git.timer`
+shows the next run. `journalctl -u stockagent-daily-git.service` shows run outcomes.
+The deployed service uses a verified copy of `maintain_git_daily.py`,
+`audit_git_content.py` and `runtime_env.sh` to keep daily publication independent
+of edits in progress. The service template takes the checkout, program and GitHub
+CLI configuration paths. The default invocation of the Python entrypoint is a
+plan, and `--apply` requests the commit and push. Scheduled pushes require an
+existing GitHub CLI login for the configured `origin` and a Gitleaks executable.
+
 ## Historical removal is a separate, recoverable operation
 
 `.gitignore` only controls untracked files; it does not remove an index entry or

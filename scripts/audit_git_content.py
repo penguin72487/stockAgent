@@ -39,7 +39,7 @@ def decision(path: str, size: int = 0, *, large_bytes: int = 5 * 1024**2) -> dic
                               and ".pre-e-" in first)
     node_runtime = (len(parts) > 1
                     and (first in {"service_data", ".stversions", ".codex_remote_perf"}
-                         or first.startswith("stockagent-rate-limits-")))
+                         or first.startswith(("stockagent-rate-limits-", "opening-source-probe-"))))
     private = (name.startswith(".env") and not name.endswith((".example", ".sample", ".template"))
                or p.suffix.lower() in PRIVATE_SUFFIXES
                or name in {"id_rsa", "id_ed25519"} or ".ssh" in parts)
@@ -97,8 +97,8 @@ def object_sizes(repo: Path, oids: set[str]) -> dict[str, int]:
     return sizes
 
 
-def history_inventory(repo: Path, *, reflogs: bool = False) -> dict:
-    scope = ["--all", *(["--reflog"] if reflogs else [])]
+def history_versions(repo: Path, scope: list[str], *, added_only: bool = False) -> dict[str, set[str]]:
+    """Read path/object pairs, including intermediate commits and merge parents."""
     raw = git(repo, "log", *scope, "--root", "-m", "--full-history", "--raw",
               "--no-abbrev", "--no-renames", "--format=", "-z")
     fields = iter(raw.split(b"\0"))
@@ -111,8 +111,31 @@ def history_inventory(repo: Path, *, reflogs: bool = False) -> dict:
             raise ValueError("unexpected Git raw history record")
         old_mode, new_mode, old, new, _status = header[1:].split()
         path = next(fields).decode("utf-8", "surrogateescape")
-        versions[path].update(oid.decode() for mode, oid in ((old_mode, old), (new_mode, new))
-                              if mode != b"160000" and set(oid) != {48})
+        sides = ((new_mode, new),) if added_only else ((old_mode, old), (new_mode, new))
+        for mode, oid in sides:
+            if mode != b"000000" and set(oid) != {48}:
+                versions[path]  # Gitlinks have a path but their object lives abroad.
+                if mode != b"160000":
+                    versions[path].add(oid.decode())
+    return versions
+
+
+def outgoing_exclusions(repo: Path, base: str, tip: str) -> list[dict]:
+    """Audit every added or modified path in the exact range to be pushed."""
+    versions = history_versions(repo, [f"{base}..{tip}"], added_only=True)
+    oids = {oid for items in versions.values() for oid in items}
+    sizes = object_sizes(repo, oids)
+    excluded = []
+    for path, ids in sorted(versions.items()):
+        role = decision(path, max((sizes[oid] for oid in ids), default=0))
+        if role["decision"] != "keep":
+            excluded.append({"path": path, **role})
+    return excluded
+
+
+def history_inventory(repo: Path, *, reflogs: bool = False) -> dict:
+    scope = ["--all", *(["--reflog"] if reflogs else [])]
+    versions = history_versions(repo, scope)
     # IDE checkpoints can reference trees directly, outside every commit graph.
     # git log --all alone does not enumerate their paths.
     non_commit_refs, blob_refs = [], set()
