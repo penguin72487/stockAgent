@@ -10,6 +10,7 @@ StateDirectory=stockagent/daily-git
 StateDirectoryMode=0700
 UMask=0077
 Environment="GH_CONFIG_DIR=__GH_CONFIG_DIR__"
+Environment="XDG_STATE_HOME=/var/lib/stockagent/daily-git/github-state"
 Environment=GIT_TERMINAL_PROMPT=0
 ExecStart=/usr/bin/bash -ec 'source "__PROGRAM_DIR__/runtime_env.sh" && exec_fintech_python "__PROGRAM_DIR__/maintain_git_daily.py" --repo "__REPO_ROOT__" --state-dir /var/lib/stockagent/daily-git --apply'
 TimeoutStartSec=300

@@ -309,3 +309,4 @@ Thumbs.db
 /.stversions/
 /.codex_remote_perf/
 /opening-source-probe-*/
+/.local/state/gh/

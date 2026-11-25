@@ -22,6 +22,7 @@ from scripts import audit_git_content as content
     "service_data/stockagent-live/state.json", ".stversions/README.md~20261110",
     ".codex_remote_perf/orig/stockagent/copied_source.py",
     "opening-source-probe-temp/2026-11-11.acquisition.jsonl",
+    ".local/state/gh/device-id",
 ])
 def test_excludes_roles_not_needed_by_git(path):
     assert content.decision(path)["decision"] == "exclude"
@@ -189,7 +190,7 @@ def test_repo_ignore_rules_do_not_hide_source_or_required_fixtures(repo):
                "stockagent-rate-limits-0/provider.state", "stockagent-rate-limits-1001/provider.state",
                "service_data/stockagent-live/state.json", ".stversions/README.md~20261110",
                ".codex_remote_perf/new/stockagent/copied_source.py",
-               "opening-source-probe-temp/2026-11-11.acquisition.jsonl"]
+               "opening-source-probe-temp/2026-11-11.acquisition.jsonl", ".local/state/gh/device-id"]
     kept = ["configs/data_sync/catalog.json", "stockagent/data/panel.py", "test/test_new.py",
             "test/fixtures/a.parquet", "test/fixtures/nested/a.zip", ".env.example", "uv.lock",
             "services/discord_bot/.env copy.example", "services/dashboard/index.html",
